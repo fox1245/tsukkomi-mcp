@@ -132,7 +132,7 @@ e.close()
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--work-dir", type=Path)
-    parser.add_argument("--events", type=int, default=10000)
+    parser.add_argument("--events", type=int, default=3000)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--worker")
     args = parser.parse_args()

@@ -38,6 +38,6 @@ jobs:
           SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
 
       - name: Large-session concurrent audit gate
-        run: python scripts/benchmark_large.py
+        run: python scripts/benchmark_large.py --events 3000
         env:
           SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
