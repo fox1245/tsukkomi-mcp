@@ -1,0 +1,65 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "self-directing-mcp",
+            "tool": "codex_session_hook",
+            "input": {
+              "event_name": "UserPromptSubmit",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "turn_id": "${turn_id}",
+              "tool_input": "${prompt}"
+            },
+            "timeout": 20,
+            "statusMessage": "Checking session instructions"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "self-directing-mcp",
+            "tool": "codex_session_hook",
+            "input": {
+              "event_name": "PreToolUse",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "turn_id": "${turn_id}",
+              "tool_name": "${tool_name}",
+              "tool_input": "${tool_input}"
+            },
+            "timeout": 20,
+            "statusMessage": "Checking session instructions"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "self-directing-mcp",
+            "tool": "codex_session_hook",
+            "input": {
+              "event_name": "Stop",
+              "session_id": "${session_id}",
+              "transcript_path": "${transcript_path}",
+              "turn_id": "${turn_id}",
+              "stop_hook_active": "${stop_hook_active}"
+            },
+            "timeout": 20,
+            "statusMessage": "Checking session instructions"
+          }
+        ]
+      }
+    ]
+  }
+}

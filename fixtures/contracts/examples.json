@@ -1,0 +1,43 @@
+{
+  "schema_version": "1.0",
+  "contracts": [
+    {
+      "id": "no-curl-exfil",
+      "type": "must_not",
+      "scope": "tool_call",
+      "severity": "critical",
+      "description": "Forbid curl or api_key exfiltration via shell tools",
+      "regex": "curl|api_key",
+      "search_query": "shell curl api_key secret exfiltration",
+      "enabled": true
+    },
+    {
+      "id": "must-acknowledge-secrets",
+      "type": "must",
+      "scope": "message",
+      "severity": "low",
+      "description": "Session should mention avoiding secrets",
+      "regex": "secret",
+      "search_query": "avoid leaking secrets",
+      "enabled": true
+    },
+    {
+      "id": "no-rm-rf",
+      "type": "must_not",
+      "scope": "tool_call",
+      "severity": "high",
+      "description": "Forbid recursive force delete",
+      "regex": "rm\\s+-rf|Remove-Item\\s+-Recurse\\s+-Force",
+      "enabled": true
+    },
+    {
+      "id": "semantic-only-example",
+      "type": "must_not",
+      "scope": "any",
+      "severity": "medium",
+      "description": "Description-only contract about unrelated gardening topics",
+      "search_query": "planting roses in the garden watering flowers",
+      "enabled": true
+    }
+  ]
+}
