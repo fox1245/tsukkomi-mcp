@@ -137,6 +137,16 @@ class SessionStore:
         return {row[0] for row in self._conn.execute(
             "SELECT chunk_id FROM session_events WHERE provider=? AND session_id=?", (provider, session_id))}
 
+    def has_prior_tool_call(self, session_id, provider, call_id, name, before_byte):
+        row = self._conn.execute(
+            """SELECT 1 FROM session_events WHERE provider=? AND session_id=? AND byte_start<?
+               AND json_extract(data,'$.kind')='tool_call'
+               AND json_extract(data,'$.meta.call_id')=?
+               AND json_extract(data,'$.meta.tool_name')=? LIMIT 1""",
+            (provider, session_id, before_byte, call_id, name),
+        ).fetchone()
+        return row is not None
+
     def session_metrics(self, session_id, provider):
         row = self._conn.execute(
             "SELECT chunk_count,parse_errors,unsupported_events FROM session_metrics WHERE provider=? AND session_id=?",
@@ -299,7 +309,13 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
             reindex_reason = "parser_updated"
     # Detect a rewrite concurrent with parsing before publishing any new cursor.
     initial_stat = path.stat()
-    chunks, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start)
+    if provider == "omp" and start:
+        chunks, offset, parsed_sid = parse_session_chunks(
+            path, session_id=sid, start_byte=start,
+            prior_call=lambda call_id, name, before_byte: store.has_prior_tool_call(
+                sid, provider, call_id, name, before_byte))
+    else:
+        chunks, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start)
     if parsed_sid != sid:
         raise ValueError("session id changed while parsing")
     digest = prefix_digest(path, offset)

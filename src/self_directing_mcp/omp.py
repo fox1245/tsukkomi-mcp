@@ -7,8 +7,20 @@ from pathlib import Path
 
 from self_directing_mcp.session_events import as_text, iter_raw_lines, make_chunk, parse_error, result_success
 
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_EVENT_FIELDS = {"id", "parentId", "timestamp", "type"}
+_ADMIN_FIELDS = {
+    "title_change": _EVENT_FIELDS | {"title", "source", "previousTitle", "trigger"},
+    "credential_pin": _EVENT_FIELDS | {"provider", "hash"},
+    "mode_change": _EVENT_FIELDS | {"mode", "data"},
+    "compaction": _EVENT_FIELDS | {"summary", "shortSummary", "firstKeptEntryId",
+                                   "tokensBefore", "tokensAfter", "method",
+                                   "providerReplayThroughEntryId", "details",
+                                   "fromExtension", "preserveData"},
+}
+_CUSTOM_MESSAGE_FIELDS = _EVENT_FIELDS | {"customType", "attribution", "display", "content", "details"}
+_TODO_HUD_FIELDS = _EVENT_FIELDS | {"customType", "data"}
 
 
 class PathTraversalError(ValueError):
@@ -68,7 +80,7 @@ def resolve_session_path(root: Path, *, session_id: str | None = None, path: str
     return resolved
 
 
-def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None):
+def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, prior_call=None):
     sid = peek_session_id(path)
     if sid is None or (session_id is not None and session_id != sid):
         raise ValueError("OMP session header missing or id does not match requested session")
@@ -93,16 +105,43 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 raise ValueError("OMP event before session header")
             if obj.get("type") != "message" or not isinstance(obj.get("message"), dict):
                 record_type = obj.get("type")
-                # These entries only change presentation/model state. The
-                # execution marker is redundant only when its actual tool call
-                # was parsed earlier in this batch; an orphan degrades coverage.
-                metadata_only = record_type in ("title", "model_change", "thinking_level_change") or (
-                    record_type == "custom" and obj.get("customType") == "session_exit")
-                if record_type == "custom" and obj.get("customType") == "tool_execution_start":
+                custom_type = obj.get("customType")
+                # Agent notifications are runtime evidence, not assistant actions.
+                # Keep their content searchable without treating it as a tool call.
+                agent_message = (record_type == "custom_message"
+                                 and set(obj) <= _CUSTOM_MESSAGE_FIELDS
+                                 and custom_type in ("async-result", "irc:incoming",
+                                                     "mid-run-todo-nudge", "goal-mode-context")
+                                 and obj.get("attribution") == "agent"
+                                 and isinstance(obj.get("content"), str)
+                                 and (obj.get("details") is None or isinstance(obj["details"], dict)))
+                metadata_only = record_type in (
+                    "title", "model_change", "thinking_level_change",
+                ) or (record_type == "title_change" and set(obj) <= _ADMIN_FIELDS["title_change"]
+                      and isinstance(obj.get("title"), str)) or (
+                    record_type == "credential_pin" and set(obj) <= _ADMIN_FIELDS["credential_pin"]
+                    and isinstance(obj.get("hash"), str) and isinstance(obj.get("provider"), str)
+                ) or (record_type == "mode_change" and set(obj) <= _ADMIN_FIELDS["mode_change"]
+                      and isinstance(obj.get("mode"), str) and isinstance(obj.get("data"), dict)
+                      and set(obj["data"]) <= {"goal"}) or (
+                    record_type == "compaction" and set(obj) <= _ADMIN_FIELDS["compaction"]
+                    and isinstance(obj.get("summary"), str)
+                    and isinstance(obj.get("firstKeptEntryId"), str)
+                ) or (record_type == "custom" and custom_type == "session_exit") or (
+                    record_type == "custom" and custom_type == "todo_hud_state"
+                    and set(obj) <= _TODO_HUD_FIELDS and isinstance(obj.get("data"), dict)
+                    and set(obj["data"]) <= {"sourceEntryId", "fingerprint", "visibility"}
+                ) or agent_message
+                if record_type == "custom" and custom_type == "tool_execution_start":
                     data = obj.get("data")
-                    metadata_only = isinstance(data, dict) and (
-                        data.get("toolCallId"), data.get("toolName")) in seen_calls
-                chunks.append(make_chunk("omp", sid, "meta", f"[omp_event:{record_type}]",
+                    if isinstance(data, dict):
+                        call = (data.get("toolCallId"), data.get("toolName"))
+                        metadata_only = call in seen_calls or (
+                            prior_call is not None and all(isinstance(part, str) and part for part in call)
+                            and prior_call(*call, start))
+                text = (f"[omp_event:{record_type}:{custom_type}] {obj['content']}"
+                        if agent_message else f"[omp_event:{record_type}]")
+                chunks.append(make_chunk("omp", sid, "meta", text,
                                          {"unsupported_event": not metadata_only, "event_type": record_type,
                                           "role": "runtime"}, line, start, end))
                 continue
@@ -129,8 +168,8 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                                           "unsupported_event": unsupported}, line, start, end, timestamp=timestamp))
                 continue
             if not content:
-                chunks.append(make_chunk("omp", sid, "turn", f"[message:{role}]",
-                                         {**base, "unsupported_event": True}, line, start, end, timestamp=timestamp))
+                chunks.append(make_chunk("omp", sid, "meta", f"[message:{role}]",
+                                         {**base, "role": "runtime"}, line, start, end, timestamp=timestamp))
             for sub, block in enumerate(content):
                 if not isinstance(block, dict):
                     block = {"type": "unknown", "value": block}

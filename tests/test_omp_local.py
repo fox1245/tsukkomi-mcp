@@ -30,6 +30,7 @@ def local_engine(tmp_path, monkeypatch):
             _message("assistant", {"type": "text", "text": "I will review the change."}))
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", raising=False)
+    monkeypatch.delenv("SELF_DIRECT_OMP_SESSIONS_DIR", raising=False)
     monkeypatch.setenv("SELF_DIRECT_LOCAL_ONLY", "true")
     settings = Settings(index_dir=tmp_path / "index", omp_sessions_dir=root,
                         openrouter_api_key_file=None, use_fake_embedder=False)
@@ -83,6 +84,66 @@ def test_unknown_incomplete_and_unsupported_history(local_engine):
     result = engine.audit_session("session-1", provider="omp", path=str(file))
     assert result["verdict"] == "unknown"
     assert "unsupported_events" in result["coverage"]["issues"]
+
+def test_omp_runtime_events_do_not_poison_read_contracts(local_engine):
+    engine, file = local_engine
+    engine.upsert_contracts([{"id": "no-curl", "type": "must_not", "scope": "tool_call",
+                              "regex": "curl", "provider": "omp"}])
+    _append(file,
+            {"type": "title_change", "title": "Reviewing"},
+            {"type": "mode_change", "mode": "goal", "data": {"goal": {"text": "review"}}},
+            {"type": "credential_pin", "provider": "openrouter", "hash": "sha256"},
+            {"type": "compaction", "summary": "Earlier discussion", "firstKeptEntryId": "entry-1"},
+            {"type": "custom", "customType": "todo_hud_state", "data": {"visibility": "shown"}},
+            {"type": "custom_message", "customType": "async-result", "attribution": "agent",
+             "content": "curl is mentioned by another agent"},
+            {"type": "custom_message", "customType": "irc:incoming", "attribution": "agent",
+             "content": "Message from another agent"},
+            {"type": "custom_message", "customType": "goal-mode-context", "attribution": "agent",
+             "content": "Goal mode is active"},
+            {"type": "custom_message", "customType": "mid-run-todo-nudge", "attribution": "agent",
+             "content": "Review the checklist"},
+            _message("assistant"))
+    read = engine.check_action("session-1", {"tool_name": "read", "arguments": {"path": "file.txt"}},
+                               provider="omp", path=str(file))
+    assert read["verdict"] == "clean" and read["coverage"]["complete"]
+    assert engine.audit_session("session-1", provider="omp", path=str(file))["verdict"] == "clean"
+    assert engine.check_action("session-1", {"tool_name": "shell", "arguments": {"command": "curl site"}},
+                               provider="omp", path=str(file))["verdict"] == "violation"
+    runtime = [chunk for chunk in engine.store.list_chunks("session-1", "omp")
+               if "mentioned by another agent" in chunk.text]
+    assert len(runtime) == 1 and runtime[0].kind == "meta" and runtime[0].meta["role"] == "runtime"
+
+
+def test_unknown_agent_event_still_degrades_coverage(local_engine):
+    engine, file = local_engine
+    engine.upsert_contracts([{"id": "no-curl", "type": "must_not", "scope": "tool_call",
+                              "regex": "curl", "provider": "omp"}])
+    _append(file, {"type": "custom_message", "customType": "future-result",
+                   "attribution": "agent", "content": "curl"})
+    result = engine.check_action("session-1", {"tool_name": "read", "arguments": {}},
+                                 provider="omp", path=str(file))
+    assert result["verdict"] == "unknown" and "unsupported_events" in result["coverage"]["issues"]
+
+
+def test_execution_marker_uses_prior_indexed_call(local_engine):
+    engine, file = local_engine
+    engine.upsert_contracts([{"id": "must-prepare", "type": "must", "scope": "tool_call",
+                              "regex": "prepare", "before_regex": "deploy",
+                              "requires_success": True, "provider": "omp"}])
+    _append(file, _message("assistant", {"type": "toolCall", "id": "call-1",
+                                        "name": "shell", "arguments": {"command": "prepare"}}))
+    assert engine.sync_session(session_id="session-1", provider="omp",
+                               path=str(file), embed=False)["coverage"]["complete"]
+    _append(file, {"type": "custom", "customType": "tool_execution_start",
+                   "data": {"toolCallId": "call-1", "toolName": "shell"}},
+            _message("toolResult", {"type": "text", "text": "done"},
+                     toolCallId="call-1", toolName="shell", isError=False),
+            _message("assistant", {"type": "toolCall", "id": "call-2",
+                                   "name": "shell", "arguments": {"command": "deploy"}}))
+    result = engine.audit_session("session-1", provider="omp", path=str(file))
+    assert result["verdict"] == "clean" and result["coverage"]["complete"]
+
 
 def test_orphan_execution_marker_degrades_coverage(local_engine):
     engine, file = local_engine
