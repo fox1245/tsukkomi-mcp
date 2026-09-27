@@ -6,6 +6,8 @@
 // TSUKKOMI_OMP_PYTHON selects the Python interpreter with tsukkomi-mcp installed;
 // TSUKKOMI_OMP_SOURCE can point at a source checkout without changing OMP's PYTHONPATH.
 // SELF_DIRECT_CONTRACTS_PATH may select an existing private contracts file.
+// tsukkomi_session_context exposes the current persisted OMP session ID for
+// scoped contracts; no inherited shell variable is a reliable substitute.
 // Coverage: only OMP hook events. Pre-tool checks can block confirmed findings;
 // tool_result and turn_end re-audit the currently persisted JSONL snapshot (a
 // hook may precede disk flush). In-memory sessions, skipped hooks, and transport
@@ -18,7 +20,15 @@ type Context = {
   sessionManager: { getSessionId(): string; getSessionFile(): string | undefined };
   ui?: { notify(message: string, level: "info" | "warning" | "error"): void };
 };
-type HookAPI = { on(event: string, handler: (event: Record<string, unknown>, ctx: Context) => unknown): void };
+type HookAPI = {
+  on(event: string, handler: (event: Record<string, unknown>, ctx: Context) => unknown): void;
+  zod: { object(shape: Record<string, never>): unknown };
+  registerTool(tool: {
+    name: string; label: string; description: string; parameters: unknown;
+    approval: "read"; loadMode: "essential";
+    execute(id: string, params: Record<string, never>, signal: unknown, onUpdate: unknown, ctx: Context): Promise<{ content: Array<{ type: "text"; text: string }> }>;
+  }): void;
+};
 type Response = { id?: number; result?: unknown; error?: unknown };
 type Audit = { ok: true; verdict: "violation" | "suspicious" | "clean" | "unknown"; applicable_contracts?: number; findings?: Array<{ contract_id?: string; reason?: string; verdict?: string }> };
 type Session = { session_id: string; provider: "omp"; path: string };
@@ -157,6 +167,20 @@ function description(audit: Audit): string {
 
 export default function tsukkomiOmp(pi: HookAPI): void {
   if (!enabled) return;
+  pi.registerTool({
+    name: "tsukkomi_session_context",
+    label: "Tsukkomi Session Context",
+    description: "Return the actual persisted OMP session ID for session-scoped Tsukkomi contracts; never infer it from shell environment.",
+    parameters: pi.zod.object({}),
+    approval: "read",
+    loadMode: "essential",
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      const current = session(ctx);
+      return { content: [{ type: "text", text: JSON.stringify(current
+        ? { ok: true, session_id: current.session_id, provider: current.provider }
+        : { ok: false, error: "no_persisted_omp_session" }) }] };
+    },
+  });
   const bridge = new LocalMcp();
   let lastNotice = "";
   const notifyOnce = (ctx: Context, message: string) => {

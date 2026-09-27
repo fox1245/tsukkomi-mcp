@@ -166,6 +166,8 @@ OpenRouter-backed hybrid/dense history search, `sync_session(embed=True)`, and N
 
 Keep machine-specific values in local OMP configuration or a private extension copy, not this repository. Start a **new persisted OMP session**; `--no-session` cannot provide history. Register only user-stated, machine-checkable contracts with `upsert_contracts` (`provider: "omp"` and the actual OMP session ID for session scope). The extension checks pending model-issued tools through local MCP before execution, blocks confirmed `violation`/`suspicious`, and re-audits after results and turns. `unknown` and transport failure are reported but do **not** block; zero applicable contracts is not `clean`. The OMP JSONL parser treats unrecognized events as incomplete coverage. Direct shell/host actions outside OMP's tool pipeline, skipped hooks, in-memory sessions, and a result not yet flushed to disk are not covered.
 
+The extension also registers the read-only `tsukkomi_session_context` tool. Call it before creating a session-scoped contract or checklist item: its `session_id` comes from the active OMP session manager. Never infer a session ID from `PI_SESSION_FILE` or a shell variable, which can belong to a parent OMP process. If no persisted session is available, do not silently create a global contract. `AGENTS.md` instructions alone are not audit contracts: register the user's explicit, machine-checkable prohibitions; broader subjective mistakes are not automatically judged by an LLM.
+
 ---
 
 ## 🧪 Testing & Audit Certification
