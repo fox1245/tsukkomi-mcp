@@ -656,7 +656,7 @@ class SelfDirectEngine:
             cost = len(frame["text"]) + len(frame["chunk_id"]) + 80
             if size + cost > 95000:
                 break
-            batch.append(frame)
+            batch.append(mask_value(frame))
             size += cost
         if not batch:
             return {"ok": False, "error": "graph_event_too_large",

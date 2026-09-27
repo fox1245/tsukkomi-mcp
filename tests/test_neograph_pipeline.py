@@ -141,3 +141,33 @@ def test_empty_ai_graph_retains_cursor_and_pending_events(tmp_path, monkeypatch)
             assert engine.graph.cursor(SID, 'codex') == before
     finally:
         engine.close()
+
+
+def test_graph_extraction_masks_session_secrets_before_remote_prompt(tmp_path, monkeypatch):
+    from self_directing_mcp.neograph_runner import _Transport
+
+    prompts = []
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-not-a-real-key")
+
+    def complete(self, prompt):
+        prompts.append(prompt)
+        return {"nodes": [], "edges": [], "extraction_summary": "No relations found"}, 5
+
+    monkeypatch.setattr(_Transport, "complete_json", complete)
+    engine = SelfDirectEngine(Settings(use_fake_embedder=True, index_dir=tmp_path / "index",
+                                       contracts_path=tmp_path / "contracts.json"))
+    try:
+        engine.ensure_ready()
+        engine.store.commit_events([
+            Chunk(chunk_id="event-1", session_id=SID, provider="omp", kind="meta",
+                  text="[omp_event:custom_message:async-result] OPENROUTER_API_KEY=unit-test-private-token",
+                  content_hash="test-content",
+                  meta={"role": "runtime", "error_text": "Bearer unit-test-private-token"})
+        ], session_id=SID, provider="omp", path=tmp_path / "session.jsonl", offset=10, digest="test")
+        engine.run_neograph_update(SID, provider="omp")
+        assert len(prompts) == 1
+        assert "unit-test-private-token" not in prompts[0]
+        assert "OPENROUTER_API_KEY=***" in prompts[0]
+        assert "event-1" in prompts[0]
+    finally:
+        engine.close()
