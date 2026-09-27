@@ -29,6 +29,7 @@ from self_directing_mcp.checklist import (
 )
 from self_directing_mcp.codex import discover as codex_discover
 from self_directing_mcp.grokbot import discover as grokbot_discover
+from self_directing_mcp import omp
 from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
 from self_directing_mcp.index.ingest import SessionStore, ingest_session
@@ -85,7 +86,7 @@ class SelfDirectEngine:
         self.store: SessionStore | None = None
         self.sparse: SparseIndex | None = None
         self.dense = None
-        self.dense_backend = "numpy"
+        self.dense_backend = "disabled"
         self.embedder = None
         self.embedder_degraded = False
         self.retriever: HybridRetriever | None = None
@@ -125,16 +126,17 @@ class SelfDirectEngine:
         index_dir = Path(s.index_dir)
         index_dir.mkdir(parents=True, exist_ok=True)
 
-        self.embedder, self.embedder_degraded = build_embedder(
-            api_key=s.resolve_api_key(),
-            use_fake=s.use_fake_embedder,
-            model=s.embedding_model,
-            dim=s.embedding_dim,
-            base_url=s.embedding_base_url,
-        )
-        self.dense, self.dense_backend = build_vector_index(
-            index_dir / ("vectors-v2-" + self.embedder.cache_key[:16]), dim=s.embedding_dim,
-            backend=s.dense_backend, extension_path=s.sqlite_vector_path)
+        if not s.local_only:
+            self.embedder, self.embedder_degraded = build_embedder(
+                api_key=s.resolve_api_key(),
+                use_fake=s.use_fake_embedder,
+                model=s.embedding_model,
+                dim=s.embedding_dim,
+                base_url=s.embedding_base_url,
+            )
+            self.dense, self.dense_backend = build_vector_index(
+                index_dir / ("vectors-v2-" + self.embedder.cache_key[:16]), dim=s.embedding_dim,
+                backend=s.dense_backend, extension_path=s.sqlite_vector_path)
         self.sparse = SparseIndex(index_dir / "sparse.sqlite")
         self.store = SessionStore(index_dir / "meta.sqlite")
         self.contracts = ContractStore(s.resolve_contracts_path())
@@ -146,14 +148,15 @@ class SelfDirectEngine:
         if s.seed_example_contracts:
             self.contracts.seed_from(seed)
 
-        self.retriever = HybridRetriever(
-            sparse=self.sparse,
-            dense=self.dense,
-            embedder=self.embedder,
-            rrf_k=s.rrf_k,
-            retrieve_top_k=s.retrieve_top_k,
-            store=self.store,
-        )
+        if not s.local_only:
+            self.retriever = HybridRetriever(
+                sparse=self.sparse,
+                dense=self.dense,
+                embedder=self.embedder,
+                rrf_k=s.rrf_k,
+                retrieve_top_k=s.retrieve_top_k,
+                store=self.store,
+            )
         self._ready = True
 
     def _resolve_provider(
@@ -161,13 +164,13 @@ class SelfDirectEngine:
         provider: str | None,
         *,
         path: str | None = None,
-    ) -> Literal["codex", "grokbot"]:
+    ) -> Literal["codex", "grokbot", "omp"]:
         """Explicit arg > settings/env > light auto-detect from path layout."""
         if provider:
             p = provider.strip().lower()
-            if p in ("codex", "grokbot"):
+            if p in ("codex", "grokbot", "omp"):
                 return p  # type: ignore[return-value]
-            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot)")
+            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot|omp)")
         # Auto-detect: path under a configured grokbot root, or <id>/<id>.jsonl layout
         if path:
             try:
@@ -195,14 +198,20 @@ class SelfDirectEngine:
         embed: bool = True,
     ) -> dict[str, Any]:
         self.ensure_ready()
-        assert self.store and self.sparse and self.dense and self.embedder
+        assert self.store and self.sparse
+        if self.settings.local_only and embed:
+            return {"ok": False, "error": "local_only", "message": "embed=True is unavailable in local-only mode"}
         try:
             resolved_provider = self._resolve_provider(provider, path=path)
         except ValueError as e:
             return {"ok": False, "error": "bad_provider", "message": str(e)}
 
         try:
-            if resolved_provider == "grokbot":
+            if resolved_provider == "omp":
+                resolved = omp.resolve_session_path(
+                    self.settings.resolve_omp_sessions_dir(), session_id=session_id, path=path
+                )
+            elif resolved_provider == "grokbot":
                 roots = self.settings.resolve_grokbot_transcripts_dirs()
                 resolved = grokbot_discover.resolve_session_path(
                     roots, session_id=session_id, path=path
@@ -212,7 +221,7 @@ class SelfDirectEngine:
                 resolved = codex_discover.resolve_session_path(
                     sessions_root, session_id=session_id, path=path
                 )
-        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError) as e:
+        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError, omp.PathTraversalError) as e:
             return {"ok": False, "error": "path_traversal", "message": str(e)}
         except FileNotFoundError as e:
             return {"ok": False, "error": "not_found", "message": str(e)}
@@ -231,7 +240,7 @@ class SelfDirectEngine:
         )
         info["ok"] = True
         info["dense_backend"] = self.dense_backend
-        info["embedder"] = type(self.embedder).__name__
+        info["embedder"] = type(self.embedder).__name__ if self.embedder else None
         info["embedder_degraded"] = self.embedder_degraded
         info["nudge"] = (
             "NUDGE: After sync_session, call audit_session before risky shell/network/"
@@ -250,15 +259,25 @@ class SelfDirectEngine:
         provider: str | None = None,
     ) -> dict[str, Any]:
         self.ensure_ready()
-        assert self.store and self.retriever
+        assert self.store and self.sparse
         provider = self._resolve_provider(provider)
         if session_id and provider == "codex":
             session_id = session_id.lower()
         k = top_k if top_k is not None else self.settings.search_top_k
         if mode not in ("hybrid", "regex", "sparse", "dense") or not 1 <= k <= 100:
             raise ValueError("mode must be hybrid|regex|sparse|dense and top_k must be 1..100")
+        if self.settings.local_only and mode in ("hybrid", "dense"):
+            raise ValueError("dense/hybrid search unavailable in local-only mode")
         if mode == "regex":
             hits = regex_search(self.store, query, session_id=session_id, top_k=k, provider=provider)
+        elif mode == "sparse" and self.settings.local_only:
+            from self_directing_mcp.retrieve.hybrid import RRFResult
+            allowed = {c.chunk_id for c in self.store.list_chunks(session_id, provider)}
+            rows = self.sparse.search(mask_secrets(query), top_k=k, session_id=session_id, allowed_ids=allowed)
+            hits = hits_to_schema(
+                [RRFResult(chunk_id=cid, ranking_score=score, dense_rank=None,
+                           sparse_rank=rank, sparse_score=score) for cid, score, rank in rows],
+                self.store.get_chunk)
         else:
             results = self.retriever.retrieve(
                 query, top_k=k, session_id=session_id, mode=mode, provider=provider
@@ -305,10 +324,14 @@ class SelfDirectEngine:
                                  {"role": "assistant", "tool_name": action.tool_name, "proposed": True},
                                  0, coverage.get("byte_offset", 0), coverage.get("byte_offset", 0))
             planned.chunk_id = "proposed:" + planned.chunk_id
-        result = run_audit(session_id=sid, contracts=self.contracts.list(), store=self.store,
+        contracts = self.contracts.list()
+        applicable = sum(rule.enabled and rule.provider in (None, provider)
+                         and rule.session_id in (None, sid) for rule in contracts)
+        result = run_audit(session_id=sid, contracts=contracts, store=self.store,
                            provider=provider, proposed=planned, coverage=coverage)
         payload = result.model_dump(mode="json")
         payload.update(ok=True, provider=provider, action_executed=False,
+                       applicable_contracts=applicable,
                        requires_attention=result.verdict != "clean")
         payload["timings_ms"] = {
             "sync": round((sync_finished - started) * 1000, 2),
@@ -609,6 +632,9 @@ class SelfDirectEngine:
         write + cursor). Each run leaves a durable checkpoint; failures stay
         inspectable via thread_id graphrag:<provider>:<session>.
         """
+        if self.settings.local_only:
+            return {"ok": False, "error": "local_only",
+                    "message": "LLM graph updates are unavailable in local-only mode."}
         sid, resolved_provider, frames, cursor = self._prepare_neograph_update(
             session_id, provider, _deadline=_deadline)
         api_key = self.settings.resolve_api_key() or ""
@@ -677,10 +703,11 @@ class SelfDirectEngine:
             "neograph_version": ng.__version__,
             "sessions_dir": str(s.resolve_sessions_dir()),
             "grokbot_transcripts_dirs": [str(p) for p in s.resolve_grokbot_transcripts_dirs()],
+            "omp_sessions_dir": str(s.resolve_omp_sessions_dir()),
             "session_provider": s.resolve_session_provider(),
             "index_dir": str(Path(s.index_dir).resolve()),
             "dense_backend": self.dense_backend,
-            "dense_count": self.dense.count(),
+            "dense_count": self.dense.count() if self.dense is not None else 0,
             "vector_extension_version": getattr(self.dense, "extension_version", None),
             "vector_compute_backend": getattr(self.dense, "compute_backend", None),
             "embedder": type(self.embedder).__name__ if self.embedder else None,

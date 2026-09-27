@@ -17,6 +17,9 @@ def current_parser_version(provider):
     if provider == "codex":
         from self_directing_mcp.codex.parse import PARSER_VERSION
         return PARSER_VERSION
+    if provider == "omp":
+        from self_directing_mcp.omp import PARSER_VERSION
+        return PARSER_VERSION
     return 1
 
 
@@ -263,7 +266,11 @@ class SessionStore:
 
 
 def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider="codex", embed=True):
-    if provider == "grokbot":
+    if embed and (dense is None or embedder is None):
+        raise ValueError("embedding unavailable in local-only mode")
+    if provider == "omp":
+        from self_directing_mcp.omp import parse_session_chunks, peek_session_id
+    elif provider == "grokbot":
         from self_directing_mcp.grokbot.parse import parse_session_chunks, peek_session_id
     else:
         from self_directing_mcp.codex.parse import parse_session_chunks, peek_session_id
@@ -308,7 +315,8 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
         # Preserve vectors and anchors for unchanged event IDs.
         stale_ids = list(set(stale_ids) - store.chunk_ids(sid, provider))
         sparse.delete_ids(stale_ids)
-        dense.delete_ids(stale_ids)
+        if dense is not None:
+            dense.delete_ids(stale_ids)
         store.finish_deletions(sid, provider)
     # Immutable event ids permit delta updates. Missing entries also repair an
     # interrupted metadata->FTS write without reindexing existing documents.
@@ -317,6 +325,13 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
     if to_index:
         sparse.upsert_many(to_index)
     coverage = store.session_status(sid, provider)
+    if embedder is None:
+        return {"session_id": sid, "provider": provider, "path": str(path.resolve()),
+                "byte_offset": offset, "new_chunks": len(chunks), "embedded": 0,
+                "total_chunks": coverage["chunk_count"], "reindexed": reindexed,
+                "parser_version": parser_version, "reindex_reason": reindex_reason,
+                "dense_restored": 0, "embedding_pending": 0, "embedding_error": None,
+                "sparse_updated": len(to_index), "coverage": coverage}
     cache_key = embedder.cache_key
     existing_ids = dense.ids()
     candidates = [store.get_chunk(cid) for cid in sorted(store.chunk_ids(sid, provider) - existing_ids)]

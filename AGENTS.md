@@ -34,6 +34,18 @@ and `SELF_DIRECT_DENSE_BACKEND=sqlite-vector`. Provision and verify these before
 FakeEmbedder and NumPy are explicit offline/test options only; never silently substitute them
 when a key is missing or a native extension fails. Explain the error and repair the setup.
 
+The separate, explicit OMP path uses `SELF_DIRECT_LOCAL_ONLY=true` with a real
+OMP JSONL session root and private index. It does not create an embedder or dense
+index and needs no key; embedding, dense/hybrid search, and LLM graph updates
+must reject rather than silently fall back. No FakeEmbedder is used in this mode.
+`extensions/tsukkomi-omp.ts` is opt-in and must receive local runtime paths
+outside this public repository. It calls the MCP with provider `omp`, not the
+Codex lifecycle adapter. A persisted session path can precede its first flush:
+prohibited proposed actions may still be blocked, while missing history stays
+unknown. Unknown/transport failure is advisory and does not block; only
+confirmed violation/suspicious findings block model-issued OMP tools. OMP hook
+coverage does not include out-of-band actions or unpersisted session evidence.
+
 Use the official [sqliteai/sqlite-vector release](https://github.com/sqliteai/sqlite-vector/releases/tag/1.1.0)
 library directly. Python wheels and local compilation are not required: Windows uses vector.dll,
 Linux vector.so, and macOS vector.dylib. After installing Python dependencies, run:
@@ -127,7 +139,7 @@ Use check_action for actions affected by active constraints. A fresh hook result
 - unknown: resolve the relevant gap before claiming compliance; continue independent authorized work.
 - clean: limited to the returned evidence/contract snapshot; not new permission.
 
-Regex checks are primary. Search ranks are not violation evidence. Description-only contracts remain unknown. Hooks never auto-execute or auto-block. Example contracts are disabled by default.
+Regex checks are primary. Search ranks are not violation evidence. Description-only contracts remain unknown. Codex hooks never auto-execute or auto-block; the opt-in OMP extension blocks only confirmed findings. Example contracts are disabled by default.
 
 ## Codex event coverage and parser upgrades
 

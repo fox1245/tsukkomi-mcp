@@ -7,6 +7,6 @@
 {"role": "tool", "message": {"content": [{"type": "tool_result", "tool_use_id": "call_curl_1", "content": "connection refused"}]}}
 {"role": "user", "message": {"content": [{"type": "text", "text": "Also check Bearer tok_live_ABCDEFG_should_mask in logs."}]}}
 {"role": "assistant", "message": {"content": [{"type": "text", "text": "Noted. Bearer tok_live_ABCDEFG_should_mask must be masked in snippets. sk-SECRETKEY1234567890 too."}]}}
-{"role": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"path": "C:\\junyeong\\Codes\\self-directing-mcp\\README.md"}}]}}
+{"role": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"path": "C:\\example\\project\\README.md"}}]}}
 {"role": "tool", "message": {"content": [{"type": "tool_result", "tool_use_id": "call_read_1", "content": "# Self-directing MCP\n..."}]}}
 {"type": "session_note", "detail": "synthetic grokbot fixture"}

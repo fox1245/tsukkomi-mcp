@@ -21,6 +21,10 @@ def _default_grokbot_transcripts_dir() -> str:
     return os.environ.get("SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR") or ""
 
 
+def _default_omp_sessions_dir() -> Path:
+    return Path(os.environ.get("SELF_DIRECT_OMP_SESSIONS_DIR") or Path.home() / ".omp" / "sessions")
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -63,7 +67,8 @@ class Settings(BaseSettings):
 
     codex_sessions_dir: Path = Field(default_factory=_default_codex_sessions_dir)
     grokbot_transcripts_dir: str = Field(default_factory=_default_grokbot_transcripts_dir)
-    session_provider: Literal["codex", "grokbot"] = "codex"
+    omp_sessions_dir: Path = Field(default_factory=_default_omp_sessions_dir)
+    session_provider: Literal["codex", "grokbot", "omp"] = "codex"
     index_dir: Path = Field(default_factory=_default_index_dir)
     contracts_path: Path | None = Field(
         default=None,
@@ -74,6 +79,7 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024
     embedding_base_url: str = "https://openrouter.ai/api/v1"
     use_fake_embedder: bool = False
+    local_only: bool = False
     dense_backend: Literal["sqlite-vector", "numpy"] = "sqlite-vector"
     sqlite_vector_path: Path | None = Field(default_factory=_default_sqlite_vector_path)
     openrouter_api_key_file: Path | None = Field(
@@ -113,6 +119,10 @@ class Settings(BaseSettings):
             return Path(override)
         return Path(self.codex_sessions_dir)
 
+
+    def resolve_omp_sessions_dir(self) -> Path:
+        return Path(os.environ.get("SELF_DIRECT_OMP_SESSIONS_DIR") or self.omp_sessions_dir)
+
     def resolve_grokbot_transcripts_dirs(self) -> list[Path]:
         from self_directing_mcp.grokbot.discover import parse_transcripts_dirs
 
@@ -120,9 +130,9 @@ class Settings(BaseSettings):
         raw = override if override is not None else self.grokbot_transcripts_dir
         return parse_transcripts_dirs(raw)
 
-    def resolve_session_provider(self) -> Literal["codex", "grokbot"]:
+    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp"]:
         override = (os.environ.get("SELF_DIRECT_SESSION_PROVIDER") or "").strip().lower()
-        if override in ("codex", "grokbot"):
+        if override in ("codex", "grokbot", "omp"):
             return override  # type: ignore[return-value]
         return self.session_provider
 
