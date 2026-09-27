@@ -147,12 +147,14 @@ python scripts/install_codex.py --trust-hooks
 python scripts/install_codex.py --verify
 ```
 
-### OMP (local contract hooks)
+### OMP (OpenRouter-backed retrieval, deterministic contract hooks)
 
-Register this server in OMP's **user** `mcp.json` and opt in to `extensions/tsukkomi-omp.ts` as an OMP user extension. Configure both the MCP entry and the extension's process with the same private index and OMP session root:
+Register this server in OMP's **user** `mcp.json` and opt in to `extensions/tsukkomi-omp.ts` as an OMP user extension. Configure both the MCP entry and the extension's process with the same private index, OMP session root, and authorized credential/vector references:
 
 ```text
-SELF_DIRECT_LOCAL_ONLY=true
+SELF_DIRECT_LOCAL_ONLY=false
+SELF_DIRECT_OPENROUTER_API_KEY_FILE=<authorized Codex/OpenRouter dotenv path>
+SELF_DIRECT_SQLITE_VECTOR_PATH=<installed native vector library path>
 SELF_DIRECT_OMP_SESSIONS_DIR=<OMP user session root>
 SELF_DIRECT_INDEX_DIR=<private writable index>
 TSUKKOMI_OMP_MONITOR=1
@@ -160,7 +162,9 @@ TSUKKOMI_OMP_PYTHON=<Python with tsukkomi-mcp dependencies>
 TSUKKOMI_OMP_SOURCE=<source checkout>/src  # omit when installed in that Python
 ```
 
-Keep machine-specific values in local OMP configuration or a private extension copy, not this repository. Start a **new persisted OMP session**; `--no-session` cannot provide history. Register only user-stated, machine-checkable contracts with `upsert_contracts` (`provider: "omp"` and the actual OMP session ID for session scope). The extension checks pending model-issued tools through local MCP before execution, blocks confirmed `violation`/`suspicious`, and re-audits after results and turns. `unknown` and transport failure are reported but do **not** block; zero applicable contracts is not `clean`. The OMP JSONL parser treats unrecognized events as incomplete coverage. Direct shell/host actions outside OMP's tool pipeline, skipped hooks, in-memory sessions, and a result not yet flushed to disk are not covered. It does not install Codex hooks or send history to OpenRouter. Dense/hybrid and LLM graph updates are unavailable in local-only mode.
+OpenRouter-backed hybrid/dense history search, `sync_session(embed=True)`, and NeoGraph updates are available by default; embedding uploads sanitized session chunks, so use an authorized key and session root. The hook's `check_action`/`audit_session` stay deterministic and refresh JSONL without embedding; they do **not** call OpenRouter on every tool/turn. Explicit offline-only mode is `SELF_DIRECT_LOCAL_ONLY=true`, which disables those remote functions.
+
+Keep machine-specific values in local OMP configuration or a private extension copy, not this repository. Start a **new persisted OMP session**; `--no-session` cannot provide history. Register only user-stated, machine-checkable contracts with `upsert_contracts` (`provider: "omp"` and the actual OMP session ID for session scope). The extension checks pending model-issued tools through local MCP before execution, blocks confirmed `violation`/`suspicious`, and re-audits after results and turns. `unknown` and transport failure are reported but do **not** block; zero applicable contracts is not `clean`. The OMP JSONL parser treats unrecognized events as incomplete coverage. Direct shell/host actions outside OMP's tool pipeline, skipped hooks, in-memory sessions, and a result not yet flushed to disk are not covered.
 
 ---
 

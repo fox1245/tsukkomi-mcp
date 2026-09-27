@@ -1,5 +1,8 @@
 // Opt-in OMP user extension. Register this file in OMP's user extensions and set
 // TSUKKOMI_OMP_MONITOR=1, SELF_DIRECT_OMP_SESSIONS_DIR and SELF_DIRECT_INDEX_DIR.
+// Remote retrieval is the default: set SELF_DIRECT_OPENROUTER_API_KEY_FILE and
+// SELF_DIRECT_SQLITE_VECTOR_PATH to authorized private files. Explicitly set
+// SELF_DIRECT_LOCAL_ONLY=true for offline-only use.
 // TSUKKOMI_OMP_PYTHON selects the Python interpreter with tsukkomi-mcp installed;
 // TSUKKOMI_OMP_SOURCE can point at a source checkout without changing OMP's PYTHONPATH.
 // SELF_DIRECT_CONTRACTS_PATH may select an existing private contracts file.
@@ -70,12 +73,16 @@ class LocalMcp {
     if (this.child) return;
     this.starting = (async () => {
       if (!root || !process.env.SELF_DIRECT_INDEX_DIR) throw new Error("private runtime locations not configured");
-      const env = { ...process.env, SELF_DIRECT_LOCAL_ONLY: "true", SELF_DIRECT_OMP_SESSIONS_DIR: root };
+      const localOnly = process.env.SELF_DIRECT_LOCAL_ONLY === "true";
+      if (!localOnly && (!process.env.SELF_DIRECT_OPENROUTER_API_KEY_FILE || !process.env.SELF_DIRECT_SQLITE_VECTOR_PATH)) {
+        throw new Error("OpenRouter key file and native vector library not configured");
+      }
+      const env = { ...process.env, SELF_DIRECT_LOCAL_ONLY: localOnly ? "true" : "false", SELF_DIRECT_OMP_SESSIONS_DIR: root };
       const source = process.env.TSUKKOMI_OMP_SOURCE;
       if (source) env.PYTHONPATH = env.PYTHONPATH ? `${source}${delimiter}${env.PYTHONPATH}` : source;
-      // The local-only engine must never select an inherited remote credential.
+      // Never pass ambient raw credentials; offline mode discards the file reference too.
       delete env.OPENROUTER_API_KEY;
-      delete env.SELF_DIRECT_OPENROUTER_API_KEY_FILE;
+      if (localOnly) delete env.SELF_DIRECT_OPENROUTER_API_KEY_FILE;
       const child = spawn(process.env.TSUKKOMI_OMP_PYTHON || "python", ["-m", "self_directing_mcp.server"],
         { env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
       this.child = child;
