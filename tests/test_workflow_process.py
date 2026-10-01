@@ -11,7 +11,16 @@ import time
 
 import pytest
 
+from self_directing_mcp import config, workflow_process
 from self_directing_mcp.workflow_process import run_process
+
+
+@pytest.fixture(autouse=True)
+def isolated_openrouter_settings(tmp_path, monkeypatch):
+    # Exercise shared settings without touching a developer's real credential file.
+    monkeypatch.setattr(config, "_repo_root", lambda: tmp_path)
+    monkeypatch.delenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", raising=False)
+    monkeypatch.setattr(workflow_process, "Settings", lambda: config.Settings(_env_file=None))
 
 
 @pytest.fixture
@@ -47,8 +56,9 @@ def test_private_environment_filesystem_and_readonly_workspace(workspace, monkey
     secret = outside / "key"
     secret.write_text("private-host-sentinel")
     (workspace / "approved.txt").write_text("approved")
-    monkeypatch.setenv("TYPESAFE_API_KEY", "private-env-sentinel")
-    monkeypatch.setenv("TSUKKOMI_TYPESAFE_KEY_FILE", str(secret))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "private-env-sentinel")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "other-provider-sentinel")
+    monkeypatch.setenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", str(secret))
     monkeypatch.setenv("TSUKKOMI_WORKFLOW_STATE", str(outside))
     code = (
         "import json, os; from pathlib import Path\n"
@@ -134,11 +144,28 @@ def test_runtime_mount_cannot_expose_workspace_parent(workspace):
     assert result["started"] is False
 
 
-def test_configured_key_inside_workspace_rejects_mount(workspace, monkeypatch):
-    secret = workspace / "host-key"
-    secret.write_text("private-host-sentinel")
-    monkeypatch.setenv("TSUKKOMI_TYPESAFE_KEY_FILE", str(secret))
-    result = run_process([sys.executable, "-c", "print(open('host-key').read())"], workspace=workspace,
+@pytest.mark.parametrize("source", ["environment", "shared_default"])
+def test_configured_key_inside_workspace_rejects_mount(workspace, monkeypatch, source):
+    secret = workspace / ".env"
+    secret.write_text("OPENROUTER_API_KEY=private-host-sentinel\n")
+    if source == "environment":
+        monkeypatch.setenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", str(secret))
+    else:
+        monkeypatch.setattr(config, "_repo_root", lambda: workspace)
+    result = run_process([sys.executable, "-c", "print(open('.env').read())"], workspace=workspace,
                          writable=True, timeout_sec=5)
     assert result["status"] == "sandbox_workspace_exposes_host_state"
+    assert result["started"] is False and result["stdout"] == ""
+
+
+def test_runtime_mount_cannot_expose_shared_openrouter_key(workspace, monkeypatch):
+    key_directory = workspace.parent / "credentials"
+    key_directory.mkdir()
+    key_file = key_directory / "authorized.env"
+    key_file.write_text("OPENROUTER_API_KEY=private-host-sentinel\n")
+    monkeypatch.setenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", str(key_file))
+    result = run_process([sys.executable, "-c", f"print(open({str(key_file)!r}).read())"],
+                         workspace=workspace, writable=False, timeout_sec=5,
+                         read_only_paths=(key_directory,))
+    assert result["status"] == "sandbox_runtime_exposes_host_state"
     assert result["started"] is False and result["stdout"] == ""

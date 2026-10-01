@@ -1,6 +1,6 @@
-"""Pinned TypeSafe Choice classification; never a substitute for local evidence.
+"""Pinned OpenRouter Jev Choice classification; never a substitute for local evidence.
 
-HTTP contract: https://docs.typesafe.ai/api and https://docs.typesafe.ai/models.
+HTTP contract: https://openrouter.ai/docs/guides/community/typesafe-sdk.
 Only owner-authorized external context may be passed here. Secret recognition is
 best-effort defense in depth, not permission to send arbitrary project content.
 No response bodies, request context, or credentials are retained in results.
@@ -21,8 +21,9 @@ from dotenv import dotenv_values
 from .security.mask import mask_secrets
 
 MAPPING_VERSION = "1"
-MODEL = "jev-1.13.0"
-ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+MODEL = "typesafe/jev-1.13"
+ENDPOINT = "https://openrouter.ai/api/v1/systemone"
+_RESPONSE_MODELS = (MODEL, "typesafe/jev-1.13-20260917")
 CHOICES = {
     0: "InsufficientEvidence",
     1: "NeedsRevision",
@@ -82,8 +83,9 @@ def _number(value: object) -> bool:
 def parse_response(payload: object, *, input_hash: str, model: str = MODEL,
                    threshold: float = .7) -> ClassifierResult:
     """Validate the documented Choice envelope without coercion or score rounding."""
+    actual_model = ""
     def invalid(reason: str) -> ClassifierResult:
-        return _failure("invalid_response", reason, model, input_hash)
+        return _failure("invalid_response", reason, actual_model, input_hash)
 
     if model != MODEL or not _number(threshold):
         return _failure("invalid_configuration", "Pinned model and finite threshold in [0,1] required.",
@@ -91,11 +93,11 @@ def parse_response(payload: object, *, input_hash: str, model: str = MODEL,
     if not isinstance(payload, dict):
         return invalid("Missing response model identity.")
     actual_model = payload.get("model")
-    if actual_model != model:
+    if actual_model not in _RESPONSE_MODELS:
         # Preserve a well-formed returned identity without storing arbitrary
         # remote text (which could echo sensitive request material).
         observed = actual_model if isinstance(actual_model, str) and re.fullmatch(
-            r"jev-[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", actual_model
+            r"typesafe/jev-[0-9]{1,6}\.[0-9]{1,6}(?:-[0-9]{8})?", actual_model
         ) else ""
         return _failure("invalid_response", "Missing or mismatched response model identity.",
                         observed, input_hash)
@@ -124,13 +126,13 @@ def parse_response(payload: object, *, input_hash: str, model: str = MODEL,
     # explicitly approximate: do not invent an exact equality with probabilities.
     if confidence < threshold:
         return ClassifierResult(
-            0, CHOICES[0], dict(probabilities), confidence, model, input_hash,
+            0, CHOICES[0], dict(probabilities), confidence, actual_model, input_hash,
             MAPPING_VERSION, "low_confidence",
             f"Proposed {choice}; reported confidence is below the approved threshold.",
         )
     choice_id = next(key for key, label in CHOICES.items() if label == choice)
     return ClassifierResult(choice_id, choice, dict(probabilities), confidence,
-                            model, input_hash, MAPPING_VERSION, "ok", "Validated Choice response.")
+                            actual_model, input_hash, MAPPING_VERSION, "ok", "Validated Choice response.")
 
 
 def _safe_context(value: object) -> bool:
@@ -150,8 +152,8 @@ def classify(context: dict, *, api_key: str | None = None,
              threshold: float = .7, timeout_sec: float = 15) -> ClassifierResult:
     """Evaluate approved external context; all failures are explicitly nonauthorizing.
 
-    An explicit key file is authoritative and reads TYPESAFE_API_KEY only, without
-    interpolation. Otherwise use the explicit key or TYPESAFE_API_KEY environment
+    An explicit key file is authoritative and reads OPENROUTER_API_KEY only, without
+    interpolation. Otherwise use the explicit key or OPENROUTER_API_KEY environment
     variable. No provider substitution, retries, redirects, or model aliases.
     """
     if (model != MODEL or not _number(threshold) or type(timeout_sec) not in (int, float)
@@ -181,17 +183,17 @@ def classify(context: dict, *, api_key: str | None = None,
         if key_file is not None:
             source = Path(key_file).expanduser()
             if not source.is_file():
-                return _failure("missing_key", "Configured TypeSafe key file is unavailable.", model, input_hash)
-            key = dotenv_values(source, interpolate=False).get("TYPESAFE_API_KEY")
+                return _failure("missing_key", "Configured OpenRouter key file is unavailable.", model, input_hash)
+            key = dotenv_values(source, interpolate=False).get("OPENROUTER_API_KEY")
         else:
-            key = api_key if api_key is not None else os.environ.get("TYPESAFE_API_KEY")
+            key = api_key if api_key is not None else os.environ.get("OPENROUTER_API_KEY")
     except (OSError, UnicodeError, ValueError):
-        return _failure("missing_key", "Configured TypeSafe key file could not be read.", model, input_hash)
+        return _failure("missing_key", "Configured OpenRouter key file could not be read.", model, input_hash)
     if not isinstance(key, str) or not key.strip():
-        return _failure("missing_key", "TYPESAFE_API_KEY is required; no other provider key is accepted.", model, input_hash)
+        return _failure("missing_key", "OPENROUTER_API_KEY is required; no other provider key is accepted.", model, input_hash)
     key = key.strip()
     if not key.isascii() or any(ord(char) < 33 or ord(char) == 127 for char in key):
-        return _failure("invalid_key", "TypeSafe API key is not a valid bearer credential.", model, input_hash)
+        return _failure("invalid_key", "OpenRouter API key is not a valid bearer credential.", model, input_hash)
     if key in body.decode("utf-8"):
         return _failure("unsafe_context", "Request contains the configured credential.", model, "")
     try:
@@ -199,14 +201,14 @@ def classify(context: dict, *, api_key: str | None = None,
             response = client.post(ENDPOINT, content=body,
                                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
         if not 200 <= response.status_code < 300:
-            return _failure("http_error", f"TypeSafe returned HTTP {response.status_code}.", model, input_hash)
+            return _failure("http_error", f"OpenRouter returned HTTP {response.status_code}.", model, input_hash)
         payload = response.json(object_pairs_hook=_unique_object)
     except httpx.TimeoutException:
-        return _failure("timeout", "TypeSafe request timed out.", model, input_hash)
+        return _failure("timeout", "OpenRouter request timed out.", model, input_hash)
     except httpx.HTTPError:
-        return _failure("transport_error", "TypeSafe transport failed.", model, input_hash)
+        return _failure("transport_error", "OpenRouter transport failed.", model, input_hash)
     except (ValueError, UnicodeError, RecursionError):
-        return _failure("invalid_response", "TypeSafe returned invalid JSON.", model, input_hash)
+        return _failure("invalid_response", "OpenRouter returned invalid JSON.", model, input_hash)
     return parse_response(payload, input_hash=input_hash, model=model, threshold=threshold)
 
 

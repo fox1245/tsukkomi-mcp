@@ -8,10 +8,11 @@ from pathlib import Path
 import shutil
 from threading import Event
 
+import httpx
 import pytest
 
-from self_directing_mcp import workflow
-from self_directing_mcp.workflow_jev import ClassifierResult
+from self_directing_mcp import config, workflow, workflow_jev
+from self_directing_mcp.workflow_jev import ClassifierResult, MODEL
 from self_directing_mcp.workflow_requirements import approve_project
 
 
@@ -67,7 +68,7 @@ def choose(monkeypatch, controller, choice, session="case"):
     names = {0: "InsufficientEvidence", 1: "NeedsRevision", 2: "ReadyForVerification", 3: "ReadyForCompletion"}
     def adversarial_classifier(context, **kwargs):
         return ClassifierResult(choice, names[choice], {name: float(i == choice) for i, name in names.items()},
-                                1.0, "jev-1.13.0", workflow._digest(context), "1", "ok", "")
+                                1.0, MODEL, workflow._digest(context), "1", "ok", "")
     monkeypatch.setattr(workflow, "classify", adversarial_classifier)
     result = controller.classify(session)
     assert result["ok"], result
@@ -82,6 +83,76 @@ def advance(monkeypatch, controller, session="case"):
 
 def command(text="done"):
     return {"tool_name": "workflow_command", "arguments": {"argv": ["{python}", "-c", f"print({text!r})"], "cwd": "."}}
+
+
+@pytest.fixture
+def isolated_openrouter_settings(tmp_path, monkeypatch):
+    # Never read a developer's real dotenv during credential integration tests.
+    monkeypatch.setattr(config, "_repo_root", lambda: tmp_path)
+    monkeypatch.delenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", raising=False)
+    monkeypatch.setattr(workflow, "Settings", lambda: config.Settings(_env_file=None))
+
+
+@pytest.mark.parametrize("source", ["file", "setting", "environment"])
+def test_classifier_uses_shared_openrouter_credential_authority(
+        project, tmp_path, monkeypatch, isolated_openrouter_settings, source):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "environment-sentinel")
+    expected_key = source + "-sentinel"
+    if source == "file":
+        key_file = tmp_path / "authorized.env"
+        key_file.write_text("OPENROUTER_API_KEY=file-sentinel\n")
+        monkeypatch.setenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", str(key_file))
+    elif source == "setting":
+        monkeypatch.setattr(workflow, "Settings", lambda: config.Settings(
+            _env_file=None, OPENROUTER_API_KEY=expected_key))
+    controller = workflow.WorkflowController(project.approval_dir, tmp_path / "credential-state")
+    response_model = "typesafe/jev-1.13-20260917"
+
+    def authenticate(request):
+        if request.headers.get("Authorization") != "Bearer " + expected_key:
+            return httpx.Response(401)
+        return httpx.Response(200, json={
+            "model": response_model,
+            "answers": {"next_stage": {
+                "type": "choice", "choice": "ReadyForVerification", "confidence": 1.0,
+                "probabilities": {name: float(choice == 2) for choice, name in workflow_jev.CHOICES.items()},
+            }},
+        })
+
+    client = httpx.Client
+    transport = httpx.MockTransport(authenticate)
+    monkeypatch.setattr(workflow_jev.httpx, "Client", lambda **kwargs: client(transport=transport, **kwargs))
+    result = controller.classify("credential-case")
+    assert result["ok"] and result["choice_id"] == 2 and result["model"] == response_model
+    recorded = json.dumps(controller.status("credential-case"))
+    assert expected_key not in recorded and "environment-sentinel" not in recorded
+
+
+@pytest.mark.parametrize("file_content", [None, "", b"\xff", "ANTHROPIC_API_KEY=other-provider-sentinel\n"])
+def test_configured_openrouter_file_failure_cannot_use_environment_or_other_provider(
+        project, tmp_path, monkeypatch, isolated_openrouter_settings, file_content):
+    key_file = tmp_path / "authorized.env"
+    if isinstance(file_content, bytes):
+        key_file.write_bytes(file_content)
+    elif file_content is not None:
+        key_file.write_text(file_content)
+    monkeypatch.setenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", str(key_file))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "environment-sentinel")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "other-provider-sentinel")
+    controller = workflow.WorkflowController(project.approval_dir, tmp_path / "credential-state")
+
+    def forbidden_request(request):
+        raise AssertionError("A configured unusable key file must not issue a request")
+
+    client = httpx.Client
+    transport = httpx.MockTransport(forbidden_request)
+    monkeypatch.setattr(workflow_jev.httpx, "Client", lambda **kwargs: client(transport=transport, **kwargs))
+    result = controller.classify("credential-case")
+    assert not result["ok"] and result["status"] == "missing_key" and result["choice_id"] == 0
+    state = controller.status("credential-case")
+    assert state["stage"] == "requirements"
+    recorded = json.dumps(state)
+    assert "environment-sentinel" not in recorded and "other-provider-sentinel" not in recorded
 
 
 def test_wrong_completion_class_cannot_replace_actual_test_or_proof_evidence(controller, monkeypatch):
@@ -149,7 +220,7 @@ def test_failed_execution_is_not_completed_and_consumes_grant(controller, monkey
 def test_low_confidence_and_forged_classification_cannot_advance(controller, monkeypatch):
     assert not controller.transition("case", "unrecorded-model-claim")["allowed"]
     monkeypatch.setattr(workflow, "classify", lambda *a, **kw: ClassifierResult(
-        0, "InsufficientEvidence", {}, 0, "jev-1.13.0", "0" * 64, "1", "low_confidence", "uncertain"))
+        0, "InsufficientEvidence", {}, 0, MODEL, "0" * 64, "1", "low_confidence", "uncertain"))
     classification = controller.classify("case")
     assert not classification["ok"]
     result = controller.transition("case", classification["classification_id"])

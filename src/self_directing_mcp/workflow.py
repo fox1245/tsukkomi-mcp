@@ -20,6 +20,7 @@ import tempfile
 import time
 from typing import Any
 
+from self_directing_mcp.config import Settings
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.neograph_runtime import graph_operation, run_stages
 from self_directing_mcp.workflow_jev import MAPPING_HASH, classify
@@ -177,7 +178,9 @@ class WorkflowController:
             return {"ok": False, "status": "context_unavailable", "choice_id": 0, "reason": str(exc)}
         context = {"requirements": self.project.context(), "stage": before["stage"],
                    "changes": changes, "evidence": before["evidence"], "versions": before["versions"]}
-        result = classify(context, key_file=_optional_path("TSUKKOMI_TYPESAFE_KEY_FILE"),
+        settings = Settings()
+        result = classify(context, key_file=settings.openrouter_api_key_file,
+                          api_key=settings.openrouter_api_key,
                           threshold=self.project.manifest.get("confidence_threshold", .7))
         payload = result.as_dict()
         classification_id = secrets.token_hex(16)

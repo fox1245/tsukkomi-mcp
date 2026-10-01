@@ -17,6 +17,8 @@ import sysconfig
 import tempfile
 import time
 
+from self_directing_mcp.config import Settings
+
 
 class SandboxError(RuntimeError):
     pass
@@ -45,8 +47,11 @@ def _runtime_paths(extra: tuple[Path, ...], workspace: Path) -> list[Path]:
     paths.update(Path(path).expanduser().absolute() for path in extra)
     sensitive = [Path.home().resolve()]
     sensitive.extend(Path(value).expanduser().resolve() for key in
-                     ("TSUKKOMI_WORKFLOW_STATE", "TSUKKOMI_WORKFLOW_APPROVAL", "TSUKKOMI_TYPESAFE_KEY_FILE")
+                     ("TSUKKOMI_WORKFLOW_STATE", "TSUKKOMI_WORKFLOW_APPROVAL")
                      if (value := os.environ.get(key)))
+    key_file = Settings().openrouter_api_key_file
+    if key_file is not None:
+        sensitive.append(key_file.expanduser().resolve())
     if any(item == workspace or item.is_relative_to(workspace) for item in sensitive):
         raise SandboxError("sandbox_workspace_exposes_host_state")
     protected = [*sensitive, workspace]

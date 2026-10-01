@@ -443,8 +443,10 @@ async def workflow_run_checks(session_id: str, provider: str = "agy", kind: str 
 async def workflow_classify(session_id: str, provider: str = "agy") -> dict[str, Any]:
     """Request JEV Choice using explicitly approved synthetic requirement context.
 
-    The host supplies TYPESAFE_API_KEY or TSUKKOMI_TYPESAFE_KEY_FILE. Errors and
-    low confidence never authorize a transition. No transcript is sent.
+    The host reuses OPENROUTER_API_KEY / SELF_DIRECT_OPENROUTER_API_KEY_FILE for
+    pinned typesafe/jev-1.13 on OpenRouter. Errors and low confidence never
+    authorize a transition. Each classification makes at most one remote call;
+    no transcript is sent.
     """
     return await _dispatch_workflow("classify", session_id, provider=provider)
 
