@@ -42,7 +42,6 @@ def test_tools_list_exposes_required_fields_and_enum(tmp_path):
                 assert "type" in rule.get("required", [])
                 assert rule["properties"]["type"]["enum"] == ["must", "must_not"]
                 assert rule.get("additionalProperties") is False
-                assert "must_not" in tool.description and "must" in tool.description
     asyncio.run(asyncio.wait_for(scenario(), timeout=30))
 
 

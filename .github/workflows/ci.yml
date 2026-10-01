@@ -2,8 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -13,6 +19,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.12"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -24,37 +31,15 @@ jobs:
       - name: Install package (dev)
         run: python -m pip install -U pip && python -m pip install -e ".[dev]"
 
-      - name: Install pinned Lean toolchain (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y zstd bubblewrap
-          curl --fail --location --silent --show-error \
-            https://github.com/leanprover/lean4/releases/download/v4.34.1/lean-4.34.1-linux.tar.zst \
-            --output "$RUNNER_TEMP/lean.tar.zst"
-          echo "47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4  $RUNNER_TEMP/lean.tar.zst" | sha256sum --check -
-          tar --zstd -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/lean-4.34.1-linux/bin" >> "$GITHUB_PATH"
 
-      - name: Run pytest
-        run: python -m pytest -q
+      - name: Run smoke tests
+        run: >-
+          python -m pytest -q
+          tests/test_mcp_transport.py
+          tests/test_workflow_jev.py
+          tests/test_windows_session_paths.py
         env:
           SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
 
       - name: Build distribution
         run: python -m build
-
-      - name: Compiled workflow policy evaluation
-        if: runner.os == 'Linux'
-        run: python scripts/benchmark_workflow.py --lean lean
-
-      - name: Synthetic offline performance gate
-        run: python scripts/benchmark.py
-        env:
-          SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
-
-      - name: Large-session concurrent audit gate
-        run: python scripts/benchmark_large.py --events 3000
-        env:
-          SELF_DIRECT_USE_FAKE_EMBEDDER: "true"

@@ -299,6 +299,10 @@ The extension also registers the read-only `tsukkomi_session_context` tool. Call
 
 The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, workflow version/grant invalidation, proof rejection, path isolation, and MCP transport. Lean integration tests report a skip when the native toolchain is unavailable; install it to exercise the new workflow layer.
 
+CI is intentionally lightweight on Linux and Windows: it runs only the explicit MCP transport, Jev boundary, and session-path smoke tests, then builds the source distribution and wheel. Pushes and pull requests trigger it; superseded runs for the same ref are cancelled, and each job is capped at 10 minutes. No API keys or paid model calls are used.
+
+The full regression suite, real Lean proof/kernel checks, and all performance/large-session/concurrency benchmarks are **local deep checks**, not CI gates. A green CI result does not establish full workflow/native proof coverage or performance guarantees. Run the following locally when the changed surface requires it; live model validation still requires separate model/budget approval.
+
 ```bash
 pytest -q
 python scripts/benchmark.py
