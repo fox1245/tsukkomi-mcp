@@ -42,7 +42,7 @@ Autonomous coding agents are powerful, but prompt-based instructions alone are v
 - Define explicit, non-negotiable rules for your agent:
   - **Prohibitions (`must_not`)**: Intercept dangerous commands, unapproved pushes, or directory escapes before execution (`decision: deny`).
   - **Mandatory Prerequisites (`must`)**: Enforce testing before deployment (`requires_success: true`).
-  - **Confirmation Prompts**: Convert risky actions into interactive user confirmations (`decision: ask`).
+- **Confirmation Prompts**: AGY returns `force_ask` for suspicious exceptions so a cached Always Allow grant does not replace confirmation.
 - Contracts can be **global** or strictly **scoped per session**.
 
 ### 2. 📋 Verifiable Checklist with Evidence Gating (`update_checklist`)
@@ -57,17 +57,17 @@ Autonomous coding agents are powerful, but prompt-based instructions alone are v
 - In Google Antigravity, active graph relationships are delivered into agent context before each tool invocation.
 
 ### 4. 🔒 Multi-Runtime Lifecycle Hooks
-- **Google Antigravity (AGY)**: High-performance stdio hook adapter (`scripts/agy_hook.py`) supporting `PreToolUse` contract interception and `Stop` evidence checklist verification.
+- **Google Antigravity (AGY)**: Stdio hooks cover every tool, local transcript synchronization, host-observed Pre/Post execution receipts, normal-stop checklist enforcement, and pre-invocation context. Unknown verification denies in enforced mode; advisory mode must be explicitly selected. See [installation and host boundaries](docs/agy-installation.md).
 - **OpenAI Codex**: Native lifecycle hook installer (`scripts/install_codex.py`) with advisory UserPromptSubmit, PreToolUse, and Stop hooks.
 - **Cursor / Grok Bot**: Dynamic transcript detection and multi-root parsing.
 
 ### 5. 🔍 Privacy-Preserving Hybrid Search
 - Dense cosine similarity using native `sqlite-vector` (AVX2-accelerated C extension) combined with SQLite FTS5 BM25 and Regex.
-- **Automatic Secret Masking**: API keys, bearer tokens, and private credentials are automatically masked before any embedding or text retrieval.
+- **Secret Masking**: Known credential patterns are masked before embedding or retrieval. This is not a guarantee that arbitrary personal data or every secret format is removed.
 
 ---
 
-## 🛠️ MCP Tools Reference (17 Tools)
+## MCP Tools Reference
 
 | Category | Tool | Description |
 |---|---|---|
@@ -83,11 +83,133 @@ Autonomous coding agents are powerful, but prompt-based instructions alone are v
 | | `propose_graph_update`| Validate node/edge additions with evidence chunk requirements. |
 | | `commit_graph_update` | Atomically commit validated graph updates with cursor progression. |
 | | `run_neograph_update` | Execute live LLM GraphRAG extraction pipeline via NeoGraph. |
-| **Search & Analytics** | `sync_session` | Incremental evidence sync across Codex/Cursor transcripts. |
+| **Search & Analytics** | `sync_session` | Incremental evidence sync across Codex, Grok Bot, OMP, and AGY transcripts. |
 | | `search_history` | Hybrid retrieval (Dense vector + BM25 + Regex) over history. |
 | | `get_chunk` | Retrieve raw evidence chunk with automatic secret masking. |
 | | `analyze_activity` | SQLite time-series analysis: retry gaps, error bursts, stalled items. |
 | **Hooks** | `codex_session_hook` | Adapter for Codex lifecycle events and local audit context. |
+| **Approved Workflows** | `workflow_status` | Current state, requirements, versions, and observed verification records. |
+| | `workflow_run_checks` | Execute owner-approved test commands and kernel-check approved Lean statements. |
+| | `workflow_classify` | Request a versioned JEV Choice using approved synthetic context. |
+| | `workflow_transition` | Evaluate the current classification through the compiled Lean transition function. |
+| | `workflow_authorize` | Issue a single-use, action/version/state-bound execution grant. |
+| | `workflow_execute` | Recheck and consume the grant, run the exact argv, then record success or failure. |
+
+## Approved workflows: PRD, JEV, Lean, and NeoGraph
+
+The optional workflow layer separates owner-approved original requirements from a derived Markdown wiki. It progresses through `requirements → formalize → implement → verify → complete`, with explicit revision paths. JEV requests a transition; it does not supply proof or test evidence. The runtime calls the **compiled Lean function**, not a separately maintained Python gate.
+
+Requirements, code (including additions/deletions), specification, tests, policy, and class mapping have content identities. Changes invalidate classifications, verification records, and grants. Required obligations and obligations activated by actual code changes are independent of the classifier. Explicit `depends_on` and `conflicts_with` links are checked; contradictions in unrestricted natural-language prose still need owner review. Changing the PRD, expected tests, any Lean source/definitions/proof body, specification, policy, or approval manifest requires fresh owner approval. A live file hash cannot substitute for its captured approved identity.
+
+### Owner setup
+
+Install Lean **4.34.1 or newer**, including its matching `leanc` and `leanchecker`, and put `lean` on `PATH` (or set `TSUKKOMI_LEAN`). Workflow execution requires **Linux bubblewrap with unprivileged namespaces**; configure `TSUKKOMI_BWRAP` if it is not on `PATH`. Missing isolation fails closed, with no unsandboxed fallback. Compilation and policy audits are cached by source/toolchain identity, not repeated at every hook. The packaged policy proves one-step and arbitrary-sequence completion safety; its three theorems require no axioms. Domain proofs permit only `propext`, `Classical.choice`, and `Quot.sound`; transitive `sorryAx`, custom axioms, and mismatched theorem types are rejected.
+
+Create the real PRD, implementation, test, specification, and proof files before approving a manifest. For example:
+
+```json
+{
+  "schema_version": 1,
+  "prd": "PRD.md",
+  "scope": ["src/**/*.py"],
+  "class_mapping_version": "1",
+  "confidence_threshold": 0.7,
+  "external_context": "synthetic",
+  "protected_paths": ["release.py"],
+  "requirements": [{
+    "id": "REQ-RETRY",
+    "text": "Retrying an existing request must not create another order.",
+    "required": true,
+    "status": "approved",
+    "source": {
+      "path": "PRD.md",
+      "section": "Retry",
+      "quote": "A repeated request ID creates one order."
+    },
+    "code": ["src/orders.py"],
+    "specs": ["spec/order.md"],
+    "tests": ["retry"],
+    "proofs": ["retry"],
+    "depends_on": [],
+    "conflicts_with": [],
+    "exceptions": []
+  }],
+  "tests": {
+    "retry": {
+      "argv": ["{python}", "-m", "pytest", "tests/test_retry.py", "-q"],
+      "paths": ["tests/test_retry.py"],
+      "timeout_sec": 60
+    }
+  },
+  "proofs": {
+    "retry": {
+      "path": "proofs/Retry.lean",
+      "theorem": "Order.retry",
+      "statement": "∀ (s : Order.State) (r : Nat), Order.insert (Order.insert s r) r = Order.insert s r"
+    }
+  },
+  "completion_actions": [
+    {
+      "tool_name": "workflow_command",
+      "argument_pattern": "^\\{\"argv\":\\[\"\\{python\\}\",\"release\\.py\"\\],\"cwd\":\"\\.\"\\}$"
+    },
+    {"tool_name": "run_command", "argument_pattern": "release\\.py"}
+  ]
+}
+```
+
+The PRD origin uses an exact, unique Markdown heading and a verbatim quote under that heading. All referenced paths are project-relative; escaping paths and tracked symlinks are rejected. Test/proof IDs must resolve, and mandatory requirements need both kinds of verification.
+
+From the directory containing `project/`, an owner—not the agent—runs:
+
+```bash
+tsukkomi-workflow approve --root project --manifest requirements.json --output trusted/approval
+tsukkomi-workflow wiki --approval trusted/approval --output derived-wiki
+```
+
+Approval creation is exclusive and is deliberately **not** exposed as an MCP tool. A revised approval goes into a new directory. Configure the MCP server and AGY hook process with the same absolute, host-owned paths:
+
+```text
+TSUKKOMI_WORKFLOW_APPROVAL=<read-only approved snapshot outside the workspace>
+TSUKKOMI_WORKFLOW_STATE=<private host-writable state outside the workspace>
+TSUKKOMI_LEAN=<trusted lean executable>
+TSUKKOMI_BWRAP=<trusted bubblewrap executable>
+TSUKKOMI_TYPESAFE_KEY_FILE=<authorized external dotenv containing TYPESAFE_API_KEY>
+```
+
+Keep approval, checker, hook configuration, Lean toolchain/cache, and evidence storage outside the agent's write authority. Checksums and file modes do not protect against an unrestricted process running as the same OS user. Use the host's sandbox/read-only mounts or a separate service account. Approval and workflow state must be separate directories.
+
+### Verification and execution
+
+Run `workflow_run_checks` to observe real subprocess exit codes and independently checked Lean proofs. Tests run against a fresh, readonly materialized snapshot of approved verification files and current tracked implementation—not the live project with untracked `conftest.py`, `sitecustomize.py`, or generated caches. Source-glob selection cannot silently authorize mutable harness/configuration files. The sandbox has a private writable temporary directory, no network or host credentials/state, and an allowlisted environment. Tests must write temporary artifacts there rather than modify the readonly snapshot. The runner does not accept model-supplied pass flags, replacement commands, or expected results. Source versions are checked before and after verification; interruption leaves nonpassing evidence.
+
+Candidate Lean compilation is sandboxed. `leanchecker` replays the candidate against hash-pinned, readonly core imports; a source-pinned native auditor separately replays candidate declarations and checks the exact approved type and transitive axioms without loading candidate elaborator extensions. Unchanged trusted core libraries are not reproved for every request. Candidate stdout is not an audit report. Approved statements use trusted core syntax and fully qualified names, not candidate-defined notation or typeclass registration. Native `.olean` deserialization still assumes structurally valid artifacts: this is not the stronger comparator-plus-independent-external-checker guarantee described in [Lean's proof-validation guidance](https://lean-lang.org/doc/reference/latest/ValidatingProofs/).
+
+`workflow_classify` calls the documented TypeSafe Choice endpoint with pinned `jev-1.13.0`. The fixed mapping is `0=InsufficientEvidence`, `1=NeedsRevision`, `2=ReadyForVerification`, `3=ReadyForCompletion`; no Score rounding is used. The input hash binds the actual request, rubric, mapping, and model. Approved requirement origins, actual bounded code diffs, state, and verification summaries are the only context sent. Oversized or non-text changes are not silently truncated.
+
+Remote classification is disabled unless the owner explicitly sets `external_context: "synthetic"`. This release's experiments are synthetic; do not label private production data synthetic to bypass consent. `TYPESAFE_API_KEY` may alternatively be supplied in the process environment. A missing key, timeout, invalid distribution, unknown class/model, or low confidence is a nonauthorizing result. Other providers' keys are never substituted. The example confidence threshold is an operator setting, **not** an empirically validated accuracy guarantee.
+
+Use a fresh classification ID for each `workflow_transition`. A completion choice reports readiness while remaining in `verify`; it cannot skip the owned completion action. After reaching `verify` with current mandatory evidence, `workflow_authorize` accepts an action such as:
+
+```json
+{"tool_name":"workflow_command","arguments":{"argv":["{python}","release.py"],"cwd":"."}}
+```
+
+Pass the returned grant and the **identical action** to `workflow_execute`. It rechecks state, versions, classification, cancellation, and Lean policy immediately before consuming the grant. Only successful owned execution sets `complete`. Started, succeeded, failed, and uncertain outcomes are distinct; a crash after consumption cannot replay the grant. A timeout after launch never claims that no action ran. The local completion sandbox permits writes to the actual approved project, but not private host state/credentials or network access. No shell interpolation is performed, and cancellation/timeout terminates the sandbox process group and descendants.
+
+AGY rejects direct mapped completion actions and directs the agent to the owned executor; its normal Stop hook holds an incomplete workflow and provides requirements, evidence, and permitted recovery actions. Cancellation, error stops, and pauses for background work are not restarted. Reads, repairs, and checks remain available unless a separate explicit contract restricts them. **Unmapped tools, direct shell access outside registered hooks, and the advisory Codex adapter are not an enforcement boundary.**
+
+Lean proves the policy/model under its stated assumptions; it does not prove arbitrary Python/TypeScript implementations equivalent to that model. Real tests supply implementation evidence only for exercised cases. The workflow is separate from session GraphRAG extraction and does not require an LLM to decide whether recorded tests passed.
+
+### Reproducible synthetic policy evaluation
+
+```bash
+TSUKKOMI_TEST_LEAN=lean python -m pytest -q
+python scripts/benchmark_workflow.py --lean lean
+```
+
+The benchmark compares 640 finite stage/class/evidence combinations with an independent reference, measures false allowances/blocks and per-stage latency, and exercises correction of each missing mandatory fact. It is an adversarial **policy** evaluation, not live JEV accuracy or a whole-host coverage claim. Live JEV validation requires a TypeSafe key; offline transport fixtures never count as live service evidence.
+
 
 ---
 
@@ -173,21 +295,18 @@ The extension also registers the read-only `tsukkomi_session_context` tool. Call
 
 ---
 
-## 🧪 Testing & Audit Certification
+## Testing and verification
 
-The repository includes a comprehensive test suite covering parsers, streaming appends, redaction, temporal obligations, Windows UNC traversal defense, and MCP transport:
+The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, workflow version/grant invalidation, proof rejection, path isolation, and MCP transport. Lean integration tests report a skip when the native toolchain is unavailable; install it to exercise the new workflow layer.
 
 ```bash
 pytest -q
 python scripts/benchmark.py
 ```
 
-### 🏅 LLM-as-a-Judge Audit Passed (100%)
-All 37 commits in this repository have been independently reviewed and certified safe by **9 LLM-as-a-judge subagents** across 3 batches ($X = N \times Y \times Z$ formula):
-- Zero secret / credential leaks
-- Zero unresolved hardcoded personal paths
-- Zero destructive shell scripts
-- Full memory & path-traversal boundary guarantees
+### Verification scope
+
+Test results and staged secret-pattern scans are bounded evidence, not certification that arbitrary secrets or every host bypass are absent. Inspect matched staged lines before committing, keep credentials in an external authorized dotenv file, and never commit raw personal transcripts or local runtime state.
 
 ---
 

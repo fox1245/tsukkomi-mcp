@@ -26,12 +26,13 @@ tsukkomi-mcp = "self_directing_mcp.server:main"
 self-directing-mcp = "self_directing_mcp.server:main"
 tsukkomi-install-codex = "self_directing_mcp.install_codex:main"
 self-directing-install-codex = "self_directing_mcp.install_codex:main"
+tsukkomi-workflow = "self_directing_mcp.workflow_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-self_directing_mcp = ["resources/*.json"]
+self_directing_mcp = ["resources/*.json", "resources/workflow/*.lean"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

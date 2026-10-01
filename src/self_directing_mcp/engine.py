@@ -19,7 +19,7 @@ from self_directing_mcp.audit.contracts import (
     scope_counts,
     visible_contracts,
 )
-from self_directing_mcp.audit.runner import run_audit
+from self_directing_mcp.audit.runner import action_applies, run_audit
 from self_directing_mcp.checklist import (
     INCOMPLETE_NOTE,
     ChecklistStore,
@@ -29,7 +29,7 @@ from self_directing_mcp.checklist import (
 )
 from self_directing_mcp.codex import discover as codex_discover
 from self_directing_mcp.grokbot import discover as grokbot_discover
-from self_directing_mcp import omp
+from self_directing_mcp import omp, agy
 from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
 from self_directing_mcp.index.ingest import SessionStore, ingest_session
@@ -96,17 +96,21 @@ class SelfDirectEngine:
         self.neograph = None
         self._ready = False
 
-    def hook_obligations(self, session_id: str) -> dict[str, Any]:
+    def hook_obligations(self, session_id: str, provider: str = "codex", path: str | None = None) -> dict[str, Any]:
         """Read atomically replaced rule files without initializing indexes.
 
         Missing obligations are not a compliance verdict. Corrupt files raise,
         so unavailable rules cannot be mistaken for an empty rule set.
         """
-        sid = session_id.lower()
+        provider = self._resolve_provider(provider)
+        sid = session_id.lower() if provider in ("codex", "agy") else session_id
+        if provider == "agy" and path is not None:
+            agy.resolve_session_path(self.settings.resolve_agy_app_data_dirs(),
+                                     session_id=sid, path=path, require_exists=False)
         path = self.settings.resolve_contracts_path()
         doc = ContractsDocument.model_validate_json(path.read_bytes()) if path.exists() else ContractsDocument()
         rules = [r for r in visible_contracts(doc.contracts, sid)
-                 if r.enabled and r.provider in (None, "codex")]
+                 if r.enabled and r.provider in (None, provider)]
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in sid)[:120]
         path = Path(self.settings.index_dir) / "checklists" / f"{safe}.json"
         checklist = ChecklistDocument.model_validate_json(path.read_bytes()) if path.exists() else ChecklistDocument(session_id=sid)
@@ -115,7 +119,7 @@ class SelfDirectEngine:
         payload = {"contracts": [r.model_dump(mode="json") for r in rules],
                    "pending": [i.model_dump(mode="json") for i in pending]}
         return {"status": "applicable" if rules or pending else "not_applicable",
-                "contracts": rules, "pending": pending,
+                "contracts": rules, "pending": pending, "has_checklist": bool(checklist.items),
                 "snapshot": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}
 
     @serialized
@@ -164,19 +168,23 @@ class SelfDirectEngine:
         provider: str | None,
         *,
         path: str | None = None,
-    ) -> Literal["codex", "grokbot", "omp"]:
+    ) -> Literal["codex", "grokbot", "omp", "agy"]:
         """Explicit arg > settings/env > light auto-detect from path layout."""
         if provider:
             p = provider.strip().lower()
-            if p in ("codex", "grokbot", "omp"):
+            if p in ("codex", "grokbot", "omp", "agy"):
                 return p  # type: ignore[return-value]
-            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot|omp)")
+            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot|omp|agy)")
         # Auto-detect: path under a configured grokbot root, or <id>/<id>.jsonl layout
         if path:
             try:
                 path_r = Path(path).expanduser().resolve()
             except OSError:
                 path_r = Path(path)
+            if agy.peek_session_id(path_r) and any(
+                path_r.is_relative_to(root) for root in self.settings.resolve_agy_app_data_dirs()
+            ):
+                return "agy"
             for root in self.settings.resolve_grokbot_transcripts_dirs():
                 try:
                     path_r.relative_to(Path(root).resolve())
@@ -207,7 +215,11 @@ class SelfDirectEngine:
             return {"ok": False, "error": "bad_provider", "message": str(e)}
 
         try:
-            if resolved_provider == "omp":
+            if resolved_provider == "agy":
+                resolved = agy.resolve_session_path(
+                    self.settings.resolve_agy_app_data_dirs(), session_id=session_id, path=path
+                )
+            elif resolved_provider == "omp":
                 resolved = omp.resolve_session_path(
                     self.settings.resolve_omp_sessions_dir(), session_id=session_id, path=path
                 )
@@ -221,7 +233,7 @@ class SelfDirectEngine:
                 resolved = codex_discover.resolve_session_path(
                     sessions_root, session_id=session_id, path=path
                 )
-        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError, omp.PathTraversalError) as e:
+        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError, omp.PathTraversalError, agy.PathTraversalError) as e:
             return {"ok": False, "error": "path_traversal", "message": str(e)}
         except FileNotFoundError as e:
             return {"ok": False, "error": "not_found", "message": str(e)}
@@ -249,6 +261,18 @@ class SelfDirectEngine:
         return info
 
     @serialized
+    def record_agy_hook(self, payload: dict[str, Any], event: str) -> None:
+        """Record host hook observations separately from native transcript bytes."""
+        from self_directing_mcp.agy_receipts import ReceiptStore
+        sid = payload["conversationId"].lower()
+        path = agy.resolve_session_path(self.settings.resolve_agy_app_data_dirs(),
+                                        session_id=sid, path=payload["transcriptPath"],
+                                        require_exists=False)
+        ReceiptStore(Path(self.settings.index_dir)).record(
+            sid, path, payload["stepIdx"], payload["toolCall"], event,
+            error=payload.get("error", "") if event == "PostToolUse" else None)
+
+    @serialized
     def search_history(
         self,
         query: str,
@@ -261,7 +285,7 @@ class SelfDirectEngine:
         self.ensure_ready()
         assert self.store and self.sparse
         provider = self._resolve_provider(provider)
-        if session_id and provider == "codex":
+        if session_id and provider in ("codex", "agy"):
             session_id = session_id.lower()
         k = top_k if top_k is not None else self.settings.search_top_k
         if mode not in ("hybrid", "regex", "sparse", "dense") or not 1 <= k <= 100:
@@ -300,7 +324,7 @@ class SelfDirectEngine:
         started = time.perf_counter()
         self.ensure_ready()
         provider = self._resolve_provider(provider)
-        sid = session_id.lower() if provider == "codex" else session_id
+        sid = session_id.lower() if provider in ("codex", "agy") else session_id
         # Always refresh local evidence. Regex audit never depends on remote embeddings.
         record = self.store.cursor_record(sid, provider)
         try:
@@ -325,6 +349,10 @@ class SelfDirectEngine:
                                  0, coverage.get("byte_offset", 0), coverage.get("byte_offset", 0))
             planned.chunk_id = "proposed:" + planned.chunk_id
         contracts = self.contracts.list()
+        if planned is not None:
+            # Plain must rules are completion checkpoints, not preconditions
+            # that prevent the very action needed to produce their evidence.
+            contracts = [rule for rule in contracts if rule.type != "must" or rule.before_regex]
         applicable = sum(rule.enabled and rule.provider in (None, provider)
                          and rule.session_id in (None, sid) for rule in contracts)
         result = run_audit(session_id=sid, contracts=contracts, store=self.store,
@@ -333,6 +361,12 @@ class SelfDirectEngine:
         payload.update(ok=True, provider=provider, action_executed=False,
                        applicable_contracts=applicable,
                        requires_attention=result.verdict != "clean")
+        if planned is not None:
+            action_rules = [rule for rule in contracts if rule.enabled and rule.provider in (None, provider)
+                            and rule.session_id in (None, sid) and action_applies(rule, planned)]
+            payload["action_scope"] = "applicable" if action_rules else "not_applicable"
+            payload["action_contracts"] = [rule.id for rule in action_rules]
+            payload["requires_history"] = any(rule.type == "must" for rule in action_rules)
         payload["timings_ms"] = {
             "sync": round((sync_finished - started) * 1000, 2),
             "evaluation": round((time.perf_counter() - sync_finished) * 1000, 2)}
@@ -423,6 +457,27 @@ class SelfDirectEngine:
             },
         }
 
+    def _verified_checklist_evidence(self, sid: str, provider: str, evidence_ids: list[str]) -> bool:
+        """Evidence IDs are claims until current, linked runtime results resolve."""
+        if not evidence_ids or self.store is None:
+            return False
+        if not self.store.session_status(sid, provider).get("complete"):
+            return False
+        chunks = self.store.list_chunks(sid, provider)
+        positions = {chunk.chunk_id: index for index, chunk in enumerate(chunks)}
+        by_id = {chunk.chunk_id: chunk for chunk in chunks}
+        for identifier in evidence_ids:
+            result = by_id.get(identifier)
+            if result is None or result.kind != "tool_result" or result.meta.get("success") is not True:
+                return False
+            call_id = result.meta.get("call_id")
+            calls = [chunk for chunk in chunks if chunk.kind == "tool_call" and chunk.meta.get("call_id") == call_id]
+            outputs = [chunk for chunk in chunks if chunk.kind == "tool_result" and chunk.meta.get("call_id") == call_id]
+            if (not call_id or len(calls) != 1 or len(outputs) != 1
+                    or positions[calls[0].chunk_id] >= positions[result.chunk_id]):
+                return False
+        return True
+
     @serialized
     def update_checklist(
         self,
@@ -440,8 +495,15 @@ class SelfDirectEngine:
         self.ensure_ready()
         assert self.checklists
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
         doc = self.checklists.load(sid)
+        if any(change.get("status") == RequirementStatus.DONE.value or "evidence_chunk_ids" in change
+               for change in update or []):
+            record = self.store.cursor_record(sid, resolved_provider)
+            refreshed = self.sync_session(session_id=sid, provider=resolved_provider, embed=False,
+                                          path=record["path"] if record else None)
+        else:
+            refreshed = {"ok": True}
         added = []
         for item in add or []:
             entry = RequirementItem(
@@ -463,14 +525,12 @@ class SelfDirectEngine:
             before = item.status
             if "evidence_chunk_ids" in change:
                 item.evidence_chunk_ids = list(change["evidence_chunk_ids"])
-            if change.get("status") == RequirementStatus.DONE.value:
-                if item.evidence_chunk_ids:
-                    item.status = RequirementStatus.DONE
-                    item.verified = bool(change.get("verified", True))
-                else:
-                    # Completion claim without evidence never marks done.
-                    item.status = RequirementStatus.PENDING_VERIFICATION
-                    item.verified = False
+            if change.get("status") == RequirementStatus.DONE.value or (
+                    "evidence_chunk_ids" in change and item.status == RequirementStatus.DONE):
+                verified = (refreshed.get("ok") is True and change.get("verified") is not False
+                            and self._verified_checklist_evidence(sid, resolved_provider, item.evidence_chunk_ids))
+                item.status = RequirementStatus.DONE if verified else RequirementStatus.PENDING_VERIFICATION
+                item.verified = verified
             elif change.get("status"):
                 item.status = change["status"]
             if change.get("blocked_reason"):
@@ -495,8 +555,13 @@ class SelfDirectEngine:
         self.ensure_ready()
         assert self.checklists
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
         doc = self.checklists.load(sid)
+        for item in doc.items:
+            if item.status == RequirementStatus.DONE and (
+                    not item.verified or not self._verified_checklist_evidence(sid, resolved_provider, item.evidence_chunk_ids)):
+                item.status = RequirementStatus.PENDING_VERIFICATION
+                item.verified = False
         return {"ok": True, "session_id": sid, "items": [i.model_dump(mode="json") for i in doc.items]}
 
     @serialized
@@ -506,7 +571,7 @@ class SelfDirectEngine:
         self.ensure_ready()
         assert self.store
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
         return analyze_activity(self.store, session_id=sid, provider=resolved_provider,
                                 window_minutes=max(1, min(window_minutes, 1440)))
 
@@ -517,12 +582,17 @@ class SelfDirectEngine:
         node_id: str | None = None,
         provider: str | None = None,
         depth: int = 1,
+        path: str | None = None,
     ) -> dict[str, Any]:
         """Fetch GraphRAG context: entity neighbor subgraph or overall session graph."""
         self.ensure_ready()
         assert self.graph is not None
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
+        if path is not None:
+            synced = self.sync_session(session_id=sid, provider=resolved_provider, path=path, embed=False)
+            if not synced.get("ok") or not synced.get("coverage", {}).get("complete"):
+                return {"ok": False, "error": synced.get("error", "incomplete_history"), "nodes": [], "edges": []}
 
         if node_id:
             res = self.graph.neighbors(sid, resolved_provider, node_id, depth=depth)
@@ -558,7 +628,7 @@ class SelfDirectEngine:
         self.ensure_ready()
         assert self.store and self.graph
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
         verdict = validate_proposal(proposal, store=self.store, session_id=sid, provider=resolved_provider)
         cursor = self.graph.cursor(sid, resolved_provider)
         return {"ok": verdict["ok"], **verdict, "cursor": cursor,
@@ -572,7 +642,7 @@ class SelfDirectEngine:
         self.ensure_ready()
         assert self.store and self.graph
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
         existing = self.graph.find_job(proposal.get("job_id", "") or "adhoc")
         if existing and existing["status"] == "applied":
             # Idempotent replay: same job id never double-applies.
@@ -607,7 +677,7 @@ class SelfDirectEngine:
     def _prepare_neograph_update(self, session_id, provider=None):
         self.ensure_ready()
         resolved = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved == "codex" else session_id
+        sid = session_id.lower() if resolved in ("codex", "agy") else session_id
         return sid, resolved, self.store.event_frames(sid, resolved), self.graph.cursor(sid, resolved)
 
     @serialized
@@ -724,7 +794,7 @@ class SelfDirectEngine:
         if self.dense_backend == "numpy":
             status["degraded_flags"].append("dense_numpy_fallback")
         if session_id:
-            status["session"] = self.store.session_status(session_id.lower() if self._resolve_provider(provider) == "codex" else session_id, self._resolve_provider(provider))
+            status["session"] = self.store.session_status(session_id.lower() if self._resolve_provider(provider) in ("codex", "agy") else session_id, self._resolve_provider(provider))
         status["nudge"] = (
             "NUDGE: Call sync_session at session start; audit_session before risky actions."
         )

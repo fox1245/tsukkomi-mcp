@@ -20,6 +20,9 @@ def current_parser_version(provider):
     if provider == "omp":
         from self_directing_mcp.omp import PARSER_VERSION
         return PARSER_VERSION
+    if provider == "agy":
+        from self_directing_mcp.agy import PARSER_VERSION
+        return PARSER_VERSION
     return 1
 
 
@@ -278,7 +281,9 @@ class SessionStore:
 def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider="codex", embed=True):
     if embed and (dense is None or embedder is None):
         raise ValueError("embedding unavailable in local-only mode")
-    if provider == "omp":
+    if provider == "agy":
+        from self_directing_mcp.agy import parse_session_chunks, peek_session_id
+    elif provider == "omp":
         from self_directing_mcp.omp import parse_session_chunks, peek_session_id
     elif provider == "grokbot":
         from self_directing_mcp.grokbot.parse import parse_session_chunks, peek_session_id
@@ -291,7 +296,7 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
         sid = session_id_from_filename(path) if provider == "codex" else None
     if not sid:
         raise ValueError("cannot determine session id")
-    sid = sid.lower() if provider == "codex" else sid
+    sid = sid.lower() if provider in ("codex", "agy") else sid
     cursor = store.cursor_record(sid, provider)
     parser_version = current_parser_version(provider)
     start, reindexed = (cursor["byte_offset"] if cursor else 0), False
@@ -307,9 +312,20 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
         elif cursor["parser_version"] != parser_version:
             start, reindexed = 0, True
             reindex_reason = "parser_updated"
+    receipt_store = None
+    if provider == "agy":
+        from self_directing_mcp.agy_receipts import ReceiptStore
+        receipt_store = ReceiptStore(store.db_path.parent)
+        receipts, receipt_digest, indexed_digest = receipt_store.snapshot(sid, path)
+        if cursor and receipt_digest != indexed_digest:
+            start, reindexed = 0, True
+            reindex_reason = "hook_receipts_changed"
     # Detect a rewrite concurrent with parsing before publishing any new cursor.
     initial_stat = path.stat()
-    if provider == "omp" and start:
+    if provider == "agy":
+        chunks, offset, parsed_sid = parse_session_chunks(
+            path, session_id=sid, start_byte=start, receipts=receipts)
+    elif provider == "omp" and start:
         chunks, offset, parsed_sid = parse_session_chunks(
             path, session_id=sid, start_byte=start,
             prior_call=lambda call_id, name, before_byte: store.has_prior_tool_call(
@@ -325,6 +341,8 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
     if chunks or reindexed or cursor is None or offset != cursor["byte_offset"]:
         store.commit_events(chunks, session_id=sid, provider=provider, path=path, offset=offset,
                             digest=digest, replace=reindexed, parser_version=parser_version)
+    if receipt_store is not None:
+        receipt_store.mark_indexed(sid, receipt_digest)
     stale_ids = store.pending_deletions(sid, provider)
     if stale_ids:
         # Replayable cleanup also repairs a crash after metadata was committed.

@@ -19,7 +19,7 @@ SearchMode = Literal["hybrid", "regex", "sparse", "dense"]
 class Chunk(BaseModel):
     chunk_id: str
     session_id: str
-    provider: Literal["codex", "grokbot", "omp"] = "codex"
+    provider: Literal["codex", "grokbot", "omp", "agy"] = "codex"
     kind: ChunkKind
     text: str
     content_hash: str
@@ -57,7 +57,7 @@ class ContractRule(BaseModel):
     )
     enabled: bool = True
     revision: int = Field(default=1, ge=1, description="Set on update; do not send manually.")
-    provider: Literal["codex", "grokbot", "omp"] | None = Field(
+    provider: Literal["codex", "grokbot", "omp", "agy"] | None = Field(
         default=None, description="Limit to one provider; omit for all."
     )
     session_id: str | None = Field(

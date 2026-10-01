@@ -24,6 +24,21 @@ def _eligible(chunk, rule):
     return scope_matches(chunk, rule.scope) and chunk.meta.get("role") in rule.roles
 
 
+def action_applies(rule, proposed) -> bool:
+    """Determine action scope without mistaking completion obligations for gates."""
+    if not _eligible(proposed, rule):
+        return False
+    if rule.type == "must" and not rule.before_regex:
+        return False
+    pattern = rule.before_regex if rule.type == "must" else rule.regex
+    if not pattern:
+        return True
+    try:
+        return re.search(pattern, proposed.text, re.IGNORECASE | re.MULTILINE) is not None
+    except re.error:
+        return True
+
+
 def _presence(rule, matches, prefix):
     if not matches:
         return "violation", "required evidence missing before checkpoint", []

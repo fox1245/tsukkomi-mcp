@@ -152,7 +152,7 @@ async def sync_session(
 
     Audit/check_action refresh automatically; do not sync separately before them.
     Provide session_id or path under the configured root.
-    provider: "codex" (default), "grokbot", or "omp" (OMP JSONL).
+    provider: "codex" (default), "grokbot", "omp" (OMP JSONL), or "agy".
     When omitted, uses SELF_DIRECT_SESSION_PROVIDER or auto-detects from path layout.
     Every event occurrence is retained; only new sanitized text hashes are embedded.
     Set embed=False for local indexing. SELF_DIRECT_LOCAL_ONLY=true disables
@@ -179,7 +179,7 @@ async def search_history(
     Use when relevant evidence is missing. Do NOT treat retrieval
     alone as compliance proof — call audit_session; contracts/regex are authoritative.
     top_k defaults from settings (search_top_k). Never treat top-1 alone as a violation.
-    provider filters the index (codex|grokbot|omp). Local-only supports regex/sparse, not dense/hybrid.
+    provider filters the index (codex|grokbot|omp|agy). Local-only supports regex/sparse, not dense/hybrid.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.search_history,
@@ -199,7 +199,7 @@ async def audit_session(session_id: str, provider: str | None = None, path: str 
     Rules/regex are primary; hybrid is auxiliary only.
     Refreshes local JSONL first and returns coverage and a contracts snapshot.
     Unknown means evidence/verification is missing; it must not be called compliance.
-    provider filters the audit (codex|grokbot|omp).
+    provider filters the audit (codex|grokbot|omp|agy).
     timeout_ms: optional per-call budget in milliseconds for large sessions.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=True)
@@ -331,14 +331,15 @@ async def analyze_activity(session_id: str, provider: str | None = None,
 
 @mcp.tool()
 async def get_graph_context(session_id: str, node_id: str | None = None,
-                            provider: str | None = None, depth: int = 1) -> dict[str, Any]:
+                            provider: str | None = None, depth: int = 1,
+                            path: str | None = None) -> dict[str, Any]:
     """Query the GraphRAG knowledge graph: nodes, edges, and entity dependencies.
 
     If node_id is provided, returns the entity's neighbor subgraph up to depth.
     If node_id is omitted, returns the active session knowledge graph.
     """
     return await _dispatch(_engine.get_graph_context, session_id, node_id=node_id,
-                           provider=provider, depth=depth, audit=True)
+                           provider=provider, depth=depth, path=path, audit=True)
 
 
 @mcp.tool()
@@ -381,6 +382,100 @@ async def run_neograph_update(session_id: str, provider: str | None = None,
               min(_engine.settings.graph_update_timeout_sec, _engine.settings.max_tool_timeout_sec))
     return await _dispatch(_engine.run_neograph_update, session_id, provider=provider,
                            budget_override=budget, cooperative=True)
+
+
+async def _dispatch_workflow(method: str, *args, timeout_ms=None, **kwargs):
+    from self_directing_mcp.workflow import configured_workflow
+    budget = _resolve_timeout_sec(timeout_ms, audit=False)
+    deadline = time.monotonic() + budget
+    abandoned, entered = Event(), Event()
+
+    def invoke():
+        if abandoned.is_set() or time.monotonic() >= deadline:
+            raise TimeoutError("workflow request expired before execution")
+        entered.set()
+        controller = configured_workflow()
+        if controller is None:
+            return {"ok": False, "error": "workflow_not_configured", "action_executed": False}
+        return getattr(controller, method)(*args, _deadline=deadline, cancel_event=abandoned, **kwargs)
+
+    worker = asyncio.create_task(asyncio.to_thread(invoke))
+    try:
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=budget)
+    except TimeoutError:
+        abandoned.set()
+        # A process already running must be killed and its observed result kept.
+        # A worker still waiting on a host lock must never launch after expiry.
+        try:
+            return await asyncio.wait_for(asyncio.shield(worker), timeout=.25)
+        except TimeoutError:
+            may_have_run = method == "execute" and entered.is_set()
+            return {"ok": False, "error": "workflow_deadline", "outcome": "outcome_unknown" if may_have_run else "not_started",
+                    "outcome_unknown": may_have_run, "started": None if may_have_run else False,
+                    "action_executed": None if may_have_run else False, "requires_attention": True}
+    except asyncio.CancelledError:
+        abandoned.set()
+        raise
+    finally:
+        # Retrieve a late worker exception without cancelling its cleanup or
+        # pretending that cancelling an asyncio Future terminates a process.
+        worker.add_done_callback(lambda finished: finished.exception() if not finished.cancelled() else None)
+
+
+@mcp.tool()
+async def workflow_status(session_id: str, provider: str = "agy") -> dict[str, Any]:
+    """Read the host-approved workflow, current obligations and observed evidence."""
+    return await _dispatch_workflow("status", session_id, provider=provider)
+
+
+@mcp.tool()
+async def workflow_run_checks(session_id: str, provider: str = "agy", kind: str = "all",
+                              timeout_ms: int | None = None) -> dict[str, Any]:
+    """Run owner-approved real tests/proofs; bind observations to current versions.
+
+    No model-supplied pass flag, command, expected result or proof can be submitted.
+    """
+    return await _dispatch_workflow("run_checks", session_id, provider=provider,
+                                    kind=kind, timeout_ms=timeout_ms)
+
+
+@mcp.tool()
+async def workflow_classify(session_id: str, provider: str = "agy") -> dict[str, Any]:
+    """Request JEV Choice using explicitly approved synthetic requirement context.
+
+    The host supplies TYPESAFE_API_KEY or TSUKKOMI_TYPESAFE_KEY_FILE. Errors and
+    low confidence never authorize a transition. No transcript is sent.
+    """
+    return await _dispatch_workflow("classify", session_id, provider=provider)
+
+
+@mcp.tool()
+async def workflow_transition(session_id: str, classification_id: str,
+                               provider: str = "agy") -> dict[str, Any]:
+    """Evaluate a current classification through the compiled Lean policy."""
+    return await _dispatch_workflow("transition", session_id, classification_id, provider=provider)
+
+
+@mcp.tool()
+async def workflow_authorize(session_id: str, classification_id: str, action: dict[str, Any],
+                              provider: str = "agy") -> dict[str, Any]:
+    """Mint a single-use grant bound to exact workflow_command argv/cwd and versions.
+
+    Requires current proof/test observations. This does not execute the action.
+    Owner approval is deliberately not an MCP tool.
+    """
+    return await _dispatch_workflow("authorize", session_id, classification_id, action, provider=provider)
+
+
+@mcp.tool()
+async def workflow_execute(session_id: str, grant: str, action: dict[str, Any],
+                            provider: str = "agy", timeout_ms: int | None = None) -> dict[str, Any]:
+    """Recheck and consume a grant, execute its exact argv, and observe the outcome.
+
+    Changed arguments, targets, state, policy or evidence invalidate the grant.
+    """
+    return await _dispatch_workflow("execute", session_id, grant, action, provider=provider,
+                                    timeout_ms=timeout_ms)
 
 
 def main() -> None:

@@ -1,0 +1,2 @@
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-01T00:00:00Z","content":"<USER_REQUEST>Run npm test before deploy.</USER_REQUEST>"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-01T00:00:01Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"npm test\"","Cwd":"\"/synthetic/project\"","WaitMsBeforeAsync":"5000","toolAction":"\"Running tests\"","toolSummary":"\"Execute tests\""}}]}

@@ -68,7 +68,12 @@ class Settings(BaseSettings):
     codex_sessions_dir: Path = Field(default_factory=_default_codex_sessions_dir)
     grokbot_transcripts_dir: str = Field(default_factory=_default_grokbot_transcripts_dir)
     omp_sessions_dir: Path = Field(default_factory=_default_omp_sessions_dir)
-    session_provider: Literal["codex", "grokbot", "omp"] = "codex"
+    agy_app_data_dirs: list[Path] = Field(default_factory=lambda: [
+        Path.home() / ".gemini" / name
+        for name in ("antigravity", "antigravity-cli", "antigravity-ide")
+    ])
+    agy_enforcement: Literal["enforced", "advisory"] = "enforced"
+    session_provider: Literal["codex", "grokbot", "omp", "agy"] = "codex"
     index_dir: Path = Field(default_factory=_default_index_dir)
     contracts_path: Path | None = Field(
         default=None,
@@ -123,6 +128,9 @@ class Settings(BaseSettings):
     def resolve_omp_sessions_dir(self) -> Path:
         return Path(os.environ.get("SELF_DIRECT_OMP_SESSIONS_DIR") or self.omp_sessions_dir)
 
+    def resolve_agy_app_data_dirs(self) -> list[Path]:
+        return [Path(root).expanduser().resolve() for root in self.agy_app_data_dirs]
+
     def resolve_grokbot_transcripts_dirs(self) -> list[Path]:
         from self_directing_mcp.grokbot.discover import parse_transcripts_dirs
 
@@ -130,9 +138,9 @@ class Settings(BaseSettings):
         raw = override if override is not None else self.grokbot_transcripts_dir
         return parse_transcripts_dirs(raw)
 
-    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp"]:
+    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp", "agy"]:
         override = (os.environ.get("SELF_DIRECT_SESSION_PROVIDER") or "").strip().lower()
-        if override in ("codex", "grokbot", "omp"):
+        if override in ("codex", "grokbot", "omp", "agy"):
             return override  # type: ignore[return-value]
         return self.session_provider
 
