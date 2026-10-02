@@ -73,13 +73,52 @@ def test_timeout_ms_accepted_and_invalid_values_rejected(tmp_path):
     asyncio.run(asyncio.wait_for(scenario(), timeout=30))
 
 
-def test_default_behavior_without_timeout_unchanged(tmp_path):
+def test_default_timeout_preserves_detect_only_contract(tmp_path):
     async def scenario():
         env = _server_env(tmp_path, {"SELF_DIRECT_AUDIT_TIMEOUT_SEC": "6"})
         async with stdio_client(_stdio(env, tmp_path)) as (reader, writer):
             async with ClientSession(reader, writer) as client:
                 await client.initialize()
+                await client.call_tool("upsert_contracts", {"contracts": [
+                    {"id": "no-delete", "type": "must_not", "scope": "tool_call", "regex": "DELETE"}
+                ]})
                 audit = await client.call_tool("audit_session", {"session_id": SID})
                 payload = json.loads(audit.content[0].text)
-                assert "timings_ms" in payload
+                assert payload["verdict"] == "clean"
+                assert payload["coverage"]["complete"] is True
+                assert payload["action_executed"] is False
+    asyncio.run(asyncio.wait_for(scenario(), timeout=30))
+
+
+def test_stdio_distinguishes_request_deadline_from_index_busy(tmp_path):
+    from self_directing_mcp.index.locking import index_lock
+
+    async def scenario():
+        env = _server_env(tmp_path)
+        async with stdio_client(_stdio(env, tmp_path)) as (reader, writer):
+            async with ClientSession(reader, writer) as client:
+                await client.initialize()
+                warm = await client.call_tool("sync_session", {"session_id": SID, "embed": False})
+                assert json.loads(warm.content[0].text)["ok"] is True
+                with index_lock(tmp_path / "index"):
+                    deadline = await client.call_tool("audit_session", {"session_id": SID, "timeout_ms": 50})
+                    busy = await client.call_tool("audit_session", {"session_id": SID, "timeout_ms": 5000})
+                    for response, expected in ((deadline, "request_deadline"), (busy, "index_busy")):
+                        value = json.loads(response.content[0].text)
+                        assert value["error"] == expected
+                        assert value["verdict"] == "unknown"
+                        assert value["coverage"]["complete"] is False
+                        assert value["action_executed"] is False
+                # An expired transport request cannot contaminate the next control.
+                await client.call_tool("upsert_contracts", {"contracts": [
+                    {"id": "no-delete", "type": "must_not", "regex": "DELETE"}
+                ]})
+                next_call = await client.call_tool("check_action", {
+                    "session_id": SID, "action": {"tool_name": "shell", "arguments": "echo safe"},
+                    "timeout_ms": 5000,
+                })
+                value = json.loads(next_call.content[0].text)
+                assert value["verdict"] == "clean" and value["coverage"]["complete"]
+                assert value["action_executed"] is False
+
     asyncio.run(asyncio.wait_for(scenario(), timeout=30))

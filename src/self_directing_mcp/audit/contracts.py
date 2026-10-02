@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 from self_directing_mcp.schemas import ContractRule, ContractsDocument
+from self_directing_mcp.request_control import check_request, publication
 
 
 GLOBAL_CONTRACT_MEANING = (
@@ -38,55 +40,93 @@ class ContractStore:
         if self.path.exists():
             self.load()
 
+    def capture(self) -> tuple[bytes | None, str]:
+        check_request()
+        try:
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return None, "missing"
+        return raw, "present:" + hashlib.sha256(raw).hexdigest()
+
+    def current_token(self) -> str:
+        return self.capture()[1]
+
     def load(self) -> ContractsDocument:
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        self._doc = ContractsDocument.model_validate(data)
+        raw, _token = self.capture()
+        # Never retain previously valid authority when the file is lost/corrupt.
+        self._doc = ContractsDocument()
+        if raw is not None:
+            self._doc = ContractsDocument.model_validate_json(raw)
         return self._doc
 
     def save(self) -> None:
+        self.publish_document(self._doc, self._doc.model_dump_json(indent=2))
+
+    def publish_document(self, document, payload, expected_token=None):
+        check_request()
+        if expected_token is not None and self.current_token() != expected_token:
+            raise ValueError("stale contract preparation")
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
-            self._doc.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(self.path)
+        try:
+            temporary.write_text(payload, encoding="utf-8")
+            with publication():
+                if expected_token is not None and self.current_token() != expected_token:
+                    raise ValueError("contract authority changed before publication")
+                check_request()
+                temporary.replace(self.path)
+            self._doc = document
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def list(self) -> list[ContractRule]:
-        return list(self._doc.contracts)
+        return [rule.model_copy(deep=True) for rule in self._doc.contracts]
 
     def load_if_changed(self) -> None:
-        if self.path.exists():
-            self.load()
+        self.load()
 
-    def upsert(self, rules: list[ContractRule]) -> list[ContractRule]:
-        by_id = {c.id: c for c in self._doc.contracts}
-        saved: list[ContractRule] = []
-        for r in rules:
+    @staticmethod
+    def prepare_upsert(document, rules):
+        by_id = {c.id: c for c in document.contracts}
+        saved = []
+        for original in rules:
+            check_request()
+            r = original.model_copy(deep=True)
             if r.id in by_id:
                 previous = by_id[r.id]
                 r = r.model_copy(update={"revision": previous.revision + 1})
-                # Preserve the user's original wording unless the update provides one.
                 if not r.source_quote and previous.source_quote:
                     r = r.model_copy(update={"source_quote": previous.source_quote})
-                self._doc.history.setdefault(r.id, []).append(previous)
+                document.history.setdefault(r.id, []).append(previous)
             by_id[r.id] = r
             saved.append(r)
-        self._doc.contracts = list(by_id.values())
-        self.save()
+        document.contracts = list(by_id.values())
         return saved
 
-    def revoke(self, rule_id: str) -> ContractRule | None:
-        """Disable a rule; history and source quote remain for audit."""
-        by_id = {c.id: c for c in self._doc.contracts}
+    def upsert(self, rules: list[ContractRule]) -> list[ContractRule]:
+        document = self._doc.model_copy(deep=True)
+        saved = self.prepare_upsert(document, rules)
+        self.publish_document(document, document.model_dump_json(indent=2))
+        return [rule.model_copy(deep=True) for rule in saved]
+
+    @staticmethod
+    def prepare_revoke(document, rule_id):
+        by_id = {c.id: c for c in document.contracts}
         rule = by_id.get(rule_id)
         if rule is None:
             return None
-        disabled = rule.model_copy(update={"enabled": False})
-        self._doc.history.setdefault(rule_id, []).append(rule)
+        disabled = rule.model_copy(update={"enabled": False}, deep=True)
+        document.history.setdefault(rule_id, []).append(rule)
         by_id[rule_id] = disabled
-        self._doc.contracts = list(by_id.values())
-        self.save()
+        document.contracts = list(by_id.values())
         return disabled
+
+    def revoke(self, rule_id: str) -> ContractRule | None:
+        """Disable a rule; history and source quote remain for audit."""
+        document = self._doc.model_copy(deep=True)
+        disabled = self.prepare_revoke(document, rule_id)
+        if disabled is not None:
+            self.publish_document(document, document.model_dump_json(indent=2))
+        return disabled.model_copy(deep=True) if disabled is not None else None
 
     def seed_from(self, seed_path: Path) -> int:
         """Load contracts from a seed JSON if store is empty."""

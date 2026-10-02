@@ -7,6 +7,8 @@ import uuid
 from functools import wraps
 from collections.abc import Callable, Sequence
 
+
+from self_directing_mcp.request_control import check_request, current_request, request_scope
 try:
     import neograph_engine as ng
 except (ImportError, OSError) as exc:
@@ -64,6 +66,22 @@ def run_stages(name: str, stages: Sequence[tuple[str, Callable]]) -> dict:
     checkpoint. These short graphs restart from fresh inputs after interruption;
     they do not advertise recovery of Python closures or external side effects.
     """
+    control = current_request()
+    check_request()
+    callback_error = None
+
+    def bind(callback):
+        def invoke():
+            nonlocal callback_error
+            with request_scope(control):
+                try:
+                    check_request()
+                    callback()
+                except Exception as exc:
+                    # Native bindings may wrap a Python callback exception.
+                    callback_error = exc
+                    raise
+        return invoke
     names = [stage for stage, _ in stages]
     if not names or len(set(names)) != len(names):
         raise ValueError("NeoGraph stages must have unique, nonempty names")
@@ -79,8 +97,9 @@ def run_stages(name: str, stages: Sequence[tuple[str, Callable]]) -> dict:
                   zip([ng.START_NODE, *names], [*names, ng.END_NODE])],
     }
     with _guard:
-        _pending[invocation] = dict(stages)
+        _pending[invocation] = {stage: bind(callback) for stage, callback in stages}
     try:
+        check_request()
         engine = ng.GraphEngine.compile(definition, ctx)
     finally:
         with _guard:
@@ -89,11 +108,23 @@ def run_stages(name: str, stages: Sequence[tuple[str, Callable]]) -> dict:
     # Execute sequentially on the calling thread, not native fan-out workers.
     engine.set_worker_count(1)
     started = time.monotonic()
-    result = engine.run(ng.RunConfig(thread_id=invocation, input={},
-                                   resume_if_exists=False, max_steps=len(names) + 2))
+    check_request()
+    try:
+        result = engine.run(ng.RunConfig(thread_id=invocation, input={},
+                                       resume_if_exists=False, max_steps=len(names) + 2))
+    except Exception as exc:
+        if callback_error is not None:
+            raise callback_error from exc
+        check_request()
+        raise
+    if callback_error is not None:
+        raise callback_error
+    # Do not perform a global stopped-success check here: workflow callbacks
+    # must retain actual owned execution outcomes and completed cleanup receipts.
     completed = result.output.get("channels", {}).get("completed", {}).get("value", [])
     trace = list(result.execution_trace or [])
     if completed != names or trace != names:
+        check_request()
         raise RuntimeError("NeoGraph did not complete the required stage sequence")
     return {"executor": "neograph-engine", "version": ng.__version__,
             "run_id": invocation, "graph": name, "nodes": trace,

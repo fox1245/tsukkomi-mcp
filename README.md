@@ -308,6 +308,32 @@ pytest -q
 python scripts/benchmark.py
 ```
 
+### Shared-index concurrency and deadlines
+
+The [shared-index fix (#3)](https://github.com/fox1245/tsukkomi-mcp/issues/3) separates stable source preparation, guarded publication, and detached audit evaluation. Audit snapshots contain only scoped authoritative event rows/counts and detached rule content; deterministic checks do not repair FTS or restore embedding caches. Explicit sync still repairs derived indexes, and sparse/hybrid search materializes deferred canonical evidence before querying.
+
+Audit evaluation and source hashing/parsing do not retain the shared writer lease. Before a result is published, metadata, source observations, rules, and AGY receipts are revalidated; changed authority makes the result incomplete/unknown while retaining captured findings. Startup may add the AGY receipt-version side table without rewriting the six-column cursor schema or changing SQLite journal modes.
+
+Requests share an absolute deadline/cancellation control through nested calls and native callbacks. Non-authorizing responses distinguish `index_busy`, `request_deadline`, `request_cancelled`, and `operation_timeout`; unrelated SQLite failures are not converted into successful empty searches. A stopped request cannot begin a later publication, but an admitted commit or one already-running blocking call may finish. This is cooperative stopping, not forced thread termination or proof of rollback.
+
+Default combined writer-lock wait (1 second), audit budget (8 seconds), ordinary budget (45 seconds), and explicit-tool cap (600 seconds) are unchanged. Real writes, initialization, raw captures, and derived persistent mutations remain guarded and can still contend. Upgrade/restart every process using the shared index from its actual configured source/package; a branch fix does not update already-running servers. See [implementation and verification boundaries](docs/timeout-fix.md).
+
+### Shared-index queue PoC
+
+The opt-in `scripts/poc_shared_index_queue.py` experiment connects separate client processes to one authenticated IPv4 loopback service. It uses the real NeoGraph `RequestQueue` through a small C++/ctypes bridge and runs real `SelfDirectEngine` operations against a temporary synthetic index. It does not replace the deployed MCP transport, touch existing indexes, load API keys, or add a CI gate.
+
+Requirements: a POSIX host, an installed GCC-compatible C++20 compiler, the project Python dependencies, and a NeoGraph source checkout containing `include/neograph/util/request_queue.h` and `deps/concurrentqueue.h`. No dependencies are downloaded by the PoC.
+
+```bash
+python scripts/poc_shared_index_queue.py run --neograph-root ../NeoGraph --workers 4
+```
+
+The runner compiles only the bridge, compares 16 independent clients with one worker and the selected multiworker count, and checks real clean/violation verdicts, bounded rejection, queued expiry, disconnect cancellation, running deadlines, and shutdown settlement. It separately reports `writer_lease_peak`, actual native audit `evaluation_peak`, metadata progress during evaluation, and `residual_writer_contention`. Deliberate writer/native-stage holds are labeled diagnostic fixtures, not production latency. Wall throughput includes client startup and IPC and has no performance pass/fail threshold.
+
+For an interactive experiment, use `serve --neograph-root ../NeoGraph --workers 1 --capacity 32`; its readiness line gives a private endpoint-file path. The `client --endpoint-file <path> --request '<JSON>'` mode supports `check_action`, `sync_session` with `embed=false`, `audit_session`, and `audit_status` for the synthetic session. `{"op":"stop"}` closes the queue, settles accepted futures, and shuts the service down naturally. Endpoint credentials and compiled libraries are temporary; do not commit an endpoint file.
+
+A queued request that expires never enters the engine. An already-started request can temporarily outlive its response deadline: it reports `still_running`/unknown, then settles at a cooperative checkpoint or returns an actual admitted-work outcome. Multiple workers can overlap detached evaluation, but cannot bypass a genuinely held writer lease. The PoC never claims forced cancellation of a running syscall.
+
 ### Verification scope
 
 Test results and staged secret-pattern scans are bounded evidence, not certification that arbitrary secrets or every host bypass are absent. Inspect matched staged lines before committing, keep credentials in an external authorized dotenv file, and never commit raw personal transcripts or local runtime state.

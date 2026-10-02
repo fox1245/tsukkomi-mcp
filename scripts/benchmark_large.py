@@ -41,9 +41,9 @@ def worker(root, sid):
                 result = await server.check_action(sid, ProposedAction(tool_name="shell", arguments="echo safe"))
                 if result.get("verdict") == "clean":
                     break
-                # A bounded, explicitly unverified busy reply is part of the API
-                # contract. Count it; never turn other unknown outcomes into success.
-                assert result.get("error") == "index_busy_or_deadline", result
+                # Retry only a genuine bounded engine/file lease conflict.
+                # Deadline, cancellation and operation/storage failures are not busy.
+                assert result.get("error") == "index_busy", result
                 assert result["coverage"]["complete"] is False
                 busy_replies += 1
                 if attempt == 4 or time.perf_counter() - start >= 8.0:

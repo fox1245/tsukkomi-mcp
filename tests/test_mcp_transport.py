@@ -1,4 +1,4 @@
-"""Exercise actual MCP stdio transport, schema validation and serialized engine calls."""
+"""Exercise actual MCP stdio transport, schema validation and concurrent requests."""
 import asyncio
 import json
 import os
@@ -33,13 +33,15 @@ def test_stdio_contract_to_preflight(tmp_path):
                 ]})
                 assert not response.isError
                 responses = await asyncio.gather(*[
-                    client.call_tool("check_action", {"session_id": sid, "action": {
+                    client.call_tool("check_action", {"session_id": sid, "timeout_ms": 5000, "action": {
                         "tool_name": "shell", "arguments": {"command": command}}})
                     for command in ("echo hello", "rm -rf /fictional-test-path")
                 ])
                 values = [json.loads(r.content[0].text) for r in responses]
                 assert [v["verdict"] for v in values] == ["clean", "violation"]
                 assert all(v["action_executed"] is False for v in values)
+                assert all(v["coverage"]["complete"] is True for v in values)
+                assert values[0]["contracts_snapshot"] == values[1]["contracts_snapshot"]
                 status = await client.call_tool("audit_status", {"session_id": sid})
                 assert json.loads(status.content[0].text)["session"]["chunk_count"] == 1
     asyncio.run(asyncio.wait_for(scenario(), timeout=30))

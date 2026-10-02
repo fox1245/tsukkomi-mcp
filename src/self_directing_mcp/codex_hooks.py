@@ -13,6 +13,9 @@ from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.session_events import as_text
 from self_directing_mcp.codex.discover import ensure_under_root
 
+from self_directing_mcp.request_control import (
+    IndexBusy, RequestStopped, check_request, publication, request_operation,
+)
 EVENTS = ("UserPromptSubmit", "PreToolUse", "Stop")
 _READ_TOOLS = {"read", "read_file", "list", "list_files", "glob", "search", "get",
                "view_image", "get_chunk", "list_contracts", "get_checklist", "audit_status",
@@ -100,6 +103,7 @@ def _read_has_constraint(rules, tool_name, tool_input):
     if name != tool_name:
         text += f"\n[tool_call:{name}] {as_text(args)}"
     for rule in rules:
+        check_request()
         if rule.scope not in ("tool_call", "any") or "assistant" not in rule.roles:
             continue
         if rule.type == "must_not" and not rule.regex:
@@ -121,12 +125,19 @@ def _context(event, text):
 
 @contextmanager
 def _state_lock(engine, deadline):
-    budget = engine.settings.lock_wait_timeout_sec
+    check_request()
+    expires = time.monotonic() + engine.settings.lock_wait_timeout_sec
     if deadline is not None:
-        budget = min(budget, deadline - time.monotonic())
-    if budget <= 0 or not engine._hook_lock.acquire(timeout=budget):
-        raise TimeoutError("hook_state_busy")
+        expires = min(expires, deadline)
+    while True:
+        check_request()
+        remaining = expires - time.monotonic()
+        if remaining <= 0:
+            raise IndexBusy()
+        if engine._hook_lock.acquire(timeout=min(.02, remaining)):
+            break
     try:
+        check_request()
         yield
     finally:
         engine._hook_lock.release()
@@ -146,6 +157,7 @@ def _evidence_stamp(engine, path, rules):
     digest = hashlib.sha256()
     with checked.open("rb") as source:
         for line in source:
+            check_request()
             try:
                 record = json.loads(line)
             except (ValueError, UnicodeError):
@@ -171,12 +183,22 @@ def _evidence_stamp(engine, path, rules):
             if record.get("type") == "event_msg" and payload.get("type") in ("agent_message", "agent_reasoning") and not messages:
                 continue
             digest.update(line)
+    check_request()
     return digest.hexdigest()
 
 
+def _publish_state(engine, key, state):
+    with publication():
+        engine._hook_states[key] = dict(state)
+        engine._hook_states.move_to_end(key)
+        while len(engine._hook_states) > 256:
+            engine._hook_states.popitem(last=False)
+
+
+@request_operation
 def handle_hook(engine, event_name, session_id=None, transcript_path=None,
                 tool_name=None, tool_input=None, *, prompt=None, turn_id=None,
-                stop_hook_active=False, _deadline=None):
+                stop_hook_active=False, _deadline=None, cancel_event=None):
     if event_name not in EVENTS or (event_name == "Stop" and stop_hook_active):
         return {}
     if tool_name and re.search(r"(?:^|__)self[-_]directing[-_]mcp(?:__|[.:])", tool_name):
@@ -191,22 +213,22 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
         obligations = engine.hook_obligations(session_id)
         with _state_lock(engine, _deadline):
             key = session_id.lower()
-            state = engine._hook_states.setdefault(key, {"dirty": False, "checkpoint": None})
-            engine._hook_states.move_to_end(key)
-            while len(engine._hook_states) > 256:
-                engine._hook_states.popitem(last=False)
+            state = dict(engine._hook_states.get(key, {"dirty": False, "checkpoint": None}))
             stamp = obligations["snapshot"]
             if event_name == "UserPromptSubmit":
                 if not state["dirty"]:
+                    evidence_stamp = (_evidence_stamp(engine, transcript_path, obligations["contracts"])
+                                      if obligations["status"] != "not_applicable" else None)
                     state["checkpoint"] = stamp
-                    state["evidence"] = (_evidence_stamp(engine, transcript_path, obligations["contracts"])
-                                         if obligations["status"] != "not_applicable" else None)
+                    state["evidence"] = evidence_stamp
+                    _publish_state(engine, key, state)
                 if not _carries_requirement_signal(user_prompt):
                     return {}
                 signature = (turn_id, user_prompt)
                 if state.get("nudge") == signature:
                     return {}
                 state["nudge"] = signature
+                _publish_state(engine, key, state)
                 return _context(event_name, f"Self-directing session: {session_id}. " + _GUIDANCE)
             if obligations["status"] == "not_applicable":
                 return {}
@@ -217,12 +239,12 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
                 if _read_only(tool_name, tool_input) and not _read_has_constraint(rules, tool_name, tool_input):
                     return {}
                 state["dirty"] = True
+                _publish_state(engine, key, state)
             elif not state["dirty"] and state["checkpoint"] == stamp:
                 current = _evidence_stamp(engine, transcript_path, rules)
                 if current is not None and current == state.get("evidence"):
                     return {}
-            if _deadline is not None and time.monotonic() >= _deadline:
-                raise TimeoutError("request_expired_before_execution")
+            check_request()
             if event_name == "PreToolUse":
                 # Every proposed mutation gets fresh evidence, including repeated
                 # commands following a newly failed prerequisite test.
@@ -244,6 +266,7 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
                 state["dirty"] = False
                 state["checkpoint"] = stamp
                 state["evidence"] = evidence_stamp
+                _publish_state(engine, key, state)
             findings = [{"id": f["contract_id"], "verdict": f["verdict"], "reason": f["reason"]}
                         for f in audit.get("findings", []) if f["verdict"] != "clean"]
             if event_name == "Stop":
@@ -262,6 +285,9 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
             if event_name == "Stop" and state.get("last_output") == signature:
                 return {}
             state["last_output"] = signature
+            _publish_state(engine, key, state)
             return _context(event_name, context)
+    except (IndexBusy, RequestStopped):
+        raise
     except Exception as exc:
         return _context(event_name, f"Self-directing audit: unknown ({type(exc).__name__}); local evidence could not be checked.")

@@ -12,6 +12,9 @@ from pydantic import TypeAdapter, ValidationError, create_model
 from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.schemas import ContractRule, ProposedAction
 from self_directing_mcp.codex_hooks import handle_hook
+from self_directing_mcp.request_control import (
+    IndexBusy, RequestControl, RequestStopped, check_request, request_scope,
+)
 
 HOOK_INSTRUCTIONS = (
     "Local session history and explicit constraint checks, used when relevant. "
@@ -56,33 +59,60 @@ def _format_contract_errors(contracts, exc: ValidationError) -> str:
         lines.append(f"{target}.{field_path}: {msg}")
     return "Invalid contracts input; nothing was saved. " + "; ".join(lines)
 
+def _incomplete_response(reason):
+    return {"ok": False, "verdict": "unknown", "error": reason,
+            "coverage": {"complete": False, "issues": [reason]},
+            "action_executed": False, "requires_attention": True,
+            "nudge": "Local work did not complete; this is not compliance or proof of rollback."}
+
+
+def _collect_worker_exception(worker):
+    if not worker.cancelled():
+        worker.exception()
+
+
+async def _await_request(work, control, budget):
+    # Keep the actual thread task alive to collect its eventual exception.
+    worker = asyncio.create_task(asyncio.to_thread(work))
+    worker.add_done_callback(_collect_worker_exception)
+    try:
+        done, _ = await asyncio.wait({worker}, timeout=budget)
+        if not done:
+            control.cancel("request_deadline")
+            raise RequestStopped("request_deadline")
+        return worker.result()
+    except asyncio.CancelledError:
+        control.cancel()
+        raise
+
+
 async def _dispatch(method, *args, audit=False, **kwargs):
-    """Keep JSON-RPC responsive; queued calls expire before touching the engine."""
+    """Bound the response and share cooperative stop state with its worker."""
     budget = kwargs.pop("budget_override", None)
-    cooperative = kwargs.pop("cooperative", False)
     if budget is None:
         budget = _engine.settings.audit_timeout_sec if audit else _engine.settings.request_timeout_sec
-    deadline = time.monotonic() + budget
-    abandoned = Event()
+    control = RequestControl(deadline=time.monotonic() + budget)
 
     def work():
-        if abandoned.is_set() or time.monotonic() >= deadline:
-            raise TimeoutError("request_expired_before_execution")
-        if cooperative:
-            return method(*args, _deadline=deadline, cancel_event=abandoned, **kwargs)
-        return method(*args, _deadline=deadline, **kwargs)
+        with request_scope(control):
+            check_request()
+            try:
+                result = method(*args, _deadline=control.deadline,
+                                cancel_event=control.cancel_event, **kwargs)
+            except (IndexBusy, RequestStopped):
+                raise
+            except Exception:
+                check_request()
+                raise
+            check_request()
+            return result
 
     try:
-        return await asyncio.wait_for(asyncio.to_thread(work), timeout=budget)
+        return await _await_request(work, control, budget)
+    except (IndexBusy, RequestStopped) as exc:
+        return _incomplete_response(exc.reason)
     except TimeoutError:
-        abandoned.set()
-        return {"ok": False, "verdict": "unknown", "error": "index_busy_or_deadline",
-                "coverage": {"complete": False, "issues": ["index_busy_or_deadline"]},
-                "action_executed": False, "requires_attention": True,
-                "nudge": "Local audit could not complete within its budget; this is not compliance."}
-    except asyncio.CancelledError:
-        abandoned.set()
-        raise
+        return _incomplete_response("operation_timeout")
 
 
 def _resolve_timeout_sec(timeout_ms: int | None, *, audit: bool) -> float:
@@ -103,26 +133,23 @@ def _resolve_timeout_sec(timeout_ms: int | None, *, audit: bool) -> float:
 
 
 async def _dispatch_hook(*args, **kwargs):
-    # handle_hook uses bounded engine operations and returns hook-specific context.
-    deadline = time.monotonic() + _engine.settings.audit_timeout_sec
-    abandoned = Event()
+    budget = _engine.settings.audit_timeout_sec
+    control = RequestControl(deadline=time.monotonic() + budget)
     def work():
-        if abandoned.is_set() or time.monotonic() >= deadline:
-            raise TimeoutError("request_expired_before_execution")
-        return handle_hook(_engine, *args, _deadline=deadline, **kwargs)
+        with request_scope(control):
+            check_request()
+            result = handle_hook(_engine, *args, _deadline=control.deadline,
+                                 cancel_event=control.cancel_event, **kwargs)
+            check_request()
+            return result
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(work),
-            timeout=_engine.settings.audit_timeout_sec)
-    except TimeoutError:
-        abandoned.set()
+        return await _await_request(work, control, budget)
+    except (IndexBusy, RequestStopped, TimeoutError) as exc:
+        reason = exc.reason if isinstance(exc, (IndexBusy, RequestStopped)) else "operation_timeout"
         event = args[0]
-        context = "Self-directing audit: unknown (local audit deadline); do not claim compliance."
+        context = f"Self-directing audit: unknown ({reason}); do not claim compliance."
         return ({"systemMessage": context} if event == "Stop" else
                 {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}})
-    except asyncio.CancelledError:
-        abandoned.set()
-        raise
 
 
 
@@ -381,7 +408,7 @@ async def run_neograph_update(session_id: str, provider: str | None = None,
     budget = (_resolve_timeout_sec(timeout_ms, audit=False) if timeout_ms is not None else
               min(_engine.settings.graph_update_timeout_sec, _engine.settings.max_tool_timeout_sec))
     return await _dispatch(_engine.run_neograph_update, session_id, provider=provider,
-                           budget_override=budget, cooperative=True)
+                           budget_override=budget)
 
 
 async def _dispatch_workflow(method: str, *args, timeout_ms=None, **kwargs):
@@ -401,25 +428,26 @@ async def _dispatch_workflow(method: str, *args, timeout_ms=None, **kwargs):
 
     worker = asyncio.create_task(asyncio.to_thread(invoke))
     try:
-        return await asyncio.wait_for(asyncio.shield(worker), timeout=budget)
-    except TimeoutError:
+        done, _ = await asyncio.wait({worker}, timeout=budget)
+        if done:
+            return worker.result()
         abandoned.set()
         # A process already running must be killed and its observed result kept.
         # A worker still waiting on a host lock must never launch after expiry.
-        try:
-            return await asyncio.wait_for(asyncio.shield(worker), timeout=.25)
-        except TimeoutError:
-            may_have_run = method == "execute" and entered.is_set()
-            return {"ok": False, "error": "workflow_deadline", "outcome": "outcome_unknown" if may_have_run else "not_started",
-                    "outcome_unknown": may_have_run, "started": None if may_have_run else False,
-                    "action_executed": None if may_have_run else False, "requires_attention": True}
+        done, _ = await asyncio.wait({worker}, timeout=.25)
+        if done:
+            return worker.result()
+        may_have_run = method == "execute" and entered.is_set()
+        return {"ok": False, "error": "workflow_deadline", "outcome": "outcome_unknown" if may_have_run else "not_started",
+                "outcome_unknown": may_have_run, "started": None if may_have_run else False,
+                "action_executed": None if may_have_run else False, "requires_attention": True}
     except asyncio.CancelledError:
         abandoned.set()
         raise
     finally:
         # Retrieve a late worker exception without cancelling its cleanup or
         # pretending that cancelling an asyncio Future terminates a process.
-        worker.add_done_callback(lambda finished: finished.exception() if not finished.cancelled() else None)
+        worker.add_done_callback(_collect_worker_exception)
 
 
 @mcp.tool()

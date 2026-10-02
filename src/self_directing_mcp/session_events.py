@@ -2,12 +2,78 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+import io
+import os
 import json
 import re
 from pathlib import Path
 from typing import Any, Iterator
 
 from self_directing_mcp.schemas import Chunk
+from self_directing_mcp.request_control import check_request
+
+
+def source_stamp(path: Path) -> tuple[int, ...]:
+    stat = Path(path).stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+@dataclass(frozen=True)
+class SourceObservation:
+    path: Path
+    stamp: tuple[int, ...]
+    data: bytes
+
+    def prefix_digest(self, length: int) -> str:
+        if length < 0 or length > len(self.data):
+            raise ValueError("source truncated during read")
+        return hashlib.sha256(memoryview(self.data)[:length]).hexdigest()
+
+    def validate(self) -> bool:
+        check_request()
+        try:
+            return source_stamp(self.path) == self.stamp
+        except OSError:
+            return False
+
+
+def capture_source(path: Path) -> SourceObservation:
+    """Read one stable source generation; parsers and receipt hashes share its bytes."""
+    check_request()
+    path = Path(path).resolve()
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        blocks = []
+        while block := stream.read(1024 * 1024):
+            check_request()
+            blocks.append(block)
+        after = os.fstat(stream.fileno())
+    stamp = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    data = b"".join(blocks)
+    observation = SourceObservation(path, stamp(after), data)
+    if stamp(before) != observation.stamp or len(data) != after.st_size or not observation.validate():
+        raise ValueError("source changed during preparation")
+    return observation
+
+
+_source_observation: ContextVar[SourceObservation | None] = ContextVar("source_observation", default=None)
+
+
+def observed_source(path: Path) -> SourceObservation | None:
+    observation = _source_observation.get()
+    return observation if observation is not None and Path(path).resolve() == observation.path else None
+
+
+@contextmanager
+def source_scope(observation: SourceObservation):
+    token = _source_observation.set(observation)
+    try:
+        yield observation
+    finally:
+        _source_observation.reset(token)
 
 
 def as_text(value: Any) -> str:
@@ -22,7 +88,9 @@ def content_hash(text: str) -> str:
 
 def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, int, int, str]]:
     """Cursors point to the start of a record. Leave unfinished final records unread."""
-    with Path(path).open("rb") as stream:
+    check_request()
+    observation = observed_source(path)
+    with (io.BytesIO(observation.data) if observation else Path(path).open("rb")) as stream:
         if start_byte < 0:
             raise ValueError("negative byte cursor")
         prefix = stream.read(start_byte)
@@ -30,6 +98,7 @@ def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, in
             raise ValueError("cursor is not on a complete record boundary")
         line_no = prefix.count(b"\n")
         while True:
+            check_request()
             start = stream.tell()
             raw = stream.readline()
             if not raw or not raw.endswith(b"\n"):

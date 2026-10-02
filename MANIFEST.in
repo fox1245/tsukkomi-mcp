@@ -2,6 +2,6 @@ include AGENTS.md codex-hooks.md .env.example
 recursive-include fixtures *.json *.jsonl
 recursive-include docs *.md
 recursive-include docs *.json
-recursive-include scripts *.py
+recursive-include scripts *.py *.cpp
 include tests/conftest.py
 recursive-include src/self_directing_mcp/resources/workflow *.lean

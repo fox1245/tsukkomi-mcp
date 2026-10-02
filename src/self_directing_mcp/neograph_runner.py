@@ -18,6 +18,8 @@ cross-process resume API; callers rerun against a fresh evidence/version snapsho
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from functools import wraps
 import urllib.request
 import time
 import threading
@@ -25,8 +27,24 @@ import uuid
 from pathlib import Path
 from typing import Any
 from self_directing_mcp.neograph_runtime import ng
+from self_directing_mcp.request_control import (
+    IndexBusy, RequestStopped, check_request, current_request, request_scope,
+)
 
 _compile_lock = threading.RLock()
+
+
+@contextmanager
+def _compile_guard():
+    while True:
+        check_request()
+        if _compile_lock.acquire(timeout=.02):
+            break
+    try:
+        check_request()
+        yield
+    finally:
+        _compile_lock.release()
 
 
 EXTRACT_PROMPT = """You are a graph extractor. Read the session events and return
@@ -76,6 +94,7 @@ class _Transport:
 
     def complete_json(self, prompt: str, schema: dict[str, Any] | None = None,
                       max_tokens: int = 8000) -> tuple[dict[str, Any], int]:
+        check_request()
         schema = schema or self.schema
         body = json.dumps({
             "model": self.model,
@@ -88,57 +107,100 @@ class _Transport:
         req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions",
             data=body, headers={"Authorization": "Bearer " + self.api_key,
                                 "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+        check_request()
+        control = current_request()
+        timeout = self.timeout_s
+        if control is not None and control.deadline is not None:
+            timeout = min(timeout, max(.001, control.deadline - time.monotonic()))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
+        check_request()
         if data["choices"][0].get("finish_reason") != "stop":
             raise ValueError("Graph proposal completion did not finish normally")
         content = data["choices"][0]["message"].get("content") or ""
         tokens = data.get("usage", {}).get("total_tokens", 0)
-        return json.loads(content), tokens
+        proposal = json.loads(content)
+        check_request()
+        return proposal, tokens
 
 
 def run_update_pipeline(*, session_id: str, provider: str, events: list[dict[str, Any]],
                         api_key: str, model: str, checkpoint_dir: str,
-                        on_proposal, deadline=None, cancel_event=None) -> dict[str, Any]:
+                        on_proposal, _deadline=None, cancel_event=None) -> dict[str, Any]:
     """Run the update as a NeoGraph topology; on_proposal does validate+apply.
 
     on_proposal is a callback(engine_result_proposal) -> dict (the MCP commit
     result) supplied by the engine layer, keeping storage ownership in MCP.
     Returns the node outputs plus the run's execution trace length.
     """
-    def check_active():
-        if (deadline is not None and time.monotonic() >= deadline) or (
-                cancel_event is not None and cancel_event.is_set()):
-            raise TimeoutError("graph_update_cancelled_or_expired")
-    check_active()
-    remaining = min(240.0, deadline - time.monotonic()) if deadline is not None else 240.0
-    transport = _Transport(api_key, model, timeout_s=max(.001, remaining))
+    with request_scope(deadline=_deadline, cancel_event=cancel_event):
+        check_request()
+        try:
+            return _run_update_pipeline(
+                session_id=session_id, provider=provider, events=events,
+                api_key=api_key, model=model, checkpoint_dir=checkpoint_dir,
+                on_proposal=on_proposal)
+        except (RequestStopped, IndexBusy):
+            raise
+        except Exception:
+            check_request()
+            raise
+
+
+def _run_update_pipeline(*, session_id, provider, events, api_key, model,
+                         checkpoint_dir, on_proposal):
+    check_request()
+    control = current_request()
+    callback_error = None
+    transport = _Transport(api_key, model)
+
+    def callback(method):
+        @wraps(method)
+        def invoke(*args, **kwargs):
+            nonlocal callback_error
+            with request_scope(control):
+                try:
+                    check_request()
+                    return method(*args, **kwargs)
+                except Exception as exc:
+                    callback_error = exc
+                    raise
+        return invoke
 
     class ExtractNode(ng.GraphNode):
         def get_name(self):
             return "extract"
 
+        @callback
         def run(self, input):
-            check_active()
+            check_request()
             events = input.state.get("events") or []
-            event_block = chr(10).join(
-                f"- {e['chunk_id']} [{e['kind']}] {e['text']}" for e in events)
+            lines = []
+            for event in events:
+                check_request()
+                lines.append(f"- {event['chunk_id']} [{event['kind']}] {event['text']}")
+            event_block = chr(10).join(lines)
             prompt = EXTRACT_PROMPT.replace("{events}", event_block)
             try:
                 if len(event_block) > 100000:
                     raise ValueError("graph_input_too_large; use an explicit bounded event batch")
                 proposal, tokens = transport.complete_json(prompt)
+                check_request()
                 return [ng.ChannelWrite("proposal", proposal),
                         ng.ChannelWrite("llm_tokens", tokens)]
+            except RequestStopped:
+                raise
             except Exception as exc:  # extraction failure keeps evidence intact
+                check_request()
                 return [ng.ChannelWrite("extract_error", type(exc).__name__)]
 
     class ValidateNode(ng.GraphNode):
         def get_name(self):
             return "validate"
 
+        @callback
         def run(self, input):
-            check_active()
+            check_request()
             proposal = input.state.get("proposal")
             if proposal is None:
                 error = input.state.get("extract_error") or "no proposal produced"
@@ -154,14 +216,16 @@ def run_update_pipeline(*, session_id: str, provider: str, events: list[dict[str
                     "message": "No relations returned; cursor retained. Review the input and extractor explanation before retrying.",
                 })]
             verdict = on_proposal("validate", proposal)
+            check_request()
             return [ng.ChannelWrite("validation", verdict)]
 
     class ApplyNode(ng.GraphNode):
         def get_name(self):
             return "apply"
 
+        @callback
         def run(self, input):
-            check_active()
+            check_request()
             verdict = input.state.get("validation") or {}
             if not verdict.get("ok"):
                 return [ng.ChannelWrite("apply_result",
@@ -194,17 +258,28 @@ def run_update_pipeline(*, session_id: str, provider: str, events: list[dict[str
     }
 
     ctx = ng.NodeContext()  # LLM transport is ours; engine coordinates the flow.
+    check_request()
     store = ng.SqliteCheckpointStore(str(Path(checkpoint_dir) / "neograph_checkpoints.sqlite"))
-    with _compile_lock:
+    with _compile_guard():
         ng.NodeFactory.register_type("ng_extract", lambda name, config, ctx: ExtractNode())
         ng.NodeFactory.register_type("ng_validate", lambda name, config, ctx: ValidateNode())
         ng.NodeFactory.register_type("ng_apply", lambda name, config, ctx: ApplyNode())
         engine = ng.GraphEngine.compile(definition, ctx, store)
     engine.set_worker_count(1)
+    check_request()
     thread_id = f"graphrag:{provider}:{session_id}:{uuid.uuid4().hex}"
-    result = engine.run(ng.RunConfig(thread_id=thread_id,
-                                     input={"events": events, "session_id": session_id},
-                                     resume_if_exists=False))
+    try:
+        result = engine.run(ng.RunConfig(thread_id=thread_id,
+                                       input={"events": events, "session_id": session_id},
+                                       resume_if_exists=False))
+    except Exception as exc:
+        if callback_error is not None:
+            raise callback_error from exc
+        raise
+    if callback_error is not None:
+        raise callback_error
+    # Preserve native completed receipts/observed admitted commit outcomes.
+    # Response expiry is handled by the dispatcher, not fake pipeline rollback.
     channels = result.output["channels"]
     return {
         "executor": "neograph-engine",
