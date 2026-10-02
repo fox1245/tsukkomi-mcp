@@ -33,7 +33,7 @@ def _default_index_dir() -> Path:
     override = os.environ.get("SELF_DIRECT_INDEX_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    return _repo_root() / ".self_direct_index"
+    return Path.home() / ".self_direct_index"
 
 
 def _default_sqlite_vector_path() -> Path | None:
@@ -45,16 +45,6 @@ def _default_sqlite_vector_path() -> Path | None:
         cand = repo / "native" / ext
         if cand.is_file():
             return cand.resolve()
-    return None
-
-
-def _default_openrouter_api_key_file() -> Path | None:
-    override = os.environ.get("SELF_DIRECT_OPENROUTER_API_KEY_FILE")
-    if override:
-        return Path(override).expanduser().resolve()
-    env_file = _repo_root() / ".env"
-    if env_file.is_file():
-        return env_file.resolve()
     return None
 
 
@@ -88,7 +78,7 @@ class Settings(BaseSettings):
     dense_backend: Literal["sqlite-vector", "numpy"] = "sqlite-vector"
     sqlite_vector_path: Path | None = Field(default_factory=_default_sqlite_vector_path)
     openrouter_api_key_file: Path | None = Field(
-        default_factory=_default_openrouter_api_key_file,
+        default=None,
         description="Authorized dotenv file containing OPENROUTER_API_KEY; never log its contents",
     )
     seed_example_contracts: bool = False

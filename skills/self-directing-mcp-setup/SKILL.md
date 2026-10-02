@@ -97,8 +97,12 @@ OPENROUTER_API_KEY=
 
 SELF_DIRECT_USE_FAKE_EMBEDDER=false
 SELF_DIRECT_DENSE_BACKEND=sqlite-vector
-# Note: SELF_DIRECT_SQLITE_VECTOR_PATH, SELF_DIRECT_INDEX_DIR, and OPENROUTER_API_KEY_FILE
-# automatically resolve dynamically relative to the repository via pathlib.
+# Default persistent index: ~/.self_direct_index, independent of package location.
+# SELF_DIRECT_INDEX_DIR=/absolute/path/to/existing-or-managed/index
+# SELF_DIRECT_SQLITE_VECTOR_PATH=/absolute/path/to/native/vector.so
+# Set only when selecting an authoritative authorized key file:
+# SELF_DIRECT_OPENROUTER_API_KEY_FILE=/absolute/path/to/authorized/.env
+# Otherwise the key follows explicit Settings, environment, and cwd .env precedence.
 ```
 > [!NOTE]
 > If `OPENROUTER_API_KEY` is not provided, set `SELF_DIRECT_USE_FAKE_EMBEDDER=true` to enable offline bag-of-tokens embedding and local regex contracts.

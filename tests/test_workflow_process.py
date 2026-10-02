@@ -144,14 +144,16 @@ def test_runtime_mount_cannot_expose_workspace_parent(workspace):
     assert result["started"] is False
 
 
-@pytest.mark.parametrize("source", ["environment", "shared_default"])
-def test_configured_key_inside_workspace_rejects_mount(workspace, monkeypatch, source):
+@pytest.mark.parametrize("source", ["environment", "repository_dotenv", "cwd_dotenv"])
+def test_host_dotenv_inside_workspace_rejects_mount(workspace, monkeypatch, source):
     secret = workspace / ".env"
     secret.write_text("OPENROUTER_API_KEY=private-host-sentinel\n")
     if source == "environment":
         monkeypatch.setenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", str(secret))
-    else:
+    elif source == "repository_dotenv":
         monkeypatch.setattr(config, "_repo_root", lambda: workspace)
+    else:
+        monkeypatch.chdir(workspace)
     result = run_process([sys.executable, "-c", "print(open('.env').read())"], workspace=workspace,
                          writable=True, timeout_sec=5)
     assert result["status"] == "sandbox_workspace_exposes_host_state"

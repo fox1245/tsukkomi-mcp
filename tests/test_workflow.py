@@ -88,7 +88,6 @@ def command(text="done"):
 @pytest.fixture
 def isolated_openrouter_settings(tmp_path, monkeypatch):
     # Never read a developer's real dotenv during credential integration tests.
-    monkeypatch.setattr(config, "_repo_root", lambda: tmp_path)
     monkeypatch.delenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", raising=False)
     monkeypatch.setattr(workflow, "Settings", lambda: config.Settings(_env_file=None))
 

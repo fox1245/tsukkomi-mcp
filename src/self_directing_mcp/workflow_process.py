@@ -17,6 +17,7 @@ import sysconfig
 import tempfile
 import time
 
+from self_directing_mcp import config
 from self_directing_mcp.config import Settings
 
 
@@ -49,6 +50,10 @@ def _runtime_paths(extra: tuple[Path, ...], workspace: Path) -> list[Path]:
     sensitive.extend(Path(value).expanduser().resolve() for key in
                      ("TSUKKOMI_WORKFLOW_STATE", "TSUKKOMI_WORKFLOW_APPROVAL")
                      if (value := os.environ.get(key)))
+    # Keep dotenv protection independent of explicit key-file selection.
+    sensitive.extend(path.resolve() for path in
+                     (Path.cwd() / ".env", config._repo_root() / ".env")
+                     if path.is_file())
     key_file = Settings().openrouter_api_key_file
     if key_file is not None:
         sensitive.append(key_file.expanduser().resolve())

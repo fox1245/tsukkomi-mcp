@@ -239,6 +239,14 @@ python scripts/setup_sqlite_vector.py
 
 Downloads the platform-appropriate binary release verified with SHA-256 checksums into `.native/`.
 
+### Runtime state and credential sources
+
+Without an explicit `SELF_DIRECT_INDEX_DIR`, the persistent index defaults to `~/.self_direct_index`, independent of the checkout or installed package. Managed Codex/OMP installations keep their explicitly configured indexes. To retain an existing checkout-local index, set `SELF_DIRECT_INDEX_DIR` to that directory's absolute path before upgrading; no index data is automatically moved or copied.
+
+Without `SELF_DIRECT_OPENROUTER_API_KEY_FILE`, the shared key follows normal Settings precedence: explicit `OPENROUTER_API_KEY`, environment, then the working directory's `.env`. A package/repository-root `.env` is not automatically selected as an authoritative key file, and a keyless dotenv does not shadow a supplied key or prevent fake-mode initialization. An explicitly configured key file remains authoritative and fails closed when missing, unreadable, or keyless; it never falls back to another key.
+
+Workflow sandboxes still reject mounts exposing the host's working-directory/repository `.env` or explicitly configured credential file. Separating key selection does not grant approved programs access to dotenv secrets.
+
 ---
 
 ## 🔌 Platform Configuration

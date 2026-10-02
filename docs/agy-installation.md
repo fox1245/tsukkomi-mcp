@@ -37,7 +37,9 @@ Register the server in `~/.gemini/config/mcp_config.json`:
   }
 }
 ```
-*(Note: `SELF_DIRECT_INDEX_DIR`, `SELF_DIRECT_SQLITE_VECTOR_PATH`, and `SELF_DIRECT_OPENROUTER_API_KEY_FILE` automatically resolve relative to the repository via `pathlib.Path` defaults, but can be explicitly overridden in `env` if needed).*
+The default index is `~/.self_direct_index`, not the repository or installed package directory. `SELF_DIRECT_INDEX_DIR` preserves an explicitly selected existing/managed index; set it to the old index's absolute path before upgrading if you previously relied on the checkout-local default. No stored evidence or rules are automatically migrated.
+
+Set `SELF_DIRECT_SQLITE_VECTOR_PATH` to the installed native library and `SELF_DIRECT_OPENROUTER_API_KEY_FILE` only when selecting an authoritative authorized dotenv file. Without a configured key file, `OPENROUTER_API_KEY` uses normal Settings/environment/working-directory `.env` precedence. Missing or keyless explicitly configured files still fail closed.
 
 ---
 
