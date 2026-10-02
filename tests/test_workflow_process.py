@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from self_directing_mcp import config, workflow_process
+from self_directing_mcp import config
 from self_directing_mcp.workflow_process import run_process
 
 
@@ -20,7 +20,6 @@ def isolated_openrouter_settings(tmp_path, monkeypatch):
     # Exercise shared settings without touching a developer's real credential file.
     monkeypatch.setattr(config, "_repo_root", lambda: tmp_path)
     monkeypatch.delenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", raising=False)
-    monkeypatch.setattr(workflow_process, "Settings", lambda: config.Settings(_env_file=None))
 
 
 @pytest.fixture
@@ -171,3 +170,49 @@ def test_runtime_mount_cannot_expose_shared_openrouter_key(workspace, monkeypatc
                          read_only_paths=(key_directory,))
     assert result["status"] == "sandbox_runtime_exposes_host_state"
     assert result["started"] is False and result["stdout"] == ""
+
+
+@pytest.mark.parametrize("protected_file", ["selected_toml", "toml_key_file"])
+@pytest.mark.parametrize("mount", ["workspace", "runtime"])
+@pytest.mark.parametrize("through_symlink", [False, True])
+def test_toml_selected_host_files_reject_workspace_and_runtime_mounts(
+        workspace, monkeypatch, protected_file, mount, through_symlink):
+    protected_directory = workspace if mount == "workspace" else workspace.parent / "private-runtime"
+    protected_directory.mkdir(exist_ok=True)
+    configuration = workspace.parent / "private-configuration"
+    configuration.mkdir()
+    sentinel = "private-toml-path-sentinel"
+    if protected_file == "selected_toml":
+        protected = protected_directory / "selected.toml"
+        protected.write_text(f'[paths]\nindex_dir = "{sentinel}"\n', encoding="utf-8")
+        selector = protected
+        if through_symlink:
+            selector = configuration / "selected-link.toml"
+            selector.symlink_to(protected)
+    else:
+        protected = protected_directory / "authorized.env"
+        protected.write_text(f"OPENROUTER_API_KEY={sentinel}\n", encoding="utf-8")
+        key_path = protected
+        if through_symlink:
+            key_path = configuration / "key-link.env"
+            key_path.symlink_to(protected)
+        selector = configuration / "selected.toml"
+        # The selected credential path must be resolved relative to the TOML,
+        # not to the caller's working directory.
+        relative_key = os.path.relpath(key_path, selector.parent)
+        selector.write_text("[paths]\nopenrouter_api_key_file = " + json.dumps(relative_key) + "\n",
+                            encoding="utf-8")
+    monkeypatch.setenv("SELF_DIRECT_CONFIG_FILE", str(selector))
+    original = protected.read_text(encoding="utf-8")
+    mounted_path = "/work/" + protected.name if mount == "workspace" else str(protected)
+    command = [sys.executable, "-c",
+               f"from pathlib import Path; print(Path({mounted_path!r}).read_text()); "
+               "Path('unsafe-started').write_text('ran')"]
+    result = run_process(command, workspace=workspace, writable=True, timeout_sec=5,
+                         read_only_paths=(protected_directory,) if mount == "runtime" else ())
+    assert result["status"] == f"sandbox_{mount}_exposes_host_state", result
+    assert result["started"] is False and result["outcome_unknown"] is False
+    assert result["stdout"] == "" and result["stderr"] == ""
+    assert sentinel not in json.dumps(result)
+    assert protected.read_text(encoding="utf-8") == original
+    assert not (workspace / "unsafe-started").exists()

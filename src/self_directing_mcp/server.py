@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import argparse
 import asyncio
 import time
 from threading import Event
@@ -9,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import TypeAdapter, ValidationError, create_model
 
+from self_directing_mcp.config import get_settings
 from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.schemas import ContractRule, ProposedAction
 from self_directing_mcp.codex_hooks import handle_hook
@@ -508,7 +510,27 @@ async def workflow_execute(session_id: str, grant: str, action: dict[str, Any],
                                     timeout_ms=timeout_ms)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run the Tsukkomi MCP stdio server.")
+    parser.add_argument("--omp-bridge", action="store_true",
+                        help="Use OMP settings and validate private remote sources before startup.")
+    args = parser.parse_args(argv)
+    if args.omp_bridge:
+        try:
+            settings = get_settings(session_provider="omp")
+            if not settings.local_only:
+                key_file = settings.openrouter_api_key_file
+                native_path = settings.sqlite_vector_path
+                if key_file is None or not key_file.expanduser().is_file():
+                    raise ValueError("Missing selected key file")
+                if native_path is None or not native_path.expanduser().is_file():
+                    raise ValueError("Missing selected native library")
+                settings.resolve_api_key()
+        except (OSError, ValueError):
+            parser.error("OMP bridge configuration is unavailable or invalid")
+        # Bind the shared source to the singleton used by every MCP handler.
+        # Indexes, native loading, and remote clients remain lazy.
+        _engine.settings = settings
     mcp.run(transport="stdio")
 
 

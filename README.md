@@ -239,13 +239,27 @@ python scripts/setup_sqlite_vector.py
 
 Downloads the platform-appropriate binary release verified with SHA-256 checksums into `.native/`.
 
-### Runtime state and credential sources
+### User path configuration (TOML)
 
-Without an explicit `SELF_DIRECT_INDEX_DIR`, the persistent index defaults to `~/.self_direct_index`, independent of the checkout or installed package. Managed Codex/OMP installations keep their explicitly configured indexes. To retain an existing checkout-local index, set `SELF_DIRECT_INDEX_DIR` to that directory's absolute path before upgrading; no index data is automatically moved or copied.
+Use `~/.config/tsukkomi-mcp/config.toml` on any supported platform, or set `SELF_DIRECT_CONFIG_FILE` in the process environment to select another file. Copy and edit [config.example.toml](config.example.toml); the edited file belongs outside the repository and agent-writable workspaces.
 
-Without `SELF_DIRECT_OPENROUTER_API_KEY_FILE`, the shared key follows normal Settings precedence: explicit `OPENROUTER_API_KEY`, environment, then the working directory's `.env`. A package/repository-root `.env` is not automatically selected as an authoritative key file, and a keyless dotenv does not shadow a supplied key or prevent fake-mode initialization. An explicitly configured key file remains authoritative and fails closed when missing, unreadable, or keyless; it never falls back to another key.
+```toml
+[paths]
+index_dir = "~/private-tsukkomi/index"
+omp_sessions_dir = "~/.omp/agent/sessions"
+openrouter_api_key_file = "../credentials/openrouter.env"
+sqlite_vector_path = "native/vector.so"
+```
 
-Workflow sandboxes still reject mounts exposing the host's working-directory/repository `.env` or explicitly configured credential file. Separating key selection does not grant approved programs access to dotenv secrets.
+The eight supported keys are `index_dir`, `codex_sessions_dir`, `omp_sessions_dir`, `grokbot_transcripts_dir`, `agy_app_data_dirs`, `contracts_path`, `sqlite_vector_path`, and `openrouter_api_key_file`. AGY roots use a string array; Grokbot accepts its existing delimiter-separated string or an array of individual paths. Empty arrays disable those optional roots.
+
+Path precedence is explicit Settings arguments, environment overrides (including the existing `CODEX_SESSIONS_DIR` alias), TOML, working-directory `.env`, then defaults. TOML paths expand `~`; relative paths resolve against the canonical TOML file's directory, not the working directory or a symlink's directory. `${ENV_VAR}` interpolation is not performed. The selector itself is environment-only; a `.env` cannot silently select another TOML file.
+
+An absent default file preserves the existing defaults. An explicitly selected missing file, malformed TOML, unknown section/key, or invalid path value fails instead of silently selecting another index. Settings capture the selected sources; restart affected servers/extensions after configuration changes.
+
+Without an index override, the default remains `~/.self_direct_index`. Managed Codex/OMP registrations keep their higher-priority environment paths. To retain a checkout-local index, explicitly select its existing absolute path in TOML or environment before upgrading; no evidence or rules are automatically moved or copied.
+
+Credential values are not TOML options. Without a selected key file, `OPENROUTER_API_KEY` follows explicit Settings, environment, then working-directory `.env` precedence. A key file selected in TOML or environment remains authoritative and fails closed when missing, unreadable, or keyless. Workflow sandboxes reject mounts exposing the selected TOML, host dotenv, or selected credential file.
 
 ---
 
@@ -279,18 +293,17 @@ python scripts/install_codex.py --verify
 
 ### OMP (OpenRouter-backed retrieval, deterministic contract hooks)
 
-Register this server in OMP's **user** `mcp.json` and opt in to `extensions/tsukkomi-omp.ts` as an OMP user extension. Configure both the MCP entry and the extension's process with the same private index, OMP session root, and authorized credential/vector references:
+Register this server in OMP's **user** `mcp.json` and opt in to `extensions/tsukkomi-omp.ts` as an OMP user extension. Configure both processes with the same private TOML file (or environment overrides) for the index, OMP session root, and authorized credential/vector references. The extension starts Python in `--omp-bridge` mode, so the shared Python settings source owns validation; TOML-only paths need not be duplicated in the extension environment.
 
 ```text
 SELF_DIRECT_LOCAL_ONLY=false
-SELF_DIRECT_OPENROUTER_API_KEY_FILE=<authorized Codex/OpenRouter dotenv path>
-SELF_DIRECT_SQLITE_VECTOR_PATH=<installed native vector library path>
-SELF_DIRECT_OMP_SESSIONS_DIR=<OMP user session root>
-SELF_DIRECT_INDEX_DIR=<private writable index>
+SELF_DIRECT_CONFIG_FILE=<private TOML path>  # omit to use the default user file
 TSUKKOMI_OMP_MONITOR=1
 TSUKKOMI_OMP_PYTHON=<Python with tsukkomi-mcp dependencies>
 TSUKKOMI_OMP_SOURCE=<source checkout>/src  # omit when installed in that Python
 ```
+
+Interpreter/source bootstrap and `SELF_DIRECT_LOCAL_ONLY` remain environment options, not `[paths]` keys. Remote bridge startup requires a usable explicitly selected key file and an existing native-library path; it does not make an API call or eagerly initialize the index. Environment paths already present in managed registrations override TOML until the owner removes or changes those entries.
 
 OpenRouter-backed hybrid/dense history search, `sync_session(embed=True)`, and NeoGraph updates are available by default; embedding uploads sanitized session chunks, so use an authorized key and session root. The hook's `check_action`/`audit_session` stay deterministic and refresh JSONL without embedding; they do **not** call OpenRouter on every tool/turn. Explicit offline-only mode is `SELF_DIRECT_LOCAL_ONLY=true`, which disables those remote functions.
 NeoGraph extraction also masks known secret patterns in session events before sending a prompt to OpenRouter; keep the original session files and local index private.

@@ -54,6 +54,7 @@ def _runtime_paths(extra: tuple[Path, ...], workspace: Path) -> list[Path]:
     sensitive.extend(path.resolve() for path in
                      (Path.cwd() / ".env", config._repo_root() / ".env")
                      if path.is_file())
+    sensitive.append(config.get_config_path())
     key_file = Settings().openrouter_api_key_file
     if key_file is not None:
         sensitive.append(key_file.expanduser().resolve())

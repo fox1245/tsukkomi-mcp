@@ -37,9 +37,11 @@ Register the server in `~/.gemini/config/mcp_config.json`:
   }
 }
 ```
-The default index is `~/.self_direct_index`, not the repository or installed package directory. `SELF_DIRECT_INDEX_DIR` preserves an explicitly selected existing/managed index; set it to the old index's absolute path before upgrading if you previously relied on the checkout-local default. No stored evidence or rules are automatically migrated.
+Use `~/.config/tsukkomi-mcp/config.toml` with a `[paths]` table, or set `SELF_DIRECT_CONFIG_FILE` in the server environment to select another file. See [config.example.toml](../config.example.toml) and the [path source contract](../README.md#user-path-configuration-toml). Relative TOML paths use the configuration file's directory; explicit arguments/environment override them.
 
-Set `SELF_DIRECT_SQLITE_VECTOR_PATH` to the installed native library and `SELF_DIRECT_OPENROUTER_API_KEY_FILE` only when selecting an authoritative authorized dotenv file. Without a configured key file, `OPENROUTER_API_KEY` uses normal Settings/environment/working-directory `.env` precedence. Missing or keyless explicitly configured files still fail closed.
+Without an override, the index remains `~/.self_direct_index`, not the installed package. Preserve an existing/managed index by selecting its absolute `index_dir` in TOML or `SELF_DIRECT_INDEX_DIR`. No stored evidence or rules are automatically migrated.
+
+Select `sqlite_vector_path` and `openrouter_api_key_file` in TOML or their `SELF_DIRECT_` environment equivalents. Only the authorized key file's path belongs in TOML, not the key value. Missing or keyless selected files still fail closed. Keep the TOML and credentials outside writable workflow workspaces.
 
 ---
 

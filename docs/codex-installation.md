@@ -36,6 +36,8 @@ Guidance is merged into the effective global file: AGENTS.md, or an existing non
 
 Default installation requires a real API key in the authorized .env file, fake=false, and the official sqlite-vector native library. Set --env-file to reuse a different authorized key file. Hooks/audits still refresh locally without embedding; remote re-embedding requires user consent. New contracts are empty until the agent registers actual user requirements.
 
+The runtime also reads `~/.config/tsukkomi-mcp/config.toml` `[paths]`, or another file selected by `SELF_DIRECT_CONFIG_FILE` in the MCP entry's environment. See [config.example.toml](../config.example.toml). Existing managed `SELF_DIRECT_` path entries take precedence; to use TOML for a path, the owner must remove that conflicting entry or update it. Do not silently switch an existing index. Bootstrap executable/registration settings remain in Codex's own `config.toml`, separate from Tsukkomi's path configuration.
+
 ## Manual MCP registration
 
 Use the actual installed environment path:

@@ -1,0 +1,26 @@
+# Copy to ~/.config/tsukkomi-mcp/config.toml or select another file with
+# SELF_DIRECT_CONFIG_FILE. Keep the edited file private and outside agent workspaces.
+# Priority: explicit Settings > environment > TOML > cwd .env > defaults.
+# Paths expand ~; relative paths use the canonical TOML file's directory.
+# No ${ENV_VAR} interpolation. Only the [paths] keys below are supported.
+
+[paths]
+index_dir = "~/.self_direct_index"
+codex_sessions_dir = "~/.codex/sessions"
+omp_sessions_dir = "~/.omp/sessions"
+grokbot_transcripts_dir = []
+agy_app_data_dirs = [
+  "~/.gemini/antigravity",
+  "~/.gemini/antigravity-cli",
+  "~/.gemini/antigravity-ide",
+]
+
+# Optional overrides. Omit contracts_path to use index_dir/contracts.json.
+# contracts_path = "rules/contracts.json"
+# sqlite_vector_path = "native/vector.so"
+# openrouter_api_key_file = "../credentials/openrouter.env"
+# The selected key file remains authoritative: missing/keyless files fail closed.
+# Do not put OPENROUTER_API_KEY or another credential value in this TOML.
+# Grokbot also accepts its existing delimiter-separated string syntax, or arrays
+# of individual paths (including paths containing delimiter characters).
+# grokbot_transcripts_dir = ["history/grokbot", "history/mirror"]

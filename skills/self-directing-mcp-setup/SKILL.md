@@ -107,6 +107,8 @@ SELF_DIRECT_DENSE_BACKEND=sqlite-vector
 > [!NOTE]
 > If `OPENROUTER_API_KEY` is not provided, set `SELF_DIRECT_USE_FAKE_EMBEDDER=true` to enable offline bag-of-tokens embedding and local regex contracts.
 
+For user-custom paths, copy `config.example.toml` to `~/.config/tsukkomi-mcp/config.toml` and edit its `[paths]` values, or set `SELF_DIRECT_CONFIG_FILE` in the MCP/extension process environment. Relative paths use the TOML directory; explicit environment entries override them. Keep the edited TOML and authorized key file outside agent-writable workspaces, and put only credential file paths—not key values—in TOML. Restart the server/extension after changing selected paths.
+
 ### 6. Antigravity (`agy`) MCP Registration
 Register `self-directing-mcp` in `~/.gemini/config/mcp_config.json`:
 
