@@ -7,18 +7,21 @@ from pathlib import Path
 
 from self_directing_mcp.session_events import as_text, iter_raw_lines, make_chunk, parse_error, result_success
 
-PARSER_VERSION = 3
+PARSER_VERSION = 4
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _EVENT_FIELDS = {"id", "parentId", "timestamp", "type"}
 _ADMIN_FIELDS = {
     "title_change": _EVENT_FIELDS | {"title", "source", "previousTitle", "trigger"},
     "credential_pin": _EVENT_FIELDS | {"provider", "hash"},
+    "service_tier_change": _EVENT_FIELDS | {"serviceTier"},
     "mode_change": _EVENT_FIELDS | {"mode", "data"},
     "compaction": _EVENT_FIELDS | {"summary", "shortSummary", "firstKeptEntryId",
                                    "tokensBefore", "tokensAfter", "method",
                                    "providerReplayThroughEntryId", "details",
                                    "fromExtension", "preserveData"},
 }
+_SERVICE_TIER_PROVIDERS = {"openai", "anthropic", "google"}
+_SERVICE_TIER_VALUES = {"auto", "default", "flex", "scale", "priority", "ultrafast"}
 _CUSTOM_MESSAGE_FIELDS = _EVENT_FIELDS | {"customType", "attribution", "display", "content", "details"}
 _TODO_HUD_FIELDS = _EVENT_FIELDS | {"customType", "data"}
 
@@ -121,6 +124,15 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                       and isinstance(obj.get("title"), str)) or (
                     record_type == "credential_pin" and set(obj) <= _ADMIN_FIELDS["credential_pin"]
                     and isinstance(obj.get("hash"), str) and isinstance(obj.get("provider"), str)
+                ) or (record_type == "service_tier_change"
+                      and set(obj) <= _ADMIN_FIELDS["service_tier_change"]
+                      and "serviceTier" in obj
+                      and (obj["serviceTier"] is None or (
+                          isinstance(obj["serviceTier"], dict)
+                          and set(obj["serviceTier"]) <= _SERVICE_TIER_PROVIDERS
+                          and all(isinstance(tier, str) and tier in _SERVICE_TIER_VALUES
+                                  for tier in obj["serviceTier"].values())
+                      ))
                 ) or (record_type == "mode_change" and set(obj) <= _ADMIN_FIELDS["mode_change"]
                       and isinstance(obj.get("mode"), str) and isinstance(obj.get("data"), dict)
                       and set(obj["data"]) <= {"goal"}) or (

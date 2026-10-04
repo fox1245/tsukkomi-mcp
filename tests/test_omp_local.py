@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from self_directing_mcp import omp
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
+from self_directing_mcp.session_events import make_chunk
 
 
 def _append(path: Path, *records):
@@ -113,6 +115,111 @@ def test_omp_runtime_events_do_not_poison_read_contracts(local_engine):
     runtime = [chunk for chunk in engine.store.list_chunks("session-1", "omp")
                if "mentioned by another agent" in chunk.text]
     assert len(runtime) == 1 and runtime[0].kind == "meta" and runtime[0].meta["role"] == "runtime"
+
+
+@pytest.mark.parametrize("service_tier", [
+    None,
+    {},
+    *({"openai": tier} for tier in ("auto", "default", "flex", "scale", "priority", "ultrafast")),
+    {"anthropic": "priority"},
+    {"google": "flex"},
+    {"google": "priority"},
+    {"openai": "auto", "anthropic": "priority", "google": "flex"},
+])
+def test_service_tier_metadata_preserves_temporal_enforcement(local_engine, service_tier):
+    engine, file = local_engine
+    engine.upsert_contracts([{"id": "must-prepare", "type": "must", "scope": "tool_call",
+                             "regex": "prepare", "before_regex": "deploy",
+                             "requires_success": True, "provider": "omp"}])
+    _append(file, {"type": "service_tier_change", "serviceTier": service_tier})
+    action = {"tool_name": "shell", "arguments": {"command": "deploy"}}
+    missing = engine.check_action("session-1", action, provider="omp", path=str(file))
+    assert missing["coverage"]["complete"] is True
+    assert missing["verdict"] == "violation" and missing["action_executed"] is False
+    _append(file,
+            _message("assistant", {"type": "toolCall", "id": "prepare-1",
+                                   "name": "shell", "arguments": {"command": "prepare"}}),
+            _message("toolResult", {"type": "text", "text": "done"},
+                     toolCallId="prepare-1", toolName="shell", isError=False))
+    success = engine.check_action("session-1", action, provider="omp", path=str(file))
+    assert success["coverage"]["complete"] is True and success["verdict"] == "clean"
+    _append(file,
+            _message("assistant", {"type": "toolCall", "id": "prepare-2",
+                                   "name": "shell", "arguments": {"command": "prepare"}}),
+            _message("toolResult", {"type": "text", "text": "failed"},
+                     toolCallId="prepare-2", toolName="shell", isError=True))
+    failed = engine.check_action("session-1", action, provider="omp", path=str(file))
+    assert failed["coverage"]["complete"] is True and failed["verdict"] == "violation"
+
+
+@pytest.mark.parametrize("fields", [
+    {},
+    {"serviceTier": "priority"},
+    {"serviceTier": True},
+    {"serviceTier": []},
+    {"serviceTier": {"openai": None}},
+    {"serviceTier": {"openai": {"command": "prepare"}}},
+    {"serviceTier": {"future-provider": "priority"}},
+    {"serviceTier": {"google": "future-tier"}},
+    {"serviceTier": None, "arguments": {"command": "prepare"}},
+    {"serviceTier": None, "content": [{"type": "toolCall", "name": "shell"}]},
+])
+def test_malformed_service_tier_metadata_still_degrades_coverage(local_engine, fields):
+    engine, file = local_engine
+    engine.upsert_contracts([{"id": "must-prepare", "type": "must", "scope": "tool_call",
+                             "regex": "prepare", "before_regex": "deploy",
+                             "requires_success": True, "provider": "omp"}])
+    _append(file, {"type": "service_tier_change", **fields})
+    result = engine.check_action("session-1", {"tool_name": "shell", "arguments": {"command": "deploy"}},
+                                 provider="omp", path=str(file))
+    assert result["verdict"] == "unknown"
+    assert "unsupported_events" in result["coverage"]["issues"]
+    assert result["coverage"]["unsupported_event_count"] == 1
+
+
+def test_service_tier_parser_upgrade_reindexes_unchanged_history(local_engine, monkeypatch):
+    engine, file = local_engine
+    engine.upsert_contracts([{"id": "must-prepare", "type": "must", "scope": "tool_call",
+                             "regex": "prepare", "before_regex": "deploy",
+                             "requires_success": True, "provider": "omp"}])
+    _append(file, {"type": "service_tier_change", "serviceTier": None})
+    original_parser = omp.parse_session_chunks
+
+    def legacy_parser(*args, **kwargs):
+        chunks, offset, sid = original_parser(*args, **kwargs)
+        for index, chunk in enumerate(chunks):
+            if chunk.meta.get("event_type") == "service_tier_change":
+                chunks[index] = make_chunk("omp", sid, "meta", chunk.text,
+                                           {**chunk.meta, "unsupported_event": True},
+                                           chunk.line_start, chunk.byte_start, chunk.byte_end)
+        return chunks, offset, sid
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(omp, "PARSER_VERSION", 3)
+        legacy.setattr(omp, "parse_session_chunks", legacy_parser)
+        seeded = engine.sync_session(session_id="session-1", provider="omp", path=str(file), embed=False)
+    assert seeded["coverage"]["complete"] is False
+    assert seeded["coverage"]["unsupported_event_count"] == 1
+    old_chunks = engine.store.list_chunks("session-1", "omp")
+    old_metadata = next(chunk for chunk in old_chunks if chunk.meta.get("event_type") == "service_tier_change")
+    source_bytes = file.read_bytes()
+    restarted = SelfDirectEngine(engine.settings)
+    try:
+        updated = restarted.sync_session(session_id="session-1", provider="omp", path=str(file), embed=False)
+        assert updated["reindex_reason"] == "parser_updated"
+        assert updated["coverage"]["complete"] is True
+        current = restarted.store.list_chunks("session-1", "omp")
+        assert old_chunks[0].chunk_id == current[0].chunk_id
+        assert old_metadata.chunk_id not in {chunk.chunk_id for chunk in current}
+        result = restarted.check_action("session-1",
+                                        {"tool_name": "shell", "arguments": {"command": "deploy"}},
+                                        provider="omp", path=str(file))
+        assert result["verdict"] == "violation" and result["coverage"]["complete"] is True
+        assert file.read_bytes() == source_bytes
+        again = restarted.sync_session(session_id="session-1", provider="omp", path=str(file), embed=False)
+        assert again["reindexed"] is False and again["new_chunks"] == 0
+    finally:
+        restarted.close()
 
 
 def test_unknown_agent_event_still_degrades_coverage(local_engine):
