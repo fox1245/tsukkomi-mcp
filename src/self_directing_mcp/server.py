@@ -357,6 +357,12 @@ async def upsert_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
     applies_from_event_id (exclusive), before_regex, requires_success. before_regex
     and requires_success apply to must tool_call rules with regex. Revisions increment
     on update. Description-only rules return unknown until a verifier exists.
+    Set risk="high", auto_continue=true or when={"tool_call_regex": ...} only when
+    the user asked for that: risk="high" marks actions the user named high-risk (a
+    host may ask instead of allowing when verification fails); auto_continue=true
+    (must with regex only) lets a confirmed, fully observed miss resume a stopping
+    agent once per session; when limits a must obligation to sessions where a
+    matching tool call was observed (otherwise it is reported not_applicable).
     The response contains only the contracts from this call after save,
     not the full store. session_id=null means a global rule that applies
     to every audited session. Use list_contracts(session_id=...) to inspect
