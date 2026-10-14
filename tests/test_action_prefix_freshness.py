@@ -74,7 +74,10 @@ def test_current_gate_does_not_certify_old_success_with_unread_tests(session, mo
     finding = next(f for f in value["findings"] if f["contract_id"] == "tests-first")
     assert finding["verdict"] == "unknown"
     assert "incomplete" in finding["reason"].lower() or "unread" in finding["reason"].lower()
-    assert _verdict_response(value, advisory=False)["decision"] == "deny"
+    assert _verdict_response(value, "enforced")["decision"] == "deny"
+    # Default policy: an unverified prerequisite warns; only a contract the user marked high-risk asks.
+    assert _verdict_response(value)["decision"] == "allow"
+    assert _verdict_response(value, high_risk={"tests-first"})["decision"] == "ask"
     refreshed = engine.check_action(SID, ACTION)
     assert refreshed["coverage"]["complete"] is True
     assert refreshed["verdict"] == ("violation" if status == "failed" else "unknown")
@@ -99,7 +102,7 @@ def test_current_gate_with_complete_successful_history_remains_clean(session):
     assert value["verdict"] == "clean"
     assert value["coverage"]["complete"] is True
     assert value["requires_attention"] is False
-    assert _verdict_response(value, advisory=False)["decision"] == "allow"
+    assert _verdict_response(value, "enforced")["decision"] == "allow"
 
 
 @pytest.mark.parametrize("unrelated_gate", [False, True])
@@ -116,7 +119,7 @@ def test_history_independent_action_stays_clean_despite_growth(session, monkeypa
     assert value["verdict"] == "clean", value
     assert value["requires_history"] is False
     assert value["requires_attention"] is False
-    assert _verdict_response(value, advisory=False)["decision"] == "allow"
+    assert _verdict_response(value, "enforced")["decision"] == "allow"
 
 
 def test_confirmed_forbidden_action_not_hidden_by_unread_prerequisite(session, monkeypatch):
@@ -154,8 +157,9 @@ def test_consumers_preserve_native_unknown_without_changing_enforcement_mode(ses
         _, value = _with_growth(lambda: engine.check_action(SID, ACTION), path, monkeypatch,
                                 "during_evaluation", _late("failed"))
         assert value["verdict"] == "unknown"
-        assert _verdict_response(value, advisory=False)["decision"] == "deny"
-        advisory = _verdict_response(value, advisory=True)
+        assert _verdict_response(value, "enforced")["decision"] == "deny"
+        assert _verdict_response(value)["decision"] == "allow"
+        advisory = _verdict_response(value, "advisory")
         assert advisory["decision"] == "allow" and "ADVISORY" in advisory["reason"]
     else:
         _, value = _with_growth(
@@ -177,7 +181,7 @@ def test_observed_existence_prerequisite_survives_pure_append(session, monkeypat
     assert value["verdict"] == "clean", value
     assert value["requires_attention"] is False
     assert value["findings"][0]["verdict"] == "clean"
-    assert _verdict_response(value, advisory=False)["decision"] == "allow"
+    assert _verdict_response(value, "enforced")["decision"] == "allow"
 
 
 @pytest.mark.parametrize("timing", ["before_evaluation", "during_evaluation"])
