@@ -184,3 +184,56 @@ engine.close()
         assert len(engine.list_contracts()["contracts"]) == 24
     finally:
         engine.close()
+
+
+def test_contract_read_modify_write_holds_publication_guard(tmp_path):
+    """Preparation must happen under the same lease as capture and publication.
+
+    A second engine upserting while the first is mid-preparation must wait, not
+    capture the same token and make the first publish fail as stale.
+    """
+    import threading
+    from self_directing_mcp.audit.contracts import ContractStore
+    from self_directing_mcp.config import Settings
+    from self_directing_mcp.engine import SelfDirectEngine
+
+    def make():
+        return SelfDirectEngine(Settings(index_dir=tmp_path / "index", use_fake_embedder=True, _env_file=None))
+
+    first, second = make(), make()
+    rule = lambda cid: [{"id": cid, "type": "must_not", "regex": "NEVER"}]
+    errors, finished = [], threading.Event()
+
+    def other():
+        try:
+            second.upsert_contracts(rule("b"))
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    original = ContractStore.prepare_upsert
+    started = []
+
+    def interleaving(document, rules):
+        if not started:
+            started.append(True)
+            thread = threading.Thread(target=other)
+            thread.start()
+            interleaving.thread = thread
+            assert not finished.wait(0.5), "second writer ran during first writer's preparation"
+        return original(document, rules)
+
+    ContractStore.prepare_upsert = staticmethod(interleaving)
+    try:
+        first.upsert_contracts(rule("a"))
+        interleaving.thread.join(10)
+    finally:
+        ContractStore.prepare_upsert = staticmethod(original)
+    try:
+        assert not errors, errors
+        assert {c["id"] for c in first.list_contracts()["contracts"]} == {"a", "b"}
+        first.revoke_contract("a")
+    finally:
+        first.close()
+        second.close()

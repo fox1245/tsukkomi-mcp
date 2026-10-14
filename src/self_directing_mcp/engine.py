@@ -576,12 +576,11 @@ class SelfDirectEngine:
         assert self.contracts
         with self._publication_guard():
             raw, token = self.contracts.capture()
-        document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
-        disabled = self.contracts.prepare_revoke(document, contract_id)
-        if disabled is None:
-            return {"ok": False, "error": "not_found", "contract_id": contract_id}
-        payload = document.model_dump_json(indent=2)
-        with self._publication_guard():
+            document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
+            disabled = self.contracts.prepare_revoke(document, contract_id)
+            if disabled is None:
+                return {"ok": False, "error": "not_found", "contract_id": contract_id}
+            payload = document.model_dump_json(indent=2)
             self.contracts.publish_document(document, payload, token)
         return {"ok": True, "contract": disabled.model_dump(mode="json"),
                 "nudge": "Contract disabled. History retained; re-enable via upsert_contracts with the same id."}
@@ -601,10 +600,9 @@ class SelfDirectEngine:
                     re.compile(pattern)
         with self._publication_guard():
             raw, token = self.contracts.capture()
-        document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
-        updated = self.contracts.prepare_upsert(document, rules)
-        payload = document.model_dump_json(indent=2)
-        with self._publication_guard():
+            document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
+            updated = self.contracts.prepare_upsert(document, rules)
+            payload = document.model_dump_json(indent=2)
             self.contracts.publish_document(document, payload, token)
         return {
             "ok": True,
