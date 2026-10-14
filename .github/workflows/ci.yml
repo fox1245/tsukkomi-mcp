@@ -88,4 +88,6 @@ jobs:
           tests/test_reliability.py
           tests/test_hook_gating.py
           tests/test_claude_provider.py
+          tests/test_claude_hooks.py
+          tests/test_claude_install.py
           --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file

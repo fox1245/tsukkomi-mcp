@@ -88,7 +88,11 @@ def _default_omp_sessions_dir() -> Path:
 
 
 def _default_claude_projects_dir() -> Path:
-    return Path(os.environ.get("SELF_DIRECT_CLAUDE_PROJECTS_DIR") or Path.home() / ".claude" / "projects")
+    # Claude Code keeps its projects under CLAUDE_CONFIG_DIR when set; the MCP server and hooks inherit it.
+    configured = os.environ.get("SELF_DIRECT_CLAUDE_PROJECTS_DIR")
+    if configured:
+        return Path(configured)
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
 
 
 def _repo_root() -> Path:
@@ -132,6 +136,7 @@ class Settings(BaseSettings):
         for name in ("antigravity", "antigravity-cli", "antigravity-ide")
     ])
     agy_enforcement: Literal["confirmed_only", "advisory", "enforced"] = "confirmed_only"
+    claude_enforcement: Literal["confirmed_only", "advisory", "enforced"] = "confirmed_only"
     session_provider: Literal["codex", "grokbot", "omp", "agy", "claude"] = "codex"
     index_dir: Path = Field(default_factory=_default_index_dir)
     contracts_path: Path | None = Field(
