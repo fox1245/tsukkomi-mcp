@@ -2,6 +2,19 @@
 
 Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions follow `pyproject.toml`. Releases before 0.6.0 are not itemized here; see the git history.
 
+## Unreleased
+
+### Changed
+
+- **A request scans the source prefix once.** One `check_action` on a 300 MB session hashed the whole prefix five times (the capture pass and four later re-checks); it now hashes it once, in the capture pass. `validate_prefix()` re-checks file identity, `size >= captured length` and the SHA-256 of the last 64 KiB as streamed during the pass; an unchanged size with a moved modification time is settled by a re-read of the prefix; `validate_prefix(full=True)` is the explicit whole-prefix re-read. If the file grew while it was hashed, the bounded check replaces the second scan. The residual window this documents: a rewrite outside the last 64 KiB that restores size and modification time (or that coincides with growth), made after the capture pass of the same request, is accepted by that request and found by the next full scan.
+- A change detected between capture and publication (`SourceChanged`, a `ValueError`) now discards the observation and recaptures, at most three times in all, before failing with the same `source changed during preparation` error as before.
+- `README.md`: "Source capture" describes the one-scan rule and its residual window.
+
+### Added
+
+- `scripts/bench_integrity.py`: a synthetic micro-benchmark (default 300 MB) reporting CPU, wall time and SHA-256 passes for the first sync, a nothing-appended and a small-append `check_action` and `audit_session`.
+- Tests: pass counting through a process-wide `hashlib.sha256` meter (`tests/test_integrity_passes.py`); tamper-after-parse tests now cover both a one-shot change (recaptured, never published stale) and a source that keeps changing (rejected after the bounded retries).
+
 ## 0.6.0 - 2026-10-14
 
 Merged in [PR #7](https://github.com/fox1245/tsukkomi-mcp/pull/7) and [PR #11](https://github.com/fox1245/tsukkomi-mcp/pull/11). PR #7 also carried the unmerged commits of the AGY and workflow branch. The Claude Code integration, the shared hook policy, the masking work and AGY parser versions 6 and 7 were added to this release afterwards. Read "Upgrading to 0.6.0" in the [README](README.md) before restarting existing servers: restart every process that shares an index.

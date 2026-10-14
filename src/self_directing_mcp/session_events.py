@@ -25,7 +25,15 @@ def _stamp(stat) -> tuple[int, ...]:
 
 
 _BLOCK = 1024 * 1024
-_TAIL_WINDOW = 64 * 1024  # bytes before ``length`` re-hashed under the publication lock instead of the whole prefix
+_TAIL_WINDOW = 64 * 1024  # bytes before ``length`` that later stages re-read instead of the whole prefix
+
+
+class SourceChanged(ValueError):
+    """The source was observed to change (rewritten, truncated, replaced) while it was prepared or read.
+
+    A ``ValueError`` so every existing handler keeps working. ``ingest_session`` discards the observation and
+    retries a bounded number of times before reporting it.
+    """
 
 
 class SourceObservation:
@@ -33,10 +41,12 @@ class SourceObservation:
 
     The file may keep growing. Only bytes ``[0, length)`` were observed; ``complete_end`` is the last record
     boundary inside them. No file bytes are retained: the observation keeps device/inode, a streaming
-    SHA-256 state per requested checkpoint (with its line count) and the digest of the whole prefix.
+    SHA-256 state per requested checkpoint (with its line count), the digest of the whole prefix and the digest of
+    the last bytes (the tail window).
+
+    One request performs ONE full scan of the prefix: the capture pass itself. Every later check of the
+    observation re-reads only a bounded amount (see ``validate_prefix``); none re-hashes the whole prefix.
     ``validate()`` compares captured metadata only; equal stamps do not prove unchanged bytes.
-    ``validate_prefix()`` accepts pure growth after verifying the captured prefix still hashes identically.
-    ``validate_prefix(locked=True)`` is the bounded variant for use under the publication guard (see there).
     """
 
     def __init__(self, path, stamp, length, complete_end, full_digest, checkpoints, tail_digest=None):
@@ -46,8 +56,9 @@ class SourceObservation:
         self.complete_end = complete_end
         self._full_digest = full_digest
         self._checkpoints = checkpoints  # offset -> (sha256 state, newline count)
-        self._tail_digest = tail_digest  # SHA-256 of the last <= _TAIL_WINDOW bytes of [0, length)
+        self._tail_digest = tail_digest  # SHA-256 of the last <= _TAIL_WINDOW bytes of [0, length), as streamed
         self._prefix_ok = True  # A detected identity/size/content mismatch does not heal
+        self._mtime_ns = stamp[3]  # the modification time the scan is bound to (see validate_prefix)
         # What validate_prefix() re-hashes in the file itself. A plain file may keep growing past it; see
         # CompressedObservation for the immutable variant.
         self._guard_length, self._guard_digest, self._tolerates_growth = length, full_digest, True
@@ -67,17 +78,17 @@ class SourceObservation:
         if found is not None:
             return found
         if offset < 0 or offset > self.length:
-            raise ValueError("source truncated during read")
+            raise SourceChanged("source truncated during read")
         digest, lines = hashlib.sha256(), 0
         with self._open() as stream:
             if not same_identity(_identity(os.fstat(stream.fileno())), self.identity):
-                raise ValueError("source replaced during read")
+                raise SourceChanged("source replaced during read")
             remaining = offset
             while remaining:
                 check_request()
                 block = stream.read(min(remaining, _BLOCK))
                 if not block:
-                    raise ValueError("source truncated during read")
+                    raise SourceChanged("source truncated during read")
                 digest.update(block)
                 lines += block.count(b"\n")
                 remaining -= len(block)
@@ -86,7 +97,7 @@ class SourceObservation:
 
     def prefix_digest(self, length: int) -> str:
         if length < 0 or length > self.length:
-            raise ValueError("source truncated during read")
+            raise SourceChanged("source truncated during read")
         return self._checkpoint(length)[0].hexdigest()
 
     def line_state(self, offset: int):
@@ -105,22 +116,49 @@ class SourceObservation:
     def current_size(self) -> int:
         return self.path.stat().st_size
 
-    def validate_prefix(self, *, locked: bool = False) -> bool:
-        """Growth tolerant: same file, and the captured prefix is byte-for-byte what was hashed.
+    def validate_prefix(self, *, locked: bool = False, full: bool = False) -> bool:
+        """Is the file still the one the scan saw? Bounded: this never re-hashes the whole prefix.
 
-        The default always re-reads and hashes the whole prefix, even when stamps are unchanged (a same-size
-        rewrite can keep size, mtime and ctime); call it OUTSIDE the publication guard. With ``locked=True``
-        (inside the guard) only identity, size >= captured length and the digest of a bounded tail window are
-        checked, also without trusting stamps. A detected mismatch stays failed even if the original bytes
-        return. Residual risk: a rewrite
-        outside the tail window between the last full check and the lock is accepted at that moment; the next
-        sync compares the stored cursor ``prefix_hash`` and reindexes.
+        The capture pass is the request's one full scan. Later stages re-check, without trusting stamps alone:
+        the file identity, ``size >= captured length`` (an immutable ``.zst`` snapshot: exactly its size) and the
+        digest of the tail window, as streamed during the scan. Without growth, an unchanged size with a moved
+        modification time means the file was written; the unlocked check then settles it with a full re-read
+        (identical bytes, e.g. a ``touch``, pass; the new time becomes the baseline). ``locked=True`` is for use
+        under the publication guard: identity, size and tail only, never a re-read of the prefix.
+        ``full=True`` forces the whole-prefix re-read. A detected mismatch stays failed even if the original
+        bytes return.
+
+        Residual risk, stated precisely: a rewrite that leaves identity, size, the tail window and the
+        modification time unchanged and lies outside the tail window, made after the capture pass of the same
+        request, is accepted at that moment. The next full scan (the next sync's capture) compares the stored
+        cursor ``prefix_hash`` and reindexes. ``.zst`` snapshots are different: any change to the compressed
+        file is a rewrite, and their digest check re-reads the (compressed) file.
         """
         check_request()
         if not self._prefix_ok:
             return False
-        if locked:
-            return self._validate_tail()
+        if full or not self._tolerates_growth:
+            return self._rescan()
+        try:
+            with self.path.open("rb") as stream:
+                before = os.fstat(stream.fileno())
+                if not same_identity(_identity(before), self.identity) or not self._size_ok(before.st_size):
+                    return self._fail()
+                if self._tail_digest is None:
+                    return False
+                window = min(self._guard_length, _TAIL_WINDOW)
+                stream.seek(self._guard_length - window)
+                tail = stream.read(window)
+        except OSError:
+            return False
+        if len(tail) != window or hashlib.sha256(tail).hexdigest() != self._tail_digest:
+            return self._fail()
+        if not locked and before.st_size == self._guard_length and before.st_mtime_ns != self._mtime_ns:
+            return self._rescan()
+        return True
+
+    def _rescan(self) -> bool:
+        """Re-read the whole guarded region and compare it with what the scan saw."""
         try:
             with self.path.open("rb") as stream:
                 before = os.fstat(stream.fileno())
@@ -142,28 +180,13 @@ class SourceObservation:
         if (digest.hexdigest() != self._guard_digest or not same_identity(_identity(after), self.identity)
                 or not self._size_ok(after.st_size)):
             return self._fail()
+        if after.st_size == self._guard_length:
+            self._mtime_ns = after.st_mtime_ns
         return True
 
     def _fail(self) -> bool:
         self._prefix_ok = False
         return False
-
-    def _validate_tail(self) -> bool:
-        try:
-            with self.path.open("rb") as stream:
-                before = os.fstat(stream.fileno())
-                if not same_identity(_identity(before), self.identity) or not self._size_ok(before.st_size):
-                    return self._fail()
-                if self._tail_digest is None:
-                    return False
-                window = min(self._guard_length, _TAIL_WINDOW)
-                stream.seek(self._guard_length - window)
-                tail = stream.read(window)
-        except OSError:
-            return False
-        if len(tail) != window or hashlib.sha256(tail).hexdigest() != self._tail_digest:
-            return self._fail()
-        return True
 
 
 class CompressedObservation(SourceObservation):
@@ -201,21 +224,22 @@ def same_identity(left, right) -> bool:
     return left[1] == 0 or right[1] == 0 or tuple(left) == tuple(right)
 
 
-def _hash_prefix(stream, length, checkpoints):
-    """Stream ``[0, length)`` once. Returns (full digest, last record boundary, {offset: (state, lines)}).
+def _hash_prefix(stream, length, checkpoints, tail_window=0):
+    """Stream ``[0, length)`` once. Returns (full digest, last record boundary, {offset: (state, lines)}, tail).
 
-    States are kept for every requested checkpoint and for the last record boundary; memory is O(1) in
-    the file size apart from those small hash states.
+    States are kept for every requested checkpoint and for the last record boundary; ``tail`` is the last
+    ``tail_window`` bytes streamed. Memory is O(1) in the file size apart from those small hash states.
     """
     wanted = sorted({o for o in checkpoints if 0 < o <= length})
     digest, lines, position, boundary = hashlib.sha256(), 0, 0, 0
     states = {0: (digest.copy(), 0)}
     boundary_state = states[0]
+    tail = b""
     while position < length:
         check_request()
         block = stream.read(min(_BLOCK, length - position))
         if not block:
-            raise ValueError("source truncated during read")
+            raise SourceChanged("source truncated during read")
         newline = block.rfind(b"\n")
         splits = {o - position for o in wanted if position < o <= position + len(block)}
         if newline >= 0:
@@ -232,9 +256,11 @@ def _hash_prefix(stream, length, checkpoints):
             if newline >= 0 and split == newline + 1:
                 boundary, boundary_state = absolute, (digest.copy(), lines)
         position += len(block)
+        if tail_window:
+            tail = (tail + block)[-tail_window:]
     states.setdefault(length, (digest.copy(), lines))
     states.setdefault(boundary, boundary_state)
-    return digest.hexdigest(), boundary, states
+    return digest.hexdigest(), boundary, states, tail
 
 
 def _capture_compressed(path: Path, checkpoints, max_bytes) -> CompressedObservation:
@@ -245,7 +271,7 @@ def _capture_compressed(path: Path, checkpoints, max_bytes) -> CompressedObserva
         reader = stream.raw
         before = os.fstat(stream.fileno())
         length = reader.declared
-        full_digest, boundary, states = _hash_prefix(stream, length, checkpoints)
+        full_digest, boundary, states, _ = _hash_prefix(stream, length, checkpoints)
         reader.verify_complete()  # exactly one frame, ending exactly at the declared size
         reader.drain()
         after = os.fstat(stream.fileno())
@@ -253,7 +279,7 @@ def _capture_compressed(path: Path, checkpoints, max_bytes) -> CompressedObserva
     path_stamp = source_stamp(path)
     if (_stamp(after) != _stamp(before) or after.st_size != raw_size or not same_identity(path_stamp[:2], _identity(after))
             or path_stamp[2] != raw_size or path_stamp[3] != after.st_mtime_ns):
-        raise ValueError("source changed during preparation")
+        raise SourceChanged("source changed during preparation")
     return CompressedObservation(path, path_stamp, length, boundary, full_digest, states,
                                  hashlib.sha256(tail).hexdigest(), raw_size=raw_size, raw_digest=raw_digest,
                                  max_bytes=limit)
@@ -273,11 +299,7 @@ def capture_source(path: Path, *, checkpoints=(), max_bytes=None) -> SourceObser
     with path.open("rb") as stream:
         before = os.fstat(stream.fileno())
         length = before.st_size
-        full_digest, boundary, states = _hash_prefix(stream, length, checkpoints)
-        window = min(length, _TAIL_WINDOW)
-        stream.seek(length - window)
-        tail = stream.read(window)
-        tail_digest = hashlib.sha256(tail).hexdigest() if len(tail) == window else None
+        full_digest, boundary, states, tail = _hash_prefix(stream, length, checkpoints, _TAIL_WINDOW)
         after = os.fstat(stream.fileno())
     path_stamp = source_stamp(path)
     # Some runtimes (e.g. 9p/drvfs) give stat and fstat different ctime semantics. Compare full stamps
@@ -286,15 +308,17 @@ def capture_source(path: Path, *, checkpoints=(), max_bytes=None) -> SourceObser
     if (not same_identity(_identity(after), _identity(before)) or after.st_size < length
             or not same_identity(path_stamp[:2], _identity(after)) or path_stamp[2] < after.st_size
             or (path_stamp[2] == after.st_size and path_stamp[3] != after.st_mtime_ns)):
-        raise ValueError("source changed during preparation")
-    observation = SourceObservation(path, path_stamp, length, boundary, full_digest, states, tail_digest)
+        raise SourceChanged("source changed during preparation")
+    observation = SourceObservation(path, path_stamp, length, boundary, full_digest, states,
+                                    hashlib.sha256(tail).hexdigest())
     if after.st_size == length and path_stamp[2] == length:
         if _stamp(after) != _stamp(before):
-            raise ValueError("source changed during preparation")  # same size, new mtime: rewritten in place
+            raise SourceChanged("source changed during preparation")  # same size, new mtime: rewritten in place
     else:
-        # Grew while hashing: appended bytes are fine, a rewritten prefix is not.
+        # Grew while hashing: appended bytes are fine. A rewrite of the tail window during the pass is not; the
+        # bounded check compares it with the bytes that were streamed (the pass is the request's only full scan).
         if not observation.validate_prefix():
-            raise ValueError("source changed during preparation")
+            raise SourceChanged("source changed during preparation")
     return observation
 
 
@@ -343,7 +367,7 @@ def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, in
     # restart, so the cursor logic below is the same for both forms. A plain path opens as before.
     with (open_source(path) if size_limit is None else open_source(path, max_bytes=size_limit)) as stream:
         if observation is not None and not same_identity(_identity(os.fstat(stream.fileno())), observation.identity):
-            raise ValueError("source replaced during read")
+            raise SourceChanged("source replaced during read")
         check_digest = None
         if start_byte:
             stream.seek(start_byte - 1)
@@ -379,7 +403,7 @@ def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, in
             yield line_no, start, position, raw.decode("utf-8", errors="surrogateescape")
     if observation is not None and position == observation.complete_end and check_digest is not None:
         if check_digest.hexdigest() != observation.prefix_digest(position):
-            raise ValueError("source changed during read")
+            raise SourceChanged("source changed during read")
 
 
 def make_chunk(provider, sid, kind, text, meta, line, start, end, sub=0, timestamp=None):

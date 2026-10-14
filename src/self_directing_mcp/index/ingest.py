@@ -19,7 +19,7 @@ from self_directing_mcp.compressed_source import CompressedSourceError
 from self_directing_mcp.schemas import AuditEvent, Chunk
 from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request, publication, request_operation
-from self_directing_mcp.session_events import capture_source, observed_source, source_scope
+from self_directing_mcp.session_events import SourceChanged, capture_source, observed_source, source_scope
 
 
 @dataclass(frozen=True)
@@ -794,6 +794,9 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
     ``retain_dense_deletions``: this process has no dense index but the index directory does (a local-only hook
     sharing a server's index). Obsolete ids are removed from the sparse index and stay journalled until a process
     that can also remove their vectors syncs the session.
+
+    A source change detected while preparing (a rewrite, truncation or replacement between capture and
+    publication) discards the observation and recaptures, a bounded number of times.
     """
     requested = Path(path).resolve()
     with session_flight(_flight_key(store, provider, requested, session_id)):
@@ -810,10 +813,12 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
             except _IndexedElsewhere as elsewhere:
                 target, captured = elsewhere.path, elsewhere.observation  # a strict prefix: report the indexed source
                 continue
+            except SourceChanged:
+                continue  # discard the observation and look at the source again; the error is raised once attempts run out
             if target != requested:
                 _mark_prefix_alias(info, requested)
             return info
-        raise ValueError("source changed during preparation")
+        raise SourceChanged("source changed during preparation")
 
 
 _RECAPTURE_ATTEMPTS = 3
@@ -993,20 +998,17 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             if parsed_sid != sid:
                 raise ValueError("session id changed while parsing")
             digest = observation.prefix_digest(offset)
-            # The whole-prefix rehash stays outside the publication lock; the lock only re-checks identity, size and a
-            # bounded tail window (a rewrite elsewhere in that gap is caught by the next sync's cursor prefix_hash).
-            if not observation.validate_prefix():
-                raise ValueError("source changed during preparation")
         except BaseException:
             chunks.close()
             raise
     try:
         check_request()
-        if not observation.validate_prefix():  # full rehash, off the shared lock
-            raise ValueError("source changed during preparation")
+        # Bounded re-checks only: the capture was this request's one full scan of the prefix (see validate_prefix).
+        if not observation.validate_prefix():
+            raise SourceChanged("source changed during preparation")
         with guard():
             if not observation.validate_prefix(locked=True):
-                raise ValueError("source changed during preparation")
+                raise SourceChanged("source changed during preparation")
             current = store.cursor_record(sid, provider)
             changed_token = store.state_token(sid, provider) != expected_token
             equivalent = bool(changed_token and current and current["path"] == str(path)
@@ -1064,7 +1066,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         return info
 
     def finish():
-        source_ok = observation.validate_prefix()  # full rehash, off the shared lock
+        source_ok = observation.validate_prefix()  # bounded stage check (identity, size, tail), off the shared lock
         with guard():
             issues = []
             if store.state_token(sid, provider) != committed_token:

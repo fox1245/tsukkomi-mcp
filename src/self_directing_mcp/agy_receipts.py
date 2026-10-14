@@ -96,7 +96,7 @@ class ReceiptStore:
                         row["result_hash"] = observed
         payload = json.dumps(row, sort_keys=True)
         # A failed full read (even a transient one) is not repaired by a successful bounded tail check.
-        source_ok = observation is None or observation.validate_prefix()  # full rehash off the shared lock
+        source_ok = observation is None or observation.validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with guard(), closing(self._connect()) as conn, conn:
             if (not source_ok or (observation is not None and not observation.validate_prefix(locked=True))
                     or (observation is None and path.is_file())):

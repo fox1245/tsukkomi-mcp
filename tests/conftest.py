@@ -1,5 +1,6 @@
 
 
+import hashlib
 import os
 
 import pytest
@@ -32,6 +33,55 @@ def explicit_test_backend(tmp_path, monkeypatch):
     config_file = tmp_path / "isolated-config.toml"
     config_file.write_text("", encoding="utf-8")
     monkeypatch.setenv("SELF_DIRECT_CONFIG_FILE", str(config_file))
+
+
+class HashMeter:
+    """Counts the bytes fed to every ``hashlib.sha256`` object created while installed (copies included).
+
+    Used to prove how many times a source prefix is hashed: ``meter.bytes / file_size`` is the number of passes.
+    Replacing the factory (not one call site) means a hash site that bypasses the helpers cannot hide.
+    """
+
+    def __init__(self, monkeypatch):
+        self.bytes = 0
+        real, meter = hashlib.sha256, self
+
+        class Counted:
+            __slots__ = ("_inner",)
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def update(self, data):
+                meter.bytes += len(data)
+                self._inner.update(data)
+
+            def copy(self):
+                return Counted(self._inner.copy())
+
+            def digest(self):
+                return self._inner.digest()
+
+            def hexdigest(self):
+                return self._inner.hexdigest()
+
+        def counting(data=b"", **kwargs):
+            counted = Counted(real(**kwargs))
+            if data:
+                counted.update(data)
+            return counted
+
+        monkeypatch.setattr(hashlib, "sha256", counting)
+
+    def lap(self) -> int:
+        """Bytes hashed since the previous lap (or installation)."""
+        taken, self.bytes = self.bytes, 0
+        return taken
+
+
+@pytest.fixture
+def hash_meter(monkeypatch):
+    return HashMeter(monkeypatch)
 
 
 def pytest_sessionfinish(session, exitstatus):

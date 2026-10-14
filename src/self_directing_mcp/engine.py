@@ -563,7 +563,7 @@ class SelfDirectEngine:
         payload["contract_scope"] = {"session_id": sid, "scope": contract_scope(sid)}
         # Keep the full result: a transient read error does not latch a mismatch, so a later
         # successful bounded tail check must not certify this read.
-        source_ok = observation is None or observation.validate_prefix()  # full rehash off the shared lock
+        source_ok = observation is None or observation.validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             stale = []
             tokens = (
@@ -745,7 +745,7 @@ class SelfDirectEngine:
         payload = doc.model_dump_json(indent=2)
         source_ok = True
         if refreshed is not None and refreshed.get("_source_observation") is not None:
-            source_ok = refreshed["_source_observation"].validate_prefix()  # full rehash off the shared lock
+            source_ok = refreshed["_source_observation"].validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             path = self.checklists._path(doc.session_id)
             try:
@@ -893,7 +893,7 @@ class SelfDirectEngine:
                                                                                coverage["complete"])):
                 item.status = RequirementStatus.PENDING_VERIFICATION
                 item.verified = False
-        source_ok = observation is not None and observation.validate_prefix()  # full rehash off the shared lock
+        source_ok = observation is not None and observation.validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             state = {"_metadata_token": metadata_token, "_source_observation": observation,
                      "_receipt_token": receipt_token}
@@ -940,7 +940,7 @@ class SelfDirectEngine:
 
         source_ok = True
         if path is not None and synced.get("_source_observation") is not None:
-            source_ok = synced["_source_observation"].validate_prefix()  # full rehash off the shared lock
+            source_ok = synced["_source_observation"].validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             if path is not None and (not source_ok or not self._evidence_current(sid, resolved_provider, synced)):
                 return {"ok": False, "error": "incomplete_history", "nodes": [], "edges": []}

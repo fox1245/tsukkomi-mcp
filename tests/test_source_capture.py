@@ -192,7 +192,7 @@ def test_full_prefix_hash_reuses_one_bounded_buffer_without_reading_appends(
         return ReadintoProbe(stream) if candidate == source else stream
 
     monkeypatch.setattr(type(source), "open", open_source)
-    assert observation.validate_prefix() is True
+    assert observation.validate_prefix(full=True) is True
     assert positions == [len(content)]
     assert len(set(buffers)) == (1 if content else 0)
     if len(content) > 16:
@@ -206,5 +206,5 @@ def test_full_prefix_hash_rejects_early_eof_even_with_unchanged_stamps(source, m
     source.write_bytes(CONTENT[:-1])
     _freeze_source_metadata(monkeypatch, source, st)
     assert observation.validate() is True
-    assert observation.validate_prefix() is False
-    assert observation.validate_prefix(locked=True) is False
+    assert observation.validate_prefix(full=True) is False
+    assert observation.validate_prefix() is False and observation.validate_prefix(locked=True) is False
