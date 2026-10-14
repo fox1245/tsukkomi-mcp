@@ -52,6 +52,7 @@ REQUEST_MARGIN_SEC = 2.0          # the daemon's cooperative deadline is the req
 DEFAULT_REQUEST_TIMEOUT_SEC = 45.0
 LOG_ROTATE_BYTES = 256 * 1024
 SHUTDOWN_WATCHDOG_SEC = 20.0
+DRAIN_TIMEOUT_SEC = 150.0         # a drain never waits longer than this for in-flight requests
 SESSION_BOUND = 16                # queued + running hook requests per session
 TOTAL_BOUND = 128                 # ... and across all sessions
 HOOK_WORKERS = 8
@@ -324,7 +325,7 @@ class Daemon:
         self._loop.set_default_executor(self._heavy_pool)    # MCP tool calls (asyncio.to_thread) use the heavy lane
         self._stop = asyncio.Event()
         sock = self._bind()
-        self._server = await asyncio.start_unix_server(self._on_connect, sock=sock)
+        self._server = await asyncio.start_unix_server(self._on_connect, sock=sock, limit=P.MAX_FRAME_BYTES)
         self._write_pid()
         if self._install_signals:
             for number in (signal.SIGTERM, signal.SIGINT):
@@ -561,7 +562,8 @@ class Daemon:
             self._loop.create_task(self._finish_drain())
 
     async def _finish_drain(self) -> None:
-        while self.inflight > 0:
+        deadline = time.monotonic() + DRAIN_TIMEOUT_SEC
+        while self.inflight > 0 and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
         self._stop.set()
 
