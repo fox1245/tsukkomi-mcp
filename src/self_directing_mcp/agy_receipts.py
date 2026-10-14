@@ -12,6 +12,7 @@ from pathlib import Path
 import sqlite3
 from uuid import uuid4
 
+from self_directing_mcp.agy import load_line
 from self_directing_mcp.session_events import capture_source, iter_raw_lines, same_identity, source_scope
 from self_directing_mcp.request_control import check_request, publication
 
@@ -19,7 +20,7 @@ from self_directing_mcp.request_control import check_request, publication
 def _prefix(path: Path, step: int) -> tuple[int, str]:
     offset = 0
     for _line, start, end, raw in iter_raw_lines(path):
-        row = json.loads(raw)
+        row, _padding = load_line(raw)
         index = row.get("step_index")
         if type(index) is not int:
             raise ValueError("cannot anchor receipt to unknown transcript layout")
@@ -38,7 +39,7 @@ def result_digest(record: dict) -> str:
 def _completed_results(path: Path) -> dict[int, str]:
     results = {}
     for _line, _start, _end, raw in iter_raw_lines(path):
-        record = json.loads(raw)
+        record, _padding = load_line(raw)
         if (record.get("type") == "GENERIC" and record.get("source") == "MODEL"
                 and record.get("status") in ("DONE", "ERROR", "INVALID", "CANCELED")
                 and type(record.get("step_index")) is int):

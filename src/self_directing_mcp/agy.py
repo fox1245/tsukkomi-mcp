@@ -12,7 +12,8 @@ from self_directing_mcp.request_control import check_request
 from self_directing_mcp.session_events import (
     _identity, as_text, iter_raw_lines, make_chunk, parse_error, same_identity)
 
-PARSER_VERSION = 6
+# v7: host NUL padding in front of a record, and the IDE's typed result and context steps.
+PARSER_VERSION = 7
 DISPLAY_NAME, FULL_NAME = "transcript.jsonl", "transcript_full.jsonl"
 KNOWN_STATUS = frozenset({"DONE", "RUNNING", "ERROR", "INVALID", "CANCELED"})
 # Fields a fallback to transcript_full.jsonl is attempted for. thinking, CHECKPOINT, SYSTEM_MESSAGE and
@@ -26,6 +27,28 @@ _ID = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\Z")
 
 class PathTraversalError(ValueError):
     pass
+
+
+def split_host_padding(raw):
+    """``(body, nul_count)`` for a line (``str`` or ``bytes``): a leading contiguous run of NULs is removed.
+
+    Only a run at the very start counts. NULs anywhere else stay in ``body``, where they keep the line from
+    parsing; the caller decides what a padded line must still contain.
+    """
+    body = raw.lstrip("\x00" if isinstance(raw, str) else b"\x00")
+    return body, len(raw) - len(body)
+
+
+def load_line(raw):
+    """``(record, padding)`` for one JSONL line, tolerating the host's leading NUL run (see ``split_host_padding``).
+
+    A line that is only padding (nothing but whitespace after the run) is an error, as is any remainder that is
+    not JSON: the padding is never evidence that a record exists, and neighbouring step indexes explain nothing.
+    """
+    body, padding = split_host_padding(raw)
+    if padding and not body.strip():
+        raise ValueError("host padding without a record")
+    return json.loads(body), padding
 
 
 def valid_id(value: str) -> bool:
@@ -141,7 +164,7 @@ class _FullTranscript:
         if not raw.strip():
             return
         try:
-            row = json.loads(raw)
+            row, _padding = load_line(raw)
         except ValueError:
             return  # an unreadable line cannot be matched to a step
         step = row.get("step_index") if isinstance(row, dict) else None
@@ -181,7 +204,7 @@ class _FullTranscript:
         if len(raw) != end - start or int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big") != self._sums[slot]:
             return None, None, ("full_changed", True)
         try:
-            row = json.loads(raw)
+            row, _padding = load_line(raw)
         except ValueError:
             return None, None, ("full_changed", True)
         if (not isinstance(row, dict) or row.get("step_index") != step or row.get("type") != kind
@@ -401,7 +424,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
         try:
             if any(0xDC80 <= ord(c) <= 0xDCFF for c in raw):
                 raise ValueError("invalid UTF-8")
-            record = json.loads(raw)
+            record, padding = load_line(raw)
             if not isinstance(record, dict):
                 raise ValueError("transcript record is not an object")
             step, source, kind = record.get("step_index"), record.get("source"), record.get("type")
@@ -414,6 +437,8 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
             if status is not None and not isinstance(status, str):
                 raise ValueError("invalid status")
             base = {"event_type": kind, "step_index": step, "status": status}
+            if padding:
+                base["host_padding_bytes"] = padding  # a NUL run the host wrote before this record; see load_line
             content = record.get("content", "")
             if content is None:
                 content = ""

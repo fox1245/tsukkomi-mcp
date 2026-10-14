@@ -113,8 +113,8 @@ def deploy_check(engine, path, sid=SID):
 
 # --- 1. fallback to the sibling full transcript --------------------------------------------------
 
-def test_parser_version_is_six():
-    assert agy.PARSER_VERSION == 6
+def test_parser_version_has_not_gone_back_below_six():
+    assert agy.PARSER_VERSION >= 6  # v7 added NUL-padding tolerance and the IDE step types; see test_agy_parser_v7*
 
 
 def test_truncated_fields_restore_from_sibling_full_transcript(tmp_path):
