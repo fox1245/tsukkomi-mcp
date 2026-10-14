@@ -252,10 +252,12 @@ class _File:
 
 def _envelope(record, state):
     """Validated metadata common to every record; raises ValueError on identity or type violations."""
-    if "sessionId" in record:
-        claimed = record["sessionId"]
-        if claimed != (state.parent if state.sub else state.sid):
-            raise ValueError("record session id does not match the transcript's session")
+    _opt_str(record, "sessionId")
+    claimed = record.get("sessionId")
+    expected = state.parent if state.sub else state.sid
+    inherited = claimed is not None and claimed != expected
+    if inherited and not state.sub:
+        raise ValueError("record session id does not match the transcript's session")
     _opt_str(record, "uuid", "timestamp", "cwd", "requestId", "promptId", "agentId", "version")
     if "parentUuid" in record and record["parentUuid"] is not None and not isinstance(record["parentUuid"], str):
         raise ValueError("parentUuid must be a string or null")
@@ -265,6 +267,9 @@ def _envelope(record, state):
     if state.sub and flag is False:
         raise ValueError("record contradicts the subagent transcript it is in")
     agent = record.get("agentId")
+    if inherited and agent is None:
+        # A subagent file may replay another session's history, but only under one constant agent id.
+        raise ValueError("inherited record carries no agent id")
     if state.sub and agent is not None:
         if state.pinned_agent is not None and agent != state.pinned_agent:
             raise ValueError("agent id changed inside one transcript")
@@ -276,6 +281,10 @@ def _envelope(record, state):
             meta[name] = record[key]
     if state.sub:
         meta.update(parent_session_id=state.parent, agent_id=agent or state.pinned_agent or state.agent_id)
+        if claimed is not None:
+            meta["record_session_id"] = claimed
+        if inherited:
+            meta["inherited"] = True  # replayed history: authority is still decided by origin and flags alone
     elif agent is not None:
         meta["agent_id"] = agent
     return meta, (flag is True and not state.sub)
@@ -520,14 +529,81 @@ def _names(value):
     return value if isinstance(value, list) and all(isinstance(item, str) for item in value) else None
 
 
+def _shape(a, required, optional=None):
+    """Exactly the known keys (``type`` aside), required ones present, every value of its declared type."""
+    optional = optional or {}
+    return (set(a) <= set(required) | set(optional) | {"type"} and set(required) <= set(a)
+            and _typed(a, **required, **optional))
+
+
+def _one_line(value: str) -> str:
+    return re.sub(r"[\x00-\x1f\x7f]", " ", value)
+
+
+def _hook_ref(a):
+    """Event and name of a hook; the name is indexed only when it is a plain identifier (never a command line)."""
+    event = a["hookEvent"] if _HOOK_NAME.fullmatch(a["hookEvent"]) else None
+    name = a["hookName"] if _HOOK_NAME.fullmatch(a["hookName"]) else None
+    return f" event={event or '-'} name={name or '-'}", {"hook_event": event, "hook_name": name}
+
+
 def _hook_success(a):
     if not (_typed(a, hookEvent=str, hookName=str, exitCode=int, durationMs=(int, float), command=str, content=str,
                    stdout=str, stderr=str) and isinstance(a.get("hookEvent"), str) and isinstance(a.get("hookName"), str)):
         return None
-    event = a["hookEvent"] if _HOOK_NAME.fullmatch(a["hookEvent"]) else None
-    name = a["hookName"] if _HOOK_NAME.fullmatch(a["hookName"]) else None
-    meta = {"hook_event": event, "hook_name": name, "exit_code": a.get("exitCode")}
-    return f" event={event or '-'} name={name or '-'} exit={a['exitCode'] if 'exitCode' in a else '-'}", meta
+    text, meta = _hook_ref(a)
+    return f"{text} exit={a['exitCode'] if 'exitCode' in a else '-'}", {**meta, "exit_code": a.get("exitCode")}
+
+
+def _hook_injection(content_type):
+    """Hook-injected context/messages: runtime only. The payload may carry other tools' output; never indexed."""
+    def check(a):
+        if not (_shape(a, {"content": content_type, "hookName": str, "toolUseID": str, "hookEvent": str})
+                and a["toolUseID"]):
+            return None
+        text, meta = _hook_ref(a)
+        return text, {**meta, "tool_use_id": a["toolUseID"]}
+    return check
+
+
+def _file_reference(with_content):
+    """A file attached to the context: its path is evidence of what was shown, its content never is."""
+    required = {"filename": str, "displayPath": str, **({"content": dict} if with_content else {})}
+
+    def check(a):
+        if not _shape(a, required):
+            return None
+        if with_content and not (set(a["content"]) == {"file", "type"} and isinstance(a["content"]["type"], str)
+                                 and isinstance(a["content"]["file"], dict)):
+            return None
+        return (f" display_path={_one_line(a['displayPath'])} filename={_one_line(a['filename'])}",
+                {"filename": a["filename"], "display_path": a["displayPath"]})
+    return check
+
+
+def _thinking_drop(a):
+    required = {"requestId": str, "thinkingBlocksSent": int, "thinkingTurnsSent": int, "newlyDropped": dict,
+                "blockHashes": list, "firstReportForThreadInProcess": bool, "clientChange": dict, "model": str}
+    if not _shape(a, required, {"querySource": str}):
+        return None
+    return "", {"thinking_blocks_sent": a["thinkingBlocksSent"], "thinking_turns_sent": a["thinkingTurnsSent"],
+                "model": _label(a["model"]), "query_source": _label(a.get("querySource"))}
+
+
+def _remote_session_change(a):
+    required = {"url": (str, type(None)), "commit": str, "pr": str, "sendUserFileHint": bool,
+                "managedCommit": bool, "managedPr": bool}
+    if not _shape(a, required):
+        return None
+    return "", {"send_user_file_hint": a["sendUserFileHint"], "managed_commit": a["managedCommit"],
+                "managed_pr": a["managedPr"]}
+
+
+def _read_truncation_notice(a):
+    """The Read result linked by ``toolUseID`` was cut. The link is kept for the audit layer; the banner is not."""
+    if not (_shape(a, {"banner": str, "toolUseID": str}) and a["toolUseID"]):
+        return None
+    return f" truncated_result_for={_one_line(a['toolUseID'])}", {"truncated_result_for": a["toolUseID"]}
 
 
 def _edited_text_file(a):
@@ -566,37 +642,53 @@ _ATTACHMENTS = {
     "model": _plain(text=str),
     "date": _date,
     "deferred_tools_record": _plain(entries=list),
+    "file": _file_reference(True),
+    "compact_file_reference": _file_reference(False),
+    "hook_additional_context": _hook_injection(list),
+    "hook_system_message": _hook_injection(str),
+    "thinking_drop": _thinking_drop,
+    "remote_session_change": _remote_session_change,
+    "read_truncation_notice": _read_truncation_notice,
     **{name: _plain() for name in ("prompt_snapshot", "deferred_tools_delta", "environment", "session_context",
                                     "instructions", "credential_org", "agent_listing_delta", "auto_mode",
                                     "skill_listing", "task_status")},
 }
-_QUEUED_KEYS = {"type", "commandMode", "delivery_id", "origin", "prompt", "runId", "source_uuid", "timestamp"}
+_QUEUED_KEYS = {"type", "commandMode", "delivery_id", "origin", "prompt", "runId", "source_uuid", "timestamp", "usage",
+                "humanTurn", "isMeta", "reminderId"}
+_QUEUED_TYPES = {"delivery_id": str, "runId": str, "source_uuid": str, "timestamp": str, "isMeta": bool,
+                 "reminderId": (str, int), "humanTurn": (bool, str, int), "usage": (dict, int, float, str, type(None))}
 
 
 def _queued_command(base, a, state):
+    """A prompt queued mid-turn. Only a human prompt that is not meta is a user turn; all else is runtime."""
     status, origin, extra = _origin(a.get("origin"))
-    mode = a.get("commandMode")
-    prompt = a.get("prompt")
+    mode, prompt = a.get("commandMode"), a.get("prompt")
     if (status == "bad" or not set(a) <= _QUEUED_KEYS or mode not in (None, "prompt", "task-notification")
-            or not isinstance(prompt, (str, list)) or not _typed(a, delivery_id=str, runId=str, source_uuid=str,
-                                                                  timestamp=str)):
+            or not isinstance(prompt, (str, list)) or not _typed(a, **_QUEUED_TYPES)):
         yield _unsupported(base, "[unsupported_attachment:queued_command]", attachment_type="queued_command")
         return
+    is_meta = a.get("isMeta", False)
     base = {**base, **extra, "attachment_type": "queued_command", "queued_command": True}
-    for key, name in (("delivery_id", "delivery_id"), ("runId", "run_id")):
+    for key, name in (("delivery_id", "delivery_id"), ("runId", "run_id"), ("reminderId", "reminder_id")):
         if key in a:
             base[name] = a[key]
+    if isinstance(a.get("humanTurn"), (bool, int)) or (isinstance(a.get("humanTurn"), str) and len(a["humanTurn"]) <= 64):
+        base["human_turn"] = a["humanTurn"]
+    if "isMeta" in a:
+        base["is_meta"] = is_meta
+    if mode is not None:
+        base["command_mode"] = mode
     if origin:
         base["origin_kind"] = origin
+    name = _NON_HUMAN.get(origin) or ("injected_meta" if is_meta else "queued_command")
+    if origin == "human" and (mode != "prompt" or is_meta):
+        # A human origin without the prompt mode, or on a meta record, is a contradiction: never a user turn.
+        yield _unsupported(base, "[unsupported_attachment:queued_command]", evidence_origin=name)
+        return
     if origin == "human":
-        if mode != "prompt":
-            yield _unsupported(base, "[unsupported_attachment:queued_command]")
-            return
         override = ("turn", "message:user", {"role": "user"}, False)
-    elif origin in _NON_HUMAN:
-        override = ("meta", _NON_HUMAN[origin], {"role": "runtime", "evidence_origin": _NON_HUMAN[origin]}, False)
     else:
-        override = ("meta", "queued_command", {"role": "runtime", "evidence_origin": "queued_command"}, False)
+        override = ("meta", name, {"role": "runtime", "evidence_origin": name}, False)
     yield from _user_blocks(base, prompt, origin=origin, compact=False, transcript_only=False, is_meta=False,
                             sidechain=state.sub, record={}, override=override)
 
