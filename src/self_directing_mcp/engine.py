@@ -430,7 +430,8 @@ class SelfDirectEngine:
         """Materialize deferred canonical evidence before searching its derived view."""
         with self._publication_guard():
             allowed = self.store.chunk_ids(session_id, provider)
-            missing = allowed - self.sparse.present(allowed)
+            # A session search probes only its own ids; a global search needs every id, so one scan is cheaper.
+            missing = allowed - (self.sparse.present(allowed) if session_id else self.sparse.ids())
             if not missing:
                 return
             snapshot = self.store.capture_evidence(session_id, provider, history=False, anchors=missing)
