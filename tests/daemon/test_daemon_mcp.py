@@ -169,6 +169,26 @@ def test_a_dotenv_in_the_clients_working_directory_is_honoured_by_the_daemon_for
     runtime.stop()
 
 
+def test_the_integrity_worker_runs_once_per_engine_not_once_per_connection(world, runtime):
+    index = world.new_index("worker")
+    support.start_daemon_process(runtime)
+
+    async def scenario():
+        params = [server_params(world, index, "on", SELF_DIRECT_INTEGRITY_BACKGROUND_VERIFY="true") for _ in range(3)]
+        async with stdio_client(params[0]) as (r1, w1), stdio_client(params[1]) as (r2, w2), \
+                stdio_client(params[2]) as (r3, w3):
+            async with ClientSession(r1, w1) as a, ClientSession(r2, w2) as b, ClientSession(r3, w3) as c:
+                for session in (a, b, c):
+                    await session.initialize()
+                    decode(await session.call_tool("audit_status", {}))
+                return support.daemon_status(runtime), decode(await a.call_tool("audit_status", {}))
+
+    status, audit = asyncio.run(asyncio.wait_for(scenario(), 120))
+    assert status["connections"] >= 3 and status["engines"] == 1 and status["integrity_workers"] == 1
+    assert audit["integrity_worker"]["running"] is True
+    runtime.stop()
+
+
 # --- --omp-bridge -------------------------------------------------------------------------------------------------
 
 def raw_initialize(proc, request_id=1):
@@ -254,7 +274,7 @@ PROBE = r"""
 import json, sys
 from self_directing_mcp import entry
 from self_directing_mcp.daemon import relay
-relay.pipe = lambda sock: (sock.close(), 0)[1]
+relay.pipe = lambda sock, *args: (sock.close(), 0)[1]
 baseline = set(sys.modules)
 try:
     entry.main([])
@@ -395,3 +415,138 @@ def test_a_draining_daemon_finishes_running_mcp_requests_and_refuses_new_ones(ru
     assert daemon.wait_exit(10)
     assert reader.readline() == b""                                  # the connection closed after the last answer
     sock.close()
+
+
+# --- the relay survives a daemon restart --------------------------------------------------------------------------
+
+class RelayProc:
+    """A relay process driven with raw JSON-RPC lines."""
+
+    def __init__(self, world, index, flag="on", **extra):
+        self.proc = subprocess.Popen([sys.executable, "-m", "self_directing_mcp"], cwd=str(world.root),
+                                     env=mcp_env(world, index, flag, **extra), stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.lines: list[dict] = []
+        self.cond = threading.Condition()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        for raw in self.proc.stdout:
+            with self.cond:
+                self.lines.append(json.loads(raw))
+                self.cond.notify_all()
+
+    def send(self, message):
+        self.proc.stdin.write((json.dumps(message) + "\n").encode())
+        self.proc.stdin.flush()
+
+    def reply(self, request_id, timeout=60.0):
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while True:
+                for line in self.lines:
+                    if line.get("id") == request_id:
+                        return line
+                left = deadline - time.monotonic()
+                if left <= 0 or self.proc.poll() is not None and not self.cond.wait(0.2):
+                    if left <= 0:
+                        raise TimeoutError(f"no reply to {request_id}")
+                self.cond.wait(min(0.2, max(left, 0)))
+
+    def handshake(self):
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}})
+        assert "result" in self.reply(1)
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def call(self, request_id, name="audit_status", timeout=60.0):
+        self.send({"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                   "params": {"name": name, "arguments": {}}})
+        return self.reply(request_id, timeout)
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=20)
+        except Exception:
+            self.proc.kill()
+        for stream in (self.proc.stdout, self.proc.stderr):
+            stream.close()
+
+
+def test_a_relay_reconnects_to_a_successor_daemon_and_replays_its_handshake(world, runtime):
+    index = world.new_index("reconnect")
+    relay_proc = RelayProc(world, index)
+    try:
+        relay_proc.handshake()
+        first = json.loads(relay_proc.call(2)["result"]["content"][0]["text"])
+        assert first["served_by"] == "daemon"
+        first_pid = support.daemon_status(runtime)["pid"]
+        area = rundir.open_runtime_dir(runtime.environ(), create=False)
+        try:
+            assert core.query(area, {"op": "drain", "force": True})["ok"] is True       # the daemon leaves (idle, rss, ...)
+        finally:
+            area.close()
+        deadline = time.monotonic() + 20
+        while support.pid_alive(first_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        second = relay_proc.call(3, timeout=60)                                          # the same session goes on
+        assert "result" in second and json.loads(second["result"]["content"][0]["text"])["ok"] is True
+        assert support.daemon_status(runtime)["pid"] != first_pid
+        assert len(json.loads((runtime.dir / rundir.SPAWNS_NAME).read_text())) == 2
+        assert relay_proc.proc.poll() is None
+    finally:
+        relay_proc.close()
+        runtime.stop()
+
+
+def drop_connections(daemon):
+    loop = daemon.daemon._loop
+    loop.call_soon_threadsafe(lambda: [w.close() for w in list(daemon.daemon._writers)])
+
+
+def test_a_request_in_flight_when_the_connection_drops_gets_an_error_and_the_session_continues(world, runtime, inproc):
+    gate = threading.Event()
+    daemon = inproc(hook_runner=lambda *a: {}, engine_factory=lambda settings: SlowEngine(settings, gate),
+                    mcp_server=mcp_session.McpHandler())
+    relay_proc = RelayProc(world, world.new_index("inflight"))
+    try:
+        relay_proc.handshake()
+        relay_proc.send({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                         "params": {"name": "audit_status", "arguments": {}}})
+        deadline = time.monotonic() + 20
+        while daemon.daemon.inflight < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert daemon.daemon.inflight == 1
+        drop_connections(daemon)                                                          # the daemon "crashes" mid-request
+        failed = relay_proc.reply(7)
+        assert failed["error"]["code"] == -32603 and "retry" in failed["error"]["message"]
+        gate.set()                                                                        # the session is usable again
+        answered = relay_proc.call(8)
+        assert json.loads(answered["result"]["content"][0]["text"])["slow"] is True
+        assert relay_proc.proc.poll() is None
+    finally:
+        gate.set()
+        relay_proc.close()
+
+
+def test_a_relay_whose_daemon_keeps_going_away_ends_instead_of_looping(world, runtime, inproc):
+    gate = threading.Event()
+    gate.set()
+    daemon = inproc(hook_runner=lambda *a: {}, engine_factory=lambda settings: SlowEngine(settings, gate),
+                    mcp_server=mcp_session.McpHandler())
+    relay_proc = RelayProc(world, world.new_index("loop"))
+    try:
+        relay_proc.handshake()
+        for number in range(relay.MAX_RECOVERIES + 1):
+            deadline = time.monotonic() + 30
+            while relay_proc.proc.poll() is None and daemon.daemon.connections < 1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if relay_proc.proc.poll() is not None:
+                break
+            drop_connections(daemon)
+            time.sleep(0.3)
+        assert relay_proc.proc.wait(timeout=30) == relay.EXIT_UNAVAILABLE
+        assert "keeps going away" in relay_proc.proc.stderr.read().decode()
+    finally:
+        relay_proc.close()

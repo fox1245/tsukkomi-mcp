@@ -214,6 +214,9 @@ class Engines:
     def __len__(self) -> int:
         return len(self._engines)
 
+    def worker_count(self) -> int:
+        return len(self._workers)
+
     def close_all(self) -> None:
         with self._lock:
             engines, self._engines = list(self._engines.items()), {}
@@ -275,7 +278,8 @@ class Daemon:
 
     def snapshot(self) -> dict:
         return {"pid": os.getpid(), "uptime_sec": round(time.time() - self.started_at, 1), "inflight": self.inflight,
-                "connections": self.connections, "engines": len(self.engines), "draining": self.draining,
+                "connections": self.connections, "engines": len(self.engines),
+                "integrity_workers": self.engines.worker_count(), "draining": self.draining,
                 "drain_reason": self.drain_reason, "rss_mb": round(read_rss_mb(), 1),
                 "requests": dict(self.stats)}
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import sys
 import threading
@@ -30,6 +31,10 @@ from self_directing_mcp.daemon import client, protocol as P, rundir
 
 AVAILABILITY_SEC = 15.0
 CHUNK = 64 * 1024
+MAX_RECOVERIES = 5
+RECOVERY_WINDOW_SEC = 60.0
+RESTART_ERROR = "tsukkomi daemon restarted before this request finished; retry it"
+_RESPONSE_HEAD = re.compile(r'\{"jsonrpc":\s*"2\.0",\s*"id":\s*(-?\d+|"(?:[^"\\]|\\.)*"),\s*"(?:result|error)"')
 EXIT_UNAVAILABLE = 1
 EXIT_CONFIGURATION = 2
 ERROR_CODE = -32603
@@ -134,42 +139,202 @@ def _answer_initialize(message: str, wait: float = 5.0) -> None:
         pass
 
 
-def pipe(sock) -> int:
-    """Copy stdin to the daemon and the daemon to stdout until either side ends."""
-    state = {"stdin_closed": False}
+def _line_key(value):
+    return value if isinstance(value, (int, str)) else repr(value)
 
-    def down() -> None:
-        code = 0
+
+def _error_line(key, message: str) -> bytes:
+    return (json.dumps({"jsonrpc": "2.0", "id": key, "error": {"code": ERROR_CODE, "message": message}}) + "\n").encode()
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _lines(buffer: bytearray, chunk: bytes):
+    """Complete lines of a byte stream (``buffer`` keeps the unfinished tail)."""
+    buffer += chunk
+    while True:
+        end = buffer.find(b"\n")
+        if end < 0:
+            return
+        line = bytes(buffer[:end + 1])
+        del buffer[:end + 1]
+        yield line
+
+
+class Relay:
+    """The two byte pipes plus the bookkeeping that lets a session survive a daemon restart.
+
+    The relay remembers the host's ``initialize`` request and ``initialized`` notification and which requests are
+    still unanswered. When the daemon goes away (memory cap, version switch, crash) while the host is still talking,
+    every unanswered request gets a JSON-RPC error (the host sees an ordinary failed call, not a dead server), the
+    relay reconnects (starting a successor under the usual guards), replays the two handshake messages (the daemon's
+    answer to the replayed ``initialize`` is consumed here: the host already has its own) and the session goes on.
+    Several recoveries in a short time end the process instead (``MAX_RECOVERIES`` in ``RECOVERY_WINDOW_SEC``)."""
+
+    def __init__(self, sock, environ, mode: str, cwd, python=None) -> None:
+        self.sock, self.environ, self.mode, self.cwd, self.python = sock, environ, mode, cwd, python
+        self.cond = threading.Condition()
+        self.initialize: bytes | None = None
+        self.initialized: bytes | None = None
+        self.pending: dict = {}
+        self.stdin_closed = False
+        self.recoveries: list[float] = []
+
+    # -- host -> daemon --------------------------------------------------------------------------------------
+    def forward(self, line: bytes) -> None:
+        try:
+            message = json.loads(line)
+        except ValueError:
+            message = None
+        request = None
+        if isinstance(message, dict):
+            method = message.get("method")
+            if method == "initialize" and message.get("id") is not None and self.initialize is None:
+                self.initialize = line
+            elif method == "notifications/initialized":
+                self.initialized = line
+            if method and message.get("id") is not None:
+                request = message["id"]
+        with self.cond:
+            while self.sock is None:                       # a recovery is running: hold the line until it is over
+                self.cond.wait(1.0)
+            sock = self.sock
+            # Registered while a connection exists, so a recovery's sweep of the unanswered requests can neither
+            # miss this request nor answer it and then see it sent again.
+            if request is not None:
+                self.pending[_line_key(request)] = request
+            elif isinstance(message, dict) and message.get("method") == "notifications/cancelled":
+                self.pending.pop(_line_key((message.get("params") or {}).get("requestId")), None)
+        try:
+            sock.sendall(line)
+        except OSError:
+            # The daemon went away under this line. The reader recovers; a request is answered by that recovery's
+            # sweep of the unanswered requests, a notification is simply lost.
+            pass
+
+    def run_up(self) -> int:
+        buffer = bytearray()
         try:
             while True:
-                data = sock.recv(CHUNK)
-                if not data:
+                chunk = os.read(0, CHUNK)
+                if not chunk:
                     break
-                view = memoryview(data)
-                while view:
-                    view = view[os.write(1, view):]
+                for line in _lines(buffer, chunk):
+                    self.forward(line)
         except OSError:
-            code = EXIT_UNAVAILABLE
-        else:
-            code = 0 if state["stdin_closed"] else EXIT_UNAVAILABLE     # the daemon left while the host still talks
-        os._exit(code)
-
-    threading.Thread(target=down, name="relay-down", daemon=True).start()
-    try:
-        while True:
-            data = os.read(0, CHUNK)
-            if not data:
-                break
-            sock.sendall(data)
-    except OSError:
-        return EXIT_UNAVAILABLE
-    state["stdin_closed"] = True
-    try:
-        sock.shutdown(1)                                   # SHUT_WR: the daemon ends the session, `down` then exits
-    except OSError:
+            return EXIT_UNAVAILABLE
+        self.stdin_closed = True
+        with self.cond:
+            sock = self.sock
+        try:
+            if sock is not None:
+                sock.shutdown(1)                           # SHUT_WR: the daemon ends the session, `down` then exits
+        except OSError:
+            return 0
+        time.sleep(30)                                     # `down` ends the process; this bounds a daemon that ignores EOF
         return 0
-    time.sleep(30)                                         # `down` ends the process; this bounds a daemon that ignores EOF
-    return 0
+
+    # -- daemon -> host --------------------------------------------------------------------------------------
+    def run_down(self) -> None:
+        sock, buffer = self.sock, bytearray()
+        while True:
+            try:
+                chunk = sock.recv(CHUNK)
+            except OSError:
+                chunk = b""
+            if chunk:
+                try:
+                    for line in _lines(buffer, chunk):
+                        self.answered(line)
+                        _write_all(1, line)
+                except OSError:
+                    os._exit(EXIT_UNAVAILABLE)             # the host closed its end
+                continue
+            if self.stdin_closed:
+                os._exit(0)
+            sock, buffer = self.recover(), bytearray()
+
+    def answered(self, line: bytes) -> None:
+        text = line.decode("utf-8", "replace")
+        head = _RESPONSE_HEAD.match(text)
+        try:
+            if head:
+                key = _line_key(json.loads(head.group(1)))
+            elif len(line) < 1 << 20:                      # another key order: parse it
+                reply = json.loads(text)
+                if not isinstance(reply, dict) or reply.get("id") is None or ("result" not in reply and "error" not in reply):
+                    return
+                key = _line_key(reply["id"])
+            else:
+                return
+        except ValueError:
+            return
+        with self.cond:
+            self.pending.pop(key, None)
+
+    def recover(self):
+        """Called by the reader when the daemon closed the connection: answer, reconnect, replay. Never returns on failure."""
+        now = time.monotonic()
+        self.recoveries = [t for t in self.recoveries if now - t < RECOVERY_WINDOW_SEC] + [now]
+        with self.cond:
+            self.sock = None
+            unanswered, self.pending = list(self.pending.values()), {}
+        try:
+            for original in unanswered:
+                _write_all(1, _error_line(original, RESTART_ERROR))
+        except OSError:
+            os._exit(EXIT_UNAVAILABLE)
+        if len(self.recoveries) > MAX_RECOVERIES:
+            print("tsukkomi-mcp: the daemon keeps going away; giving up (daemon_unavailable)", file=sys.stderr)
+            os._exit(EXIT_UNAVAILABLE)
+        try:
+            sock = open_session(self.environ, self.mode, self.cwd, python=self.python)
+            self._replay(sock)
+        except (RelayError, OSError, EOFError, P.ProtocolError, ValueError) as exc:
+            message = exc.message if isinstance(exc, RelayError) else type(exc).__name__
+            print(f"tsukkomi-mcp: could not reconnect to the daemon: {message}", file=sys.stderr)
+            os._exit(exc.code if isinstance(exc, RelayError) else EXIT_UNAVAILABLE)
+        with self.cond:
+            self.sock = sock
+            self.cond.notify_all()
+        if self.stdin_closed:
+            try:
+                sock.shutdown(1)
+            except OSError:
+                pass
+        return sock
+
+    def _replay(self, sock) -> None:
+        if self.initialize is None:
+            return
+        sock.sendall(self.initialize)
+        original = _line_key(json.loads(self.initialize)["id"])
+        buffer = bytearray()
+        sock.settimeout(60.0)
+        while True:
+            chunk = sock.recv(CHUNK)
+            if not chunk:
+                raise EOFError("daemon closed during the replayed initialize")
+            for line in _lines(buffer, chunk):
+                head = _RESPONSE_HEAD.match(line.decode("utf-8", "replace"))
+                if head and _line_key(json.loads(head.group(1))) == original:
+                    if json.loads(line).get("error"):
+                        raise RelayError("the daemon refused the replayed handshake", EXIT_UNAVAILABLE)
+                    if self.initialized is not None:
+                        sock.sendall(self.initialized)
+                    sock.settimeout(None)
+                    return
+
+
+def pipe(sock, environ=None, mode: str = "default", cwd=None, python=None) -> int:
+    """Copy stdin to the daemon and the daemon to stdout until either side ends; survive daemon restarts."""
+    relay = Relay(sock, os.environ if environ is None else environ, mode, cwd, python)
+    threading.Thread(target=relay.run_down, name="relay-down", daemon=True).start()
+    return relay.run_up()
 
 
 def main(argv=None) -> int:
@@ -191,4 +356,4 @@ def main(argv=None) -> int:
         print(f"tsukkomi-mcp: {exc.message}", file=sys.stderr)
         _answer_initialize(exc.message)
         return exc.code
-    return pipe(sock)
+    return pipe(sock, os.environ, mode, cwd)

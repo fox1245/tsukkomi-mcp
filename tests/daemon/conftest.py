@@ -2,12 +2,25 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
 import daemon_support as support
 
 _RUNTIMES: list[support.Runtime] = []
+# The daemon is Linux only in this release (``SELF_DIRECT_DAEMON=on`` is ``off`` elsewhere); these modules exercise it.
+PORTABLE = {"test_daemon_protocol.py"}
+
+
+def pytest_collection_modifyitems(config, items):
+    if sys.platform.startswith("linux"):
+        return
+    skip = pytest.mark.skip(reason="the resident daemon is Linux only")
+    for item in items:
+        name = os.path.basename(str(item.fspath))
+        if "tests/daemon" in str(item.fspath).replace(os.sep, "/") and name not in PORTABLE:
+            item.add_marker(skip)
 
 
 @pytest.fixture(autouse=True)
