@@ -235,8 +235,10 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
         nonlocal findings
         findings = [audit_contract(r, session_id=session_id, store=store, provider=provider,
                                    proposed=proposed, chunks=chunks) for r in _checked(active)]
-        if provider == "agy":
-            agy_evidence_rules(active, findings, chunks, proposed=proposed, coverage=coverage)
+        # Provider-specific partial-observation passes post-process the findings; other providers have none.
+        evidence_rules = _EVIDENCE_RULES.get(provider)
+        if evidence_rules is not None:
+            evidence_rules(active, findings, chunks, proposed=proposed, coverage=coverage)
     def aggregate_findings():
         nonlocal overall
         if coverage and not coverage.get("complete"):
@@ -295,6 +297,11 @@ def _wants_attempts(rule) -> bool:
     return rule.scope in ("tool_call", "any")  # a must may be met, or only attempted, by a call
 
 
+def _reads_results(rule) -> bool:
+    """Whether the rule inspects tool-result text (a result in scope for a tool-role rule)."""
+    return rule.scope in ("tool_result", "any") and "tool" in set(rule.roles)
+
+
 def _dependencies(rule) -> set:
     """(step type, field) pairs this rule's verdict can depend on."""
     roles, scope = set(rule.roles), rule.scope
@@ -306,7 +313,7 @@ def _dependencies(rule) -> set:
             deps.add(("PLANNER_RESPONSE", "content"))
     if scope in ("tool_call", "any") and roles & {"assistant", "runtime"}:
         deps.add(("PLANNER_RESPONSE", "tool_calls"))
-    if scope in ("tool_result", "any") and "tool" in roles:
+    if _reads_results(rule):
         deps.add(("GENERIC", "content"))
     if rule.requires_success:
         deps.add(("GENERIC", "content"))
@@ -368,6 +375,26 @@ def _unknown(item, code, why) -> None:
     item.basis = (item.basis or "") + f"; {code}"
 
 
+def _absent(item) -> bool:
+    return item.verdict == "violation" and "evidence missing" in item.reason
+
+
+def _unresolved(item) -> bool:
+    return item.verdict == "unknown" and "completion status" in item.reason
+
+
+def _cut_unknown(rule, item, code, why, *, history=True) -> bool:
+    """Partial observation, shared by every provider whose evidence can be cut.
+
+    A cut dependency cannot show a missing match, so a prohibition that would turn clean for lack of a match, or an
+    obligation that would turn unmet for lack of evidence, is unknown instead. A visible match is never touched.
+    """
+    unmet = (history and item.verdict == "clean") if rule.type == "must_not" else (_absent(item) or _unresolved(item))
+    if unmet:
+        _unknown(item, code, why)
+    return unmet
+
+
 def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None) -> None:
     """Apply the partial-observation, pending and legacy rules above to ``findings`` (mutated in place)."""
     events = list(events)
@@ -390,9 +417,10 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
         if rule.type == "must_not":
             if history and item.verdict != "unknown" and _wants_attempts(rule) and rule.regex:
                 _attempt_hits(rule, item, events, range(start, end), blocked)
-            if history and item.verdict == "clean" and cut:
-                _unknown(item, _TRUNCATED_CODE.get(cut[0][1], "truncated_" + cut[0][1]),
-                         f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{cut[0][1]} may hide a match")
+            if cut:
+                _cut_unknown(rule, item, _TRUNCATED_CODE.get(cut[0][1], "truncated_" + cut[0][1]),
+                             f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{cut[0][1]} may hide a match",
+                             history=history)
             if item.verdict == "suspicious" and rule.exception_regex and rule.source_event_id in ids:
                 source = _meta(events[ids[rule.source_event_id]])
                 if source.get("event_type") == "USER_INPUT" and "content" in (source.get("truncated_fields") or ()):
@@ -414,14 +442,13 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
                     s.get("event_type") == "USER_INPUT" and "content" in (s.get("truncated_fields") or ()) for s in sources):
                 _unknown(item, "truncated_content", "the only satisfying evidence is a truncated user message")
             continue
-        absent = item.verdict == "violation" and "evidence missing" in item.reason
-        unresolved = item.verdict == "unknown" and "completion status" in item.reason
-        if not (absent or unresolved):
+        absent = _absent(item)
+        if not (absent or _unresolved(item)):
             continue
         if cut:
             field = cut[0][1]
-            _unknown(item, _TRUNCATED_CODE.get(field, "truncated_" + field),
-                     f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{field} may hold the missing evidence")
+            _cut_unknown(rule, item, _TRUNCATED_CODE.get(field, "truncated_" + field),
+                         f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{field} may hold the missing evidence")
         elif absent and _wants_attempts(rule) and _attempted(rule, events, range(start, end), blocked):
             # Call side: a matching call was proposed, so the obligation may have been met; whether it ran, and
             # how it ended, is what the result side cannot show. A call never proposed is a real absence.
@@ -435,6 +462,52 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
         unknown = [f for f in findings if f.verdict == "unknown"]
         legacy = sum(1 for f in unknown if f.reason.startswith("unsupported_legacy"))
         coverage["unknown_breakdown"] = {"current_session": len(unknown) - legacy, "unsupported_legacy": legacy}
+
+
+# --- Claude Code evidence classes -----------------------------------------------------------------------
+# A ``read_truncation_notice`` names (``truncated_result_for``) the tool result the host cut. Such a result is
+# partial evidence: a visible match still counts, it never establishes success, and for lack of a match it can
+# neither clear a prohibition nor prove an obligation unmet (``truncated_result``). The link is resolved here
+# because the notice is a separate record; a streaming parser cannot mark a result it has already emitted.
+
+def _cut_results(events) -> list:
+    """Positions of tool results some notice marks as truncated, whatever order notice and result arrive in."""
+    targets = {t for e in events if e.kind == "meta" and isinstance(t := _meta(e).get("truncated_result_for"), str) and t}
+    if not targets:
+        return []
+    return [i for i, e in enumerate(events)
+            if e.kind == "tool_result" and isinstance(_meta(e).get("call_id"), str) and _meta(e)["call_id"] in targets]
+
+
+def claude_evidence_rules(rules, findings, events, *, proposed=None, coverage=None) -> None:
+    """Apply the cut-result rules above to ``findings`` (mutated in place)."""
+    events = list(events)
+    check_request()
+    cut_at = _cut_results(events)
+    if not cut_at:
+        return
+    ids = {event.chunk_id: index for index, event in enumerate(events)}
+    history = proposed is None
+    for rule, item in zip(rules, findings):
+        check_request()
+        reads = _reads_results(rule)
+        if not (reads or rule.requires_success):
+            continue
+        start, end = _window(rule, events, ids, proposed)
+        cut = [events[i] for i in cut_at if start <= i < end]
+        if not cut:
+            continue
+        if rule.type == "must" and item.verdict == "clean" and rule.requires_success:
+            used = {e.chunk_id for e in item.evidence}
+            if any(e.chunk_id in used for e in cut):
+                _unknown(item, "truncated_result", "a cut tool result cannot establish success")
+        elif reads:
+            _cut_unknown(rule, item, "truncated_result",
+                         "a cut tool result may hide the match" if rule.type == "must_not"
+                         else "a cut tool result may hold the missing evidence", history=history)
+
+
+_EVIDENCE_RULES = {"agy": agy_evidence_rules, "claude": claude_evidence_rules}
 
 
 def _attempted(rule, events, positions, blocked) -> bool:

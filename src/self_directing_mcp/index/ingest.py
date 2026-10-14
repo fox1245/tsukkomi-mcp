@@ -47,6 +47,8 @@ _SCOPE_KINDS = {"tool_call": "tool_call", "tool_result": "tool_result", "message
 # Meta keys the audit helper for AGY evidence classes needs on every slim event.
 _AGY_AUDIT_META = ("event_type", "step_index", "status", "pending", "linkage", "evidence_origin",
                    "tool_name", "truncated_fields", "denied_action")
+# Claude Code: a truncation notice names the tool result (``call_id``) the host cut; see audit.runner.
+_AUDIT_META = {"agy": _AGY_AUDIT_META, "claude": ("truncated_result_for", "call_id")}
 
 
 @dataclass(frozen=True)
@@ -537,9 +539,11 @@ class SessionStore:
             wanted = " OR ".join(terms) if terms else "0"
             count = self.chunk_count(session_id, provider)
             check_request()
-            # AGY evidence classes (truncation, pending, legacy, denial) are read with one extra packed column.
-            extra = ("json_extract(data,'" + "','".join("$.meta." + key for key in _AGY_AUDIT_META) + "')"
-                     if provider == "agy" else "NULL")
+            # Provider evidence classes (AGY truncation, pending, legacy, denial; Claude cut results) are read
+            # with one extra packed column.
+            packed_keys = _AUDIT_META.get(provider)
+            extra = ("json_extract(data,'" + "','".join("$.meta." + key for key in packed_keys) + "')"
+                     if packed_keys else "NULL")
             cursor = self._conn.execute(
                 "SELECT chunk_id, json_extract(data,'$.kind'), json_extract(data,'$.meta.role'),"
                 " json_extract(data,'$.meta.call_id'), json_type(data,'$.meta.success'),"
@@ -561,7 +565,7 @@ class SessionStore:
                         success = None
                     meta = {"role": role, "call_id": call_id, "success": success}
                     if packed is not None:
-                        meta.update((key, value) for key, value in zip(_AGY_AUDIT_META, json.loads(packed))
+                        meta.update((key, value) for key, value in zip(packed_keys, json.loads(packed))
                                     if value is not None)
                     events.append(AuditEvent(cid, kind, text or "", meta))
             return AuditEventSnapshot(session_id, provider, tuple(events), count)

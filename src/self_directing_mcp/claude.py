@@ -599,6 +599,17 @@ def _remote_session_change(a):
                 "managed_pr": a["managedPr"]}
 
 
+def _plan_mode(a):
+    """Plan-mode reminder: the type and whether a plan exists are indexed; the plan file is never read."""
+    required = {"isSubAgent": bool, "planExists": bool, "planFilePath": str, "reminderType": str}
+    if not _shape(a, required):
+        return None
+    kind = _label(a["reminderType"])
+    return (f" reminder_type={kind or '-'} plan_exists={'true' if a['planExists'] else 'false'}",
+            {"reminder_type": kind, "plan_exists": a["planExists"], "is_sub_agent": a["isSubAgent"],
+             "plan_file_path": a["planFilePath"]})
+
+
 def _read_truncation_notice(a):
     """The Read result linked by ``toolUseID`` was cut. The link is kept for the audit layer; the banner is not."""
     if not (_shape(a, {"banner": str, "toolUseID": str}) and a["toolUseID"]):
@@ -649,6 +660,7 @@ _ATTACHMENTS = {
     "thinking_drop": _thinking_drop,
     "remote_session_change": _remote_session_change,
     "read_truncation_notice": _read_truncation_notice,
+    "plan_mode": _plan_mode,
     **{name: _plain() for name in ("prompt_snapshot", "deferred_tools_delta", "environment", "session_context",
                                     "instructions", "credential_org", "agent_listing_delta", "auto_mode",
                                     "skill_listing", "task_status")},
@@ -719,10 +731,12 @@ def _attachment(base, record, state):
 
 # ----------------------------------------------------------------------------- runtime and metadata records
 
-_SYSTEM_SUBTYPES = {"turn_duration", "stop_hook_summary", "away_summary", "compact_boundary", "local_command"}
+_SYSTEM_SUBTYPES = {"turn_duration", "stop_hook_summary", "away_summary", "compact_boundary", "local_command",
+                    "informational"}
 _QUEUE_OPERATIONS = {"enqueue", "dequeue", "remove"}
 _METADATA = {"mode", "permission-mode", "ai-title", "agent-name", "pr-link", "file-history-snapshot",
-             "file-history-delta", "cost-state", "atis-latch", "last-prompt"}
+             "file-history-delta", "cost-state", "atis-latch", "last-prompt", "continued-in"}
+_SESSION_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
 def _system(base, record, state):
@@ -759,6 +773,13 @@ def _metadata(base, record, state):
         extra["permission_mode"] = record["permissionMode"]
     if kind == "mode" and _label(record.get("mode")):
         extra["session_mode"] = record["mode"]
+    if kind == "continued-in":
+        # Links a session to the one that continues it; the id is an identifier, never text.
+        target = record.get("continuedInSessionId")
+        if not (isinstance(target, str) and _SESSION_REF.fullmatch(target)):
+            yield _unsupported(base, f"[unsupported_claude_event:continued-in] {_keys(record)}")
+            return
+        extra["continued_in_session_id"] = target
     yield _runtime(base, f"[claude_metadata:{kind}]", "session_metadata", **extra)
 
 
