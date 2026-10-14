@@ -77,6 +77,17 @@ class NativeVectorStore:
                 out.add(row[0])
         return out
 
+    @request_operation
+    def present(self, ids):
+        ids = list(ids)
+        out = set()
+        for start in range(0, len(ids), 500):
+            check_request()
+            batch = ids[start:start + 500]
+            out.update(row[0] for row in self._conn.execute(
+                f"SELECT {self.id_column} FROM {self.table} WHERE {self.id_column} IN ({','.join('?' * len(batch))})", batch))
+        return out
+
     def clear(self):
         check_request()
         with self._conn:

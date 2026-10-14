@@ -48,9 +48,9 @@ def _classify_line(obj):
     return parts or [("meta", f"[empty:{role}]", base)]
 
 
-def parse_session_chunks(path, *, session_id=None, start_byte=0, known_hashes=None):
+def parse_session_chunks(path, *, session_id=None, start_byte=0, known_hashes=None, sink=None):
     sid = str(session_id or peek_session_id(path) or "unknown")
-    chunks, offset = [], start_byte
+    chunks, offset = ([] if sink is None else sink), start_byte
     for line, start, end, raw in iter_raw_lines(path, start_byte=start_byte):
         offset = end
         if not raw.strip():

@@ -19,6 +19,9 @@ class VectorIndex(ABC):
     @abstractmethod
     def ids(self) -> set[str]: ...
 
+    def present(self, ids) -> set[str]:
+        return set(ids) & self.ids()
+
     def upsert_many(self, pairs) -> None:
         for chunk_id, vector in pairs:
             check_request()
@@ -53,6 +56,10 @@ class NumpyVectorIndex(VectorIndex):
     @request_operation
     def ids(self) -> set[str]:
         return set(self._ids)
+
+    @request_operation
+    def present(self, ids) -> set[str]:
+        return set(ids).intersection(self._ids)
 
     def upsert_many(self, pairs) -> None:
         check_request()

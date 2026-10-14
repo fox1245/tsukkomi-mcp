@@ -188,13 +188,16 @@ def test_service_tier_parser_upgrade_reindexes_unchanged_history(local_engine, m
     original_parser = omp.parse_session_chunks
 
     def legacy_parser(*args, **kwargs):
+        sink = kwargs.pop("sink", None)
         chunks, offset, sid = original_parser(*args, **kwargs)
         for index, chunk in enumerate(chunks):
             if chunk.meta.get("event_type") == "service_tier_change":
                 chunks[index] = make_chunk("omp", sid, "meta", chunk.text,
                                            {**chunk.meta, "unsupported_event": True},
                                            chunk.line_start, chunk.byte_start, chunk.byte_end)
-        return chunks, offset, sid
+        for chunk in chunks if sink is not None else ():
+            sink.append(chunk)
+        return (sink if sink is not None else chunks), offset, sid
 
     with monkeypatch.context() as legacy:
         legacy.setattr(omp, "PARSER_VERSION", 3)

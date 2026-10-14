@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 import sqlite3
 import threading
 import time
@@ -13,6 +13,7 @@ import pytest
 from self_directing_mcp.audit import runner as audit_runner
 from self_directing_mcp.codex import parse as codex_parser
 from self_directing_mcp.engine import SelfDirectEngine
+from self_directing_mcp.index import ingest
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.request_control import (
     IndexBusy, RequestControl, RequestStopped, request_scope,
@@ -23,6 +24,12 @@ from test_agy_transcript import (
     SID as AGY_SID, _append_result, _deploy_check, _receipt_payload,
     session as agy_session,
 )
+
+
+@pytest.fixture(autouse=True)
+def second_process(monkeypatch):
+    """Races here model another process; in-process same-session callers are single-flighted (test_singleflight)."""
+    monkeypatch.setattr(ingest, "session_flight", lambda key: nullcontext())
 
 
 @pytest.fixture

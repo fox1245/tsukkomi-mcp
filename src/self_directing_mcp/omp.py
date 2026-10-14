@@ -85,11 +85,11 @@ def resolve_session_path(root: Path, *, session_id: str | None = None, path: str
     return resolved
 
 
-def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, prior_call=None):
+def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, prior_call=None, sink=None):
     sid = peek_session_id(path)
     if sid is None or (session_id is not None and session_id != sid):
         raise ValueError("OMP session header missing or id does not match requested session")
-    chunks, offset, seen_header = [], start_byte, start_byte > 0
+    chunks, offset, seen_header = ([] if sink is None else sink), start_byte, start_byte > 0
     seen_calls: set[tuple[str, str]] = set()
     for line, start, end, raw in iter_raw_lines(path, start_byte=start_byte):
         offset = end
