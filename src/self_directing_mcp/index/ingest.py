@@ -5,6 +5,9 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import json
 import sqlite3
+import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -66,7 +69,7 @@ class AuditEvidenceSnapshot:
         return frames
 
 
-_BATCH = 2000
+_BATCH = 500
 
 
 def _batches(items, size=_BATCH):
@@ -103,6 +106,50 @@ def prefix_digest(path: Path, length: int) -> str:
             digest.update(block)
             remaining -= len(block)
     return digest.hexdigest()
+
+
+class RowSpool:
+    """Prepared event rows spooled to disk (memory below 8 MiB); parsers append, publication replays in batches."""
+
+    def __init__(self):
+        self._file = tempfile.SpooledTemporaryFile(max_size=1 << 20, mode="w+", encoding="utf-8", newline="\n")
+        self.count, self.ids, self.flags = 0, set(), {}
+
+    @classmethod
+    def from_chunks(cls, chunks):
+        spool = cls()
+        for chunk in chunks:
+            spool.append(chunk)
+        return spool
+
+    def append(self, chunk):
+        check_request()
+        row = [chunk.chunk_id, chunk.provider, chunk.session_id, chunk.byte_start or 0,
+               chunk.meta.get("sub_index", 0), chunk.model_dump_json()]
+        self._file.write(json.dumps(row) + "\n")
+        self.count += 1
+        self.ids.add(chunk.chunk_id)
+        if chunk.meta.get("parse_error") or chunk.meta.get("unsupported_event"):
+            self.flags[chunk.chunk_id] = (bool(chunk.meta.get("parse_error")), bool(chunk.meta.get("unsupported_event")))
+
+    def __len__(self):
+        return self.count
+
+    def batches(self, size=256):
+        self._file.flush()
+        self._file.seek(0)
+        batch = []
+        for line in self._file:
+            batch.append(tuple(json.loads(line)))
+            if len(batch) == size:
+                check_request()
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def close(self):
+        self._file.close()
 
 
 class SessionStore:
@@ -209,12 +256,17 @@ class SessionStore:
 
     def commit_events(self, chunks, *, session_id, provider, path, offset, digest, replace=False,
                       parser_version=None, expected_token=None, prepared_rows=None, receipt_digest=None):
-        chunks = list(chunks)
-        if any(chunk.provider != provider or chunk.session_id != session_id for chunk in chunks):
-            raise ValueError("event scope differs from session publication")
-        rows = prepared_rows if prepared_rows is not None else [
-            (c.chunk_id, c.provider, c.session_id, c.byte_start or 0,
-             c.meta.get("sub_index", 0), c.model_dump_json()) for c in chunks]
+        spool = prepared_rows if isinstance(prepared_rows, RowSpool) else RowSpool.from_chunks(chunks)
+        try:
+            self._commit_spool(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
+                               replace=replace, parser_version=parser_version, expected_token=expected_token,
+                               receipt_digest=receipt_digest)
+        finally:
+            if spool is not prepared_rows:
+                spool.close()
+
+    def _commit_spool(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
+                      expected_token, receipt_digest):
         check_request()
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -222,23 +274,28 @@ class SessionStore:
                 raise ValueError("stale session preparation")
             metrics = self.session_metrics(session_id, provider)
             known = self.chunk_ids(session_id, provider)
-            additions = chunks if replace else [c for c in chunks if c.chunk_id not in known]
-            base = (0, 0, 0) if replace else metrics
-            metrics = (base[0] + len(additions),
-                       base[1] + sum(bool(c.meta.get("parse_error")) for c in additions),
-                       base[2] + sum(bool(c.meta.get("unsupported_event")) for c in additions))
             with publication():
                 if replace:
-                    stale = known - {c.chunk_id for c in chunks}
-                    for cid in stale:
+                    for cid in known - spool.ids:
                         check_request()
                         self._conn.execute("INSERT OR IGNORE INTO pending_index_deletions VALUES (?,?,?)",
                                            (provider, session_id, cid))
                     self._conn.execute("DELETE FROM session_events WHERE provider=? AND session_id=?",
                                        (provider, session_id))
-                for start in range(0, len(rows), 256):
+                added = errors = unsupported = 0
+                for batch in spool.batches():
                     check_request()
-                    self._conn.executemany("INSERT OR REPLACE INTO session_events VALUES (?,?,?,?,?,?)", rows[start:start + 256])
+                    self._conn.executemany("INSERT OR REPLACE INTO session_events VALUES (?,?,?,?,?,?)", batch)
+                    for row in batch:
+                        if row[1] != provider or row[2] != session_id:
+                            raise ValueError("event scope differs from session publication")
+                        if replace or row[0] not in known:
+                            added += 1
+                            flag = spool.flags.get(row[0], (False, False))
+                            errors += flag[0]
+                            unsupported += flag[1]
+                base = (0, 0, 0) if replace else metrics
+                metrics = (base[0] + added, base[1] + errors, base[2] + unsupported)
                 synced_at = datetime.now(timezone.utc).isoformat()
                 self._conn.execute("INSERT OR REPLACE INTO session_cursors VALUES (?,?,?,?,?,?)",
                                    (provider, session_id, str(path.resolve()), offset, digest, synced_at))
@@ -491,6 +548,11 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
 @request_operation
 def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider="codex",
                    embed=True, derived=True, guard=nullcontext):
+    return _ingest_session(path=path, session_id=session_id, store=store, sparse=sparse, dense=dense,
+                           embedder=embedder, provider=provider, embed=embed, derived=derived, guard=guard)
+
+
+def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard):
     if embed and (dense is None or embedder is None):
         raise ValueError("embedding unavailable in local-only mode")
     if provider == "agy":
@@ -553,70 +615,78 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
             receipt_rows, receipts, receipt_digest, indexed_digest = receipt_store.prepare_bindings(receipt_capture, path)
             if cursor and (receipt_digest != indexed_digest or cursor.get("receipt_digest") != receipt_digest):
                 start, reindexed, reindex_reason = 0, True, "hook_receipts_changed"
-        if provider == "agy":
-            chunks, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, receipts=receipts)
-        elif provider == "omp" and start:
-            # This lookup is request-owned and bound to the captured cursor generation.
-            earliest = {}
-            for before, call_id, name in prior_calls:
-                key = (call_id, name)
-                earliest[key] = min(earliest.get(key, before), before)
-            chunks, offset, parsed_sid = parse_session_chunks(
-                path, session_id=sid, start_byte=start,
-                prior_call=lambda call_id, name, before_byte: earliest.get((call_id, name), float("inf")) < before_byte)
-        else:
-            chunks, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start)
-        if parsed_sid != sid:
-            raise ValueError("session id changed while parsing")
-        digest = observation.prefix_digest(offset)
-        # Large comparison stays outside the publication lock; the lock only re-checks the file stamp.
-        if not observation.validate_prefix():
-            raise ValueError("source changed during preparation")
-        prepared_rows = []
-        for chunk in chunks:
-            check_request()
-            prepared_rows.append((chunk.chunk_id, chunk.provider, chunk.session_id, chunk.byte_start or 0,
-                                  chunk.meta.get("sub_index", 0), chunk.model_dump_json()))
-    check_request()
-    with guard():
-        if not observation.validate_prefix():
-            raise ValueError("source changed during preparation")
-        current = store.cursor_record(sid, provider)
-        changed_token = store.state_token(sid, provider) != expected_token
-        equivalent = bool(changed_token and current and current["path"] == str(path)
-                          and current["byte_offset"] == offset and current["prefix_hash"] == digest
-                          and current["parser_version"] == parser_version)
-        if equivalent:
-            live_rows = dict(store.capture_evidence(sid, provider, history=False,
-                                                   anchors=(row[0] for row in prepared_rows)).rows)
-            equivalent = all(live_rows.get(row[0]) == row[-1] for row in prepared_rows)
-            if receipt_store is not None:
-                equivalent = (equivalent and current.get("receipt_digest") == receipt_digest
-                              and receipt_store.authority_token(sid)[1] == receipt_authority_before[1]
-                              and receipt_store.read_capture(sid)[0] == receipt_rows)
-        if changed_token and not equivalent:
-            raise ValueError("stale session preparation")
-        if not equivalent:
-            if receipt_store is not None:
-                if receipt_store.authority_token(sid) != receipt_authority_before:
-                    raise ValueError("receipt authority changed during preparation")
-                receipt_store.publish_bindings(sid, receipt_capture, receipt_rows)
-            if chunks or reindexed or cursor is None or offset != cursor["byte_offset"]:
-                store.commit_events(chunks, session_id=sid, provider=provider, path=path, offset=offset,
-                                    digest=digest, replace=reindexed, parser_version=parser_version,
-                                    expected_token=expected_token, prepared_rows=prepared_rows, receipt_digest=receipt_digest)
-            if receipt_store is not None:
-                receipt_store.mark_indexed(sid, receipt_digest)
-        else:
-            chunks = []
-        with store._read_boundary():
-            committed_token = store.state_token(sid, provider)
-            committed_cursor = store.cursor_record(sid, provider)
-            metrics = store.session_metrics(sid, provider)
-            receipt_authority = receipt_store.authority_token(sid) if receipt_store is not None else None
+        chunks = RowSpool()
+        try:
+            if provider == "agy":
+                _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, receipts=receipts,
+                                                             sink=chunks)
+            elif provider == "omp" and start:
+                # This lookup is request-owned and bound to the captured cursor generation.
+                earliest = {}
+                for before, call_id, name in prior_calls:
+                    key = (call_id, name)
+                    earliest[key] = min(earliest.get(key, before), before)
+                _, offset, parsed_sid = parse_session_chunks(
+                    path, session_id=sid, start_byte=start, sink=chunks,
+                    prior_call=lambda call_id, name, before_byte: earliest.get((call_id, name), float("inf")) < before_byte)
+            else:
+                _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, sink=chunks)
+            if parsed_sid != sid:
+                raise ValueError("session id changed while parsing")
+            digest = observation.prefix_digest(offset)
+            # Large comparison stays outside the publication lock; the lock only re-checks the file stamp.
+            if not observation.validate_prefix():
+                raise ValueError("source changed during preparation")
+        except BaseException:
+            chunks.close()
+            raise
+    try:
+        check_request()
+        with guard():
+            if not observation.validate_prefix():
+                raise ValueError("source changed during preparation")
+            current = store.cursor_record(sid, provider)
+            changed_token = store.state_token(sid, provider) != expected_token
+            equivalent = bool(changed_token and current and current["path"] == str(path)
+                              and current["byte_offset"] == offset and current["prefix_hash"] == digest
+                              and current["parser_version"] == parser_version)
+            if equivalent:
+                for batch in chunks.batches():
+                    live_rows = dict(store.capture_evidence(sid, provider, history=False,
+                                                           anchors=[row[0] for row in batch]).rows)
+                    if not all(live_rows.get(row[0]) == row[-1] for row in batch):
+                        equivalent = False
+                        break
+                if receipt_store is not None:
+                    equivalent = (equivalent and current.get("receipt_digest") == receipt_digest
+                                  and receipt_store.authority_token(sid)[1] == receipt_authority_before[1]
+                                  and receipt_store.read_capture(sid)[0] == receipt_rows)
+            if changed_token and not equivalent:
+                raise ValueError("stale session preparation")
+            if not equivalent:
+                if receipt_store is not None:
+                    if receipt_store.authority_token(sid) != receipt_authority_before:
+                        raise ValueError("receipt authority changed during preparation")
+                    receipt_store.publish_bindings(sid, receipt_capture, receipt_rows)
+                if chunks.count or reindexed or cursor is None or offset != cursor["byte_offset"]:
+                    store.commit_events((), session_id=sid, provider=provider, path=path, offset=offset,
+                                        digest=digest, replace=reindexed, parser_version=parser_version,
+                                        expected_token=expected_token, prepared_rows=chunks, receipt_digest=receipt_digest)
+                if receipt_store is not None:
+                    receipt_store.mark_indexed(sid, receipt_digest)
+            else:
+                chunks.count = 0
+            with store._read_boundary():
+                committed_token = store.state_token(sid, provider)
+                committed_cursor = store.cursor_record(sid, provider)
+                metrics = store.session_metrics(sid, provider)
+                receipt_authority = receipt_store.authority_token(sid) if receipt_store is not None else None
+    finally:
+        new_chunks = chunks.count
+        chunks.close()
     coverage = coverage_from_capture(sid, provider, committed_cursor, metrics, observation)
     info = {"session_id": sid, "provider": provider, "path": str(path), "byte_offset": offset,
-            "new_chunks": len(chunks), "embedded": 0, "total_chunks": coverage["chunk_count"],
+            "new_chunks": new_chunks, "embedded": 0, "total_chunks": coverage["chunk_count"],
             "reindexed": reindexed, "parser_version": parser_version, "reindex_reason": reindex_reason,
             "dense_restored": 0, "embedding_pending": 0, "embedding_error": None,
             "sparse_updated": 0, "coverage": coverage,

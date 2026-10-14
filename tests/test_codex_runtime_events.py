@@ -136,12 +136,15 @@ def seed_legacy_index(engine, path, monkeypatch):
     original_parser = parse.parse_session_chunks
 
     def legacy_parser(*args, **kwargs):
+        sink = kwargs.pop("sink", None)
         chunks, offset, sid = original_parser(*args, **kwargs)
         last = chunks[-1]
         chunks[-1] = make_chunk("codex", sid, "meta", last.text,
                                {"event_type": "world_state", "unsupported_event": True},
                                last.line_start, last.byte_start, last.byte_end, timestamp=last.timestamp)
-        return chunks, offset, sid
+        for chunk in chunks if sink is not None else ():
+            sink.append(chunk)
+        return (sink if sink is not None else chunks), offset, sid
 
     engine.ensure_ready()
     spy = RecordingEmbedder()

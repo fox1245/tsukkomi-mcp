@@ -101,12 +101,12 @@ def _classify_and_text(obj):
     return "meta", f"[{etype}] {as_text(payload or obj)}", meta
 
 
-def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None):
+def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, sink=None):
     """Retain every occurrence; known_hashes is accepted for legacy callers only."""
     from self_directing_mcp.codex.discover import session_id_from_filename
 
     sid = (session_id or peek_session_id(path) or session_id_from_filename(Path(path)) or "unknown").lower()
-    chunks, offset = [], start_byte
+    chunks, offset = ([] if sink is None else sink), start_byte
     for line, start, end, raw in iter_raw_lines(path, start_byte=start_byte):
         offset = end
         if not raw.strip():

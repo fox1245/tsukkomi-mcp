@@ -70,7 +70,7 @@ def resolve_session_path(roots: list[Path], *, session_id: str | None = None,
     return resolved
 
 
-def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, receipts=None):
+def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, receipts=None, sink=None):
     """Read the host's display JSONL, not lifecycle hook payloads.
 
     CLI 1.2.9 emits JSON-encoded values in tool_calls[].args and omits call IDs.
@@ -79,7 +79,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
     sid = peek_session_id(path)
     if sid is None or (session_id is not None and sid != session_id.lower()):
         raise ValueError("AGY transcript session identity mismatch")
-    chunks, offset = [], start_byte
+    chunks, offset = ([] if sink is None else sink), start_byte
     for line, start, end, raw in iter_raw_lines(path, start_byte=start_byte):
         offset = end
         if not raw.strip():
