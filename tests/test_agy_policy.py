@@ -365,6 +365,24 @@ def test_an_incomplete_workflow_continues_at_most_once(env, monkeypatch):
     assert stop(engine, path)["decision"] == "allow"
 
 
+
+def test_advisory_never_continues_or_denies_for_an_incomplete_workflow(env, monkeypatch):
+    engine, path = env
+    class Controller:
+        def status(self, session_id, provider):
+            return {"stage": "implementing", "requirements": [], "evidence": [], "problems": []}
+    monkeypatch.setattr("self_directing_mcp.workflow.configured_workflow", lambda: Controller())
+    monkeypatch.setattr("self_directing_mcp.workflow.guard_host_action",
+                        lambda sid, action, provider: {"decision": "deny", "reason": "managed completion"})
+    set_mode(engine, "advisory")
+    stopped = stop(engine, path)
+    assert stopped["decision"] == "allow" and stopped["reason"].startswith("ADVISORY")
+    pre = handle_pre_tool_use(engine, SID, call("ls"), str(path))
+    assert pre["decision"] == "allow" and pre["reason"].startswith("ADVISORY")
+    set_mode(engine, "confirmed_only")                      # advisory spent no budget
+    assert stop(engine, path)["decision"] == "continue"
+    assert handle_pre_tool_use(engine, SID, call("ls"), str(path))["decision"] == "deny"
+
 # --- errors: fail-open in every mode, per event -----------------------------------------------------------
 
 def _raising(*args, **kwargs):

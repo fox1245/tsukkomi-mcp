@@ -10,9 +10,12 @@ Default ``confirmed_only`` (``SELF_DIRECT_CLAUDE_ENFORCEMENT``):
   ``risk: high`` applies (then ask); clean and not-applicable pass through silently. "Pass through" means no
   permission decision at all: Claude Code's own permission flow still decides, because a clean verdict is not a
   permission grant. ``advisory`` never denies or asks; ``enforced`` also denies ``unknown``.
-* Stop / SubagentStop: block (continue the agent) only for a confirmed, fully observed miss of a contract marked
-  ``auto_continue``, at most once per session across the main agent and its subagents, never for the same reason
-  twice, never when the persisted counter is unreadable and never while ``stop_hook_active``.
+* Stop: block (continue the agent) only for a confirmed, fully observed miss of a contract marked
+  ``auto_continue``, at most once per session, never for the same reason twice, never when the persisted counter
+  is unreadable and never while ``stop_hook_active``. Claude Code runs Stop before the final assistant message is
+  written to the transcript, so message-scoped misses wait for the host's copy of that message to appear there.
+* SubagentStop: judges the subagent's own transcript and reports, but never blocks. A global obligation the user
+  set for their session is not a task the subagent was given, so it cannot justify restarting the subagent.
 * Internal errors fail open with a visible warning in every mode and are recorded in ``hook_health``; Stop always
   allows. Repeated failures show a banner at the next UserPromptSubmit or SessionStart.
 * UserPromptSubmit also fires for scheduled, loop, subagent-report and peer messages, so it is never authority:
@@ -44,7 +47,9 @@ BUDGET_NOTE = hook_policy.budget_note("session")
 SUBAGENT_UNKNOWN = ("The subagent's transcript is unavailable; its completion cannot be verified "
                     "(does not block stopping).")
 TRANSCRIPT_LAGS = ("Claude Code's transcript does not contain the final assistant message yet; "
-                   "completion cannot be verified (does not block stopping).")
+                   "message obligations cannot be verified (does not block stopping).")
+SUBAGENT_NEVER_BLOCKS = "A subagent's stop is reported, never blocked."
+_FINAL_MESSAGE_SCOPES = ("message", "any")     # what the unflushed final assistant text could still satisfy
 SUBAGENT_HISTORY = ("A subagent's own history is not consulted for this call; "
                     "history-dependent obligations stay unverified.")
 
@@ -183,7 +188,7 @@ def handle_pre_tool_use(engine: SelfDirectEngine, call: HookCall, path: str | No
 
 
 def _claim(engine: SelfDirectEngine, call: HookCall, key: str) -> bool:
-    # One budget for the whole Claude Code session: the main agent and every subagent draw on it.
+    # One budget for the whole Claude Code session (subagent stops never draw on it).
     return ClaudeHookState(engine.settings.index_dir).claim_continue(call.session_id, key)
 
 
@@ -212,13 +217,16 @@ def handle_stop(engine: SelfDirectEngine, call: HookCall, path: str, *, session_
     if not obligations["contracts"] and not obligations["has_checklist"]:
         return {"decision": "allow"}
     notes, misses = hook_policy.checkpoint(engine, "claude", sid, path, obligations, "Claude Code")
-    if misses and _transcript_lags(path, call.last_message):
-        misses = []
+    if any(rule.scope in _FINAL_MESSAGE_SCOPES for rule, _f in misses) and _transcript_lags(path, call.last_message):
+        # Earlier tool calls and results are on disk; only the final text can still satisfy these obligations.
+        misses = [(rule, f) for rule, f in misses if rule.scope not in _FINAL_MESSAGE_SCOPES]
         notes.append(TRANSCRIPT_LAGS)
     if mode == "advisory":
         return {"decision": "allow", "reason": "ADVISORY (not compliance): " + " ".join(notes)} if notes else {"decision": "allow"}
-    if misses:
-        key = hook_policy.miss_key(misses, prefix=f"{sid}:" if subagent else "")
+    if misses and subagent:
+        notes.append(SUBAGENT_NEVER_BLOCKS)
+    elif misses:
+        key = hook_policy.miss_key(misses)
         if _claim(engine, call, key):
             return {"decision": "continue", "reason":
                     "A user-specified completion obligation is confirmed unmet: " + hook_policy.miss_summary(misses)

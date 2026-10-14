@@ -56,6 +56,8 @@ def handle_pre_tool_use(engine: SelfDirectEngine, session_id: str, tool_call: di
     from self_directing_mcp.workflow import guard_host_action
     workflow = guard_host_action(session_id, {"tool_name": tool_call["name"], "arguments": tool_call["args"]}, "agy")
     if workflow is not None:
+        if _mode(engine) == "advisory":      # advisory never denies, whatever the source of the finding
+            return {"decision": "allow", "reason": "ADVISORY (not compliance): " + workflow["reason"]}
         return {"decision": workflow["decision"], "reason": workflow["reason"]}
     judged = hook_policy.judge_action(engine, "agy", session_id, path, tool_call["name"], tool_call["args"],
                                       _mode(engine))
@@ -92,6 +94,8 @@ def handle_stop(engine: SelfDirectEngine, session_id: str, payload: dict[str, An
                        "allowed_next_actions": ["revise_implementation", "workflow_run_checks", "workflow_classify"]}
             note = "Workflow completion is unverified: " + json.dumps(details)
             # An owner-approved workflow is a user-specified completion obligation, but the cap still applies.
+            if mode == "advisory":
+                return {"decision": "allow", "reason": "ADVISORY (not compliance): " + note}
             if _spend_continue(engine, session_id, _reason_key([f"workflow:{state['stage']}"])):
                 return {"decision": "continue", "reason": note}
             return {"decision": "allow", "reason": note + " " + BUDGET_NOTE}

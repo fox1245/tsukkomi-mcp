@@ -168,6 +168,18 @@ def test_default_mode_is_confirmed_only_and_enforced_remains_an_explicit_option(
     assert state.resolve_mode() == "confirmed_only"      # the fallback never trusts an invalid value
 
 
+def test_projects_dir_follows_claude_config_dir_unless_set_explicitly(monkeypatch, tmp_path):
+    from self_directing_mcp.config import _default_claude_projects_dir
+    monkeypatch.delenv("SELF_DIRECT_CLAUDE_PROJECTS_DIR", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    assert _default_claude_projects_dir() == tmp_path / "cfg" / "projects"
+    monkeypatch.setenv("SELF_DIRECT_CLAUDE_PROJECTS_DIR", str(tmp_path / "explicit"))
+    assert _default_claude_projects_dir() == tmp_path / "explicit"
+    monkeypatch.delenv("SELF_DIRECT_CLAUDE_PROJECTS_DIR")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert _default_claude_projects_dir() == Path.home() / ".claude" / "projects"
+
+
 def test_claude_and_agy_modes_are_independent(monkeypatch):
     monkeypatch.setenv("SELF_DIRECT_CLAUDE_ENFORCEMENT", "advisory")
     monkeypatch.setenv("SELF_DIRECT_AGY_ENFORCEMENT", "enforced")
@@ -571,6 +583,19 @@ def test_an_incomplete_workflow_blocks_at_most_once_and_never_in_advisory(env, m
 
 # --- Stop before the transcript is flushed ----------------------------------------------------------------
 
+WORKTREE = {"id": "worktree", "type": "must", "scope": "tool_call", "provider": "claude", "regex": "git worktree",
+            "auto_continue": True, "description": "use git worktree"}
+
+
+def test_a_lagging_final_message_only_defers_obligations_that_message_could_satisfy(env):
+    # Claude Code 2.1.x runs Stop before writing the final assistant message; tool calls are already on disk.
+    engine, path = env
+    engine.upsert_contracts([WORKTREE])
+    write(path, human("hi"), assistant(use("t1", "Bash", command="ls")), tool_result("t1", "ok"))
+    response = stop(engine, path, last_assistant_message="All finished.")
+    assert response["decision"] == "block" and "worktree" in response["reason"]
+
+
 def test_a_block_needs_the_hosts_final_message_to_be_in_the_transcript(env):
     engine, path = env
     engine.upsert_contracts([ACK])
@@ -611,27 +636,28 @@ def make_subagent(engine, *records):
     return write(sub_file(root), prompt_of_parent("do the sub task"), *records)
 
 
-def test_subagent_stop_judges_the_subagents_own_transcript_not_the_parents(env):
+def test_subagent_stop_judges_the_subagents_own_transcript_and_reports_without_blocking(env):
     engine, path = env
     engine.upsert_contracts([dict(ACK, session_id=None)])
     write(path, human("hi"), assistant(text("VERIFIED")))              # the parent satisfied it
     make_subagent(engine, assistant(text("done"), sub=True))
     response = subagent_stop(engine, agent_id=AGENT_ID)
-    assert response["decision"] == "block" and "ack" in response["reason"]
+    assert "decision" not in response
+    assert "ack" in response["systemMessage"] and "never blocked" in response["systemMessage"]
+    assert health(engine).continue_claims(SID) in (0, None)
 
 
-def test_subagent_stop_uses_the_payload_path_and_the_budget_is_shared_with_the_main_agent(env):
+def test_subagent_stop_uses_the_payload_path_and_never_spends_the_main_agents_budget(env):
     engine, path = env
     engine.upsert_contracts([ACK])
     child = make_subagent(engine, assistant(text("done"), sub=True))
     first = subagent_stop(engine, agent_transcript_path=str(child), agent_id="ignored-when-a-path-is-given")
-    assert first["decision"] == "block"
-    assert "decision" not in stop(engine, path)                           # one automatic block per session, total
-    assert "decision" not in subagent_stop(engine, agent_id=AGENT_ID)
+    assert "decision" not in first and "ack" in first["systemMessage"]
+    assert stop(engine, path)["decision"] == "block"
     assert health(engine).continue_claims(SID) == 1
 
 
-def test_main_stop_then_subagent_stop_also_share_the_single_budget(env):
+def test_main_stop_then_subagent_stop_never_blocks_twice(env):
     engine, path = env
     engine.upsert_contracts([ACK])
     make_subagent(engine, assistant(text("done"), sub=True))
