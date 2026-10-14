@@ -142,7 +142,7 @@ def _command(i: int) -> str:
     return ("echo step-%d" % i, "git status --short", "ls -la src", "python -m compileall -q src")[i % 4]
 
 
-def claude_pair(sid: str, n: int, i: int) -> str:
+def claude_pair(sid: str, n: int, i: int, scale: int = 1) -> str:
     """Two JSONL lines: an assistant tool_use and its successful tool_result (one 'step')."""
     def env(kind, k, **extra):
         record = {"type": kind, "uuid": f"00000000-0000-4000-8000-{k:012d}", "parentUuid": None, "sessionId": sid,
@@ -154,11 +154,11 @@ def claude_pair(sid: str, n: int, i: int) -> str:
     use = env("assistant", 2 * n, requestId="req_synthetic", message={
         "id": f"msg_{i}", "role": "assistant", "model": "claude-synthetic", "stop_reason": "tool_use",
         "stop_sequence": None, "content": [
-            {"type": "text", "text": f"Step {i}. " + FILLER * 2},
+            {"type": "text", "text": f"Step {i}. " + FILLER * (2 * scale)},
             {"type": "tool_use", "id": cid, "name": "Bash", "input": {"command": _command(i)}}]})
     result = env("user", 2 * n + 1, sourceToolAssistantUUID="00000000-0000-4000-8000-0000000000aa", message={
         "role": "user", "content": [{"type": "tool_result", "tool_use_id": cid, "is_error": False,
-                                     "content": f"ok {i}. " + FILLER * 3}]})
+                                     "content": f"ok {i}. " + FILLER * (3 * scale)}]})
     return use + "\n" + result + "\n"
 
 
@@ -170,14 +170,14 @@ def claude_head(sid: str) -> str:
                        "origin": {"kind": "human"}, "promptId": "prompt-1"}) + "\n"
 
 
-def agy_pair(step: int) -> str:
+def agy_pair(step: int, scale: int = 1) -> str:
     """AGY display transcript: a planner step with one proposed call and its RUN_COMMAND result."""
     call = {"step_index": step, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
-            "created_at": "2026-10-01T00:00:01Z", "content": f"Step {step}. " + FILLER,
+            "created_at": "2026-10-01T00:00:01Z", "content": f"Step {step}. " + FILLER * scale,
             "tool_calls": [{"name": "run_command", "args": {"CommandLine": json.dumps(_command(step)),
                                                             "Cwd": json.dumps("/synthetic/project")}}]}
     result = {"step_index": step + 1, "source": "MODEL", "type": "RUN_COMMAND", "status": "DONE",
-              "created_at": "2026-10-01T00:00:02Z", "exit_code": 0, "content": f"ok {step}. " + FILLER * 2}
+              "created_at": "2026-10-01T00:00:02Z", "exit_code": 0, "content": f"ok {step}. " + FILLER * (2 * scale)}
     return json.dumps(call) + "\n" + json.dumps(result) + "\n"
 
 
@@ -187,30 +187,31 @@ def agy_head() -> str:
                        "content": "<USER_REQUEST>run the unit tests, then deploy</USER_REQUEST>"}) + "\n"
 
 
-def codex_pair(i: int) -> str:
+def codex_pair(i: int, scale: int = 1) -> str:
     cid = f"call-{i}"
     call = {"type": "response_item", "payload": {"type": "function_call", "name": "shell", "call_id": cid,
                                                  "arguments": {"command": _command(i)}}}
     out = {"type": "response_item", "payload": {"type": "function_call_output", "call_id": cid,
-                                                "output": json.dumps({"exit_code": 0, "output": "ok " + FILLER * 3})}}
+                                                "output": json.dumps({"exit_code": 0, "output": "ok " + FILLER * (3 * scale)})}}
     msg = {"type": "response_item", "payload": {"type": "message", "role": "assistant",
-                                                "content": f"Step {i}. " + FILLER * 2}}
+                                                "content": f"Step {i}. " + FILLER * (2 * scale)}}
     return json.dumps(msg) + "\n" + json.dumps(call) + "\n" + json.dumps(out) + "\n"
 
 
 class Transcript:
-    """One synthetic session file that can grow by whole records."""
+    """One synthetic session file that can grow by whole records. ``scale`` multiplies the filler text per event
+    (the large session uses bigger events, about 1.4 KB each, like the roundtable's 314 MB / 225k-event session)."""
 
-    def __init__(self, kind: str, path: Path, sid: str) -> None:
-        self.kind, self.path, self.sid, self.i = kind, path, sid, 0
+    def __init__(self, kind: str, path: Path, sid: str, scale: int = 1) -> None:
+        self.kind, self.path, self.sid, self.i, self.scale = kind, path, sid, 0, scale
 
     def _record(self) -> str:
         self.i += 1
         if self.kind == "claude":
-            return claude_pair(self.sid, self.i, self.i)
+            return claude_pair(self.sid, self.i, self.i, self.scale)
         if self.kind == "agy":
-            return agy_pair(2 * self.i - 1)
-        return codex_pair(self.i)
+            return agy_pair(2 * self.i - 1, self.scale)
+        return codex_pair(self.i, self.scale)
 
     def create(self, target_bytes: int) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -572,7 +573,7 @@ def cold_cell(sandbox: Sandbox, host: str, contracts: int, size_label: str, size
     """
     sid = CLAUDE_SID.format(sid_index) if host == "claude" else AGY_SID.format(sid_index)
     path = claude_path(sandbox.projects, sid) if host == "claude" else agy_path(sandbox.agy_app, sid)
-    transcript = Transcript(host, path, sid)
+    transcript = Transcript(host, path, sid, 1 if size_label == "small" else args.large_scale)
     started = time.perf_counter()
     transcript.create(size_bytes)
     initial_bytes = path.stat().st_size
@@ -717,7 +718,7 @@ def warm_worker(spec_path: str) -> None:
     from self_directing_mcp import server          # noqa: E402  (after the environment is set)
     imported = {"wall_ms": round((time.perf_counter() - t_wall) * 1000, 1),
                 "cpu_ms": round((self_cpu() - t_cpu) * 1000, 1)}
-    transcript = Transcript("codex", Path(spec["path"]), spec["sid"])
+    transcript = Transcript("codex", Path(spec["path"]), spec["sid"], spec.get("scale", 1))
     transcript.i = spec["records"]
     session, path = spec["sid"], spec["path"]
     action = {"tool_name": "shell", "arguments": {"command": ACTION_COMMAND}}
@@ -776,12 +777,13 @@ def warm_cell(sandbox: Sandbox, contracts: int, size_label: str, size_bytes: int
     config = sandbox.write_config(index, contracts_file)
     sid = CODEX_SID.format(contracts % 100 if size_label == "small" else 99)
     path = codex_path(sandbox.sessions, sid)
-    transcript = Transcript("codex", path, sid)
+    scale = 1 if size_label == "small" else args.large_scale
+    transcript = Transcript("codex", path, sid, scale)
     began = time.perf_counter()
     transcript.create(size_bytes)
     log(f"  codex {size_label}: generated {path.stat().st_size / 1e6:.1f} MB in {time.perf_counter() - began:.1f}s")
     spec = {"path": str(path), "sid": sid, "records": transcript.i, "append_bytes": args.append_bytes,
-            "initial_bytes": path.stat().st_size,
+            "initial_bytes": path.stat().st_size, "scale": scale,
             "repeat": args.warm_repeat if size_label == "small" else args.large_repeat,
             "first_timeout_ms": 1_800_000}
     spec_path = sandbox.root / f"warm-{contracts}-{size_label}.json"
@@ -1131,8 +1133,12 @@ def parse_args(argv=None):
     p.add_argument("--session-mb", type=int, default=1, help="small synthetic session size in MB (default 1)")
     p.add_argument("--large", action="store_true", help="also run the large session (opt-in; never in CI)")
     p.add_argument("--large-mb", type=int, default=300, help="large session size in MB (default 300)")
-    p.add_argument("--large-hosts", default="codex,claude", help="hosts for the large session: codex (warm), claude, agy (cold)")
+    p.add_argument("--large-hosts", default="codex", help="hosts for the large session: codex (warm calls), claude and "
+                   "agy (cold hooks; each first run indexes the whole session and takes minutes)")
+    p.add_argument("--large-scale", type=int, default=5,
+                   help="filler multiplier per event in the large session (5 gives events of about 1.4 KB)")
     p.add_argument("--large-contracts", type=int, default=10)
+    p.add_argument("--skip-small", action="store_true", help="with --large: measure only the large session")
     p.add_argument("--append-bytes", type=int, default=4096, help="bytes appended to the transcript before each cold run/warm step")
     p.add_argument("--runs", type=int, default=20, help="cold repetitions per event (after one discarded warm-up)")
     p.add_argument("--warm-repeat", type=int, default=15)
@@ -1186,7 +1192,7 @@ def main(argv=None) -> int:
         small = args.session_mb * 1_000_000
         if "cold" in only:
             log("cold hooks (fresh process per event)")
-            for n in counts:
+            for n in ([] if args.skip_small else counts):
                 for host in ("claude", "agy"):
                     report["cold"].append(cold_cell(sandbox, host, n, "small", small, args, versus=versus, log=log))
             if args.large:
@@ -1198,11 +1204,11 @@ def main(argv=None) -> int:
                                                         log=log))
         if "burst" in only:
             log("concurrent sessions")
-            for n in counts[-1:]:
+            for n in ([] if args.skip_small else counts[-1:]):
                 report["burst"].append(burst_cell(sandbox, n, args, log=log))
         if "warm" in only:
             log("warm resident-server calls")
-            for n in counts:
+            for n in ([] if args.skip_small else counts):
                 report["warm"].append(warm_cell(sandbox, n, "small", small, args, log=log))
             if args.large and "codex" in args.large_hosts.split(","):
                 report["warm"].append(warm_cell(sandbox, args.large_contracts, "large", args.large_mb * 1_000_000,
