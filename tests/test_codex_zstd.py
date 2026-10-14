@@ -232,6 +232,44 @@ def test_plain_replaced_by_compressed_keeps_ids_anchors_and_vectors(world, monke
     assert world.engine.store.chunk_count(SID, "codex") == len(before)
 
 
+def test_a_compressed_source_keeps_full_verification_and_a_plain_cursor(world):
+    """A ``.zst`` snapshot is validated by the digest of its compressed bytes; it never gets a block table."""
+    from self_directing_mcp.source_blocks import is_block_hash
+    packed = world.packed(jsonl(40, pad=25))
+    info = world.sync(packed)
+    assert info["ok"] and info["integrity"]["mode"] == "full" and info["integrity"]["full_reason"] == "legacy_source"
+    assert not is_block_hash(world.cursor()["prefix_hash"])  # plain SHA-256: portable between .jsonl and .jsonl.zst
+    assert world.engine.store.source_block_record(SID, "codex") is None
+    asked_fast = world.engine.sync_session(session_id=SID, embed=False, verify="fast")
+    assert asked_fast["integrity"]["mode"] == "full" and asked_fast["integrity"]["full_reason"] == "legacy_source"
+    audit = world.engine.audit_session(SID)
+    assert audit["integrity"]["mode"] == "full" and audit["integrity"]["full_verified_through_byte"] == len(jsonl(40, pad=25))
+
+
+def test_a_block_cursor_follows_the_session_into_its_compressed_twin_and_back(world):
+    """Plain (block table) -> compressed (plain digest) -> plain again: no reparse of what was indexed, and the
+    cursor's hash form follows the source form, never a mismatch that would reindex."""
+    from self_directing_mcp.source_blocks import is_block_hash
+    data = jsonl(30)
+    plain = world.plain(data)
+    world.sync(plain)
+    assert is_block_hash(world.cursor()["prefix_hash"]) and world.engine.store.source_block_record(SID, "codex")
+    packed = world.packed(data)
+    plain.unlink()
+    info = world.sync()
+    assert info["ok"] and not info["reindexed"] and world.parses == [0]
+    assert world.cursor()["path"] == str(packed) and not is_block_hash(world.cursor()["prefix_hash"])
+    assert world.engine.store.source_block_record(SID, "codex") is None
+    grown = data + jsonl(40, start=30, header=False)
+    packed.unlink()
+    plain = world.plain(grown)
+    info = world.sync(verify="fast")  # asked cheap: another path and a plain digest are settled by a full pass
+    assert info["ok"] and not info["reindexed"] and world.parses == [0, len(data)] and info["new_chunks"] > 0
+    assert is_block_hash(world.cursor()["prefix_hash"]) and world.engine.store.source_block_record(SID, "codex")
+    assert info["integrity"]["mode"] == "full" and info["integrity"]["full_reason"] == "path_changed"
+    assert world.sync(verify="fast")["integrity"]["mode"] == "fast"
+
+
 def test_plain_that_grew_before_it_was_compressed_continues_from_the_cursor(world):
     plain = world.plain(jsonl(20))
     world.sync(plain)

@@ -154,7 +154,7 @@ def codex_action(host, command):
 def omp_action(host, command):
     """What extensions/tsukkomi-omp.ts does on a tool_call: ask check_action, block only if actionable."""
     result = host.engine.check_action(host.session_id, {"tool_name": "shell", "arguments": {"command": command}},
-                                      provider="omp", path=str(host.path))
+                                      provider="omp", path=str(host.path), verify="fast")
     blocked = result["verdict"] in OMP_ACTIONABLE
     return {"block": True} if blocked else {}
 

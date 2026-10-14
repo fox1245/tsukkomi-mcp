@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 import argparse
 import asyncio
 import ctypes
@@ -18,6 +18,7 @@ from self_directing_mcp.config import get_settings
 from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.schemas import ContractRule, ProposedAction
 from self_directing_mcp.codex_hooks import handle_hook
+from self_directing_mcp.integrity_worker import start_integrity_worker
 from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.request_control import (
     IndexBusy, RequestControl, RequestStopped, check_request, request_scope,
@@ -298,6 +299,7 @@ async def sync_session(
     provider: str | None = None,
     embed: bool = True,
     timeout_ms: int | None = None,
+    verify: Literal["full", "fast"] = "full",
 ) -> dict[str, Any]:
     """Index/update local session history when retrieval needs fresh evidence.
 
@@ -311,9 +313,12 @@ async def sync_session(
     check_action/audit_session always refresh without embedding. Example contracts are disabled by default.
     timeout_ms: optional per-call budget in milliseconds for large sessions
     (overrides the default request timeout, capped by max_tool_timeout_sec).
+    verify: "full" (default) verifies every block of the source; "fast" compares only its tail, latest and sampled
+    blocks. The result's integrity object says which happened and when the source was last verified in full.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
-    return await _dispatch(_engine.sync_session, session_id=session_id, path=path, provider=provider, embed=embed, budget_override=budget)
+    return await _dispatch(_engine.sync_session, session_id=session_id, path=path, provider=provider, embed=embed,
+                           verify=verify, budget_override=budget)
 
 
 @mcp.tool()
@@ -359,16 +364,21 @@ async def audit_session(session_id: str, provider: str | None = None, path: str 
 
 @mcp.tool()
 async def check_action(session_id: str, action: ProposedAction, provider: str | None = None, path: str | None = None,
-                       timeout_ms: int | None = None) -> dict[str, Any]:
+                       timeout_ms: int | None = None, verify: Literal["full", "fast"] = "full") -> dict[str, Any]:
     """Check a proposed tool call against current contracts and refreshed local history.
 
     action contains tool_name and arguments (object or string). Supports must_not
     rules and must prerequisites such as successful tests before deploy.
     Never executes the action or persists it as an executed event. A clean result
     is limited to the returned coverage and contracts snapshot; it is not permission.
+    verify: "full" (default) verifies every block of the source. "fast" is for hook-time callers: it compares the
+    tail, the latest blocks and a random sample with their stored digests (and settles anything it cannot vouch
+    for in full). Read the result's integrity object: it says which was done and when the source was last
+    verified in full; that is a past fact, never a guarantee about the source now.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=True)
-    return await _dispatch(_engine.check_action, session_id, action.model_dump(), provider=provider, path=path, audit=True, budget_override=budget)
+    return await _dispatch(_engine.check_action, session_id, action.model_dump(), provider=provider, path=path,
+                           verify=verify, audit=True, budget_override=budget)
 
 
 @mcp.tool()
@@ -660,6 +670,9 @@ def main(argv: list[str] | None = None) -> None:
         # Indexes, native loading, and remote clients remain lazy.
         _engine.settings = settings
     _mask_logging()
+    # A resident server closes the gap that fast hook-time checks leave: it verifies watched sources in full while
+    # idle. Hook processes (one event each) never do this.
+    start_integrity_worker(_engine)
     try:
         mcp.run(transport="stdio")
     except Exception:

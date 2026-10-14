@@ -114,8 +114,10 @@ def judge_action(engine: SelfDirectEngine, provider: str, session_id: str, path:
     obligations = read_obligations(engine, provider, session_id, path)
     if not obligations["contracts"]:
         return None
+    # Hook time: verify the source cheaply (see ``integrity`` in the result); the engine settles it in full when
+    # the verdict would rest on anything the cheap check cannot vouch for.
     audit = engine.check_action(session_id=session_id, provider=provider, path=path,
-                                action={"tool_name": tool_name, "arguments": arguments})
+                                action={"tool_name": tool_name, "arguments": arguments}, verify="fast")
     if adjust is not None:
         audit = adjust(audit, obligations)
     high_risk = frozenset(rule.id for rule in obligations["contracts"] if rule.risk == "high")
@@ -128,9 +130,14 @@ def reason_key(items: list[str]) -> str:
 
 
 def confirmed_misses(obligations: dict, audit: dict) -> list:
-    """Auto-continue obligations that are confirmed unmet on complete, current evidence; otherwise none."""
+    """Auto-continue obligations that are confirmed unmet on complete, current evidence; otherwise none.
+
+    Restarting an agent rests on the strongest evidence only: the audit must have verified the source in FULL
+    (``integrity.mode == "full"``); a fast or missing integrity report confirms nothing."""
     coverage = audit.get("coverage", {})
     if audit.get("ok") is not True or coverage.get("complete") is not True or coverage.get("issues"):
+        return []
+    if (audit.get("integrity") or {}).get("mode") != "full":
         return []
     rules = {rule.id: rule for rule in obligations["contracts"]
              if rule.auto_continue and rule.type == "must" and rule.enabled}

@@ -19,7 +19,10 @@ from self_directing_mcp.compressed_source import CompressedSourceError
 from self_directing_mcp.schemas import AuditEvent, Chunk
 from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request, publication, request_operation
-from self_directing_mcp.session_events import SourceChanged, capture_source, observed_source, source_scope
+from self_directing_mcp.session_events import (
+    SourceChanged, capture_source, capture_source_fast, observed_source, source_scope,
+)
+from self_directing_mcp.source_blocks import BlockDraft, BlockRecord, BlockTable, FastFallback, is_block_hash
 
 
 @dataclass(frozen=True)
@@ -312,6 +315,16 @@ class SessionStore:
                 provider TEXT NOT NULL, session_id TEXT NOT NULL, chunk_id TEXT NOT NULL,
                 PRIMARY KEY(provider,session_id,chunk_id)
             );
+            -- Block digests of the indexed prefix (see source_blocks). Bound to a cursor by synced_at; a cursor
+            -- written by an older process leaves it stale, which is detected, never trusted.
+            CREATE TABLE IF NOT EXISTS source_blocks (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, path TEXT NOT NULL,
+                dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+                block_size INTEGER NOT NULL, covered INTEGER NOT NULL, lines INTEGER NOT NULL,
+                digests BLOB NOT NULL, tail BLOB, root TEXT NOT NULL, synced_at TEXT NOT NULL,
+                full_verified_at TEXT, full_verified_through INTEGER,
+                PRIMARY KEY(provider, session_id)
+            );
         """)
         check_request()
         self._conn.commit()
@@ -360,19 +373,51 @@ class SessionStore:
         record = self.cursor_record(session_id, provider)
         return (record["byte_offset"], record["path"]) if record else (0, None)
 
+    def source_block_record(self, session_id, provider="codex"):
+        """The stored block table of a session, or None. The caller must check ``bound_to(cursor)``."""
+        with self._read_boundary():
+            return self._source_block_record(session_id, provider)
+
+    def _source_block_record(self, session_id, provider):
+        row = self._conn.execute("SELECT * FROM source_blocks WHERE provider=? AND session_id=?",
+                                 (provider, session_id)).fetchone()
+        if row is None:
+            return None
+        table = BlockTable(covered=row["covered"], lines=row["lines"], digests=bytes(row["digests"]),
+                           tail=None if row["tail"] is None else bytes(row["tail"]), root=row["root"],
+                           block_size=row["block_size"])
+        return BlockRecord(provider=provider, session_id=session_id, path=row["path"], dev=_unsigned64(row["dev"]),
+                           ino=_unsigned64(row["ino"]),
+                           size=row["size"], mtime_ns=row["mtime_ns"], table=table, synced_at=row["synced_at"],
+                           full_verified_at=row["full_verified_at"], full_verified_through=row["full_verified_through"])
+
+    def mark_full_verified(self, session_id, provider, record, *, at, through, dev, ino, size, mtime_ns):
+        """Record that EVERY block of ``record``'s table matched the source at ``at``. Compare-and-set on the table's
+        publication and root: a table replaced meanwhile is never stamped."""
+        with self._conn, publication():
+            changed = self._conn.execute(
+                "UPDATE source_blocks SET full_verified_at=?, full_verified_through=?, dev=?, ino=?, size=?, mtime_ns=?"
+                " WHERE provider=? AND session_id=? AND synced_at=? AND root=?",
+                (at, through, _signed64(dev), _signed64(ino), size, mtime_ns, provider, session_id, record.synced_at,
+                 record.table.root)).rowcount
+            check_request()
+        return changed == 1
+
     def commit_events(self, chunks, *, session_id, provider, path, offset, digest, replace=False,
-                      parser_version=None, expected_token=None, prepared_rows=None, receipt_digest=None):
+                      parser_version=None, expected_token=None, prepared_rows=None, receipt_digest=None, blocks=None):
+        """``blocks``: the ``BlockDraft`` published with the cursor in the same transaction. A publication without
+        one (a source whose cursor is a plain digest) removes the session's block row."""
         spool = prepared_rows if isinstance(prepared_rows, RowSpool) else RowSpool.from_chunks(chunks)
         try:
             self._commit_spool(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
                                replace=replace, parser_version=parser_version, expected_token=expected_token,
-                               receipt_digest=receipt_digest)
+                               receipt_digest=receipt_digest, blocks=blocks)
         finally:
             if spool is not prepared_rows:
                 spool.close()
 
     def _commit_spool(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
-                      expected_token, receipt_digest):
+                      expected_token, receipt_digest, blocks=None):
         check_request()
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -411,6 +456,16 @@ class SessionStore:
                                    (provider, session_id, str(path.resolve()), offset, digest, synced_at))
                 self._conn.execute("INSERT OR REPLACE INTO session_parser_versions VALUES (?,?,?,?)",
                                    (provider, session_id, current_parser_version(provider) if parser_version is None else parser_version, synced_at))
+                if blocks is None:
+                    self._conn.execute("DELETE FROM source_blocks WHERE provider=? AND session_id=?",
+                                       (provider, session_id))
+                else:
+                    table = blocks.table
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO source_blocks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (provider, session_id, str(path.resolve()), _signed64(blocks.dev), _signed64(blocks.ino), blocks.size,
+                         blocks.mtime_ns, table.block_size, table.covered, table.lines, table.digests, table.tail,
+                         table.root, synced_at, blocks.full_verified_at, blocks.full_verified_through))
                 if provider == "agy":
                     self._conn.execute("INSERT OR REPLACE INTO session_receipt_versions VALUES (?,?,?,?)",
                                        (provider, session_id, receipt_digest, synced_at))
@@ -721,6 +776,127 @@ class SessionStore:
         return coverage
 
 
+@dataclass(frozen=True)
+class IntegrityPolicy:
+    """How source integrity is verified (see ``source_blocks`` and the README, "Source integrity")."""
+
+    recent_blocks: int = 4  # fast path: the latest complete blocks that are always compared
+    sample_blocks: int = 8  # fast path: random other blocks compared (drawn fresh for every call)
+    full_verify_interval_sec: float = 300.0  # a fast check is only allowed this long after the last full one
+    clock: Any = lambda: datetime.now(timezone.utc)
+    rng: Any = None  # None: fresh system randomness per call
+
+    @classmethod
+    def from_settings(cls, settings):
+        return cls(recent_blocks=settings.integrity_fast_recent_blocks,
+                   sample_blocks=settings.integrity_fast_sample_blocks,
+                   full_verify_interval_sec=settings.integrity_full_verify_interval_sec)
+
+    def new_rng(self):
+        return self.rng() if self.rng is not None else None
+
+
+def _signed64(value: int) -> int:
+    """SQLite integers are signed 64-bit; device and file ids may use the whole unsigned range (stored bit for bit)."""
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def _unsigned64(value: int) -> int:
+    return value + (1 << 64) if value < 0 else value
+
+
+def _blockable(provider, path) -> bool:
+    """Plain files of every provider but AGY keep a block table. AGY receipts bind to plain prefix digests, and a
+    ``.zst`` snapshot is validated by the digest of its (compressed) bytes; both keep full verification."""
+    from self_directing_mcp.compressed_source import is_compressed
+    return provider != "agy" and not is_compressed(path)
+
+
+def _cursor_kind(cursor):
+    """``"blocks"`` / ``"sha"`` by the cursor's stored hash; None without a cursor."""
+    if cursor is None:
+        return None
+    return "blocks" if is_block_hash(cursor["prefix_hash"]) else "sha"
+
+
+def capture_for_cursor(provider, path, cursor, checkpoints, max_bytes, *, publish=False):
+    """One full capture collecting what is needed to compare with ``cursor`` (and to publish, with ``publish``)."""
+    kind, blockable = _cursor_kind(cursor), _blockable(provider, path)
+    blocks = kind == "blocks" or (publish and blockable)
+    sha = kind == "sha" or (publish and not blockable) or not blocks
+    return capture_source(path, checkpoints=checkpoints, max_bytes=max_bytes, sha=sha, blocks=blocks)
+
+
+def _hash_matches(observation, offset, stored) -> bool:
+    return observation.cursor_hash(offset, "blocks" if is_block_hash(stored) else "sha") == stored
+
+
+def _parse_time(value):
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def _plan(provider, path, cursor, record, verify, policy):
+    """``(mode, reason)``: whether this request may verify in the cheap way. ``reason`` explains a full scan that a
+    fast one could have replaced; None when full was asked for."""
+    if not _blockable(provider, path):
+        return "full", "legacy_source"
+    if cursor is None:
+        return "full", "first_sync"
+    if verify != "fast":
+        return "full", None
+    if cursor["path"] != str(path):
+        return "full", "path_changed"
+    if cursor["parser_version"] != current_parser_version(provider):
+        return "full", "parser_updated"
+    if not is_block_hash(cursor["prefix_hash"]):
+        return "full", "migration"
+    if record is None or not record.bound_to(cursor):
+        return "full", "no_record"
+    verified = _parse_time(record.full_verified_at)
+    if verified is None:
+        return "full", "unverified"
+    age = (policy.clock() - verified).total_seconds()
+    # An interval of 0 means every check is full; a clock that jumped back is not evidence of recency.
+    if policy.full_verify_interval_sec <= 0 or age > policy.full_verify_interval_sec or age < -60:
+        return "full", "interval_elapsed"
+    return "fast", None
+
+
+def index_generation(cursor) -> str:
+    """Names one publication of one session's index state (changes with every cursor write)."""
+    stamp = f"{cursor['synced_at']}|{cursor['byte_offset']}|{cursor['parser_version']}"
+    return "i1:" + hashlib.sha256(stamp.encode()).hexdigest()[:16]
+
+
+def integrity_report(observation, cursor, record) -> dict:
+    """The ``integrity`` object of a response.
+
+    ``mode`` is how THIS request checked the source. ``full_verified_*`` describe the last verification of every
+    byte of the indexed prefix, a past event: they say nothing about the source as it is now. A fast request
+    compared only the blocks listed in ``fast_checked``.
+    """
+    at = through = None
+    if record is not None and record.bound_to(cursor) and cursor["path"] == str(observation.path):
+        at, through = record.full_verified_at, record.full_verified_through
+    elif observation.mode == "full":
+        # No stored table for this file (a source form without one, or a copy of the indexed source): the scan this
+        # request just did is the verification, of as much of the indexed prefix as this file holds.
+        at, through = observation.scanned_at, min(cursor["byte_offset"], observation.length)
+    report = {"mode": observation.mode, "full_verified_through_byte": through, "full_verified_at": at,
+              "source_generation": observation.generation, "index_generation": index_generation(cursor)}
+    if observation.mode == "fast":
+        report["fast_checked"] = observation.fast_checked
+    elif observation.full_reason:
+        report["full_reason"] = observation.full_reason
+        if observation.lag_sec is not None:
+            report["verification_lag_sec"] = round(observation.lag_sec, 3)
+    return report
+
+
 def coverage_from_capture(session_id, provider, record, metrics, observation=None, *, alias=False, max_bytes=None):
     """``alias``: ``observation`` is a verified copy or continuation of the indexed source, which lives at another path.
 
@@ -736,8 +912,8 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
         if record["parser_version"] != current_parser_version(provider):
             issues.append("parser_outdated")
         try:
-            observation = observation or capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],),
-                                                        max_bytes=max_bytes)
+            observation = observation or capture_for_cursor(provider, Path(record["path"]), record,
+                                                            (record["byte_offset"],), max_bytes)
             if alias:
                 result.update(indexed_path=record["path"], requested_path=str(observation.path))
             if (str(observation.path) != record["path"] and not alias) or not observation.validate_prefix():
@@ -747,7 +923,7 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
             result["pending_bytes"] = max(0, result["file_size"] - record["byte_offset"])
             if result["pending_bytes"]:
                 issues.append("unread_bytes")
-            if observation.prefix_digest(record["byte_offset"]) != record["prefix_hash"]:
+            if not _hash_matches(observation, record["byte_offset"], record["prefix_hash"]):
                 issues.append("source_changed")
         except RequestStopped:
             raise
@@ -784,7 +960,8 @@ def agy_coverage(coverage, stats, receipts=None):
 
 @request_operation
 def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider="codex",
-                   embed=True, derived=True, guard=nullcontext, retain_dense_deletions=False):
+                   embed=True, derived=True, guard=nullcontext, retain_dense_deletions=False,
+                   verify="full", policy=None):
     """Serialize per (index, provider, session). Later callers find the cursor current and skip the parse.
 
     A parser-version bump therefore reparses a session once per process no matter how many hooks race on it;
@@ -795,9 +972,14 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
     sharing a server's index). Obsolete ids are removed from the sparse index and stay journalled until a process
     that can also remove their vectors syncs the session.
 
+    ``verify``: ``"full"`` scans the whole source prefix once; ``"fast"`` (hook-time checks) may compare only the
+    tail, the latest blocks and a random sample with the stored block digests (``IntegrityPolicy``), and falls
+    back to a full scan whenever it cannot vouch. The result's ``integrity`` object says which happened.
+
     A source change detected while preparing (a rewrite, truncation or replacement between capture and
-    publication) discards the observation and recaptures, a bounded number of times.
+    publication) discards the observation and recaptures, in full, a bounded number of times.
     """
+    policy = policy or IntegrityPolicy()
     requested = Path(path).resolve()
     with session_flight(_flight_key(store, provider, requested, session_id)):
         seen, target, captured = [], requested, None
@@ -806,7 +988,7 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
             try:
                 info = _ingest_session(path=target, session_id=session_id, store=store, sparse=sparse, dense=dense,
                                        embedder=embedder, provider=provider, embed=embed, derived=derived,
-                                       guard=guard, seen=seen, observation=handed,
+                                       guard=guard, seen=seen, observation=handed, verify=verify, policy=policy,
                                        retain_dense_deletions=retain_dense_deletions)
             except _StaleObservation:
                 continue  # another process published past our capture: observe the file again
@@ -814,7 +996,8 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
                 target, captured = elsewhere.path, elsewhere.observation  # a strict prefix: report the indexed source
                 continue
             except SourceChanged:
-                continue  # discard the observation and look at the source again; the error is raised once attempts run out
+                verify = "full"  # whatever moved, the next attempt does not rest on a cheap check
+                continue
             if target != requested:
                 _mark_prefix_alias(info, requested)
             return info
@@ -854,24 +1037,24 @@ def _mark_prefix_alias(info, requested):
     coverage["complete"] = False
 
 
-def _other_source(cursor, path, observation, session_id, max_bytes=None):
+def _other_source(cursor, path, observation, session_id, max_bytes=None, provider="codex"):
     """Another file claims the session id whose cursor indexes ``cursor["path"]``. Streaming hashes only; no writes.
 
     "copy": this file starts with the indexed prefix and the indexed file still exists, "moved": the same but that
     file is gone, "replaced": it is gone and this file does not continue it (reindex, as before). A strict prefix of
     the indexed file raises _IndexedElsewhere; two files that disagree raise AmbiguousSessionSource.
     """
-    indexed, offset = Path(cursor["path"]), cursor["byte_offset"]
-    continues = observation.length >= offset and observation.prefix_digest(offset) == cursor["prefix_hash"]
+    indexed, offset, kind = Path(cursor["path"]), cursor["byte_offset"], _cursor_kind(cursor)
+    continues = observation.length >= offset and _hash_matches(observation, offset, cursor["prefix_hash"])
     present = indexed.is_file()
     if continues:
         return "copy" if present else "moved"
     if not present:
         return "replaced"
-    other = capture_source(indexed, checkpoints=(offset, observation.length), max_bytes=max_bytes)
-    if (other.length >= offset and other.prefix_digest(offset) == cursor["prefix_hash"]
+    other = capture_for_cursor(provider, indexed, cursor, (offset, observation.length), max_bytes)
+    if (other.length >= offset and _hash_matches(other, offset, cursor["prefix_hash"])
             and observation.length < offset
-            and other.prefix_digest(observation.length) == observation.prefix_digest(observation.length)):
+            and other.cursor_hash(observation.length, kind) == observation.cursor_hash(observation.length, kind)):
         raise _IndexedElsewhere(indexed, other)
     raise AmbiguousSessionSource(session_id, indexed, path)
 
@@ -901,22 +1084,69 @@ def _provider_parser(provider):
     return parse_session_chunks, peek_session_id
 
 
+def _draft(observation, offset, record):
+    """The block table to publish with a cursor at ``offset``. A full scan compared every block just now; a fast
+    check keeps the previous verification stamps (it verified nothing in full)."""
+    table = observation.table_at(offset)
+    stamp = observation.stamp
+    if observation.mode == "full":
+        verified_at, through = observation.scanned_at, offset
+    elif record is not None:
+        verified_at, through = record.full_verified_at, record.full_verified_through
+    else:
+        verified_at = through = None
+    return BlockDraft(table, stamp[0], stamp[1], stamp[2], stamp[3], verified_at, through)
+
+
+def _capture_observation(path, provider, known, record, hint, verify, policy, max_bytes):
+    """The request's capture: a fast check when allowed and possible, otherwise the one full scan of the prefix."""
+    mode, reason = _plan(provider, path, known, record, verify, policy)
+    lag = None
+    if reason == "interval_elapsed":
+        lag = (policy.clock() - _parse_time(record.full_verified_at)).total_seconds() - policy.full_verify_interval_sec
+    if mode == "fast":
+        try:
+            observation = capture_source_fast(path, record, recent=policy.recent_blocks, samples=policy.sample_blocks,
+                                              rng=policy.new_rng())
+        except FastFallback as fallback:
+            reason = fallback.reason  # the cheap signals (or a block) say this must be settled by a full scan
+        else:
+            observation.scanned_at = policy.clock().isoformat()
+            return observation
+    observation = capture_for_cursor(provider, path, known, hint, max_bytes, publish=True)
+    observation.full_reason, observation.lag_sec = reason, lag
+    observation.scanned_at = policy.clock().isoformat()
+    return observation
+
+
 def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard, seen,
-                    observation=None, retain_dense_deletions=False):
+                    observation=None, retain_dense_deletions=False, verify="full", policy=None):
     if embed and (dense is None or embedder is None):
         raise ValueError("embedding unavailable in local-only mode")
     parse_session_chunks, peek_session_id = _provider_parser(provider)
     path = Path(path).resolve()
+    policy = policy or IntegrityPolicy()
+    planned = None  # the cursor a fast capture was planned from; it must still be the current one
     if observation is None:
-        hint = ()
-        if session_id:
+        hint, known, record, sid_hint = (), None, None, session_id
+        if not sid_hint:
+            try:
+                sid_hint = peek_session_id(path)
+            except (OSError, ValueError):
+                sid_hint = None
+        if sid_hint:
             try:
                 with guard(), store._read_boundary():
-                    known = store.cursor_record(session_id.lower() if provider in ("codex", "agy") else session_id, provider)
+                    known = store.cursor_record(sid_hint.lower() if provider in ("codex", "agy") else sid_hint, provider)
+                    record = store.source_block_record(known["session_id"], provider) if known else None
                 hint = (known["byte_offset"],) if known and type(known["byte_offset"]) is int else ()
             except (OSError, sqlite3.Error):
-                hint = ()
-        observation = capture_source(path, checkpoints=hint, max_bytes=store.max_decompressed_bytes)
+                hint, known, record = (), None, None
+        observation = _capture_observation(path, provider, known, record, hint, verify, policy,
+                                           store.max_decompressed_bytes)
+        planned = known
+    if observation.scanned_at is None:  # an observation handed in by a retry: its scan finished before now
+        observation.scanned_at = policy.clock().isoformat()
     with source_scope(observation):
         sid = session_id or peek_session_id(path)
         if not sid:
@@ -931,6 +1161,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         receipt_store, receipts, fallback_retries = None, {}, ()
         with guard(), store._read_boundary():
             cursor = store.cursor_record(sid, provider)
+            record = store.source_block_record(sid, provider) if cursor else None
             expected_token = store.state_token(sid, provider)
             prior_calls = (store.prior_calls(sid, provider)
                            if provider == "omp" and cursor and observation.complete_end > cursor["byte_offset"] else ())
@@ -943,6 +1174,9 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 if (receipt_authority_before[0] != "present"
                         or receipt_authority_before[2] != receipt_store.rows_digest(receipt_capture[0])):
                     raise ValueError("receipt authority changed during capture")
+        if observation.mode == "fast" and (cursor is None or planned is None
+                                           or cursor["synced_at"] != planned["synced_at"]):
+            raise _StaleObservation()  # the table the check used belongs to a publication that is gone
         if cursor and cursor["path"] == str(path) and type(cursor["byte_offset"]) is int \
                 and cursor["byte_offset"] > observation.length:
             # Never rewind a newer cursor from an older capture. Only a recapture that is still shorter than
@@ -954,14 +1188,14 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         # reindexing on a path change; elsewhere a copy or continuation of the indexed prefix is not a new source.
         relation = None
         if cursor and provider != "agy" and cursor["path"] != str(path) and type(cursor["byte_offset"]) is int:
-            relation = _other_source(cursor, path, observation, sid, store.max_decompressed_bytes)
+            relation = _other_source(cursor, path, observation, sid, store.max_decompressed_bytes, provider)
         parser_version = current_parser_version(provider)
         start = cursor["byte_offset"] if cursor else 0
         reindexed, reindex_reason = False, None
         if cursor:
             try:
                 changed = relation not in ("copy", "moved") and (
-                    str(path) != cursor["path"] or observation.prefix_digest(start) != cursor["prefix_hash"])
+                    str(path) != cursor["path"] or not _hash_matches(observation, start, cursor["prefix_hash"]))
             except ValueError:
                 changed = True
             if changed:
@@ -997,7 +1231,9 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, sink=chunks)
             if parsed_sid != sid:
                 raise ValueError("session id changed while parsing")
-            digest = observation.prefix_digest(offset)
+            blockable = _blockable(provider, path)
+            digest = observation.cursor_hash(offset, "blocks" if blockable else "sha")
+            draft = _draft(observation, offset, record) if blockable else None
         except BaseException:
             chunks.close()
             raise
@@ -1032,10 +1268,23 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                     if receipt_store.authority_token(sid) != receipt_authority_before:
                         raise ValueError("receipt authority changed during preparation")
                     receipt_store.publish_bindings(sid, receipt_capture, receipt_rows)
-                if chunks.count or reindexed or cursor is None or offset != cursor["byte_offset"] or relation == "moved":
+                # A cursor without a block table (written before this version, by an older process, or after a
+                # change of source form) is republished with one, even when nothing else changed.
+                own = draft is not None and cursor is not None and cursor["path"] == str(path) and relation is None
+                bound = own and record is not None and record.bound_to(cursor)
+                needs_table = own and not bound
+                if (chunks.count or reindexed or cursor is None or offset != cursor["byte_offset"]
+                        or relation == "moved" or needs_table):
                     store.commit_events((), session_id=sid, provider=provider, path=path, offset=offset,
                                         digest=digest, replace=reindexed, parser_version=parser_version,
-                                        expected_token=expected_token, prepared_rows=chunks, receipt_digest=receipt_digest)
+                                        expected_token=expected_token, prepared_rows=chunks, receipt_digest=receipt_digest,
+                                        blocks=draft)
+                elif bound and observation.mode == "full":
+                    # Nothing to publish, but every block was just compared: stamp the stored table.
+                    stamp = observation.stamp
+                    store.mark_full_verified(sid, provider, record, at=observation.scanned_at,
+                                             through=record.table.covered, dev=stamp[0], ino=stamp[1],
+                                             size=stamp[2], mtime_ns=stamp[3])
                 if receipt_store is not None:
                     receipt_store.mark_indexed(sid, receipt_digest)
             else:
@@ -1043,6 +1292,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             with store._read_boundary():
                 committed_token = store.state_token(sid, provider)
                 committed_cursor = store.cursor_record(sid, provider)
+                committed_record = store.source_block_record(sid, provider)
                 metrics = store.session_metrics(sid, provider)
                 receipt_authority = receipt_store.authority_token(sid) if receipt_store is not None else None
                 agy_stats = store.agy_evidence_stats(sid) if provider == "agy" else None
@@ -1059,14 +1309,19 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             "reindexed": reindexed, "parser_version": parser_version, "reindex_reason": reindex_reason,
             "dense_restored": 0, "embedding_pending": 0, "embedding_error": None,
             "sparse_updated": 0, "coverage": coverage,
+            "integrity": integrity_report(observation, committed_cursor, committed_record),
             "_source_observation": observation, "_metadata_token": committed_token, "_receipt_token": receipt_authority}
+    if reindexed:
+        # What this request's verification found: the index was rebuilt from the source as it is now. For
+        # "source_changed" that is a mismatch of the stored digests, never a runtime failure.
+        info["integrity"]["reindex_reason"] = reindex_reason
     if alias:
         info["alias_of"] = committed_cursor["path"]
     if not derived:
         return info
 
     def finish():
-        source_ok = observation.validate_prefix()  # bounded stage check (identity, size, tail), off the shared lock
+        source_ok = observation.validate_prefix()  # bounded; see validate_prefix
         with guard():
             issues = []
             if store.state_token(sid, provider) != committed_token:

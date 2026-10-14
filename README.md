@@ -154,8 +154,8 @@ Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout
 | **Governance & Contracts** | `upsert_contracts` | Create or update explicit invariant rules (`must` / `must_not`). |
 | | `list_contracts` | Inspect active contracts for the current session and global scope. |
 | | `revoke_contract` | Disable a contract while preserving history. |
-| | `check_action` | Pre-flight test of a proposed action against current contracts. |
-| | `audit_session` | Audit executed session history against active contracts. |
+| | `check_action` | Pre-flight test of a proposed action against current contracts. `verify="fast"` selects the hook-time source verification; the result's `integrity` says what was compared. |
+| | `audit_session` | Audit executed session history against active contracts (always a full source verification). |
 | | `audit_status` | Health check: vector extension, index schema, degraded flags, per-session coverage. |
 | **Checklist & Evidence** | `update_checklist` | Update requirements; enforces evidence gating for completion. |
 | | `get_checklist` | Inspect checklist status, history and linked evidence. |
@@ -251,6 +251,9 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_GRAPH_UPDATE_TIMEOUT_SEC` | `300` | Budget for `run_neograph_update`. |
 | `SELF_DIRECT_MAX_TOOL_TIMEOUT_SEC` | `600` | Upper bound for a client-supplied `timeout_ms`. |
 | `SELF_DIRECT_MAX_CONCURRENT_CALLS` | `4` | **New in 0.6.0.** Heavy tool calls that may run at once (minimum 1); excess calls wait within their own deadline. |
+| `SELF_DIRECT_INTEGRITY_FAST_RECENT_BLOCKS`, `SELF_DIRECT_INTEGRITY_FAST_SAMPLE_BLOCKS` | `4`, `8` | Fast (hook-time) source verification: the latest complete 1 MiB blocks and the random sample compared with their stored digests. `0` for either disables that part (the tail block is always compared). See [Source integrity](#source-integrity-full-and-fast-verification). |
+| `SELF_DIRECT_INTEGRITY_FULL_VERIFY_INTERVAL_SEC` | `300` | A fast check is allowed only this long after the last verification of every block; then the next check is full. `0`: always full. |
+| `SELF_DIRECT_INTEGRITY_BACKGROUND_VERIFY`, `SELF_DIRECT_INTEGRITY_BACKGROUND_IDLE_SEC`, `SELF_DIRECT_INTEGRITY_BACKGROUND_MAX_SCANS` | `true`, `2`, `1` | Resident servers verify watched sources in full on one background thread after this much idleness; at most this many scans per wake-up. Hook processes never do background work. |
 | `SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES` | `4294967296` | **New in 0.6.0.** Largest decompressed size a `.jsonl.zst` Codex session may declare; larger files are refused as `zstd_too_large`. |
 | `SELF_DIRECT_RETRIEVE_TOP_K`, `SELF_DIRECT_SEARCH_TOP_K`, `SELF_DIRECT_RRF_K` | `20`, `10`, `60` | Retrieval tuning. |
 | `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS` | `false` | Seed disabled demonstration contracts. |
@@ -331,7 +334,7 @@ Set `SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR` (or `grokbot_transcripts_dir` in TOML)
 
 ## Coverage and verdicts
 
-`sync_session`, `audit_session` and `check_action` report a `coverage` object (`audit_status` reports the same data under `session` when given a session id). It holds the indexed source `path`, `byte_offset` (how far the index has parsed), `file_size`, `chunk_count`, `parser_version`, an `issues` list and `complete`, which is true only when `issues` is empty.
+`sync_session`, `audit_session` and `check_action` report a `coverage` object (`audit_status` reports the same data under `session` when given a session id). It holds the indexed source `path`, `byte_offset` (how far the index has parsed), `file_size`, `chunk_count`, `parser_version`, an `issues` list and `complete`, which is true only when `issues` is empty. The same responses carry an `integrity` object that says how the source was verified for that request and when it was last verified in full ([Source integrity](#source-integrity-full-and-fast-verification)).
 
 | Verdict | Meaning |
 |---|---|
@@ -386,16 +389,81 @@ A rewrite or truncation of the same path is still reparsed or rejected as before
 
 ### Source capture
 
-Sync captures at most the length measured at the first `fstat`, in 1 MiB blocks, keeping only SHA-256 states at the cursor, at the last complete record and at the end, and the SHA-256 of the last 64 KiB as it was streamed. No file bytes are retained, so memory does not scale with the session size.
+Sync captures at most the length measured at the first `fstat`, in 1 MiB blocks. It keeps only small hash state: the SHA-256 of every complete 1 MiB block (the [block digests](#source-integrity-full-and-fast-verification)), and for a source whose cursor is a plain digest (`.jsonl.zst`, AGY, or an index written before this version) SHA-256 states at the cursor, at the last complete record and at the end. No file bytes are retained, so memory does not scale with the session size.
 
-- **One full scan of the prefix per request.** The capture pass is the scan. Every later stage of the same request (the two ingestion stages, coverage, the audit's own stage check) re-reads a bounded amount instead of hashing the prefix again: the file identity, `size >= captured length` and the SHA-256 of the last 64 KiB as it was streamed during the pass. Before this change one `check_action` hashed the whole prefix five times (measured: 5.0 passes on a 300 MB session; now 1.0). `validate_prefix()` is that bounded re-check; `validate_prefix(locked=True)` is the same without any prefix re-read, for use under the shared publication lock; `validate_prefix(full=True)` re-reads the whole prefix and is used only when asked for or when the cheap signals demand it (below). A mismatch, once detected, stays failed.
+- **One full scan of the prefix per request.** The capture pass is the scan. Every later stage of the same request (the two ingestion stages, coverage, the audit's own stage check) re-reads a bounded amount instead of hashing the prefix again: the file identity, `size >= captured length` and the SHA-256 of the last 64 KiB as it was streamed during the pass. Before this version one `check_action` hashed the whole prefix five times (measured: 5.0 passes on a 300 MB session; now 1.0). `validate_prefix()` is that bounded re-check; `validate_prefix(locked=True)` is the same without any prefix re-read, for use under the shared publication lock; `validate_prefix(full=True)` re-reads the whole prefix and is used only when asked for or when the cheap signals demand it (below). A mismatch, once detected, stays failed.
 - **Cheap signals escalate, they never excuse.** Without growth, an unchanged size with a moved modification time means the file was written (or touched). The unlocked check then settles it with a full re-read: identical bytes pass and the new time becomes the baseline; different bytes fail. Equal stamps prove nothing; they are never a reason to skip a check that would otherwise be made.
-- **A change during preparation is retried, then reported as before.** If a later stage finds that the file was rewritten, truncated or replaced between capture and publication, the observation is discarded and the file is captured again, at most three times in all. If it still does not hold still, the call fails with `source changed during preparation` and nothing is published, as before.
+- **A change during preparation is retried, then reported as before.** If a later stage finds that the file was rewritten, truncated or replaced between capture and publication, the observation is discarded and the file is captured again, in full, at most three times in all. If it still does not hold still, the call fails with `source changed during preparation` and nothing is published, as before.
 - Growth after the first measurement is not an error. An overwrite, truncation or replacement during the pass is. If the file grew while it was being hashed, the bounded check compares the last 64 KiB with the bytes that were streamed; this no longer costs a second scan.
 - `validate()` compares metadata only (device, inode, size, mtime, ctime). Equal stamps do not prove equal content.
 - `stat` and `fstat` can give `st_ctime` different meaning on some runtimes (for example 9p/drvfs), so full stamps are compared only within the same API and identity, size and mtime across them. On Windows `st_ctime` is the creation time and is never used as evidence of change. When either side reports `st_ino` 0, which some Windows filesystems do, the inode comparison is skipped and size, mtime and the hash decide.
 - A `.jsonl.zst` source is an immutable snapshot: its capture is one streaming decode, and its later checks re-read and hash the compressed file (which is small), so any change to it is a rewrite.
-- **Limits, stated precisely.** Capture and validation are not an atomic snapshot. A rewrite that leaves the identity, the size, the last 64 KiB and the modification time unchanged and lies outside the last 64 KiB, made after the capture pass of the same request, is accepted by that request's later stages. So is a rewrite outside the last 64 KiB made while the file also grew (the modification time then moves legitimately). The next full scan (the next sync's capture) compares the stored cursor hash and reindexes. This is the same residual window the lock-time check always had; it now starts at the end of the capture pass for every later stage.
+- **Limits, stated precisely.** Capture and validation are not an atomic snapshot. A rewrite that leaves the identity, the size, the last 64 KiB and the modification time unchanged and lies outside the last 64 KiB, made after the capture pass of the same request, is accepted by that request's later stages. So is a rewrite outside the last 64 KiB made while the file also grew (the modification time then moves legitimately). The next full scan (the next sync's capture, or a full verification) compares the stored cursor hash and reindexes. This is the same residual window the lock-time check always had; it now starts at the end of the capture pass for every later stage.
+
+### Source integrity: full and fast verification
+
+Re-hashing a 300 MB session on every hook made the cost of a tool-call check proportional to the size of the session file. A cursor of a plain file therefore keeps, next to the byte offset, the **block digests** of the indexed prefix: the SHA-256 of every complete 1 MiB block, the digest of the partial last block, the newline count and a root over all of it (`blocks1:<root>` is the cursor's `prefix_hash`). They are built while the file is read anyway and extended, never recomputed, as the cursor advances: a sync hashes only the new complete blocks and the partial tail. The table lives in the index metadata (`source_blocks`, created by a schema migration on first open; existing data is untouched) and is bound to exactly one cursor publication. A table that is missing, stale (a cursor written by an older process), damaged (its root does not add up) or for another path is never trusted: the next request is a full verification that rebuilds it.
+
+Every `sync_session`, `check_action` and `audit_session` response, and the context a Codex hook emits, carries an `integrity` object:
+
+```json
+"integrity": {
+  "mode": "fast",
+  "full_verified_through_byte": 314572800,
+  "full_verified_at": "2026-10-15T12:00:00.123456+00:00",
+  "source_generation": "g1:830-269c96:314572800:5b0e8e1b98536aaf",
+  "index_generation": "i1:93d3c13bb79981cf",
+  "fast_checked": {"tail": true, "recent": [309, 310, 311, 312], "sampled": [3, 8, 41, 77, 90, 134, 201, 250]}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `mode` | How **this request** checked the source: `full` (every block of the prefix was read and compared) or `fast` (see below). |
+| `full_verified_through_byte`, `full_verified_at` | The last verification of **every** block of the indexed prefix: through which byte, and when. They describe a **past event**. They are not a statement about the source as it is now, and a `fast` response must never be read as a guarantee about the whole current source. |
+| `source_generation` | Names the content this request observed: file identity, covered length and a digest of what was read. It changes with the bytes, not with the clock. |
+| `index_generation` | Names one publication of the session's index state; it changes with every cursor write. |
+| `fast_checked` | (`fast` only) The blocks that were compared: the tail, the latest blocks and the random sample. |
+| `full_reason` | (`full` only) Why the verification was full beyond the caller asking for it. `first_sync` (nothing indexed yet) and `legacy_source` (AGY, `.jsonl.zst`) can appear on any request; the others only on a request that asked for `fast`: `migration`, `parser_updated`, `path_changed`, `no_record`, `interval_elapsed`, `identity_changed`, `shrunk`, `same_size_modified`, `block_mismatch`, `tail_mismatch`, or `evidence_beyond_verified_region`. `interval_elapsed` also carries `verification_lag_sec`: how far past its deadline the verification was. |
+| `reindex_reason` | (when the index was rebuilt) Why; `source_changed` means the stored digests no longer matched the source and the index was rebuilt from the source as it is now. |
+
+**Which operations verify how.**
+
+| Operation | Source verification |
+|---|---|
+| `audit_session` | Always `full`. There is no fast variant. |
+| `check_action`, `sync_session` | `full` by default. `verify="fast"` is for hook-time callers: the Codex `PreToolUse` hook, the Claude Code and AGY hook adapters and the OMP extension pass it. It is never chosen implicitly. |
+| Stop checkpoints, `auto_continue` decisions | `full`. A restart of the agent needs `integrity.mode == "full"` on a complete, current audit; a fast or missing `integrity` confirms nothing. |
+| A `fast` request when the last full verification is older than `SELF_DIRECT_INTEGRITY_FULL_VERIFY_INTERVAL_SEC` (default 300) | Becomes `full` (`full_reason: "interval_elapsed"`). `0` makes every check full. |
+| Resident servers (Codex, OMP, the stdio server) | One background thread verifies sources in full after `SELF_DIRECT_INTEGRITY_BACKGROUND_IDLE_SEC` (default 2) of idleness, and starts early enough to beat the interval during continuous activity. It holds no engine lock while reading, runs one scan at a time (at most `SELF_DIRECT_INTEGRITY_BACKGROUND_MAX_SCANS` per wake-up), never blocks a request and reports a deadline it could not meet (`audit_status` shows `integrity_worker`: scans, deferrals, errors, `missed_deadlines`, `max_lag_sec`). Short-lived hook processes (Claude Code, AGY) never do background work. |
+| AGY sources, `.jsonl.zst` sources | Always `full` (`full_reason: "legacy_source"`): AGY hook receipts bind to plain prefix digests, and a compressed snapshot is validated by the digest of its compressed bytes. |
+
+**What a fast check does.** Fast verification compares, against the stored digests: the file identity and size (it may only grow); the partial tail block; the latest `SELF_DIRECT_INTEGRITY_FAST_RECENT_BLOCKS` blocks (default 4); and `SELF_DIRECT_INTEGRITY_FAST_SAMPLE_BLOCKS` (default 8) random other blocks, drawn from fresh system randomness for every call. It then parses only the bytes appended after the cursor, each of them hashed block by block while consumed. No other block is read. Cost is a few MiB plus the appended bytes, whatever the size of the file.
+
+Measured with `scripts/bench_integrity.py` on a synthetic 314.6 MB Codex session of 75,000 events (WSL2, ext4, Python 3.12; median of three runs; "passes" is the bytes through SHA-256 divided by the file size):
+
+| Operation | Before: CPU (passes) | After: CPU (passes) |
+|---|---|---|
+| `check_action`, nothing appended, prohibition contracts, hook-time (`fast`) | 1.13 s (5.00) | 0.035 s (0.04) |
+| the same after 5 events were appended | 1.27 s (5.00) | 0.11 s (0.04) |
+| the same with a prerequisite gate (evaluates the indexed history) | 1.85 s (5.00) | 0.60 s (0.04); 0.02 s of it verifies the source, the rest evaluates 75,000 events |
+| `audit_session` (full verification) | 1.69 s (5.00) | 1.02 s (1.00); 0.40 s of it verifies the source |
+| first sync (authority only) | 22.2 s (6.03) | 21.4 s (3.03) |
+
+The cost of the gate row is the evaluation of the indexed history (it grows with the number of events, not with the bytes of the file); making that incremental is separate work.
+
+Cheap signals only ever escalate to full: a different file identity (a new inode), a smaller file, an unchanged size with a moved modification time, a block or tail digest that does not match. A mismatch is `source_changed` and a reindex, exactly as a mismatch of the whole-prefix hash always was; it is a content finding, never a runtime failure to fail open on. `reindex_reason: "source_changed"` is reported as before, and a stale index is never allowed to certify the new bytes: extending the table copies the digests of blocks that were not compared, so a rewrite the fast check missed is still found by the next full verification.
+
+**What a fast verdict may rely on.** Contract evaluation is the same code and the same indexed history as in a full check; nothing is cached across calls. A fast verdict adds three rules: a `clean` finding that rests on a satisfied prerequisite is accepted only when every event it cites lies inside the region that was last verified in full (it then carries `verified_through`); otherwise the request is settled in full before it answers (`full_reason: "evidence_beyond_verified_region"`); and a fast verdict never turns `unknown` or a coverage gap (`unread_bytes`, parse errors, unsupported events) into a satisfied obligation. A fast answer is labelled `fast` and is never presented as `full`.
+
+**Residual risks, stated precisely.**
+
+- A rewrite of a block that no fast check compared (it is not in the tail, not among the latest blocks and was not drawn) is not noticed by fast checks until a full verification reads it: at the latest `SELF_DIRECT_INTEGRITY_FULL_VERIFY_INTERVAL_SEC` after the previous one, at the next `audit_session`, Stop checkpoint or background scan, whichever comes first. Until then a fast verdict is computed from the index as it was verified, and says `fast`.
+- A source that is rewritten and restored between two verifications (every block compared is, again, what it was) is not detected, and no claim to the contrary is made.
+- The file identity, size and modification time that the table remembers are advisory hints. They are not compared across machines as a guarantee (a Windows and a WSL process can see different `st_dev`/`st_ino` for one file); a difference only costs a full verification. File-system notifications are not used as evidence.
+- The residual window of a request's later stages is the one described under [Source capture](#source-capture).
+
+**Compatibility.** The cursor's `prefix_hash` is a plain SHA-256 until a source gets a table: the first full request after this version migrates it in place, without a reindex (`full_reason: "migration"`). A process of an older version that meets a block cursor does not understand it, treats it as a changed source and reindexes once; restart every process that shares an index after upgrading (see [Upgrading to 0.6.0](#upgrading-to-060)). A plain rollout and its `.jsonl.zst` twin still share one cursor: the cursor's hash form follows the source form.
 
 ---
 
@@ -451,7 +519,8 @@ Default combined writer-lock wait (1 second), audit budget (8 seconds), ordinary
 6. **Reinstall dependencies.** `neograph-engine` must be exactly 0.14.1, and Python before 3.14 now needs `zstandard>=0.23` to read compressed Codex sessions (`.jsonl.zst`). `pip install -e ".[dev]"` or `scripts/install_codex.py` takes care of both; without the package, plain sessions work and compressed ones report `zstd_unavailable`.
 7. **AGY hook policy.** The default is now `confirmed_only`. An install that relied on the earlier `enforced` default (an unverifiable `PreToolUse` denied, unverified items continuing a `Stop`, an unavailable runtime denying `PreToolUse`) must set `SELF_DIRECT_AGY_ENFORCEMENT=enforced` explicitly, and even then hook errors fail open.
 8. **Sparse index masking.** Sparse (FTS) rows written before 0.6.0 hold raw text. Delete `sparse.sqlite` while the servers are stopped to have it rebuilt, masked, from the canonical store; see the [masking contract](SECURITY.md#masking-contract).
-9. **Re-verify.** Run `python scripts/install_codex.py --verify` for Codex and `audit_status` for any host. Confirm `neograph_version`, `embedder`, `dense_backend` and that `degraded_flags` is empty.
+9. **Source integrity tables.** The first open of an index adds the `source_blocks` table (a schema migration that touches nothing else), and each session's cursor migrates to a block root on its first full sync after the upgrade, without a reindex. A process on an older version that meets a migrated cursor reindexes that session once, so restart every process that shares the index (step 1). See [Source integrity](#source-integrity-full-and-fast-verification).
+10. **Re-verify.** Run `python scripts/install_codex.py --verify` for Codex and `audit_status` for any host. Confirm `neograph_version`, `embedder`, `dense_backend` and that `degraded_flags` is empty.
 
 ---
 
