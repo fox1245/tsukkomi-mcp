@@ -236,6 +236,14 @@ def scan_reports(logs: Path) -> collections.Counter:
     return counts
 
 
+def dump_logs(logs: Path, limit: int = 120) -> None:
+    """Print the head of every sanitizer log, so a CI failure is diagnosable from the job output alone."""
+    for log in sorted(logs.glob("*")):
+        lines = log.read_text(errors="replace").splitlines()
+        print(f"--- {log.name} ({len(lines)} lines)")
+        print("\n".join(lines[:limit]))
+
+
 def require_instrumented(profile: str) -> None:
     """The installed neograph-engine must be the sanitizer build, not the release wheel."""
     import importlib.util
@@ -299,6 +307,14 @@ def command_test(args) -> int:
     leak_result = logs / "lsan-result.txt"
     if args.profile == "asan":
         env["TSUKKOMI_LSAN_RESULT"] = str(leak_result)
+    # A sanitizer stops the process with _exit(), which drops block-buffered output: keep it unbuffered.
+    env["PYTHONUNBUFFERED"] = "1"
+    preflight = run([*prefix, sys.executable, "-c", "import neograph_engine, self_directing_mcp.engine; print('preflight ok')"],
+                    env=env, check=False, cwd=ROOT, capture_output=True, text=True)
+    print(preflight.stdout + preflight.stderr, end="")
+    if preflight.returncode:
+        dump_logs(logs)
+        raise SystemExit(f"importing the sanitizer build failed (exit {preflight.returncode})")
     tests = list(args.pytest_args)
     if args.profile == "tsan":
         tests += [f"--deselect={test}" for test in TSAN_DESELECT]
@@ -327,6 +343,8 @@ def command_test(args) -> int:
             problems.append(f"{owners['project']} direct leaks allocated by neograph or sqlite-vector code")
     for problem in problems:
         print("FAIL", problem)
+    if problems:
+        dump_logs(logs)
     print(f"{args.profile}:", "FAILED" if problems else "no sanitizer reports")
     return 1 if problems else 0
 
