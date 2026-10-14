@@ -29,9 +29,10 @@ from __future__ import annotations
 
 import errno
 import os
-import socket
 import sys
 import time
+
+import _socket as socket       # the C module: the socket module's Python layer costs ~2.5 ms of import per hook process
 
 from self_directing_mcp import __version__
 from self_directing_mcp.daemon import protocol as P, rundir

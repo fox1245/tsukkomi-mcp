@@ -468,9 +468,18 @@ class Daemon:
             return self._unknown(P.REASON_QUEUE_FULL)
         self.begin_request(session)
         started = time.perf_counter()
+        ran = [0.0]
+
+        def timed(*args):                                   # time spent in the lane thread: settings + judgement
+            begun = time.perf_counter()
+            try:
+                return self._hook_runner(*args)
+            finally:
+                ran[0] = (time.perf_counter() - begun) * 1000
+
         try:
             context = contextvars.copy_context()
-            response = await self._loop.run_in_executor(self._hook_pool, context.run, self._hook_runner,
+            response = await self._loop.run_in_executor(self._hook_pool, context.run, timed,
                                                         host, event, payload, env, argv)
         except Exception as exc:
             self.stats["hook_errors"] += 1
@@ -481,7 +490,7 @@ class Daemon:
         elapsed_ms = (time.perf_counter() - started) * 1000
         self.stats["hooks"] += 1
         self.log.event("hook", host=host, event=event if isinstance(event, str) else "none",
-                       ms=round(elapsed_ms, 2))
+                       ms=round(elapsed_ms, 2), run_ms=round(ran[0], 2))
         self.after_request()
         return {"op": "result", "ok": True, "response": response, "served_by": "daemon", "ms": round(elapsed_ms, 2)}
 

@@ -7,7 +7,6 @@ library fallback answers fail-open with a visible warning and records ``hook_hea
 import json
 import os
 import sys
-from pathlib import Path
 
 EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure",
           "Stop", "SubagentStop")
@@ -59,39 +58,52 @@ def _apply_index_dir(argv):
             os.environ["SELF_DIRECT_INDEX_DIR"] = arg.split("=", 1)[1]
 
 
-def _via_daemon(root, python):
+def _via_daemon():
     """Resident-daemon mode (``SELF_DIRECT_DAEMON=on``, Linux): a thin client that imports only the standard library
-    and the daemon's client module. Returns False, having read nothing, when the daemon is not in use. With the
-    daemon in use the answer is the daemon's or a visible fail-open; there is no in-process fallback."""
+    and the daemon's client module (not even ``pathlib``, whose import costs more than the rest of the client).
+    Returns False, having read nothing, when the daemon is not in use. With the daemon in use the answer is the
+    daemon's or a visible fail-open; there is no in-process fallback."""
+    here = os.path.realpath(__file__)
+    root = os.path.dirname(os.path.dirname(here))
     try:
-        sys.path.insert(0, str(root / "src"))
+        sys.path.insert(0, os.path.join(root, "src"))
         from self_directing_mcp.daemon import client
         if not client.use_daemon():
             return False
     except Exception:
         return False        # the package is unusable: the standalone path below reports it, fail-open
+    python = os.path.join(root, ".venv", "Scripts/python.exe" if os.name == "nt" else "bin/python")
     argv = sys.argv[1:]
+    event = _event(argv, None)
     try:
-        payload = json.load(sys.stdin)
+        try:
+            payload = json.load(sys.stdin)
+        except Exception as exc:
+            from self_directing_mcp import claude_hook_state as state
+            response, served = state.fail_open(event, None, type(exc).__name__, state.CHECK_FAILED), False
+        else:
+            event = _event(argv, payload)
+            response, served = client.serve_hook("claude", event, payload, argv,
+                                                 python=python if os.path.isfile(python) else None)
+        json.dump(response if served else _mask(response), sys.stdout)
+        sys.stdout.write("\n")
     except Exception as exc:
-        from self_directing_mcp import claude_hook_state as state
-        event = _event(argv, None)
-        response, served = state.fail_open(event, None, type(exc).__name__, state.CHECK_FAILED), False
-    else:
-        response, served = client.serve_hook("claude", _event(argv, payload), payload, argv,
-                                             python=str(python) if python.is_file() else None)
-    json.dump(response if served else _mask(response), sys.stdout)
-    sys.stdout.write("\n")
+        # The daemon is in use, so there is no standalone fallback: a visible fail-open and nothing else.
+        reason = (f"Tsukkomi audit UNAVAILABLE (daemon_unavailable:{type(exc).__name__}): this {event or 'hook'} "
+                  "was not verified; fail-open, not a compliance verdict.")
+        print(reason, file=sys.stderr)
+        print(json.dumps(_minimal_fail_open(event, reason)))
     return True
 
 
 def main():
     _apply_index_dir(sys.argv[1:])
+    if _via_daemon():
+        return
+    from pathlib import Path
     root = Path(__file__).resolve().parent.parent
     venv = root / ".venv"
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if _via_daemon(root, python):
-        return
     try:
         if python.is_file() and Path(sys.prefix).resolve() != venv.resolve():
             os.execv(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]])
