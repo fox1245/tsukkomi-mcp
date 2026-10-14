@@ -110,18 +110,26 @@ class Ledger:
 
     @staticmethod
     def read(conn, session_id, path, steps=()) -> "Ledger":
-        """The stored state and the stored digests of ``steps`` (the only results this ledger can be asked for)."""
-        row = conn.execute("SELECT dev,ino,length,digest,max_step,bad FROM scan_state WHERE session_id=? AND path=?",
-                           (session_id, str(path))).fetchone()
-        state = None if row is None else {"identity": (int(row[0], 16), int(row[1], 16)), "length": row[2],
-                                          "digest": row[3], "max_step": row[4], "bad": bool(row[5])}
-        steps, persisted = sorted(set(steps)), {}
-        if state is not None:
-            for start in range(0, len(steps), 400):
-                batch = steps[start:start + 400]
-                persisted.update(conn.execute(
-                    "SELECT step,digest FROM scan_results WHERE session_id=? AND path=? AND step IN ("
-                    + ",".join("?" * len(batch)) + ")", (session_id, str(path), *batch)))
+        """The stored state and the stored digests of ``steps`` (the only results this ledger can be asked for),
+        read in one transaction so they describe the same publication."""
+        owned = not conn.in_transaction
+        if owned:
+            conn.execute("BEGIN")
+        try:
+            row = conn.execute("SELECT dev,ino,length,digest,max_step,bad FROM scan_state WHERE session_id=? AND path=?",
+                               (session_id, str(path))).fetchone()
+            state = None if row is None else {"identity": (int(row[0], 16), int(row[1], 16)), "length": row[2],
+                                              "digest": row[3], "max_step": row[4], "bad": bool(row[5])}
+            steps, persisted = sorted(set(steps)), {}
+            if state is not None:
+                for start in range(0, len(steps), 400):
+                    batch = steps[start:start + 400]
+                    persisted.update(conn.execute(
+                        "SELECT step,digest FROM scan_results WHERE session_id=? AND path=? AND step IN ("
+                        + ",".join("?" * len(batch)) + ")", (session_id, str(path), *batch)))
+        finally:
+            if owned:
+                conn.rollback()
         return Ledger(session_id, path, state, persisted, steps)
 
     def checkpoint(self):
@@ -180,8 +188,10 @@ class Ledger:
             return
         if update["rebuilt"]:
             conn.execute("DELETE FROM scan_results WHERE session_id=? AND path=?", (self.session_id, self.path))
-        conn.executemany("INSERT OR REPLACE INTO scan_results VALUES (?,?,?,?)",
-                         [(self.session_id, self.path, step, digest) for step, digest in update["results"].items()])
+        rows = [(self.session_id, self.path, step, digest) for step, digest in update["results"].items()]
+        for start in range(0, len(rows), 500):
+            check_request()  # a rebuild writes one row per result; a stop rolls the whole transaction back
+            conn.executemany("INSERT OR REPLACE INTO scan_results VALUES (?,?,?,?)", rows[start:start + 500])
         length, digest, max_step, bad, dev, ino = update["new"]
         conn.execute("INSERT OR REPLACE INTO scan_state VALUES (?,?,?,?,?,?,?,?)",
                      (self.session_id, self.path, dev, ino, length, digest, max_step, int(bad)))
