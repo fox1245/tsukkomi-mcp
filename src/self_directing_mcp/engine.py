@@ -7,6 +7,7 @@ from threading import Condition, RLock
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import replace
+import copy
 import hashlib
 import json
 import sqlite3
@@ -23,6 +24,7 @@ from self_directing_mcp.audit.contracts import (
     scope_counts,
     visible_contracts,
 )
+from self_directing_mcp.audit import incremental
 from self_directing_mcp.audit.patterns import compile_contract
 from self_directing_mcp.audit.runner import _worse, action_applies, audit_needs, downgrade_unproven_absence, prefix_note, run_audit
 from self_directing_mcp.checklist import (
@@ -38,7 +40,8 @@ from self_directing_mcp import omp, agy, claude
 from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
 from self_directing_mcp.index.ingest import (
-    AmbiguousSessionSource, IntegrityPolicy, SessionStore, capture_for_cursor, coverage_from_capture, ingest_session,
+    AmbiguousSessionSource, AuditEventSnapshot, IntegrityPolicy, SessionStore, capture_for_cursor, coverage_from_capture,
+    ingest_session,
 )
 from self_directing_mcp.index.sparse import SparseIndex
 from self_directing_mcp.index.vector import build_vector_index
@@ -611,27 +614,100 @@ class SelfDirectEngine:
                   and rule.session_id in (None, sid)]
         history = any(rule.regex and (rule.type == "must" or planned is None) for rule in active)
         anchors = {anchor for rule in active for anchor in (rule.source_event_id, rule.applies_from_event_id) if anchor}
-        with self._publication_guard(), self.store._read_boundary():
-            metadata_token = self.store.state_token(sid, provider)
-            if metadata_token != refreshed["_metadata_token"]:
-                coverage["complete"] = False
-                coverage["issues"].append("metadata_changed_before_capture")
-            if history:
-                # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
-                needs, link_calls = audit_needs(active, planned)
-                evidence = self.store.capture_audit_events(sid, provider, needs, link_calls=link_calls)
-            else:
-                evidence = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
-            receipt_token = self._receipt_token(sid, provider)
-            if provider == "agy" and receipt_token != refreshed["_receipt_token"]:
-                coverage["complete"] = False
-                coverage["issues"].append("receipts_changed_before_capture")
         observation = refreshed["_source_observation"]
-        _mark_growth(coverage, observation)
-        # The actual native stages, model decoding and regex evaluation own no
-        # engine lease, shared SQLite handle or open read transaction.
-        result = run_audit(session_id=sid, contracts=contracts, store=evidence,
-                           provider=provider, proposed=planned, coverage=coverage)
+        report, plan, force_full = {}, None, frozenset()
+        use_plan = history and self.settings.audit_incremental
+        if use_plan and incremental.wants_call_index(active, provider):
+            try:
+                with self._publication_guard():
+                    self.store.ensure_call_index()
+            except (sqlite3.Error, RuntimeError, OSError) as exc:
+                use_plan = False
+                report.update(mode="full", fallback={"*": "call_index_unavailable:" + type(exc).__name__})
+        for attempt in range(2):
+            with self._publication_guard(), self.store._read_boundary():
+                metadata_token = self.store.state_token(sid, provider)
+                if metadata_token != refreshed["_metadata_token"] and "metadata_changed_before_capture" not in coverage["issues"]:
+                    coverage["complete"] = False
+                    coverage["issues"].append("metadata_changed_before_capture")
+                plan = None
+                if history:
+                    # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
+                    needs, link_calls = audit_needs(active, planned)
+                    if use_plan:
+                        report = {key: value for key, value in report.items() if key == "retry"}
+                        try:
+                            plan = incremental.AuditPlan.prepare(
+                                self.store, session_id=sid, provider=provider, active=active, planned=planned,
+                                needs=needs, link_calls=link_calls, shadow_every=self.settings.audit_shadow_every,
+                                force_full=force_full, report=report)
+                        except (RequestStopped, IndexBusy):
+                            raise
+                        except Exception as exc:  # the cache could not even be read: evaluate everything in full
+                            plan = None
+                            report.update(mode="full", fallback={"*": "prepare_failed:" + type(exc).__name__})
+                    if plan is not None:
+                        evidence = AuditEventSnapshot(sid, provider, tuple(plan.events), plan.count)
+                    else:
+                        evidence = self.store.capture_audit_events(sid, provider, needs, link_calls=link_calls)
+                else:
+                    evidence = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
+                receipt_token = self._receipt_token(sid, provider)
+                if (provider == "agy" and receipt_token != refreshed["_receipt_token"]
+                        and "receipts_changed_before_capture" not in coverage["issues"]):
+                    coverage["complete"] = False
+                    coverage["issues"].append("receipts_changed_before_capture")
+            _mark_growth(coverage, observation)
+            reference = None
+            if plan is not None and plan.shadow:
+                reference = AuditEventSnapshot(sid, provider, tuple(plan.reference), len(plan.reference))
+                reference_coverage = copy.deepcopy(coverage)
+            try:
+                # The actual native stages, model decoding and regex evaluation own no
+                # engine lease, shared SQLite handle or open read transaction.
+                result = run_audit(session_id=sid, contracts=contracts, store=evidence,
+                                   provider=provider, proposed=planned, coverage=coverage, plan=plan)
+            except incremental.PlanRetry as retry:
+                # A summary could not hold some input: those rules run on the full evaluator in a second pass, and
+                # the limit is remembered so later audits do not fail the same way.
+                force_full = retry.ids
+                report = {"retry": {"rules": sorted(retry.ids), "reason": retry.reason}}
+                try:
+                    with self._publication_guard():
+                        if retry.plan is not None:
+                            self.store.save_audit_states(sid, provider, retry.plan.digest,
+                                                         retry.plan.overflow_rows(), retry.plan.snapshot)
+                        if retry.drop:
+                            self.store.drop_audit_states(sid, provider, sorted(retry.ids))
+                        if retry.health:
+                            self.store.record_audit_health(sid, provider, incremental.EVALUATOR_VERSION,
+                                                           [*sorted(retry.ids), "#facts"], retry.health, retry.reason)
+                except (sqlite3.Error, OSError):
+                    pass
+                if attempt:
+                    raise
+                continue
+            break
+        mismatch = []
+        if reference is not None:
+            # Shadow: the full evaluator over the same events. It is the answer whenever the two differ.
+            full = run_audit(session_id=sid, contracts=contracts, store=reference, provider=provider,
+                             proposed=planned, coverage=reference_coverage)
+            mismatch = incremental.compare(result, full)
+            if mismatch:
+                result = full
+                ids = sorted({item.contract_id for item in full.findings} & set(plan.monitors)
+                             if mismatch == ["#audit"] else set(mismatch))
+                report["incremental_mismatch"] = ids
+                try:
+                    with self._publication_guard():
+                        self.store.record_audit_health(
+                            sid, provider, incremental.EVALUATOR_VERSION, [*ids, "#facts"], "incremental_mismatch",
+                            "incremental result differed from the full evaluator at byte "
+                            f"{plan.snapshot['offset']}")
+                except (sqlite3.Error, OSError):
+                    pass
+            report["shadow_compared"] = True
         payload = result.model_dump(mode="json")
         payload.update(ok=True, provider=provider, action_executed=False,
                        applicable_contracts=len(active), requires_attention=result.verdict != "clean")
@@ -643,6 +719,8 @@ class SelfDirectEngine:
         payload["timings_ms"] = {
             "sync": round((sync_finished - started) * 1000, 2),
             "evaluation": round((time.perf_counter() - sync_finished) * 1000, 2)}
+        if report:
+            payload["incremental"] = report
         payload["nudge"] = (
             "Detect only. violation/suspicious: STOP and report; unknown: resolve missing evidence. "
             "clean is limited to the reported contracts and history snapshot, not execution authorization.")
@@ -704,6 +782,17 @@ class SelfDirectEngine:
                     payload["notes"].append("Current action prerequisites remain unverified while their required evidence is incomplete.")
             payload["requires_attention"] = payload["verdict"] != "clean"
             payload["integrity"] = integrity
+            if plan is not None and not mismatch:
+                # The monitor state is tied to the index commit it evaluated, not to how the source was verified: if a
+                # later full verification finds a rewrite, the reindex starts a new generation and drops these states.
+                try:
+                    if plan.timeouts:
+                        self.store.drop_audit_states(sid, provider, sorted(plan.timeouts))
+                    rows = plan.state_rows()
+                    report["state"] = (self.store.save_audit_states(sid, provider, plan.digest, rows, plan.snapshot)
+                                       if rows else "unchanged")
+                except (sqlite3.Error, OSError) as exc:
+                    report["state"] = "write_failed:" + type(exc).__name__  # a cache; the next audit rebuilds it
             reason = _fast_gate(payload, integrity) if integrity.get("mode") == "fast" else None
             if reason is None:
                 with publication():

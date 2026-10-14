@@ -267,6 +267,7 @@ class SessionStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._counts = {}
         try:
             with publication():
                 self._initialize_schema()
@@ -324,6 +325,33 @@ class SessionStore:
                 digests BLOB NOT NULL, tail BLOB, root TEXT NOT NULL, synced_at TEXT NOT NULL,
                 full_verified_at TEXT, full_verified_through INTEGER,
                 PRIMARY KEY(provider, session_id)
+            );
+            -- Incremental audit support (see audit/incremental.py). Everything below is derived data: the events
+            -- and the cursor stay the authority, and a missing or disagreeing row only means "evaluate in full".
+            -- A generation counts the times a session's stored events were replaced; the commit log is the chain
+            -- of append-only commits inside the current generation.
+            CREATE TABLE IF NOT EXISTS session_generations (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                PRIMARY KEY(provider,session_id)
+            );
+            CREATE TABLE IF NOT EXISTS session_commit_log (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                byte_offset INTEGER NOT NULL, prefix_hash TEXT NOT NULL, event_count INTEGER NOT NULL,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY(provider,session_id,generation,byte_offset)
+            );
+            CREATE TABLE IF NOT EXISTS audit_monitor_state (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, monitor_id TEXT NOT NULL,
+                needs_digest TEXT NOT NULL, contract_revision INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+                parser_version INTEGER NOT NULL, evaluator_version INTEGER NOT NULL, generation INTEGER NOT NULL,
+                byte_offset INTEGER NOT NULL, prefix_hash TEXT NOT NULL, event_count INTEGER NOT NULL,
+                path TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY(provider,session_id,monitor_id,needs_digest)
+            );
+            CREATE TABLE IF NOT EXISTS audit_incremental_health (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, monitor_id TEXT NOT NULL,
+                evaluator_version INTEGER NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL,
+                PRIMARY KEY(provider,session_id,monitor_id,evaluator_version)
             );
         """)
         check_request()
@@ -419,12 +447,27 @@ class SessionStore:
     def _commit_spool(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
                       expected_token, receipt_digest, blocks=None):
         check_request()
+        self._counts.clear()
+        try:
+            self._commit_rows(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
+                              replace=replace, parser_version=parser_version, expected_token=expected_token,
+                              receipt_digest=receipt_digest)
+        finally:
+            self._counts.clear()  # a rolled-back write leaves no trace in total_changes
+
+    def _commit_rows(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
+                     expected_token, receipt_digest):
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             if expected_token is not None and self.state_token(session_id, provider) != expected_token:
                 raise ValueError("stale session preparation")
             metrics = self.session_metrics(session_id, provider)
             known = self.chunk_ids(session_id, provider)
+            previous = self._conn.execute("SELECT byte_offset FROM session_cursors WHERE provider=? AND session_id=?",
+                                          (provider, session_id)).fetchone()
+            # An append only adds rows at or after the previous cursor. Anything else (a replacement, a row that
+            # overwrites a stored id, a row before the cursor) changes the history audit state was built from.
+            touched_prefix = replace or previous is None
             prior = self._agy_tally(session_id) if provider == "agy" and not replace else Counter()
             tally = Counter()
             with publication():
@@ -442,6 +485,8 @@ class SessionStore:
                     for row in batch:
                         if row[1] != provider or row[2] != session_id:
                             raise ValueError("event scope differs from session publication")
+                        if not touched_prefix and (row[0] in known or row[3] < previous[0]):
+                            touched_prefix = True
                         if replace or row[0] not in known:
                             added += 1
                             flag = spool.flags.get(row[0], (False, False))
@@ -473,8 +518,31 @@ class SessionStore:
                                        (session_id, json.dumps(dict(prior + tally), sort_keys=True), synced_at))
                 self._conn.execute("INSERT OR REPLACE INTO session_metrics VALUES (?,?,?,?,?)",
                                    (provider, session_id, *metrics))
+                self._record_commit(provider, session_id, offset, digest, metrics[0], synced_at, touched_prefix)
                 check_request()
                 self._conn.commit()
+
+    _COMMIT_LOG_KEEP = 256
+
+    def _record_commit(self, provider, session_id, offset, digest, event_count, synced_at, rewrite):
+        """Chain this commit onto the session's append history, in the transaction that published it."""
+        row = self._conn.execute("SELECT generation FROM session_generations WHERE provider=? AND session_id=?",
+                                 (provider, session_id)).fetchone()
+        if rewrite or row is None:
+            generation = (row[0] if row else 0) + 1
+            self._conn.execute("INSERT OR REPLACE INTO session_generations VALUES (?,?,?)",
+                               (provider, session_id, generation))
+            self._conn.execute("DELETE FROM session_commit_log WHERE provider=? AND session_id=?", (provider, session_id))
+            self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=?", (provider, session_id))
+        else:
+            generation = row[0]
+        self._conn.execute("INSERT OR REPLACE INTO session_commit_log VALUES (?,?,?,?,?,?,?)",
+                           (provider, session_id, generation, offset, digest, event_count, synced_at))
+        self._conn.execute(
+            "DELETE FROM session_commit_log WHERE provider=? AND session_id=? AND generation=? AND byte_offset <"
+            " COALESCE((SELECT byte_offset FROM session_commit_log WHERE provider=? AND session_id=? AND generation=?"
+            " ORDER BY byte_offset DESC LIMIT 1 OFFSET ?), -1)",
+            (provider, session_id, generation, provider, session_id, generation, self._COMMIT_LOG_KEEP - 1))
 
     def pending_deletions(self, session_id, provider):
         return [row[0] for row in self._conn.execute(
@@ -574,6 +642,8 @@ class SessionStore:
             "SELECT chunk_id,data FROM session_events" + where + " ORDER BY provider,session_id,byte_start,sub_index", params).fetchall())
         return AuditEvidenceSnapshot(session_id, provider, rows, count)
 
+    audit_rows_fetched = 0  # slim audit rows read by this store object; tests and benchmarks read it
+
     def capture_audit_events(self, session_id, provider, needs, *, link_calls=False):
         """Ordered slim events; text is loaded only for events some ``(scope, roles)`` need can inspect.
 
@@ -581,55 +651,271 @@ class SessionStore:
         Rows are paged through a cursor and never held as raw JSON or pydantic models.
         """
         with self._read_boundary():
-            terms, term_params = [], []
-            for scope, roles in needs:
-                if scope == "attempt":
-                    # Host-logged model proposals (forbidden-attempt matching); never every runtime-role event.
-                    terms.append("json_extract(data,'$.meta.evidence_origin')='model_proposal'")
-                    continue
-                kind = _SCOPE_KINDS.get(scope)
-                parts = []
-                if kind is not None:
-                    parts.append("json_extract(data,'$.kind')=?")
-                    term_params.append(kind)
-                parts.append("json_extract(data,'$.meta.role') IN (" + ",".join("?" for _ in roles) + ")" if roles else "0")
-                term_params.extend(roles)
-                terms.append("(" + " AND ".join(parts) + ")")
-            if link_calls:
-                terms.append("json_extract(data,'$.kind') IN ('tool_call','tool_result')")
-            wanted = " OR ".join(terms) if terms else "0"
             count = self.chunk_count(session_id, provider)
-            check_request()
-            # Provider evidence classes (AGY truncation, pending, legacy, denial; Claude cut results) are read
-            # with one extra packed column.
-            packed_keys = _AUDIT_META.get(provider)
-            extra = ("json_extract(data,'" + "','".join("$.meta." + key for key in packed_keys) + "')"
-                     if packed_keys else "NULL")
-            cursor = self._conn.execute(
-                "SELECT chunk_id, json_extract(data,'$.kind'), json_extract(data,'$.meta.role'),"
-                " json_extract(data,'$.meta.call_id'), json_type(data,'$.meta.success'),"
-                " json_extract(data,'$.meta.success'), CASE WHEN " + wanted + " THEN json_extract(data,'$.text') END,"
-                " " + extra + " FROM session_events WHERE session_id=? AND provider=?"
-                " ORDER BY provider,session_id,byte_start,sub_index", term_params + [session_id, provider])
-            events = []
-            while True:
-                check_request()
-                page = cursor.fetchmany(512)
-                if not page:
-                    break
-                for cid, kind, role, call_id, success_type, success, text, packed in page:
-                    if success_type == "true":
-                        success = True
-                    elif success_type == "false":
-                        success = False
-                    elif success_type in (None, "null"):
-                        success = None
-                    meta = {"role": role, "call_id": call_id, "success": success}
-                    if packed is not None:
-                        meta.update((key, value) for key, value in zip(packed_keys, json.loads(packed))
-                                    if value is not None)
-                    events.append(AuditEvent(cid, kind, text or "", meta))
+            events = self._fetch_audit_events(session_id, provider, needs, link_calls, None)
             return AuditEventSnapshot(session_id, provider, tuple(events), count)
+
+    def capture_audit_tail(self, session_id, provider, needs, *, link_calls=False, from_byte=0):
+        """The slim events whose records start at ``from_byte`` or later, in order; call inside a read boundary.
+
+        Reads rows in proportion to the appended records, not to the session: the range is served by the
+        ``(provider, session_id, byte_start, sub_index)`` index.
+        """
+        return self._fetch_audit_events(session_id, provider, needs, link_calls, from_byte)
+
+    def _fetch_audit_events(self, session_id, provider, needs, link_calls, from_byte):
+        terms, term_params = [], []
+        for scope, roles in needs:
+            if scope == "attempt":
+                # Host-logged model proposals (forbidden-attempt matching); never every runtime-role event.
+                terms.append("json_extract(data,'$.meta.evidence_origin')='model_proposal'")
+                continue
+            kind = _SCOPE_KINDS.get(scope)
+            parts = []
+            if kind is not None:
+                parts.append("json_extract(data,'$.kind')=?")
+                term_params.append(kind)
+            parts.append("json_extract(data,'$.meta.role') IN (" + ",".join("?" for _ in roles) + ")" if roles else "0")
+            term_params.extend(roles)
+            terms.append("(" + " AND ".join(parts) + ")")
+        if link_calls:
+            terms.append("json_extract(data,'$.kind') IN ('tool_call','tool_result')")
+        wanted = " OR ".join(terms) if terms else "0"
+        check_request()
+        # Provider evidence classes (AGY truncation, pending, legacy, denial; Claude cut results) are read
+        # with one extra packed column.
+        packed_keys = _AUDIT_META.get(provider)
+        extra = ("json_extract(data,'" + "','".join("$.meta." + key for key in packed_keys) + "')"
+                 if packed_keys else "NULL")
+        tail, tail_params = ("", []) if from_byte is None else (" AND byte_start>=?", [from_byte])
+        cursor = self._conn.execute(
+            "SELECT chunk_id, json_extract(data,'$.kind'), json_extract(data,'$.meta.role'),"
+            " json_extract(data,'$.meta.call_id'), json_type(data,'$.meta.success'),"
+            " json_extract(data,'$.meta.success'), CASE WHEN " + wanted + " THEN json_extract(data,'$.text') END,"
+            " " + extra + ", byte_start, sub_index FROM session_events WHERE session_id=? AND provider=?" + tail
+            + " ORDER BY provider,session_id,byte_start,sub_index", term_params + [session_id, provider] + tail_params)
+        events = []
+        while True:
+            check_request()
+            page = cursor.fetchmany(512)
+            if not page:
+                break
+            for cid, kind, role, call_id, success_type, success, text, packed, byte_start, sub_index in page:
+                if success_type == "true":
+                    success = True
+                elif success_type == "false":
+                    success = False
+                elif success_type in (None, "null"):
+                    success = None
+                meta = {"role": role, "call_id": call_id, "success": success}
+                if packed is not None:
+                    meta.update((key, value) for key, value in zip(packed_keys, json.loads(packed))
+                                if value is not None)
+                events.append(AuditEvent(cid, kind, text or "", meta, (byte_start, sub_index)))
+            self.audit_rows_fetched += len(page)
+        return events
+
+    # --- Incremental audit state ------------------------------------------------------------------------------
+    # Derived data only. The events and the cursor are the authority; nothing here may make an audit cleaner.
+
+    def audit_lineage(self, session_id, provider):
+        """The cursor, the session's generation and its newest commit-log row, as of this read boundary."""
+        cursor = self._cursor_record(session_id, provider)
+        row = self._conn.execute("SELECT generation FROM session_generations WHERE provider=? AND session_id=?",
+                                 (provider, session_id)).fetchone()
+        latest = None
+        if row is not None:
+            found = self._conn.execute(
+                "SELECT byte_offset,prefix_hash,event_count,synced_at FROM session_commit_log"
+                " WHERE provider=? AND session_id=? AND generation=? ORDER BY byte_offset DESC LIMIT 1",
+                (provider, session_id, row[0])).fetchone()
+            latest = dict(found) if found is not None else None
+        return {"cursor": cursor, "generation": row[0] if row is not None else None, "latest": latest}
+
+    def lineage_row(self, session_id, provider, generation, offset):
+        found = self._conn.execute(
+            "SELECT byte_offset,prefix_hash,event_count,synced_at FROM session_commit_log"
+            " WHERE provider=? AND session_id=? AND generation=? AND byte_offset=?",
+            (provider, session_id, generation, offset)).fetchone()
+        return dict(found) if found is not None else None
+
+    def load_audit_states(self, session_id, provider, needs_digest):
+        rows = self._conn.execute(
+            "SELECT monitor_id,contract_revision,fingerprint,parser_version,evaluator_version,generation,byte_offset,"
+            "prefix_hash,event_count,path,state FROM audit_monitor_state"
+            " WHERE provider=? AND session_id=? AND needs_digest=?", (provider, session_id, needs_digest)).fetchall()
+        out = {}
+        for row in rows:
+            record = dict(row)
+            try:
+                record["state"] = json.loads(record["state"])
+            except ValueError:
+                continue  # an unreadable cache row is the same as no row
+            out[record["monitor_id"]] = record
+        return out
+
+    def audit_health(self, session_id, provider, evaluator_version):
+        return {row[0]: (row[1], row[2]) for row in self._conn.execute(
+            "SELECT monitor_id,status,detail FROM audit_incremental_health"
+            " WHERE provider=? AND session_id=? AND evaluator_version=?", (provider, session_id, evaluator_version))}
+
+    def record_audit_health(self, session_id, provider, evaluator_version, monitor_ids, status, detail):
+        """Persist 'do not trust incremental evaluation of this contract here' (until the evaluator changes)."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn, publication():
+            self._conn.execute("BEGIN IMMEDIATE")
+            for monitor_id in monitor_ids:
+                self._conn.execute("INSERT OR REPLACE INTO audit_incremental_health VALUES (?,?,?,?,?,?,?)",
+                                   (provider, session_id, monitor_id, evaluator_version, status, detail[:2000], now))
+                self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND monitor_id=?",
+                                   (provider, session_id, monitor_id))
+            check_request()
+
+    def drop_audit_states(self, session_id, provider, monitor_ids):
+        """Forget stored monitor states (all needs variants) without marking the contract unhealthy."""
+        with self._conn, publication():
+            self._conn.execute("BEGIN IMMEDIATE")
+            for monitor_id in monitor_ids:
+                self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND monitor_id=?",
+                                   (provider, session_id, monitor_id))
+            check_request()
+
+    def save_audit_states(self, session_id, provider, needs_digest, rows, snapshot):
+        """Write monitor states and the evaluated cursor in one transaction; returns ``"saved"`` or why not.
+
+        ``snapshot`` is what the evaluation read: ``generation`` (``None`` when no valid commit chain existed),
+        ``offset``, ``prefix_hash``, ``synced_at``, ``path`` and ``count``. The write is refused unless the index
+        still contains exactly that point: same chain and log row, or (when the chain is new) the same cursor. A
+        state is never written over a newer one of the same generation.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn, publication():
+            self._conn.execute("BEGIN IMMEDIATE")
+            cursor = self._conn.execute(
+                "SELECT byte_offset,prefix_hash,synced_at,path FROM session_cursors WHERE provider=? AND session_id=?",
+                (provider, session_id)).fetchone()
+            row = self._conn.execute("SELECT generation FROM session_generations WHERE provider=? AND session_id=?",
+                                     (provider, session_id)).fetchone()
+            if snapshot["generation"] is not None:
+                if row is None or row[0] != snapshot["generation"]:
+                    return "stale_generation"
+                logged = self._conn.execute(
+                    "SELECT prefix_hash,event_count FROM session_commit_log"
+                    " WHERE provider=? AND session_id=? AND generation=? AND byte_offset=?",
+                    (provider, session_id, snapshot["generation"], snapshot["offset"])).fetchone()
+                if logged is None or logged[0] != snapshot["prefix_hash"] or logged[1] != snapshot["count"]:
+                    return "stale_lineage"
+                generation = snapshot["generation"]
+            else:
+                if cursor is None or tuple(cursor) != (snapshot["offset"], snapshot["prefix_hash"],
+                                                        snapshot["synced_at"], snapshot["path"]):
+                    return "stale_cursor"
+                generation = (row[0] if row is not None else 0) + 1
+                self._conn.execute("INSERT OR REPLACE INTO session_generations VALUES (?,?,?)",
+                                   (provider, session_id, generation))
+                self._conn.execute("DELETE FROM session_commit_log WHERE provider=? AND session_id=?", (provider, session_id))
+                self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=?", (provider, session_id))
+                self._conn.execute("INSERT OR REPLACE INTO session_commit_log VALUES (?,?,?,?,?,?,?)",
+                                   (provider, session_id, generation, snapshot["offset"], snapshot["prefix_hash"],
+                                    snapshot["count"], snapshot["synced_at"]))
+            for item in rows:
+                check_request()
+                self._conn.execute(
+                    "INSERT INTO audit_monitor_state VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(provider,session_id,monitor_id,needs_digest) DO UPDATE SET"
+                    " contract_revision=excluded.contract_revision, fingerprint=excluded.fingerprint,"
+                    " parser_version=excluded.parser_version, evaluator_version=excluded.evaluator_version,"
+                    " generation=excluded.generation, byte_offset=excluded.byte_offset,"
+                    " prefix_hash=excluded.prefix_hash, event_count=excluded.event_count, path=excluded.path,"
+                    " state=excluded.state, updated_at=excluded.updated_at"
+                    " WHERE audit_monitor_state.generation < excluded.generation OR"
+                    " (audit_monitor_state.generation = excluded.generation AND"
+                    "  audit_monitor_state.byte_offset <= excluded.byte_offset)",
+                    (provider, session_id, item["monitor_id"], needs_digest, item["contract_revision"],
+                     item["fingerprint"], item["parser_version"], item["evaluator_version"], generation,
+                     snapshot["offset"], snapshot["prefix_hash"], snapshot["count"], snapshot["path"],
+                     json.dumps(item["state"], separators=(",", ":")), now))
+            # Keep the newest few needs variants of a monitor (audit and action checks differ), drop the rest.
+            self._conn.execute(
+                "DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND rowid IN ("
+                " SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY monitor_id ORDER BY updated_at DESC) AS n"
+                " FROM audit_monitor_state WHERE provider=? AND session_id=?) WHERE n > 4)",
+                (provider, session_id, provider, session_id))
+            check_request()
+            return "saved"
+
+    _CALL_INDEX = ("CREATE INDEX IF NOT EXISTS events_call ON session_events(provider, session_id,"
+                   " json_extract(data,'$.meta.call_id')) WHERE json_extract(data,'$.meta.call_id') IS NOT NULL")
+
+    def ensure_call_index(self):
+        """Index events by call id so a monitor can ask which calls and results share one. Built once per index.
+
+        Never call this inside a read boundary: creating the index writes.
+        """
+        if self._conn.in_transaction:
+            raise RuntimeError("ensure_call_index must run outside a read boundary")
+        if self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='events_call'").fetchone():
+            return
+        with self._conn, publication():
+            self._conn.execute(self._CALL_INDEX)
+            check_request()
+
+    def audit_call_events(self, session_id, provider, call_ids, before_byte):
+        """``{call_id: [(kind, (byte_start, sub_index), chunk_id)]}`` for stored calls and results of these ids."""
+        found = {}
+        ids = list(call_ids)
+        for start in range(0, len(ids), 400):
+            check_request()
+            batch = ids[start:start + 400]
+            rows = self._conn.execute(
+                "SELECT json_extract(data,'$.meta.call_id'), json_extract(data,'$.kind'), byte_start, sub_index, chunk_id"
+                # ``+byte_start``: keep the planner on the call-id index; a range on byte_start would scan the session.
+                " FROM session_events WHERE provider=? AND session_id=? AND +byte_start<?"
+                " AND json_extract(data,'$.meta.call_id') IN (" + ",".join("?" for _ in batch) + ")"
+                " AND json_extract(data,'$.kind') IN ('tool_call','tool_result')",
+                [provider, session_id, before_byte, *batch]).fetchall()
+            for call_id, kind, byte_start, sub_index, chunk_id in rows:
+                found.setdefault(call_id, []).append((kind, (byte_start, sub_index), chunk_id))
+        self.audit_rows_fetched += sum(len(v) for v in found.values())
+        return found
+
+    PROPOSAL_LOOKBACK = 4096  # events scanned back from the first appended one
+    PROPOSAL_ROWS = 128       # proposals of one tool kept from that window
+
+    def anchor_chunks(self, session_id, provider, anchors):
+        """The stored events named by ``anchors`` that belong to this session, as full chunks (no session scan)."""
+        found = []
+        for anchor in anchors:
+            check_request()
+            chunk = self.get_chunk(anchor)
+            if chunk is not None and chunk.session_id == session_id and chunk.provider == provider:
+                found.append(chunk)
+        return found
+
+    def audit_proposals_before(self, session_id, provider, name, before_byte):
+        """Model proposals of tool ``name`` among the last ``PROPOSAL_LOOKBACK`` events before ``before_byte``.
+
+        Returns ``(rows, complete)``, newest first, ``(key, text)`` each, at most ``PROPOSAL_ROWS``; ``complete`` is
+        false when the window did not reach the start of the session or held more proposals than that, so an older
+        one may exist.
+        """
+        check_request()
+        edge = self._conn.execute(
+            "SELECT 1 FROM (SELECT 1 FROM session_events WHERE provider=? AND session_id=? AND byte_start<?"
+            " ORDER BY byte_start DESC, sub_index DESC LIMIT ?) ", (provider, session_id, before_byte,
+                                                                    self.PROPOSAL_LOOKBACK + 1)).fetchall()
+        complete = len(edge) <= self.PROPOSAL_LOOKBACK
+        rows = self._conn.execute(
+            "SELECT byte_start, sub_index, json_extract(data,'$.text') FROM (SELECT byte_start, sub_index, data"
+            " FROM session_events WHERE provider=? AND session_id=? AND byte_start<?"
+            " ORDER BY byte_start DESC, sub_index DESC LIMIT ?)"
+            " WHERE json_extract(data,'$.meta.evidence_origin')='model_proposal'"
+            " AND json_extract(data,'$.meta.tool_name') IS ? ORDER BY byte_start DESC, sub_index DESC LIMIT ?",
+            (provider, session_id, before_byte, self.PROPOSAL_LOOKBACK, name, self.PROPOSAL_ROWS + 1)).fetchall()
+        if len(rows) > self.PROPOSAL_ROWS:
+            rows, complete = rows[:self.PROPOSAL_ROWS], False
+        self.audit_rows_fetched += len(rows)
+        return [((row[0], row[1]), row[2] or "") for row in rows], complete
 
     def agy_fallback_retries(self, session_id):
         """Sizes (None: missing) of the sibling full log recorded with this session's transient failed fallbacks."""
@@ -741,7 +1027,16 @@ class SessionStore:
             clauses.append("provider=?")
             params.append(provider)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        return self._conn.execute("SELECT COUNT(*) FROM session_events" + where, params).fetchone()[0]
+        # COUNT(*) walks the whole session's index range; a state token asks for it several times per request. The
+        # answer cannot change while neither this connection nor another one has written (``data_version`` moves
+        # for other connections, ``total_changes`` for this one), and this store's own writes drop the cache.
+        version = (self._conn.execute("PRAGMA data_version").fetchone()[0], self._conn.total_changes)
+        cached = self._counts.get((session_id, provider))
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        count = self._conn.execute("SELECT COUNT(*) FROM session_events" + where, params).fetchone()[0]
+        self._counts[(session_id, provider)] = (version, count)
+        return count
 
     def known_hashes(self, session_id, provider=None):
         return {c.content_hash for c in self.list_chunks(session_id, provider)}

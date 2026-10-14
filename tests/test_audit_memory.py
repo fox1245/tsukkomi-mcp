@@ -26,6 +26,7 @@ def _history(path):
 
 def test_audit_memory_is_bounded_by_what_the_contracts_need(session):
     engine, path = session
+    engine.settings.audit_shadow_every = 0  # the shadow comparison deliberately holds the whole event list
     bulk_bytes = _history(path)
     engine.upsert_contracts([{"id": "no-delete", "type": "must_not", "scope": "tool_call", "regex": "DELETE"}])
     assert engine.audit_session(SID)["verdict"] == "clean"  # sync + warm-up outside the measurement

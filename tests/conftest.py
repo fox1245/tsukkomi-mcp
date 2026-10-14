@@ -29,6 +29,10 @@ def explicit_test_backend(tmp_path, monkeypatch):
     else:
         monkeypatch.setenv("SELF_DIRECT_DENSE_BACKEND", "numpy")
     monkeypatch.delenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", raising=False)
+    # Every audit in the suite also runs the full evaluator beside the incremental one and compares them; a
+    # difference returns the full result, so an incremental defect shows up as the mismatch assertions of
+    # tests/test_incremental_*.py or as a changed finding, never as a silent wrong answer.
+    monkeypatch.setenv("SELF_DIRECT_AUDIT_SHADOW_EVERY", "1")
     # Never load a developer's per-user TOML while running isolated regressions.
     config_file = tmp_path / "isolated-config.toml"
     config_file.write_text("", encoding="utf-8")
@@ -82,6 +86,32 @@ class HashMeter:
 @pytest.fixture
 def hash_meter(monkeypatch):
     return HashMeter(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def strict_incremental(monkeypatch, request):
+    """A shadow comparison that finds the incremental result different from the full one fails the test.
+
+    In production a difference returns the full result and disables the incremental path for that contract; here it
+    must be loud, or the whole suite would pass over an incremental defect. Tests that provoke a mismatch on purpose
+    carry the ``allow_incremental_mismatch`` marker.
+    """
+    from self_directing_mcp.audit import incremental
+    real = incremental.compare
+
+    def strict(result, reference):
+        bad = real(result, reference)
+        if bad and request.node.get_closest_marker("allow_incremental_mismatch") is None:
+            raise AssertionError(f"incremental audit differs from the full evaluator for {bad}: "
+                                 f"{[f.model_dump() for f in result.findings]} != "
+                                 f"{[f.model_dump() for f in reference.findings]}")
+        return bad
+
+    monkeypatch.setattr(incremental, "compare", strict)
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "allow_incremental_mismatch: the test provokes an incremental/full mismatch")
 
 
 def pytest_sessionfinish(session, exitstatus):
