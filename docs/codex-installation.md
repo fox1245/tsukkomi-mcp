@@ -11,7 +11,7 @@ python scripts/install_codex.py --trust-hooks
 python scripts/install_codex.py --verify
 ```
 
-Use python3 or py -3.13 where appropriate. The script prefers uv when installed and otherwise uses venv/pip. It installs a regular package in a managed environment, while its configured credential file and native library must remain at their registered absolute paths.
+Use python3 or py -3.13 where appropriate. The script prefers uv when installed and otherwise uses venv/pip. It installs a regular package in a managed environment, including the exact dependency `neograph-engine==0.14.1`, while its configured credential file and native library must remain at their registered absolute paths.
 
 Options:
 
@@ -65,6 +65,8 @@ hooks = true
 
 Windows uses venv\Scripts\python.exe. Merge into existing tables; do not duplicate an existing [features] table. The normal installer handles this.
 
+The installer registers an explicit `SELF_DIRECT_INDEX_DIR`, so the default index location (`~/.self_direct_index` since the index moved out of the checkout) does not affect it. A manual registration without that variable would use the default and must name an existing index explicitly. Optional runtime limits go in the same `env` table, for example `SELF_DIRECT_MAX_CONCURRENT_CALLS` (default 4) for the number of heavy tool calls that run at once. Because a Codex client's tool deadline bounds each call, raise `tool_timeout_sec` as well when raising a `SELF_DIRECT_*_TIMEOUT_SEC` budget.
+
 ## Manual hook registration
 
 Merge [codex-hooks.example.json](codex-hooks.example.json) into CODEX_HOME/hooks.json. Keep existing entries and their order. The handlers call self-directing-mcp.codex_session_hook and receive structured values from Codex:
@@ -73,13 +75,15 @@ Merge [codex-hooks.example.json](codex-hooks.example.json) into CODEX_HOME/hooks
 - PreToolUse passes the pending tool name/input for a prospective check.
 - Stop verifies changed work and remaining obligations, deduplicating unchanged checkpoints without continuing or terminating the turn. A no-contract hook skips index initialization and does not claim compliance.
 
+Codex rollouts are appended while the hook runs, so an audit usually judges a growing file. When the only coverage gap is appended bytes, the hook context includes `judged_through_byte` and `unread_bytes`: findings and a `clean` result describe the session as of that offset, and a proposed action's success-required prerequisites stay `unknown` until the unread history is seen. Rewrites, truncation or a replaced file are not treated as growth and stay `unknown`.
+
 Read the resulting definitions, then trust them with /hooks. The installer can perform that narrow trust step after an explicit --trust-hooks request: it uses each currentHash returned by hooks/list and writes only that hook's trusted_hash. It never invents a hash or trusts other handlers.
 
 Missing MCP connections do not cause the hook system to reconnect the server. Some hosted/specialized tools do not emit PreToolUse. Manual check_action/audit_session remains available. Hook output is advisory and does not become a new authorization.
 
 ## Manual AGENTS guidance
 
-Copy the section under "Guidance installed for everyday use" from the repository AGENTS.md into your effective global AGENTS file, or run the installer to maintain its marker-delimited block.
+The installer maintains a marker-delimited block in your effective global AGENTS file; its text is the `GUIDANCE` constant in `src/self_directing_mcp/install_codex.py`. To apply it by hand, copy that block (between the `BEGIN`/`END` marker comments the installer writes) rather than free-typing it. The "Guidance installed for everyday use" section of the repository AGENTS.md describes the same behavior in more detail but is not the installed text.
 
 The guidance asks the agent to register the user's actual scoped requirements, inspect planned actions, retrieve source evidence and distinguish unknown from clean. It also discourages redundant checks when a fresh hook result already covers the action. Reading AGENTS.md describes the procedure; an agent or a human must actually run the installer to apply it.
 
@@ -96,7 +100,9 @@ The verification command checks:
 
 On failure, inspect the reported step and the timestamped backup. Restore only files that need recovery after comparing against newer edits. The installer refuses concurrent file replacement and malformed/duplicate owned markers instead of deleting unrelated settings. It never modifies auth.json.
 
-For updates, rerun the same installation command. New hook definitions require review/trust again. Global AGENTS or project instructions can override one another; report which effective file was changed rather than assuming an ignored file will load.
+For updates, rerun the same installation command. New hook definitions require review/trust again.
+
+After updating the package (for example to 0.6.0), start a new Codex session so the MCP connection and its parser are reloaded, and restart any other process that shares the same index. The Codex parser version 3 bump reparses each session lazily, once, on its next sync or audit; existing events, anchors, model-specific vector caches, contracts and checklists are preserved. A process still running the old package can write cursors that the new one must reparse, which is why all processes sharing an index should be restarted. Global AGENTS or project instructions can override one another; report which effective file was changed rather than assuming an ignored file will load.
 
 ## Sources
 
