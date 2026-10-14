@@ -139,7 +139,7 @@ def daemon_environment(environ) -> dict:
     kept = {name: value for name, value in environ.items()
             if name in KEEP_ENV or name.startswith(KEEP_ENV_PREFIXES)}
     src = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    if os.path.isdir(os.path.join(src, "self_directing_mcp")):
+    if os.path.isdir(os.path.join(src, "self_directing_mcp")) and src not in kept.get("PYTHONPATH", "").split(os.pathsep):
         kept["PYTHONPATH"] = src + (os.pathsep + kept["PYTHONPATH"] if kept.get("PYTHONPATH") else "")
     return kept
 

@@ -105,7 +105,23 @@ class Lab:
             time.sleep(0.02)
         raise RuntimeError("the daemon did not start")
 
+    def stop_spawned_daemon(self) -> None:
+        """A daemon that a relay or a hook started (not ``daemon_proc``): stop it through its own pid file, so that
+        removing the runtime directory never leaves one running."""
+        try:
+            pid = int((self.runtime_dir / "daemon.pid").read_text())
+            with open(f"/proc/{pid}/cmdline", "rb") as stream:
+                if b"self_directing_mcp.daemon" not in stream.read():
+                    return
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 20
+            while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+        except (OSError, ValueError):
+            pass
+
     def stop_daemon(self) -> None:
+        self.stop_spawned_daemon()
         if self.daemon_proc is None:
             return
         try:
