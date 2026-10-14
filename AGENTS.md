@@ -205,11 +205,18 @@ session_meta fields are validated, but base_instructions, dynamic_tools, account
 lists are never indexed. A complete inherited parent session_meta in the middle of a sub-agent
 file is accepted; a first-line id mismatch is still an error.
 
-AGY parser v6 restores fields the host cut from the sibling transcript_full.jsonl when it matches;
+AGY parser v7 restores fields the host cut from the sibling transcript_full.jsonl when it matches;
 what stays cut leaves dependent verdicts unknown, never clean, and results from before the
-conversation's first hook receipt are legacy_unlinked (unsupported_legacy). Claude Code parser v1
+conversation's first hook receipt are legacy_unlinked (unsupported_legacy). The Antigravity IDE's
+typed result steps (RUN_COMMAND, VIEW_FILE, CODE_ACTION, MCP_TOOL, LIST_DIRECTORY) follow those
+rules: no call ids exist, so linkage is a host receipt only. A linked, DONE RUN_COMMAND with host
+exit_code 0 is success evidence, a nonzero exit_code is a failure and an unlinked result is never
+success. CONVERSATION_HISTORY and KNOWLEDGE_ARTIFACTS are runtime metadata; any other step type
+stays unsupported. A leading run of NUL bytes in front of a valid record is stripped and recorded
+(host_padding_bytes); NULs anywhere else stay a parse error. Claude Code parser v2
 takes user authority only from a recorded origin.kind of human (plus the documented legacy and
-queued-command cases); everything else, including a subagent's task prompt, is runtime evidence.
+queued-command cases); everything else, including a subagent's task prompt and a scheduled_task_fire
+announcement (a cron task fired; its prompt is never indexed), is runtime evidence.
 
 OMP parser v8 treats host notices, image blocks, session_init, model_usage, branch_summary,
 redactedThinking, ttsr_injection and developer messages as runtime records, not user

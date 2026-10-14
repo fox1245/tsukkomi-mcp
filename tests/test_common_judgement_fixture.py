@@ -366,3 +366,55 @@ def test_unknown_evidence_is_never_clean_and_never_resumes_on_any_host(make_host
     assert _facts(responses["codex"])["verdict"] == "unknown"
     assert responses["omp"] == {} and responses["agy"]["decision"] == "allow"
     assert "decision" not in responses["claude"] and "Not verified" in responses["claude"]["systemMessage"]
+
+
+# --- host runtime records are not evidence on any host ---------------------------------------------------------
+
+def _append_host_runtime_records(hosts, phrases):
+    """Records only AGY (IDE context steps, a NUL-padded runtime line) and Claude Code (a scheduled-task
+    announcement whose prompt carries ``phrases``) emit. Codex and OMP histories stay as they are."""
+    agy = hosts["agy"].path
+    lines = [{"step_index": 2, "source": "SYSTEM", "type": "CONVERSATION_HISTORY", "status": "DONE",
+              "created_at": "2026-10-01T00:00:02Z"},
+             {"step_index": 3, "source": "SYSTEM", "type": "KNOWLEDGE_ARTIFACTS", "status": "DONE",
+              "created_at": "2026-10-01T00:00:03Z"}]
+    padded = {"step_index": 4, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE",
+              "created_at": "2026-10-01T00:00:04Z", "content": " ".join(phrases)}
+    with agy.open("ab") as stream:
+        for record in lines:
+            stream.write(json.dumps(record).encode() + b"\n")
+        stream.write(b"\x00" * 1550 + json.dumps(padded).encode() + b"\n")
+    claude = hosts["claude"].path
+    fired = {"type": "system", "subtype": "scheduled_task_fire", "uuid": "00000000-0000-4000-8000-0000000000f1",
+             "parentUuid": None, "sessionId": CLAUDE_SID, "timestamp": "2026-10-01T00:00:59.000Z",
+             "cwd": "/synthetic/project", "isSidechain": False, "userType": "external", "version": "9.9.9",
+             "isMeta": False, "cron": "*/5 * * * *", "cronKind": "recurring", "taskId": "task-0001",
+             "taskKind": "cron", "content": " ".join(phrases), "prompt": " ".join(phrases)}
+    with claude.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(fired) + "\n")
+
+
+def test_host_runtime_records_never_change_the_judgement_on_any_host(make_hosts):
+    """A scheduled-task prompt (Claude Code), IDE context steps and a padded line (AGY) carry the very phrases the
+    user-role contracts look for. They are runtime text: they do not satisfy a user obligation, do not violate a
+    user prohibition, and leave coverage complete, so all four hosts still return the same verdicts."""
+    approval, secret = "approved-by-the-owner", "SCHEDULED-ONLY-PHRASE"
+    contracts = [ACK,
+                 {"id": "owner-approval", "type": "must", "scope": "message", "roles": ["user"], "regex": approval},
+                 {"id": "no-secret", "type": "must_not", "scope": "message", "roles": ["user"], "regex": secret}]
+    hosts = make_hosts([USER, WORKING], contracts)
+    _append_host_runtime_records(hosts, [approval, secret, "VERIFIED"])
+    for host in hosts.values():
+        host.engine.audit_session(host.session_id, provider=host.name, path=str(host.path))
+    judged = _same_judgement(hosts, "audit_session")
+    assert judged["verdict"] == "violation" and judged["coverage"] == (True, ())
+    assert judged["findings"] == [("ack", "violation", "applicable"), ("no-secret", "clean", "applicable"),
+                                  ("owner-approval", "violation", "applicable")]
+    # And the extra records were in fact parsed on the two hosts that have them (no silent skip).
+    agy_chunks = hosts["agy"].engine.store.list_chunks(AGY_SID, "agy")
+    assert {c.meta.get("event_type") for c in agy_chunks} >= {"CONVERSATION_HISTORY", "KNOWLEDGE_ARTIFACTS"}
+    assert any(c.meta.get("host_padding_bytes") == 1550 for c in agy_chunks)
+    claude_chunks = hosts["claude"].engine.store.list_chunks(CLAUDE_SID, "claude")
+    assert any(c.meta.get("system_subtype") == "scheduled_task_fire" and c.meta["role"] == "runtime"
+               for c in claude_chunks)
+    assert not any(secret in c.text or approval in c.text for c in agy_chunks + claude_chunks if c.meta["role"] == "user")

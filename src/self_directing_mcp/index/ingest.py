@@ -46,7 +46,7 @@ class AuditEventSnapshot:
 _SCOPE_KINDS = {"tool_call": "tool_call", "tool_result": "tool_result", "message": "turn"}
 # Meta keys the audit helper for AGY evidence classes needs on every slim event.
 _AGY_AUDIT_META = ("event_type", "step_index", "status", "pending", "linkage", "evidence_origin",
-                   "tool_name", "truncated_fields", "denied_action")
+                   "tool_name", "truncated_fields", "denied_action", "result_type")
 # Claude Code: a truncation notice names the tool result (``call_id``) the host cut; see audit.runner.
 _AUDIT_META = {"agy": _AGY_AUDIT_META, "claude": ("truncated_result_for", "call_id")}
 
@@ -142,10 +142,12 @@ def prefix_digest(path: Path, length: int) -> str:
     return digest.hexdigest()
 
 
-def agy_tally(linkage, pending, media_count, event_type, still, restored, fallback=None):
+def agy_tally(linkage, pending, media_count, event_type, still, restored, fallback=None, padding=None, sub=0):
     """Counter increments for one AGY event's evidence classes; shared by commit and the scan fallback."""
     from self_directing_mcp.agy import JUDGED_FIELDS
     out = []
+    if padding and not sub:
+        out.append(("host_padded_records", 1))  # one per padded line: every chunk of it carries the padding
     if linkage == "legacy_unlinked":
         out.append(("legacy_unlinked_results", 1))
     if pending:
@@ -165,7 +167,7 @@ def _agy_stats_dict(counter):
     def bucket(prefix):
         return {key.split("|", 1)[1]: count for key, count in sorted(counter.items()) if key.startswith(prefix + "|")}
     return {"legacy_unlinked_results": counter["legacy_unlinked_results"], "running_results": counter["running_results"],
-            "media_placeholders": counter["media_placeholders"],
+            "media_placeholders": counter["media_placeholders"], "host_padded_records": counter["host_padded_records"],
             "truncation": {"restored_from_full": bucket("restored"), "unrestored": bucket("unrestored"),
                            "ignored": bucket("ignored")}}
 
@@ -196,7 +198,8 @@ class RowSpool:
         if chunk.provider == "agy":
             meta = chunk.meta
             tally = agy_tally(meta.get("linkage"), meta.get("pending"), meta.get("media_count"), meta.get("event_type"),
-                              meta.get("truncated_fields"), meta.get("restored_fields"), meta.get("fallback"))
+                              meta.get("truncated_fields"), meta.get("restored_fields"), meta.get("fallback"),
+                              meta.get("host_padding_bytes"), meta.get("sub_index", 0))
             if tally:
                 self.tallies[chunk.chunk_id] = tally
 
@@ -587,7 +590,8 @@ class SessionStore:
         tally = Counter()
         cursor = self._conn.execute(
             "SELECT json_extract(data,'$.meta.linkage','$.meta.pending','$.meta.media_count','$.meta.event_type',"
-            "'$.meta.truncated_fields','$.meta.restored_fields','$.meta.fallback') FROM session_events"
+            "'$.meta.truncated_fields','$.meta.restored_fields','$.meta.fallback','$.meta.host_padding_bytes',"
+            "'$.meta.sub_index') FROM session_events"
             " WHERE provider='agy' AND session_id=?", (session_id,))
         while True:
             check_request()

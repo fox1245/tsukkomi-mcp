@@ -25,13 +25,15 @@ from self_directing_mcp.session_events import as_text, iter_raw_lines, make_chun
 
 # Bumping this triggers a lazy per-session reparse on the next sync/audit of each already-indexed session.
 # v1: initial Claude Code provider (main and subagent transcripts, origin-based user authority).
-PARSER_VERSION = 1
+# v2: the ``system`` record ``scheduled_task_fire`` (a cron task fired) as runtime metadata.
+PARSER_VERSION = 2
 
 SUBAGENTS = "subagents"
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _STEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
 _HOOK_NAME = re.compile(r"[A-Za-z0-9_.:*/@+-]{1,200}\Z")
+_CRON = re.compile(r"[0-9*/,?# -]{1,100}\Z")  # digits and cron punctuation only: no word can ride along
 
 
 class PathTraversalError(ValueError):
@@ -732,17 +734,44 @@ def _attachment(base, record, state):
 # ----------------------------------------------------------------------------- runtime and metadata records
 
 _SYSTEM_SUBTYPES = {"turn_duration", "stop_hook_summary", "away_summary", "compact_boundary", "local_command",
-                    "informational"}
+                    "informational", "scheduled_task_fire"}
 _QUEUE_OPERATIONS = {"enqueue", "dequeue", "remove"}
 _METADATA = {"mode", "permission-mode", "ai-title", "agent-name", "pr-link", "file-history-snapshot",
              "file-history-delta", "cost-state", "atis-latch", "last-prompt", "continued-in"}
 _SESSION_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
+def _scheduled_task_fire(record):
+    """Small identifiers of a scheduled-task announcement, or None when a payload field is not text.
+
+    ``prompt`` (the scheduled automation text) and ``content`` are validated and never indexed: like every other
+    system payload they are runtime text, not something the user said. Only short identifiers survive, and an
+    odd one is dropped rather than making the announcement unsupported.
+    """
+    if any(key in record and not isinstance(record[key], str)
+           for key in ("prompt", "content", "cron", "cronKind", "taskId", "taskKind")):
+        return None
+    found = {name: record[key] for key, name in (("taskId", "task_id"), ("taskKind", "task_kind"),
+                                                 ("cronKind", "cron_kind")) if _label(record.get(key))}
+    if isinstance(record.get("cron"), str) and _CRON.fullmatch(record["cron"]):
+        found["cron"] = " ".join(record["cron"].split())
+    return found
+
+
 def _system(base, record, state):
     subtype, level = record.get("subtype"), record.get("level", "")
     if subtype not in _SYSTEM_SUBTYPES or not isinstance(level, str) or not isinstance(record.get("isMeta", False), bool):
         yield _unsupported(base, f"[unsupported_system:{_label(subtype) or '?'}] {_keys(record)}")
+        return
+    if subtype == "scheduled_task_fire":
+        found = _scheduled_task_fire(record)
+        if found is None:
+            yield _unsupported(base, "[unsupported_system:scheduled_task_fire] " + _keys(record))
+            return
+        text = "[system:scheduled_task_fire]" + "".join(
+            f' {name}="{value}"' if name == "cron" else f" {name}={value}" for name, value in found.items())
+        yield _runtime(base, text, "scheduled_task_fire", system_subtype=subtype, **found,
+                       **({"level": _label(level)} if _label(level) else {}))
         return
     extra = {"system_subtype": subtype, "level": _label(level) or None}
     if _is_int(record.get("durationMs")):
