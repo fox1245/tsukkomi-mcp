@@ -30,6 +30,7 @@ import hashlib
 import json
 import re
 import time
+from bisect import bisect_left
 
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES
 from self_directing_mcp.audit import runner
@@ -312,6 +313,7 @@ class RuleMonitor:
                 self.when_invalid = True
         self.static_unknown = self.regex_invalid or self.when_invalid
         self.is_must_not = rule.type == "must_not"
+        self.inert = self.static_unknown  # nothing to fold in: a fixed outcome, or a table that overflowed
         self.deps = runner._dependencies(rule) if self.agy else frozenset()
         self.wants_attempts = self.agy and runner._wants_attempts(rule) and self.regex is not None
         self.track_trigger_proposals = self.agy and rule.type == "must" and self.trigger is not None
@@ -330,6 +332,9 @@ class RuleMonitor:
         self.overflow = None
         self.dirty = False
         self.new = False  # built from nothing in this run
+        if not (self.agy or self.when_re or self.src_id or self.from_id) and not self.static_unknown:
+            # No anchors, no `when`, no provider classes: the plain path does the same as ``feed`` with less work.
+            self.feed = self._feed_forbidden if self.is_must_not else self._feed_required
 
     # --- persistence ---
 
@@ -359,14 +364,33 @@ class RuleMonitor:
         self.att = [{"k": tuple(item["k"]), "e": item["e"], "t": item["t"]} for item in data["att"]]
         self.trg_n, self.trg = data["trg_n"], [tuple(key) for key in data["trg"]]
         self.src_tu, self.overflow = data["src_tu"], data["overflow"]
+        self.inert = self.static_unknown or bool(self.overflow)
 
     # --- feeding ---
 
     def eligible(self, event):
         return (self.kind is None or event.kind == self.kind) and event.meta.get("role") in self.roles
 
+    def _feed_forbidden(self, event, pools):
+        if (not self.inert and (self.kind is None or event.kind == self.kind)
+                and event.meta.get("role") in self.roles and self.regex.search(event.text)):
+            self._forbidden(event)
+
+    def _feed_required(self, event, pools):
+        if self.inert:
+            return
+        matched = False
+        if (self.kind is None or event.kind == self.kind) and event.meta.get("role") in self.roles:
+            text = event.text
+            if self.trigger is not None and self.trigger.search(text):
+                self._checkpoint(event)
+            matched = self.regex.search(text) is not None
+        if self.lh is not None:
+            self._follow(event)
+        if matched:
+            self._hit(event, pools)
+
     def feed(self, event, pools):
-        self.dirty = True
         if event.chunk_id == self.src_id:
             self.src = True
             if self.agy:
@@ -375,7 +399,7 @@ class RuleMonitor:
             if event.chunk_id == self.from_id:
                 self.started, self.from_key = True, event.key
             return
-        if self.static_unknown or self.overflow:
+        if self.inert:
             return
         text = event.text
         if self.when_re is not None and not self.when_met:
@@ -404,7 +428,7 @@ class RuleMonitor:
             self.hit_ev.append(_ev(event, flag=self.agy))
         if self.rule.exception_regex:
             if len(self.exc) >= EXCEPTION_MAX_HITS or self.exc_chars + len(event.text) > EXCEPTION_MAX_CHARS:
-                self.overflow = "exception hit store is full"
+                self.overflow, self.inert = "exception hit store is full", True
                 return
             self.exc.append(event.text)
             self.exc_chars += len(event.text)
@@ -758,18 +782,26 @@ def fold(events, monitors, facts, pools):
     ``(facts, offset)`` or ``None``); a consumer skips events whose record starts before its offset."""
     shared, shared_offset = facts if facts is not None else (None, 0)
     shared_on = shared is not None and not shared.overflow
+    feeds = [(monitor.feed, offset) for monitor, offset in monitors]
+    note = pools.note if pools.track_calls or pools.track_proposals else None
     for number, event in enumerate(events):
         if not number & 511:
             check_request()
         start = event.key[0]
-        for monitor, offset in monitors:
+        for feed, offset in feeds:
             if start >= offset:
-                monitor.feed(event, pools)
+                feed(event, pools)
         if shared_on and start >= shared_offset:
             shared.feed(event, pools)
-            shared.dirty = True
             shared_on = not shared.overflow
-        pools.note(event)
+        if note is not None:
+            note(event)
+    if events:
+        last = events[-1].key[0]
+        for monitor, offset in monitors:
+            monitor.dirty = monitor.dirty or last >= offset
+        if shared is not None and last >= shared_offset:
+            shared.dirty = True
 
 
 class AuditPlan:
@@ -888,8 +920,9 @@ class AuditPlan:
             if facts_row is not None:
                 checked["#facts"] = facts_row["byte_offset"]
             rows = {**deltas, "#facts": facts_row}
+            starts = [event.key[0] for event in events]  # in order, so a count after an offset is a bisection
             for name, offset in checked.items():
-                tail = sum(1 for event in events if event.key[0] >= offset)
+                tail = len(starts) - bisect_left(starts, offset)
                 expected = rows[name]["event_count"]
                 ok = (tail == latest["event_count"] - expected) if mode == "delta" else (len(events) - tail == expected)
                 if not ok:

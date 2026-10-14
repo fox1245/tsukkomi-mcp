@@ -173,13 +173,22 @@ def pattern(rng, *, bad=0.04):
     return rng.choice(BAD_PATTERNS) if rng.random() < bad else rng.choice(PATTERNS)
 
 
-def contracts(rng, provider, events, count):
-    """``count`` random rules covering every supported shape (all with a regex; description-only rules are
-    evaluated by the reference in every mode)."""
+def contracts(rng, provider, events, count, *, descriptions=0.0):
+    """``count`` random rules covering every supported shape. ``descriptions`` is the share of description-only rules
+    (no regex), which no monitor serves: the reference judges them in every mode."""
     ids = [e.chunk_id for e in events]
     out = []
     for number in range(count):
         kind = rng.choice(["must_not", "must"])
+        if rng.random() < descriptions:
+            spec = {"id": f"r{number}", "type": kind, "description": "a rule that needs a verifier",
+                    "roles": rng.sample(ROLES, rng.randint(1, 3))}
+            if ids and rng.random() < 0.5:
+                spec["source_event_id"] = rng.choice(ids) if rng.random() < 0.8 else "missing-source"
+            if ids and rng.random() < 0.3:
+                spec["applies_from_event_id"] = rng.choice(ids) if rng.random() < 0.8 else "missing-anchor"
+            out.append(ContractRule(**spec))
+            continue
         spec = {"id": f"r{number}", "type": kind, "severity": rng.choice(["critical", "high", "medium", "low"]),
                 "roles": rng.sample(ROLES, rng.randint(1, 3)), "revision": rng.randint(1, 3)}
         spec["regex"] = pattern(rng)

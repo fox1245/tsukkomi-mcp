@@ -50,7 +50,7 @@ def batches(rng, events):
 def test_random_appends_match_the_full_evaluator(tmp_path, provider, seed):
     rng = random.Random(f"store/{provider}/{seed}")
     session = grow(provider, rng, 90)
-    rules = contracts(rng, provider, session.events, 6)
+    rules = contracts(rng, provider, session.events, 6, descriptions=0.2)
     harness = Harness(tmp_path, provider)
     reports = []
     for step, batch in enumerate(batches(rng, session.events)):
