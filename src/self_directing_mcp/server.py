@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from typing import Any
+import argparse
 import asyncio
+import ctypes
+import sys
 import time
 from threading import Event
 
@@ -9,9 +12,13 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import TypeAdapter, ValidationError, create_model
 
+from self_directing_mcp.config import get_settings
 from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.schemas import ContractRule, ProposedAction
 from self_directing_mcp.codex_hooks import handle_hook
+from self_directing_mcp.request_control import (
+    IndexBusy, RequestControl, RequestStopped, check_request, request_scope,
+)
 
 HOOK_INSTRUCTIONS = (
     "Local session history and explicit constraint checks, used when relevant. "
@@ -56,33 +63,130 @@ def _format_contract_errors(contracts, exc: ValidationError) -> str:
         lines.append(f"{target}.{field_path}: {msg}")
     return "Invalid contracts input; nothing was saved. " + "; ".join(lines)
 
+def _incomplete_response(reason):
+    return {"ok": False, "verdict": "unknown", "error": reason,
+            "coverage": {"complete": False, "issues": [reason]},
+            "action_executed": False, "requires_attention": True,
+            "nudge": "Local work did not complete; this is not compliance or proof of rollback."}
+
+
+def _collect_worker_exception(worker):
+    if not worker.cancelled():
+        worker.exception()
+
+
+TRIM_MIN_CALL_SEC = 0.5
+TRIM_MIN_INTERVAL_SEC = 5.0
+_last_trim = 0.0
+
+
+def _libc():
+    try:
+        return ctypes.CDLL("libc.so.6")
+    except OSError:
+        return None
+
+
+def _trim_heap():
+    """Return freed glibc heap to the OS; Linux/glibc only, failures ignored."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        trim = getattr(_libc(), "malloc_trim", None)
+        if trim is not None:
+            trim(0)
+    except Exception:
+        pass
+
+
+class _HeavyGate:
+    """Loop-local semaphore for heavy engine work. Slots are released only when the
+    worker thread really finishes, so abandoned (deadline-expired) workers still count."""
+
+    def __init__(self):
+        self._loop = self._limit = self._sem = None
+        self.running = 0
+
+    async def acquire(self, deadline):
+        loop, limit = asyncio.get_running_loop(), max(1, _engine.settings.max_concurrent_calls)
+        if self._sem is None or self._loop is not loop or self._limit != limit:
+            self._loop, self._limit, self._sem, self.running = loop, limit, asyncio.Semaphore(limit), 0
+        sem = self._sem
+        try:
+            await asyncio.wait_for(sem.acquire(), max(0.0, deadline - time.monotonic()))
+        except TimeoutError:
+            raise RequestStopped("request_deadline") from None
+        self.running += 1
+        return sem
+
+    def release(self, sem, started):
+        sem.release()
+        if sem is not self._sem:
+            return
+        self.running -= 1
+        global _last_trim
+        now = time.monotonic()
+        if (self.running == 0 and now - started >= TRIM_MIN_CALL_SEC
+                and now - _last_trim >= TRIM_MIN_INTERVAL_SEC):
+            _last_trim = now
+            self._loop.run_in_executor(None, _trim_heap)
+
+
+_gate = _HeavyGate()
+
+
+async def _await_request(work, control, budget, heavy=True):
+    # Keep the actual thread task alive to collect its eventual exception.
+    slot = await _gate.acquire(control.deadline) if heavy else None
+    started = time.monotonic()
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(work))
+    except BaseException:
+        if slot is not None:
+            _gate.release(slot, started)
+        raise
+    worker.add_done_callback(_collect_worker_exception)
+    if slot is not None:
+        worker.add_done_callback(lambda _w: _gate.release(slot, started))
+    try:
+        done, _ = await asyncio.wait({worker}, timeout=max(0.0, control.deadline - time.monotonic()))
+        if not done:
+            control.cancel("request_deadline")
+            raise RequestStopped("request_deadline")
+        return worker.result()
+    except asyncio.CancelledError:
+        control.cancel()
+        raise
+
+
 async def _dispatch(method, *args, audit=False, **kwargs):
-    """Keep JSON-RPC responsive; queued calls expire before touching the engine."""
+    """Bound the response and share cooperative stop state with its worker."""
     budget = kwargs.pop("budget_override", None)
-    cooperative = kwargs.pop("cooperative", False)
+    heavy = kwargs.pop("heavy", True)
     if budget is None:
         budget = _engine.settings.audit_timeout_sec if audit else _engine.settings.request_timeout_sec
-    deadline = time.monotonic() + budget
-    abandoned = Event()
+    control = RequestControl(deadline=time.monotonic() + budget)
 
     def work():
-        if abandoned.is_set() or time.monotonic() >= deadline:
-            raise TimeoutError("request_expired_before_execution")
-        if cooperative:
-            return method(*args, _deadline=deadline, cancel_event=abandoned, **kwargs)
-        return method(*args, _deadline=deadline, **kwargs)
+        with request_scope(control):
+            check_request()
+            try:
+                result = method(*args, _deadline=control.deadline,
+                                cancel_event=control.cancel_event, **kwargs)
+            except (IndexBusy, RequestStopped):
+                raise
+            except Exception:
+                check_request()
+                raise
+            check_request()
+            return result
 
     try:
-        return await asyncio.wait_for(asyncio.to_thread(work), timeout=budget)
+        return await _await_request(work, control, budget, heavy)
+    except (IndexBusy, RequestStopped) as exc:
+        return _incomplete_response(exc.reason)
     except TimeoutError:
-        abandoned.set()
-        return {"ok": False, "verdict": "unknown", "error": "index_busy_or_deadline",
-                "coverage": {"complete": False, "issues": ["index_busy_or_deadline"]},
-                "action_executed": False, "requires_attention": True,
-                "nudge": "Local audit could not complete within its budget; this is not compliance."}
-    except asyncio.CancelledError:
-        abandoned.set()
-        raise
+        return _incomplete_response("operation_timeout")
 
 
 def _resolve_timeout_sec(timeout_ms: int | None, *, audit: bool) -> float:
@@ -103,26 +207,23 @@ def _resolve_timeout_sec(timeout_ms: int | None, *, audit: bool) -> float:
 
 
 async def _dispatch_hook(*args, **kwargs):
-    # handle_hook uses bounded engine operations and returns hook-specific context.
-    deadline = time.monotonic() + _engine.settings.audit_timeout_sec
-    abandoned = Event()
+    budget = _engine.settings.audit_timeout_sec
+    control = RequestControl(deadline=time.monotonic() + budget)
     def work():
-        if abandoned.is_set() or time.monotonic() >= deadline:
-            raise TimeoutError("request_expired_before_execution")
-        return handle_hook(_engine, *args, _deadline=deadline, **kwargs)
+        with request_scope(control):
+            check_request()
+            result = handle_hook(_engine, *args, _deadline=control.deadline,
+                                 cancel_event=control.cancel_event, **kwargs)
+            check_request()
+            return result
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(work),
-            timeout=_engine.settings.audit_timeout_sec)
-    except TimeoutError:
-        abandoned.set()
+        return await _await_request(work, control, budget)
+    except (IndexBusy, RequestStopped, TimeoutError) as exc:
+        reason = exc.reason if isinstance(exc, (IndexBusy, RequestStopped)) else "operation_timeout"
         event = args[0]
-        context = "Self-directing audit: unknown (local audit deadline); do not claim compliance."
+        context = f"Self-directing audit: unknown ({reason}); do not claim compliance."
         return ({"systemMessage": context} if event == "Stop" else
                 {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}})
-    except asyncio.CancelledError:
-        abandoned.set()
-        raise
 
 
 
@@ -152,7 +253,7 @@ async def sync_session(
 
     Audit/check_action refresh automatically; do not sync separately before them.
     Provide session_id or path under the configured root.
-    provider: "codex" (default), "grokbot", or "omp" (OMP JSONL).
+    provider: "codex" (default), "grokbot", "omp" (OMP JSONL), or "agy".
     When omitted, uses SELF_DIRECT_SESSION_PROVIDER or auto-detects from path layout.
     Every event occurrence is retained; only new sanitized text hashes are embedded.
     Set embed=False for local indexing. SELF_DIRECT_LOCAL_ONLY=true disables
@@ -179,7 +280,7 @@ async def search_history(
     Use when relevant evidence is missing. Do NOT treat retrieval
     alone as compliance proof — call audit_session; contracts/regex are authoritative.
     top_k defaults from settings (search_top_k). Never treat top-1 alone as a violation.
-    provider filters the index (codex|grokbot|omp). Local-only supports regex/sparse, not dense/hybrid.
+    provider filters the index (codex|grokbot|omp|agy). Local-only supports regex/sparse, not dense/hybrid.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.search_history,
@@ -199,7 +300,7 @@ async def audit_session(session_id: str, provider: str | None = None, path: str 
     Rules/regex are primary; hybrid is auxiliary only.
     Refreshes local JSONL first and returns coverage and a contracts snapshot.
     Unknown means evidence/verification is missing; it must not be called compliance.
-    provider filters the audit (codex|grokbot|omp).
+    provider filters the audit (codex|grokbot|omp|agy).
     timeout_ms: optional per-call budget in milliseconds for large sessions.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=True)
@@ -223,7 +324,7 @@ async def check_action(session_id: str, action: ProposedAction, provider: str | 
 @mcp.tool()
 async def get_chunk(chunk_id: str) -> dict[str, Any]:
     """Fetch a chunk by id. Secrets in text are masked (sk-, Bearer, api_key=)."""
-    return await _dispatch(_engine.get_chunk, chunk_id)
+    return await _dispatch(_engine.get_chunk, chunk_id, heavy=False)
 
 
 @mcp.tool()
@@ -235,13 +336,13 @@ async def list_contracts(session_id: str | None = None) -> dict[str, Any]:
     Other sessions' contracts are not returned. This is a view over the
     shared store, not a per-session store split.
     """
-    return await _dispatch(_engine.list_contracts, session_id=session_id)
+    return await _dispatch(_engine.list_contracts, heavy=False, session_id=session_id)
 
 
 @mcp.tool()
 async def revoke_contract(contract_id: str) -> dict[str, Any]:
     """Disable a contract by id. History and the user's source quote are retained."""
-    return await _dispatch(_engine.revoke_contract, contract_id)
+    return await _dispatch(_engine.revoke_contract, contract_id, heavy=False)
 
 
 @mcp.tool()
@@ -265,7 +366,7 @@ async def upsert_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
         validated = _contract_list_adapter.validate_python(contracts)
     except ValidationError as exc:
         raise ToolError(_format_contract_errors(contracts, exc))
-    return await _dispatch(_engine.upsert_contracts, validated)
+    return await _dispatch(_engine.upsert_contracts, validated, heavy=False)
 
 
 # Replace the auto-generated input schema with a typed one that exposes
@@ -288,7 +389,7 @@ async def audit_status(session_id: str | None = None, provider: str | None = Non
     Call when diagnosing sync gaps. Prefer sync_session + audit_session for the hook workflow.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=True)
-    return await _dispatch(_engine.audit_status, session_id=session_id, provider=provider, audit=True, budget_override=budget)
+    return await _dispatch(_engine.audit_status, heavy=False, session_id=session_id, provider=provider, audit=True, budget_override=budget)
 
 
 @mcp.tool()
@@ -331,14 +432,15 @@ async def analyze_activity(session_id: str, provider: str | None = None,
 
 @mcp.tool()
 async def get_graph_context(session_id: str, node_id: str | None = None,
-                            provider: str | None = None, depth: int = 1) -> dict[str, Any]:
+                            provider: str | None = None, depth: int = 1,
+                            path: str | None = None) -> dict[str, Any]:
     """Query the GraphRAG knowledge graph: nodes, edges, and entity dependencies.
 
     If node_id is provided, returns the entity's neighbor subgraph up to depth.
     If node_id is omitted, returns the active session knowledge graph.
     """
     return await _dispatch(_engine.get_graph_context, session_id, node_id=node_id,
-                           provider=provider, depth=depth, audit=True)
+                           provider=provider, depth=depth, path=path, audit=True)
 
 
 @mcp.tool()
@@ -380,10 +482,127 @@ async def run_neograph_update(session_id: str, provider: str | None = None,
     budget = (_resolve_timeout_sec(timeout_ms, audit=False) if timeout_ms is not None else
               min(_engine.settings.graph_update_timeout_sec, _engine.settings.max_tool_timeout_sec))
     return await _dispatch(_engine.run_neograph_update, session_id, provider=provider,
-                           budget_override=budget, cooperative=True)
+                           budget_override=budget)
 
 
-def main() -> None:
+async def _dispatch_workflow(method: str, *args, timeout_ms=None, **kwargs):
+    from self_directing_mcp.workflow import configured_workflow
+    budget = _resolve_timeout_sec(timeout_ms, audit=False)
+    deadline = time.monotonic() + budget
+    abandoned, entered = Event(), Event()
+
+    def invoke():
+        if abandoned.is_set() or time.monotonic() >= deadline:
+            raise TimeoutError("workflow request expired before execution")
+        entered.set()
+        controller = configured_workflow()
+        if controller is None:
+            return {"ok": False, "error": "workflow_not_configured", "action_executed": False}
+        return getattr(controller, method)(*args, _deadline=deadline, cancel_event=abandoned, **kwargs)
+
+    worker = asyncio.create_task(asyncio.to_thread(invoke))
+    try:
+        done, _ = await asyncio.wait({worker}, timeout=budget)
+        if done:
+            return worker.result()
+        abandoned.set()
+        # A process already running must be killed and its observed result kept.
+        # A worker still waiting on a host lock must never launch after expiry.
+        done, _ = await asyncio.wait({worker}, timeout=.25)
+        if done:
+            return worker.result()
+        may_have_run = method == "execute" and entered.is_set()
+        return {"ok": False, "error": "workflow_deadline", "outcome": "outcome_unknown" if may_have_run else "not_started",
+                "outcome_unknown": may_have_run, "started": None if may_have_run else False,
+                "action_executed": None if may_have_run else False, "requires_attention": True}
+    except asyncio.CancelledError:
+        abandoned.set()
+        raise
+    finally:
+        # Retrieve a late worker exception without cancelling its cleanup or
+        # pretending that cancelling an asyncio Future terminates a process.
+        worker.add_done_callback(_collect_worker_exception)
+
+
+@mcp.tool()
+async def workflow_status(session_id: str, provider: str = "agy") -> dict[str, Any]:
+    """Read the host-approved workflow, current obligations and observed evidence."""
+    return await _dispatch_workflow("status", session_id, provider=provider)
+
+
+@mcp.tool()
+async def workflow_run_checks(session_id: str, provider: str = "agy", kind: str = "all",
+                              timeout_ms: int | None = None) -> dict[str, Any]:
+    """Run owner-approved real tests/proofs; bind observations to current versions.
+
+    No model-supplied pass flag, command, expected result or proof can be submitted.
+    """
+    return await _dispatch_workflow("run_checks", session_id, provider=provider,
+                                    kind=kind, timeout_ms=timeout_ms)
+
+
+@mcp.tool()
+async def workflow_classify(session_id: str, provider: str = "agy") -> dict[str, Any]:
+    """Request JEV Choice using explicitly approved synthetic requirement context.
+
+    The host reuses OPENROUTER_API_KEY / SELF_DIRECT_OPENROUTER_API_KEY_FILE for
+    pinned typesafe/jev-1.13 on OpenRouter. Errors and low confidence never
+    authorize a transition. Each classification makes at most one remote call;
+    no transcript is sent.
+    """
+    return await _dispatch_workflow("classify", session_id, provider=provider)
+
+
+@mcp.tool()
+async def workflow_transition(session_id: str, classification_id: str,
+                               provider: str = "agy") -> dict[str, Any]:
+    """Evaluate a current classification through the compiled Lean policy."""
+    return await _dispatch_workflow("transition", session_id, classification_id, provider=provider)
+
+
+@mcp.tool()
+async def workflow_authorize(session_id: str, classification_id: str, action: dict[str, Any],
+                              provider: str = "agy") -> dict[str, Any]:
+    """Mint a single-use grant bound to exact workflow_command argv/cwd and versions.
+
+    Requires current proof/test observations. This does not execute the action.
+    Owner approval is deliberately not an MCP tool.
+    """
+    return await _dispatch_workflow("authorize", session_id, classification_id, action, provider=provider)
+
+
+@mcp.tool()
+async def workflow_execute(session_id: str, grant: str, action: dict[str, Any],
+                            provider: str = "agy", timeout_ms: int | None = None) -> dict[str, Any]:
+    """Recheck and consume a grant, execute its exact argv, and observe the outcome.
+
+    Changed arguments, targets, state, policy or evidence invalidate the grant.
+    """
+    return await _dispatch_workflow("execute", session_id, grant, action, provider=provider,
+                                    timeout_ms=timeout_ms)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run the Tsukkomi MCP stdio server.")
+    parser.add_argument("--omp-bridge", action="store_true",
+                        help="Use OMP settings and validate private remote sources before startup.")
+    args = parser.parse_args(argv)
+    if args.omp_bridge:
+        try:
+            settings = get_settings(session_provider="omp")
+            if not settings.local_only:
+                key_file = settings.openrouter_api_key_file
+                native_path = settings.sqlite_vector_path
+                if key_file is None or not key_file.expanduser().is_file():
+                    raise ValueError("Missing selected key file")
+                if native_path is None or not native_path.expanduser().is_file():
+                    raise ValueError("Missing selected native library")
+                settings.resolve_api_key()
+        except (OSError, ValueError):
+            parser.error("OMP bridge configuration is unavailable or invalid")
+        # Bind the shared source to the singleton used by every MCP handler.
+        # Indexes, native loading, and remote clients remain lazy.
+        _engine.settings = settings
     mcp.run(transport="stdio")
 
 

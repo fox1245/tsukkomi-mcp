@@ -1,24 +1,15 @@
 {
   "self-directing-guard": {
     "enabled": true,
-    "PreToolUse": [
-      {
-        "matcher": "run_command|write_to_file|replace_file_content",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.mcp-servers/self-directing-mcp/scripts/agy_hook.py --event PreToolUse",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "type": "command",
-        "command": "~/.mcp-servers/self-directing-mcp/scripts/agy_hook.py --event Stop",
-        "timeout": 10
-      }
-    ]
+    "PreToolUse": [{
+      "matcher": "*",
+      "hooks": [{"type": "command", "command": "python /absolute/path/to/tsukkomi-mcp/scripts/agy_hook.py --event=PreToolUse", "timeout": 30}]
+    }],
+    "PostToolUse": [{
+      "matcher": "*",
+      "hooks": [{"type": "command", "command": "python /absolute/path/to/tsukkomi-mcp/scripts/agy_hook.py --event=PostToolUse", "timeout": 30}]
+    }],
+    "PreInvocation": [{"type": "command", "command": "python /absolute/path/to/tsukkomi-mcp/scripts/agy_hook.py --event=PreInvocation", "timeout": 30}],
+    "Stop": [{"type": "command", "command": "python /absolute/path/to/tsukkomi-mcp/scripts/agy_hook.py --event=Stop", "timeout": 30}]
   }
 }

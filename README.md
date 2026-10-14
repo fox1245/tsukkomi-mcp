@@ -42,7 +42,7 @@ Autonomous coding agents are powerful, but prompt-based instructions alone are v
 - Define explicit, non-negotiable rules for your agent:
   - **Prohibitions (`must_not`)**: Intercept dangerous commands, unapproved pushes, or directory escapes before execution (`decision: deny`).
   - **Mandatory Prerequisites (`must`)**: Enforce testing before deployment (`requires_success: true`).
-  - **Confirmation Prompts**: Convert risky actions into interactive user confirmations (`decision: ask`).
+- **Confirmation Prompts**: AGY returns `force_ask` for suspicious exceptions so a cached Always Allow grant does not replace confirmation.
 - Contracts can be **global** or strictly **scoped per session**.
 
 ### 2. 📋 Verifiable Checklist with Evidence Gating (`update_checklist`)
@@ -57,17 +57,17 @@ Autonomous coding agents are powerful, but prompt-based instructions alone are v
 - In Google Antigravity, active graph relationships are delivered into agent context before each tool invocation.
 
 ### 4. 🔒 Multi-Runtime Lifecycle Hooks
-- **Google Antigravity (AGY)**: High-performance stdio hook adapter (`scripts/agy_hook.py`) supporting `PreToolUse` contract interception and `Stop` evidence checklist verification.
+- **Google Antigravity (AGY)**: Stdio hooks cover every tool, local transcript synchronization, host-observed Pre/Post execution receipts, normal-stop checklist enforcement, and pre-invocation context. Unknown verification denies in enforced mode; advisory mode must be explicitly selected. See [installation and host boundaries](docs/agy-installation.md).
 - **OpenAI Codex**: Native lifecycle hook installer (`scripts/install_codex.py`) with advisory UserPromptSubmit, PreToolUse, and Stop hooks.
 - **Cursor / Grok Bot**: Dynamic transcript detection and multi-root parsing.
 
 ### 5. 🔍 Privacy-Preserving Hybrid Search
 - Dense cosine similarity using native `sqlite-vector` (AVX2-accelerated C extension) combined with SQLite FTS5 BM25 and Regex.
-- **Automatic Secret Masking**: API keys, bearer tokens, and private credentials are automatically masked before any embedding or text retrieval.
+- **Secret Masking**: Known credential patterns are masked before embedding or retrieval. This is not a guarantee that arbitrary personal data or every secret format is removed.
 
 ---
 
-## 🛠️ MCP Tools Reference (17 Tools)
+## MCP Tools Reference
 
 | Category | Tool | Description |
 |---|---|---|
@@ -83,11 +83,133 @@ Autonomous coding agents are powerful, but prompt-based instructions alone are v
 | | `propose_graph_update`| Validate node/edge additions with evidence chunk requirements. |
 | | `commit_graph_update` | Atomically commit validated graph updates with cursor progression. |
 | | `run_neograph_update` | Execute live LLM GraphRAG extraction pipeline via NeoGraph. |
-| **Search & Analytics** | `sync_session` | Incremental evidence sync across Codex/Cursor transcripts. |
+| **Search & Analytics** | `sync_session` | Incremental evidence sync across Codex, Grok Bot, OMP, and AGY transcripts. |
 | | `search_history` | Hybrid retrieval (Dense vector + BM25 + Regex) over history. |
 | | `get_chunk` | Retrieve raw evidence chunk with automatic secret masking. |
 | | `analyze_activity` | SQLite time-series analysis: retry gaps, error bursts, stalled items. |
 | **Hooks** | `codex_session_hook` | Adapter for Codex lifecycle events and local audit context. |
+| **Approved Workflows** | `workflow_status` | Current state, requirements, versions, and observed verification records. |
+| | `workflow_run_checks` | Execute owner-approved test commands and kernel-check approved Lean statements. |
+| | `workflow_classify` | Request a versioned JEV Choice using approved synthetic context. |
+| | `workflow_transition` | Evaluate the current classification through the compiled Lean transition function. |
+| | `workflow_authorize` | Issue a single-use, action/version/state-bound execution grant. |
+| | `workflow_execute` | Recheck and consume the grant, run the exact argv, then record success or failure. |
+
+## Approved workflows: PRD, JEV, Lean, and NeoGraph
+
+The optional workflow layer separates owner-approved original requirements from a derived Markdown wiki. It progresses through `requirements → formalize → implement → verify → complete`, with explicit revision paths. JEV requests a transition; it does not supply proof or test evidence. The runtime calls the **compiled Lean function**, not a separately maintained Python gate.
+
+Requirements, code (including additions/deletions), specification, tests, policy, and class mapping have content identities. Changes invalidate classifications, verification records, and grants. Required obligations and obligations activated by actual code changes are independent of the classifier. Explicit `depends_on` and `conflicts_with` links are checked; contradictions in unrestricted natural-language prose still need owner review. Changing the PRD, expected tests, any Lean source/definitions/proof body, specification, policy, or approval manifest requires fresh owner approval. A live file hash cannot substitute for its captured approved identity.
+
+### Owner setup
+
+Install Lean **4.34.1 or newer**, including its matching `leanc` and `leanchecker`, and put `lean` on `PATH` (or set `TSUKKOMI_LEAN`). Workflow execution requires **Linux bubblewrap with unprivileged namespaces**; configure `TSUKKOMI_BWRAP` if it is not on `PATH`. Missing isolation fails closed, with no unsandboxed fallback. Compilation and policy audits are cached by source/toolchain identity, not repeated at every hook. The packaged policy proves one-step and arbitrary-sequence completion safety; its three theorems require no axioms. Domain proofs permit only `propext`, `Classical.choice`, and `Quot.sound`; transitive `sorryAx`, custom axioms, and mismatched theorem types are rejected.
+
+Create the real PRD, implementation, test, specification, and proof files before approving a manifest. For example:
+
+```json
+{
+  "schema_version": 1,
+  "prd": "PRD.md",
+  "scope": ["src/**/*.py"],
+  "class_mapping_version": "1",
+  "confidence_threshold": 0.7,
+  "external_context": "synthetic",
+  "protected_paths": ["release.py"],
+  "requirements": [{
+    "id": "REQ-RETRY",
+    "text": "Retrying an existing request must not create another order.",
+    "required": true,
+    "status": "approved",
+    "source": {
+      "path": "PRD.md",
+      "section": "Retry",
+      "quote": "A repeated request ID creates one order."
+    },
+    "code": ["src/orders.py"],
+    "specs": ["spec/order.md"],
+    "tests": ["retry"],
+    "proofs": ["retry"],
+    "depends_on": [],
+    "conflicts_with": [],
+    "exceptions": []
+  }],
+  "tests": {
+    "retry": {
+      "argv": ["{python}", "-m", "pytest", "tests/test_retry.py", "-q"],
+      "paths": ["tests/test_retry.py"],
+      "timeout_sec": 60
+    }
+  },
+  "proofs": {
+    "retry": {
+      "path": "proofs/Retry.lean",
+      "theorem": "Order.retry",
+      "statement": "∀ (s : Order.State) (r : Nat), Order.insert (Order.insert s r) r = Order.insert s r"
+    }
+  },
+  "completion_actions": [
+    {
+      "tool_name": "workflow_command",
+      "argument_pattern": "^\\{\"argv\":\\[\"\\{python\\}\",\"release\\.py\"\\],\"cwd\":\"\\.\"\\}$"
+    },
+    {"tool_name": "run_command", "argument_pattern": "release\\.py"}
+  ]
+}
+```
+
+The PRD origin uses an exact, unique Markdown heading and a verbatim quote under that heading. All referenced paths are project-relative; escaping paths and tracked symlinks are rejected. Test/proof IDs must resolve, and mandatory requirements need both kinds of verification.
+
+From the directory containing `project/`, an owner—not the agent—runs:
+
+```bash
+tsukkomi-workflow approve --root project --manifest requirements.json --output trusted/approval
+tsukkomi-workflow wiki --approval trusted/approval --output derived-wiki
+```
+
+Approval creation is exclusive and is deliberately **not** exposed as an MCP tool. A revised approval goes into a new directory. Configure the MCP server and AGY hook process with the same absolute, host-owned paths:
+
+```text
+TSUKKOMI_WORKFLOW_APPROVAL=<read-only approved snapshot outside the workspace>
+TSUKKOMI_WORKFLOW_STATE=<private host-writable state outside the workspace>
+TSUKKOMI_LEAN=<trusted lean executable>
+TSUKKOMI_BWRAP=<trusted bubblewrap executable>
+SELF_DIRECT_OPENROUTER_API_KEY_FILE=<authorized external dotenv containing OPENROUTER_API_KEY>
+```
+
+Keep approval, checker, hook configuration, Lean toolchain/cache, and evidence storage outside the agent's write authority. Checksums and file modes do not protect against an unrestricted process running as the same OS user. Use the host's sandbox/read-only mounts or a separate service account. Approval and workflow state must be separate directories.
+
+### Verification and execution
+
+Run `workflow_run_checks` to observe real subprocess exit codes and independently checked Lean proofs. Tests run against a fresh, readonly materialized snapshot of approved verification files and current tracked implementation—not the live project with untracked `conftest.py`, `sitecustomize.py`, or generated caches. Source-glob selection cannot silently authorize mutable harness/configuration files. The sandbox has a private writable temporary directory, no network or host credentials/state, and an allowlisted environment. Tests must write temporary artifacts there rather than modify the readonly snapshot. The runner does not accept model-supplied pass flags, replacement commands, or expected results. Source versions are checked before and after verification; interruption leaves nonpassing evidence.
+
+Candidate Lean compilation is sandboxed. `leanchecker` replays the candidate against hash-pinned, readonly core imports; a source-pinned native auditor separately replays candidate declarations and checks the exact approved type and transitive axioms without loading candidate elaborator extensions. Unchanged trusted core libraries are not reproved for every request. Candidate stdout is not an audit report. Approved statements use trusted core syntax and fully qualified names, not candidate-defined notation or typeclass registration. Native `.olean` deserialization still assumes structurally valid artifacts: this is not the stronger comparator-plus-independent-external-checker guarantee described in [Lean's proof-validation guidance](https://lean-lang.org/doc/reference/latest/ValidatingProofs/).
+
+`workflow_classify` calls [OpenRouter's documented System One route](https://openrouter.ai/docs/guides/community/typesafe-sdk), `https://openrouter.ai/api/v1/systemone`, with pinned `typesafe/jev-1.13` and an OpenRouter bearer key. It accepts only that exact response identity or its canonical release identity, `typesafe/jev-1.13-20260917`, and retains the returned identity. Each classification makes at most one request: no retry, redirect, replay, provider fallback, or model alias. The fixed mapping is `0=InsufficientEvidence`, `1=NeedsRevision`, `2=ReadyForVerification`, `3=ReadyForCompletion`; no Score rounding is used. The input hash binds the actual request, rubric, mapping, and model. Approved requirement origins, actual bounded code diffs, state, and verification summaries are the only context sent. Oversized or non-text changes are not silently truncated.
+
+Remote classification is disabled unless the owner explicitly sets `external_context: "synthetic"`. This release's experiments are synthetic; do not label private production data synthetic to bypass consent. Classification reuses the server's shared OpenRouter settings: `SELF_DIRECT_OPENROUTER_API_KEY_FILE` selects an authoritative dotenv file containing `OPENROUTER_API_KEY`, read without interpolation. A missing, unreadable, or keyless configured file fails closed rather than falling back to an environment key. With no configured file, the shared `OPENROUTER_API_KEY` setting/environment is used. No separate TypeSafe key is needed or accepted, and other providers' keys are never substituted. Keep the credential file outside the workspace and runtime mounts; the child sandbox excludes it and strips host keys from its environment. A missing key, timeout, invalid distribution, unknown class/model, or low confidence is a nonauthorizing result. The example confidence threshold is an operator setting, **not** an empirically validated accuracy guarantee.
+
+Use a fresh classification ID for each `workflow_transition`. A completion choice reports readiness while remaining in `verify`; it cannot skip the owned completion action. After reaching `verify` with current mandatory evidence, `workflow_authorize` accepts an action such as:
+
+```json
+{"tool_name":"workflow_command","arguments":{"argv":["{python}","release.py"],"cwd":"."}}
+```
+
+Pass the returned grant and the **identical action** to `workflow_execute`. It rechecks state, versions, classification, cancellation, and Lean policy immediately before consuming the grant. Only successful owned execution sets `complete`. Started, succeeded, failed, and uncertain outcomes are distinct; a crash after consumption cannot replay the grant. A timeout after launch never claims that no action ran. The local completion sandbox permits writes to the actual approved project, but not private host state/credentials or network access. No shell interpolation is performed, and cancellation/timeout terminates the sandbox process group and descendants.
+
+AGY rejects direct mapped completion actions and directs the agent to the owned executor; its normal Stop hook holds an incomplete workflow and provides requirements, evidence, and permitted recovery actions. Cancellation, error stops, and pauses for background work are not restarted. Reads, repairs, and checks remain available unless a separate explicit contract restricts them. **Unmapped tools, direct shell access outside registered hooks, and the advisory Codex adapter are not an enforcement boundary.**
+
+Lean proves the policy/model under its stated assumptions; it does not prove arbitrary Python/TypeScript implementations equivalent to that model. Real tests supply implementation evidence only for exercised cases. The workflow is separate from session GraphRAG extraction and does not require an LLM to decide whether recorded tests passed.
+
+### Reproducible synthetic policy evaluation
+
+```bash
+TSUKKOMI_TEST_LEAN=lean python -m pytest -q
+python scripts/benchmark_workflow.py --lean lean
+```
+
+The benchmark compares 640 finite stage/class/evidence combinations with an independent reference, measures false allowances/blocks and per-stage latency, and exercises correction of each missing mandatory fact. It is an adversarial **policy** evaluation, not live JEV accuracy or a whole-host coverage claim. Live JEV validation requires an OpenRouter key; offline transport fixtures never count as live service evidence. A real low-confidence Choice remains nonauthorizing: the proposed label and observed probabilities are retained, but completion stays locked.
+
 
 ---
 
@@ -116,6 +238,28 @@ python scripts/setup_sqlite_vector.py
 ```
 
 Downloads the platform-appropriate binary release verified with SHA-256 checksums into `.native/`.
+
+### User path configuration (TOML)
+
+Use `~/.config/tsukkomi-mcp/config.toml` on any supported platform, or set `SELF_DIRECT_CONFIG_FILE` in the process environment to select another file. Copy and edit [config.example.toml](config.example.toml); the edited file belongs outside the repository and agent-writable workspaces.
+
+```toml
+[paths]
+index_dir = "~/private-tsukkomi/index"
+omp_sessions_dir = "~/.omp/agent/sessions"
+openrouter_api_key_file = "../credentials/openrouter.env"
+sqlite_vector_path = "native/vector.so"
+```
+
+The eight supported keys are `index_dir`, `codex_sessions_dir`, `omp_sessions_dir`, `grokbot_transcripts_dir`, `agy_app_data_dirs`, `contracts_path`, `sqlite_vector_path`, and `openrouter_api_key_file`. AGY roots use a string array; Grokbot accepts its existing delimiter-separated string or an array of individual paths. Empty arrays disable those optional roots.
+
+Path precedence is explicit Settings arguments, environment overrides (including the existing `CODEX_SESSIONS_DIR` alias), TOML, working-directory `.env`, then defaults. TOML paths expand `~`; relative paths resolve against the canonical TOML file's directory, not the working directory or a symlink's directory. `${ENV_VAR}` interpolation is not performed. The selector itself is environment-only; a `.env` cannot silently select another TOML file.
+
+An absent default file preserves the existing defaults. An explicitly selected missing file, malformed TOML, unknown section/key, or invalid path value fails instead of silently selecting another index. Settings capture the selected sources; restart affected servers/extensions after configuration changes.
+
+Without an index override, the default remains `~/.self_direct_index`. Managed Codex/OMP registrations keep their higher-priority environment paths. To retain a checkout-local index, explicitly select its existing absolute path in TOML or environment before upgrading; no evidence or rules are automatically moved or copied.
+
+Credential values are not TOML options. Without a selected key file, `OPENROUTER_API_KEY` follows explicit Settings, environment, then working-directory `.env` precedence. A key file selected in TOML or environment remains authoritative and fails closed when missing, unreadable, or keyless. Workflow sandboxes reject mounts exposing the selected TOML, host dotenv, or selected credential file.
 
 ---
 
@@ -149,18 +293,17 @@ python scripts/install_codex.py --verify
 
 ### OMP (OpenRouter-backed retrieval, deterministic contract hooks)
 
-Register this server in OMP's **user** `mcp.json` and opt in to `extensions/tsukkomi-omp.ts` as an OMP user extension. Configure both the MCP entry and the extension's process with the same private index, OMP session root, and authorized credential/vector references:
+Register this server in OMP's **user** `mcp.json` and opt in to `extensions/tsukkomi-omp.ts` as an OMP user extension. Configure both processes with the same private TOML file (or environment overrides) for the index, OMP session root, and authorized credential/vector references. The extension starts Python in `--omp-bridge` mode, so the shared Python settings source owns validation; TOML-only paths need not be duplicated in the extension environment.
 
 ```text
 SELF_DIRECT_LOCAL_ONLY=false
-SELF_DIRECT_OPENROUTER_API_KEY_FILE=<authorized Codex/OpenRouter dotenv path>
-SELF_DIRECT_SQLITE_VECTOR_PATH=<installed native vector library path>
-SELF_DIRECT_OMP_SESSIONS_DIR=<OMP user session root>
-SELF_DIRECT_INDEX_DIR=<private writable index>
+SELF_DIRECT_CONFIG_FILE=<private TOML path>  # omit to use the default user file
 TSUKKOMI_OMP_MONITOR=1
 TSUKKOMI_OMP_PYTHON=<Python with tsukkomi-mcp dependencies>
 TSUKKOMI_OMP_SOURCE=<source checkout>/src  # omit when installed in that Python
 ```
+
+Interpreter/source bootstrap and `SELF_DIRECT_LOCAL_ONLY` remain environment options, not `[paths]` keys. Remote bridge startup requires a usable explicitly selected key file and an existing native-library path; it does not make an API call or eagerly initialize the index. Environment paths already present in managed registrations override TOML until the owner removes or changes those entries.
 
 OpenRouter-backed hybrid/dense history search, `sync_session(embed=True)`, and NeoGraph updates are available by default; embedding uploads sanitized session chunks, so use an authorized key and session root. The hook's `check_action`/`audit_session` stay deterministic and refresh JSONL without embedding; they do **not** call OpenRouter on every tool/turn. Explicit offline-only mode is `SELF_DIRECT_LOCAL_ONLY=true`, which disables those remote functions.
 NeoGraph extraction also masks known secret patterns in session events before sending a prompt to OpenRouter; keep the original session files and local index private.
@@ -169,25 +312,56 @@ Keep machine-specific values in local OMP configuration or a private extension c
 
 Known OMP presentation changes, compaction records, agent notifications, empty messages, and UI metadata are indexed without treating them as assistant tool actions. Execution-start markers are matched against earlier indexed tool calls even when the session is synced between the call and marker. Unknown event shapes and unmatched markers still make coverage incomplete; restart the OMP MCP process after a parser upgrade so the parser version triggers a full local reindex.
 
+OMP v18.4.8 `service_tier_change` records are metadata only when `serviceTier` is explicitly `null` or a map with known `openai`, `anthropic`, and `google` keys and known tier values (`auto`, `default`, `flex`, `scale`, `priority`, `ultrafast`). Missing fields, other types, unknown keys/values, and extra payload remain unsupported; a tier setting cannot satisfy a required tool action. OMP parser version 4 reindexes previously indexed, unchanged session files on their next evidence refresh after the MCP process is upgraded/restarted. Original session bytes are not rewritten, and unrelated parse errors or unknown events still prevent complete coverage.
+
 The extension also registers the read-only `tsukkomi_session_context` tool. Call it before creating a session-scoped contract or checklist item: its `session_id` comes from the active OMP session manager. Never infer a session ID from `PI_SESSION_FILE` or a shell variable, which can belong to a parent OMP process. If no persisted session is available, do not silently create a global contract. `AGENTS.md` instructions alone are not audit contracts: register the user's explicit, machine-checkable prohibitions; broader subjective mistakes are not automatically judged by an LLM.
 
 ---
 
-## 🧪 Testing & Audit Certification
+## Testing and verification
 
-The repository includes a comprehensive test suite covering parsers, streaming appends, redaction, temporal obligations, Windows UNC traversal defense, and MCP transport:
+The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, workflow version/grant invalidation, proof rejection, path isolation, and MCP transport. Lean integration tests report a skip when the native toolchain is unavailable; install it to exercise the new workflow layer.
+
+CI is intentionally lightweight on Linux and Windows: it runs only the explicit MCP transport, Jev boundary, and session-path smoke tests, then builds the source distribution and wheel. Pushes and pull requests trigger it; superseded runs for the same ref are cancelled, and each job is capped at 10 minutes. No API keys or paid model calls are used.
+
+The full regression suite, real Lean proof/kernel checks, and all performance/large-session/concurrency benchmarks are **local deep checks**, not CI gates. A green CI result does not establish full workflow/native proof coverage or performance guarantees. Run the following locally when the changed surface requires it; live model validation still requires separate model/budget approval.
 
 ```bash
 pytest -q
 python scripts/benchmark.py
 ```
 
-### 🏅 LLM-as-a-Judge Audit Passed (100%)
-All 37 commits in this repository have been independently reviewed and certified safe by **9 LLM-as-a-judge subagents** across 3 batches ($X = N \times Y \times Z$ formula):
-- Zero secret / credential leaks
-- Zero unresolved hardcoded personal paths
-- Zero destructive shell scripts
-- Full memory & path-traversal boundary guarantees
+### Shared-index concurrency and deadlines
+
+The [shared-index fix (#3)](https://github.com/fox1245/tsukkomi-mcp/issues/3) separates stable source preparation, guarded publication, and detached audit evaluation. Audit snapshots contain only scoped authoritative event rows/counts and detached rule content; deterministic checks do not repair FTS or restore embedding caches. Explicit sync still repairs derived indexes, and sparse/hybrid search materializes deferred canonical evidence before querying.
+
+Audit evaluation and source hashing/parsing do not retain the shared writer lease. Before a result is published, metadata, source observations, rules, and AGY receipts are revalidated; changed authority makes the result incomplete/unknown while retaining captured findings. Startup may add the AGY receipt-version side table without rewriting the six-column cursor schema or changing SQLite journal modes.
+
+Requests share an absolute deadline/cancellation control through nested calls and native callbacks. Non-authorizing responses distinguish `index_busy`, `request_deadline`, `request_cancelled`, and `operation_timeout`; unrelated SQLite failures are not converted into successful empty searches. A stopped request cannot begin a later publication, but an admitted commit or one already-running blocking call may finish. This is cooperative stopping, not forced thread termination or proof of rollback.
+
+Default combined writer-lock wait (1 second), audit budget (8 seconds), ordinary budget (45 seconds), and explicit-tool cap (600 seconds) are unchanged. Real writes, initialization, raw captures, and derived persistent mutations remain guarded and can still contend. Upgrade/restart every process using the shared index from its actual configured source/package; a branch fix does not update already-running servers. See [implementation and verification boundaries](docs/timeout-fix.md).
+
+Heavy tool calls (sync, search, audit, check_action, checklist, graph, hooks) run in worker threads bounded by `SELF_DIRECT_MAX_CONCURRENT_CALLS` (default 4). A request waits for a slot only within its own deadline; a request that expires while queued returns `request_deadline` without starting work (distinct from `index_busy`). A slot is held until the worker thread really finishes, even if its caller timed out. Cheap metadata calls (`list_contracts`, `upsert_contracts`, `revoke_contract`, `get_chunk`, `audit_status`) and `workflow_*` calls bypass the limit. On glibc Linux, when the last running heavy call that took at least 0.5 s finishes (at most once per 5 s) the server calls `malloc_trim(0)` to return freed heap to the OS; it is skipped on Windows/macOS/musl and failures are ignored.
+
+### Shared-index queue PoC
+
+The opt-in `scripts/poc_shared_index_queue.py` experiment connects separate client processes to one authenticated IPv4 loopback service. It uses the real NeoGraph `RequestQueue` through a small C++/ctypes bridge and runs real `SelfDirectEngine` operations against a temporary synthetic index. It does not replace the deployed MCP transport, touch existing indexes, load API keys, or add a CI gate.
+
+Requirements: a POSIX host, an installed GCC-compatible C++20 compiler, the project Python dependencies, and a NeoGraph source checkout containing `include/neograph/util/request_queue.h` and `deps/concurrentqueue.h`. No dependencies are downloaded by the PoC.
+
+```bash
+python scripts/poc_shared_index_queue.py run --neograph-root ../NeoGraph --workers 4
+```
+
+The runner compiles only the bridge, compares 16 independent clients with one worker and the selected multiworker count, and checks real clean/violation verdicts, bounded rejection, queued expiry, disconnect cancellation, running deadlines, and shutdown settlement. It separately reports `writer_lease_peak`, actual native audit `evaluation_peak`, metadata progress during evaluation, and `residual_writer_contention`. Deliberate writer/native-stage holds are labeled diagnostic fixtures, not production latency. Wall throughput includes client startup and IPC and has no performance pass/fail threshold.
+
+For an interactive experiment, use `serve --neograph-root ../NeoGraph --workers 1 --capacity 32`; its readiness line gives a private endpoint-file path. The `client --endpoint-file <path> --request '<JSON>'` mode supports `check_action`, `sync_session` with `embed=false`, `audit_session`, and `audit_status` for the synthetic session. `{"op":"stop"}` closes the queue, settles accepted futures, and shuts the service down naturally. Endpoint credentials and compiled libraries are temporary; do not commit an endpoint file.
+
+A queued request that expires never enters the engine. An already-started request can temporarily outlive its response deadline: it reports `still_running`/unknown, then settles at a cooperative checkpoint or returns an actual admitted-work outcome. Multiple workers can overlap detached evaluation, but cannot bypass a genuinely held writer lease. The PoC never claims forced cancellation of a running syscall.
+
+### Verification scope
+
+Test results and staged secret-pattern scans are bounded evidence, not certification that arbitrary secrets or every host bypass are absent. Inspect matched staged lines before committing, keep credentials in an external authorized dotenv file, and never commit raw personal transcripts or local runtime state.
 
 ---
 

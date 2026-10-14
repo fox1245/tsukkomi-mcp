@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 from functools import wraps
-from threading import RLock
+from threading import Condition, RLock
 from collections import OrderedDict
+from contextlib import contextmanager
+from dataclasses import replace
 import hashlib
 import json
+import sqlite3
 import re
 import time
 
@@ -19,7 +22,7 @@ from self_directing_mcp.audit.contracts import (
     scope_counts,
     visible_contracts,
 )
-from self_directing_mcp.audit.runner import run_audit
+from self_directing_mcp.audit.runner import _worse, action_applies, audit_needs, downgrade_unproven_absence, prefix_note, run_audit
 from self_directing_mcp.checklist import (
     INCOMPLETE_NOTE,
     ChecklistStore,
@@ -29,10 +32,10 @@ from self_directing_mcp.checklist import (
 )
 from self_directing_mcp.codex import discover as codex_discover
 from self_directing_mcp.grokbot import discover as grokbot_discover
-from self_directing_mcp import omp
+from self_directing_mcp import omp, agy
 from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
-from self_directing_mcp.index.ingest import SessionStore, ingest_session
+from self_directing_mcp.index.ingest import SessionStore, ingest_session, coverage_from_capture
 from self_directing_mcp.index.sparse import SparseIndex
 from self_directing_mcp.index.vector import build_vector_index
 from self_directing_mcp.index.locking import index_lock
@@ -43,42 +46,75 @@ from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.timeseries import analyze_activity
 from self_directing_mcp.graphrag import GraphStore, validate_proposal
 from self_directing_mcp.neograph_runner import run_update_pipeline
-from self_directing_mcp.neograph_runtime import ng, run_stages, graph_operation
+from self_directing_mcp.neograph_runtime import ng, graph_operation
+from self_directing_mcp.request_control import (
+    IndexBusy, RequestStopped, check_request, current_request, publication, request_operation, request_scope,
+)
+from self_directing_mcp.session_events import capture_source
 
 
 def serialized(method):
+    @request_operation
     @wraps(method)
     def wrapped(self, *args, **kwargs):
-        deadline = kwargs.pop("_deadline", None)
-        started = time.monotonic()
-        wait_until = min(deadline or float("inf"), started + self.settings.lock_wait_timeout_sec)
-        remaining = wait_until - started
-        if remaining <= 0 or not self._lock.acquire(timeout=remaining):
-            raise TimeoutError("local_index_busy")
-        try:
-            if self._operation_depth:
-                return method(self, *args, **kwargs)
-            remaining = wait_until - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("local_index_busy")
-            with index_lock(Path(self.settings.index_dir), timeout=remaining):
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("request_expired_before_execution")
-                self._operation_depth += 1
-                try:
-                    if self.dense is not None:
-                        self.dense.refresh()
-                    return method(self, *args, **kwargs)
-                finally:
-                    self._operation_depth -= 1
-        finally:
-            self._lock.release()
+        with self._publication_guard():
+            return method(self, *args, **kwargs)
     return wrapped
+
+
+def detached_operation(method):
+    @request_operation
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._components():
+            return method(self, *args, **kwargs)
+    return wrapped
+
+def workflow_operation(method):
+    """Own component lifetime without discarding observed workflow cleanup outcomes."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with request_scope(deadline=kwargs.get("_deadline"), cancel_event=kwargs.get("cancel_event")):
+            with self._components():
+                return method(self, *args, **kwargs)
+    return wrapped
+
+
+
+def _mark_growth(coverage, observation) -> bool:
+    """Record the judged offset and unread bytes. ``judged_prefix`` means pure append is the only gap."""
+    judged = coverage.get("byte_offset")
+    if judged is None:
+        return False
+    unread = coverage.get("pending_bytes", 0)
+    if observation is not None:
+        try:
+            unread = max(unread, observation.current_size() - judged)
+        except OSError:
+            pass
+    unread = max(0, unread)
+    coverage["judged_through_byte"], coverage["unread_bytes"] = judged, unread
+    if unread:
+        if "unread_bytes" not in coverage["issues"]:
+            coverage["issues"].append("unread_bytes")
+        coverage["complete"] = False
+        coverage["judged_prefix"] = set(coverage["issues"]) == {"unread_bytes"}
+    return bool(unread)
+
+
+CHECKLIST_EVALUATION_ATTEMPTS = 3
+
+
+class ChecklistConflict(ValueError):
+    """Checklist file or evidence moved between capture and publication."""
 
 
 class SelfDirectEngine:
     def __init__(self, settings: Settings | None = None) -> None:
         self._lock = RLock()
+        self._lifetime = Condition(self._lock)
+        self._active_operations = 0
+        self._closing = False
         self._operation_depth = 0
         self._hook_lock = RLock()
         self._hook_states = OrderedDict()
@@ -96,17 +132,67 @@ class SelfDirectEngine:
         self.neograph = None
         self._ready = False
 
-    def hook_obligations(self, session_id: str) -> dict[str, Any]:
+    @contextmanager
+    def _publication_guard(self):
+        """Combined bounded local/file lease for capture, lifetime and publication."""
+        check_request()
+        started = time.monotonic()
+        control = current_request()
+        wait_until = min(control.deadline if control and control.deadline is not None else float("inf"),
+                         started + self.settings.lock_wait_timeout_sec)
+        remaining = wait_until - started
+        if remaining <= 0 or not self._lock.acquire(timeout=max(0, remaining)):
+            check_request()
+            raise IndexBusy()
+        try:
+            check_request()
+            if self._operation_depth:
+                yield
+                return
+            remaining = wait_until - time.monotonic()
+            if remaining <= 0:
+                check_request()
+                raise IndexBusy()
+            with index_lock(Path(self.settings.index_dir), timeout=remaining):
+                check_request()
+                self._operation_depth += 1
+                try:
+                    yield
+                finally:
+                    self._operation_depth -= 1
+        finally:
+            self._lock.release()
+
+    @contextmanager
+    def _components(self):
+        # Refcount lifetime without retaining either publication lock over CPU/I/O.
+        with self._publication_guard():
+            if self._closing:
+                raise IndexBusy()
+            self.ensure_ready()
+            self._active_operations += 1
+        try:
+            yield
+        finally:
+            with self._lifetime:
+                self._active_operations -= 1
+                self._lifetime.notify_all()
+
+    def hook_obligations(self, session_id: str, provider: str = "codex", path: str | None = None) -> dict[str, Any]:
         """Read atomically replaced rule files without initializing indexes.
 
         Missing obligations are not a compliance verdict. Corrupt files raise,
         so unavailable rules cannot be mistaken for an empty rule set.
         """
-        sid = session_id.lower()
+        provider = self._resolve_provider(provider)
+        sid = session_id.lower() if provider in ("codex", "agy") else session_id
+        if provider == "agy" and path is not None:
+            agy.resolve_session_path(self.settings.resolve_agy_app_data_dirs(),
+                                     session_id=sid, path=path, require_exists=False)
         path = self.settings.resolve_contracts_path()
         doc = ContractsDocument.model_validate_json(path.read_bytes()) if path.exists() else ContractsDocument()
         rules = [r for r in visible_contracts(doc.contracts, sid)
-                 if r.enabled and r.provider in (None, "codex")]
+                 if r.enabled and r.provider in (None, provider)]
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in sid)[:120]
         path = Path(self.settings.index_dir) / "checklists" / f"{safe}.json"
         checklist = ChecklistDocument.model_validate_json(path.read_bytes()) if path.exists() else ChecklistDocument(session_id=sid)
@@ -115,13 +201,21 @@ class SelfDirectEngine:
         payload = {"contracts": [r.model_dump(mode="json") for r in rules],
                    "pending": [i.model_dump(mode="json") for i in pending]}
         return {"status": "applicable" if rules or pending else "not_applicable",
-                "contracts": rules, "pending": pending,
+                "contracts": rules, "pending": pending, "has_checklist": bool(checklist.items),
                 "snapshot": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}
 
     @serialized
     def ensure_ready(self) -> None:
         if self._ready:
             return
+        try:
+            with publication():
+                self._initialize()
+        except BaseException:
+            self.close()
+            raise
+
+    def _initialize(self):
         s = self.settings
         index_dir = Path(s.index_dir)
         index_dir.mkdir(parents=True, exist_ok=True)
@@ -164,19 +258,23 @@ class SelfDirectEngine:
         provider: str | None,
         *,
         path: str | None = None,
-    ) -> Literal["codex", "grokbot", "omp"]:
+    ) -> Literal["codex", "grokbot", "omp", "agy"]:
         """Explicit arg > settings/env > light auto-detect from path layout."""
         if provider:
             p = provider.strip().lower()
-            if p in ("codex", "grokbot", "omp"):
+            if p in ("codex", "grokbot", "omp", "agy"):
                 return p  # type: ignore[return-value]
-            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot|omp)")
+            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot|omp|agy)")
         # Auto-detect: path under a configured grokbot root, or <id>/<id>.jsonl layout
         if path:
             try:
                 path_r = Path(path).expanduser().resolve()
             except OSError:
                 path_r = Path(path)
+            if agy.peek_session_id(path_r) and any(
+                path_r.is_relative_to(root) for root in self.settings.resolve_agy_app_data_dirs()
+            ):
+                return "agy"
             for root in self.settings.resolve_grokbot_transcripts_dirs():
                 try:
                     path_r.relative_to(Path(root).resolve())
@@ -188,7 +286,7 @@ class SelfDirectEngine:
                 return "grokbot"
         return self.settings.resolve_session_provider()
 
-    @serialized
+    @detached_operation
     def sync_session(
         self,
         *,
@@ -197,7 +295,10 @@ class SelfDirectEngine:
         provider: str | None = None,
         embed: bool = True,
     ) -> dict[str, Any]:
-        self.ensure_ready()
+        info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=embed)
+        return {key: value for key, value in info.items() if not key.startswith("_")}
+
+    def _sync_session(self, *, session_id=None, path=None, provider=None, embed=True, derived=True):
         assert self.store and self.sparse
         if self.settings.local_only and embed:
             return {"ok": False, "error": "local_only", "message": "embed=True is unavailable in local-only mode"}
@@ -207,7 +308,11 @@ class SelfDirectEngine:
             return {"ok": False, "error": "bad_provider", "message": str(e)}
 
         try:
-            if resolved_provider == "omp":
+            if resolved_provider == "agy":
+                resolved = agy.resolve_session_path(
+                    self.settings.resolve_agy_app_data_dirs(), session_id=session_id, path=path
+                )
+            elif resolved_provider == "omp":
                 resolved = omp.resolve_session_path(
                     self.settings.resolve_omp_sessions_dir(), session_id=session_id, path=path
                 )
@@ -221,7 +326,7 @@ class SelfDirectEngine:
                 resolved = codex_discover.resolve_session_path(
                     sessions_root, session_id=session_id, path=path
                 )
-        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError, omp.PathTraversalError) as e:
+        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError, omp.PathTraversalError, agy.PathTraversalError) as e:
             return {"ok": False, "error": "path_traversal", "message": str(e)}
         except FileNotFoundError as e:
             return {"ok": False, "error": "not_found", "message": str(e)}
@@ -237,6 +342,8 @@ class SelfDirectEngine:
             embedder=self.embedder,
             provider=resolved_provider,
             embed=embed,
+            derived=derived,
+            guard=self._publication_guard,
         )
         info["ok"] = True
         info["dense_backend"] = self.dense_backend
@@ -248,7 +355,20 @@ class SelfDirectEngine:
         )
         return info
 
-    @serialized
+    @request_operation
+    def record_agy_hook(self, payload: dict[str, Any], event: str) -> None:
+        """Record host hook observations separately from native transcript bytes."""
+        from self_directing_mcp.agy_receipts import ReceiptStore
+        sid = payload["conversationId"].lower()
+        path = agy.resolve_session_path(self.settings.resolve_agy_app_data_dirs(),
+                                        session_id=sid, path=payload["transcriptPath"],
+                                        require_exists=False)
+        ReceiptStore(Path(self.settings.index_dir)).record(
+            sid, path, payload["stepIdx"], payload["toolCall"], event,
+            error=payload.get("error", "") if event == "PostToolUse" else None,
+            guard=self._publication_guard)
+
+    @detached_operation
     def search_history(
         self,
         query: str,
@@ -258,31 +378,41 @@ class SelfDirectEngine:
         top_k: int | None = None,
         provider: str | None = None,
     ) -> dict[str, Any]:
-        self.ensure_ready()
+        prepared_query = None
         assert self.store and self.sparse
         provider = self._resolve_provider(provider)
-        if session_id and provider == "codex":
+        if session_id and provider in ("codex", "agy"):
             session_id = session_id.lower()
         k = top_k if top_k is not None else self.settings.search_top_k
         if mode not in ("hybrid", "regex", "sparse", "dense") or not 1 <= k <= 100:
             raise ValueError("mode must be hybrid|regex|sparse|dense and top_k must be 1..100")
         if self.settings.local_only and mode in ("hybrid", "dense"):
             raise ValueError("dense/hybrid search unavailable in local-only mode")
+        if mode in ("sparse", "hybrid"):
+            self._repair_sparse_for_search(session_id, provider)
         if mode == "regex":
-            hits = regex_search(self.store, query, session_id=session_id, top_k=k, provider=provider)
-        elif mode == "sparse" and self.settings.local_only:
-            from self_directing_mcp.retrieve.hybrid import RRFResult
-            allowed = {c.chunk_id for c in self.store.list_chunks(session_id, provider)}
-            rows = self.sparse.search(mask_secrets(query), top_k=k, session_id=session_id, allowed_ids=allowed)
-            hits = hits_to_schema(
-                [RRFResult(chunk_id=cid, ranking_score=score, dense_rank=None,
-                           sparse_rank=rank, sparse_score=score) for cid, score, rank in rows],
-                self.store.get_chunk)
+            with self._publication_guard():
+                snapshot = self.store.capture_evidence(session_id, provider)
+            hits = regex_search(snapshot, query, session_id=session_id, top_k=k, provider=provider)
         else:
-            results = self.retriever.retrieve(
-                query, top_k=k, session_id=session_id, mode=mode, provider=provider
-            )
-            hits = hits_to_schema(results, self.store.get_chunk)
+            if not self.settings.local_only:
+                prepared_query = self.retriever.prepare_query(query, mode=mode)
+            with self._publication_guard():
+                if self.dense is not None and mode in ("dense", "hybrid"):
+                    self.dense.refresh()
+                if mode == "sparse" and self.settings.local_only:
+                    from self_directing_mcp.retrieve.hybrid import RRFResult
+                    snapshot = self.store.capture_evidence(session_id, provider)
+                    allowed = {cid for cid, _raw in snapshot.rows}
+                    rows = self.sparse.search(mask_secrets(query), top_k=k, session_id=session_id, allowed_ids=allowed)
+                    results = [RRFResult(chunk_id=cid, ranking_score=score, dense_rank=None,
+                                         sparse_rank=rank, sparse_score=score) for cid, score, rank in rows]
+                else:
+                    results = self.retriever.retrieve(query, top_k=k, session_id=session_id, mode=mode,
+                                                      provider=provider, query_vector=prepared_query)
+                    snapshot = self.store.capture_evidence(session_id, provider, history=False,
+                                                          anchors=(row.chunk_id for row in results))
+            hits = hits_to_schema(results, snapshot.get_chunk)
         return {
             "ok": True,
             "mode": mode,
@@ -296,26 +426,64 @@ class SelfDirectEngine:
             ),
         }
 
+    def _repair_sparse_for_search(self, session_id, provider):
+        """Materialize deferred canonical evidence before searching its derived view."""
+        with self._publication_guard():
+            allowed = self.store.chunk_ids(session_id, provider)
+            # A session search probes only its own ids; a global search needs every id, so one scan is cheaper.
+            missing = allowed - (self.sparse.present(allowed) if session_id else self.sparse.ids())
+            if not missing:
+                return
+            snapshot = self.store.capture_evidence(session_id, provider, history=False, anchors=missing)
+        documents = snapshot.list_chunks(session_id, provider)
+        with self._publication_guard():
+            current = self.store.chunk_ids(session_id, provider)
+            documents = [chunk for chunk in documents if chunk.chunk_id in current]
+            if documents:
+                self.sparse.upsert_many(documents)
+
+    def _refresh_evidence(self, sid, provider, path=None):
+        """Refresh only authority; return detached coverage and its exact inputs."""
+        with self._publication_guard():
+            record = self.store.cursor_record(sid, provider)
+        try:
+            info = self._sync_session(session_id=sid, provider=provider, embed=False,
+                                      path=path if path is not None else record["path"] if record else None,
+                                      derived=False)
+            if info.get("ok"):
+                return info
+            failure = info.get("error", "sync_failed")
+        except (RequestStopped, IndexBusy):
+            raise
+        except (OSError, ValueError) as exc:
+            failure = "sync_failed:" + type(exc).__name__
+        with self._publication_guard(), self.store._read_boundary():
+            record = self.store.cursor_record(sid, provider)
+            metrics = self.store.session_metrics(sid, provider)
+            token = self.store.state_token(sid, provider)
+        coverage = coverage_from_capture(sid, provider, record, metrics)
+        coverage["complete"] = False
+        coverage["issues"].append(failure)
+        return {"ok": False, "coverage": coverage, "_metadata_token": token,
+                "_source_observation": None, "_receipt_token": None}
+
     def _audit(self, session_id, provider, proposed=None, path=None):
         started = time.perf_counter()
-        self.ensure_ready()
         provider = self._resolve_provider(provider)
-        sid = session_id.lower() if provider == "codex" else session_id
-        # Always refresh local evidence. Regex audit never depends on remote embeddings.
-        record = self.store.cursor_record(sid, provider)
-        try:
-            synced = self.sync_session(session_id=sid, path=path or (record["path"] if record else None),
-                                       provider=provider, embed=False)
-            coverage = synced.get("coverage") or self.store.session_status(sid, provider)
-            if not synced.get("ok"):
-                coverage["complete"] = False
-                coverage["issues"].append(synced.get("error", "sync_failed"))
-        except (OSError, ValueError) as exc:
-            coverage = self.store.session_status(sid, provider)
-            coverage["complete"] = False
-            coverage["issues"].append("sync_failed:" + type(exc).__name__)
+        sid = session_id.lower() if provider in ("codex", "agy") else session_id
+        refreshed = self._refresh_evidence(sid, provider, path)
+        coverage = dict(refreshed["coverage"])
+        coverage["issues"] = list(coverage["issues"])
         sync_finished = time.perf_counter()
-        self.contracts.load_if_changed()
+        with self._publication_guard():
+            raw_contracts, contract_token = self.contracts.capture()
+        try:
+            document = ContractsDocument.model_validate_json(raw_contracts) if raw_contracts is not None else ContractsDocument()
+            contracts = document.contracts
+        except ValueError:
+            contracts = []
+            coverage["complete"] = False
+            coverage["issues"].append("contracts_corrupt")
         planned = None
         if proposed is not None:
             action = ProposedAction.model_validate(proposed)
@@ -324,55 +492,141 @@ class SelfDirectEngine:
                                  {"role": "assistant", "tool_name": action.tool_name, "proposed": True},
                                  0, coverage.get("byte_offset", 0), coverage.get("byte_offset", 0))
             planned.chunk_id = "proposed:" + planned.chunk_id
-        contracts = self.contracts.list()
-        applicable = sum(rule.enabled and rule.provider in (None, provider)
-                         and rule.session_id in (None, sid) for rule in contracts)
-        result = run_audit(session_id=sid, contracts=contracts, store=self.store,
+            # Preserve the public contracts_snapshot filtering/hash semantics.
+            contracts = [rule for rule in contracts if rule.type != "must" or rule.before_regex]
+        active = [rule for rule in contracts if rule.enabled and rule.provider in (None, provider)
+                  and rule.session_id in (None, sid)]
+        history = any(rule.regex and (rule.type == "must" or planned is None) for rule in active)
+        anchors = {anchor for rule in active for anchor in (rule.source_event_id, rule.applies_from_event_id) if anchor}
+        with self._publication_guard(), self.store._read_boundary():
+            metadata_token = self.store.state_token(sid, provider)
+            if metadata_token != refreshed["_metadata_token"]:
+                coverage["complete"] = False
+                coverage["issues"].append("metadata_changed_before_capture")
+            if history:
+                # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
+                needs, link_calls = audit_needs(active, planned)
+                evidence = self.store.capture_audit_events(sid, provider, needs, link_calls=link_calls)
+            else:
+                evidence = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
+            receipt_token = self._receipt_token(sid, provider)
+            if provider == "agy" and receipt_token != refreshed["_receipt_token"]:
+                coverage["complete"] = False
+                coverage["issues"].append("receipts_changed_before_capture")
+        observation = refreshed["_source_observation"]
+        _mark_growth(coverage, observation)
+        # The actual native stages, model decoding and regex evaluation own no
+        # engine lease, shared SQLite handle or open read transaction.
+        result = run_audit(session_id=sid, contracts=contracts, store=evidence,
                            provider=provider, proposed=planned, coverage=coverage)
         payload = result.model_dump(mode="json")
         payload.update(ok=True, provider=provider, action_executed=False,
-                       applicable_contracts=applicable,
-                       requires_attention=result.verdict != "clean")
+                       applicable_contracts=len(active), requires_attention=result.verdict != "clean")
+        if planned is not None:
+            action_rules = [rule for rule in active if action_applies(rule, planned)]
+            payload["action_scope"] = "applicable" if action_rules else "not_applicable"
+            payload["action_contracts"] = [rule.id for rule in action_rules]
+            payload["requires_history"] = any(rule.type == "must" for rule in action_rules)
         payload["timings_ms"] = {
             "sync": round((sync_finished - started) * 1000, 2),
             "evaluation": round((time.perf_counter() - sync_finished) * 1000, 2)}
         payload["nudge"] = (
             "Detect only. violation/suspicious: STOP and report; unknown: resolve missing evidence. "
-            "clean is limited to the reported contracts and history snapshot, not execution authorization."
-        )
+            "clean is limited to the reported contracts and history snapshot, not execution authorization.")
         payload["global_meaning"] = GLOBAL_CONTRACT_MEANING
-        payload["contract_scope"] = {
-            "session_id": sid,
-            "scope": contract_scope(sid),
-        }
-        return payload
+        payload["contract_scope"] = {"session_id": sid, "scope": contract_scope(sid)}
+        # Keep the full result: a transient read error does not latch a mismatch, so a later
+        # successful bounded tail check must not certify this read.
+        source_ok = observation is None or observation.validate_prefix()  # full rehash off the shared lock
+        with self._publication_guard():
+            stale = []
+            tokens = (
+                ("metadata", metadata_token, lambda: self.store.state_token(sid, provider)),
+                ("contracts", contract_token, self.contracts.current_token),
+                ("receipts", receipt_token, lambda: self._receipt_token(sid, provider)),
+            )
+            for label, expected, read_token in tokens:
+                try:
+                    if read_token() != expected:
+                        stale.append(label + "_changed_during_evaluation")
+                except (RequestStopped, IndexBusy):
+                    raise
+                except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+                    stale.append(label + "_authority_unavailable:" + type(exc).__name__)
+            known = bool(payload["coverage"].get("judged_prefix"))
+            grown = False
+            if observation is not None:
+                # Pure growth is judged as of the captured offset; any rewrite, truncation, replacement or
+                # deletion fails the prefix check and stays unknown.
+                if not source_ok or not observation.validate_prefix(locked=True):
+                    stale.append("source_changed_during_evaluation")
+                else:
+                    grown = _mark_growth(payload["coverage"], observation)
+            if grown and not known and payload["coverage"].get("judged_prefix") and not stale:
+                if downgrade_unproven_absence(payload["findings"], active):
+                    payload["verdict"] = "clean"
+                    for item in payload["findings"]:
+                        payload["verdict"] = _worse(payload["verdict"], item["verdict"])
+                payload["notes"].append(prefix_note(payload["coverage"]))
+            if stale:
+                payload["coverage"].pop("judged_prefix", None)
+                payload["snapshot_verdict"] = payload["verdict"]
+                payload.update(verdict="unknown", requires_attention=True)
+                payload["coverage"]["complete"] = False
+                payload["coverage"]["issues"].extend(stale)
+                payload["notes"].append("Authority changed or became unavailable; findings describe the captured snapshot, not current compliance.")
+            if planned is not None and payload["requires_history"] and not payload["coverage"].get("complete"):
+                # A retrospective audit may be clean as of its offset, but a proposed action runs now: unread
+                # records precede it. Pure append cannot erase an observed run, yet a newer failed or pending
+                # run can invalidate an older success; any other coverage gap invalidates both.
+                gate_ids = {rule.id for rule in action_rules if rule.type == "must"
+                            and (rule.requires_success or not payload["coverage"].get("judged_prefix"))}
+                for item in payload["findings"]:
+                    if item["contract_id"] in gate_ids and item["verdict"] == "clean":
+                        item.update(verdict="unknown",
+                                    reason="incomplete current history cannot establish the proposed action's prerequisite",
+                                    basis=(item.get("basis") or "") + "; captured prerequisite evidence does not establish current compliance")
+                if gate_ids:
+                    payload["verdict"] = _worse(payload["verdict"], "unknown")
+                    payload["notes"].append("Current action prerequisites remain unverified while their required evidence is incomplete.")
+            payload["requires_attention"] = payload["verdict"] != "clean"
+            with publication():
+                return payload
 
-    @serialized
+    def _receipt_token(self, sid, provider):
+        if provider != "agy":
+            return None
+        from self_directing_mcp.agy_receipts import ReceiptStore
+        receipts = ReceiptStore(Path(self.settings.index_dir))
+        return receipts.authority_token(sid)
+
+    @detached_operation
     def audit_session(self, session_id: str, provider: str | None = None, path: str | None = None) -> dict[str, Any]:
         return self._audit(session_id, provider, path=path)
 
-    @serialized
+    @detached_operation
     def check_action(self, session_id: str, action: dict[str, Any], provider: str | None = None, path: str | None = None):
         """Check a proposed tool call against refreshed history; never execute or persist it."""
         return self._audit(session_id, provider, proposed=action, path=path)
 
-    @serialized
+    @detached_operation
     def get_chunk(self, chunk_id: str) -> dict[str, Any]:
-        self.ensure_ready()
         assert self.store
-        chunk = self.store.get_chunk(chunk_id)
+        with self._publication_guard():
+            snapshot = self.store.capture_evidence(history=False, anchors=(chunk_id,))
+        chunk = snapshot.get_chunk(chunk_id)
         if not chunk:
             return {"ok": False, "found": False, "chunk_id": chunk_id}
         data = chunk.model_dump(mode="json")
         data = mask_value(data)
         return {"ok": True, "found": True, "chunk": data}
 
-    @serialized
+    @detached_operation
     def list_contracts(self, session_id: str | None = None) -> dict[str, Any]:
-        self.ensure_ready()
         assert self.contracts
-        self.contracts.load_if_changed()
-        stored = self.contracts.list()
+        with self._publication_guard():
+            raw, _token = self.contracts.capture()
+        stored = (ContractsDocument.model_validate_json(raw).contracts if raw is not None else [])
         selected = visible_contracts(stored, session_id)
         return {
             "ok": True,
@@ -383,21 +637,23 @@ class SelfDirectEngine:
             "counts": scope_counts(selected, len(stored)),
         }
 
-    @serialized
+    @detached_operation
     def revoke_contract(self, contract_id: str) -> dict[str, Any]:
         """Disable a rule while keeping its history and source quote for audit."""
-        self.ensure_ready()
         assert self.contracts
-        self.contracts.load_if_changed()
-        disabled = self.contracts.revoke(contract_id)
-        if disabled is None:
-            return {"ok": False, "error": "not_found", "contract_id": contract_id}
+        with self._publication_guard():
+            raw, token = self.contracts.capture()
+            document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
+            disabled = self.contracts.prepare_revoke(document, contract_id)
+            if disabled is None:
+                return {"ok": False, "error": "not_found", "contract_id": contract_id}
+            payload = document.model_dump_json(indent=2)
+            self.contracts.publish_document(document, payload, token)
         return {"ok": True, "contract": disabled.model_dump(mode="json"),
                 "nudge": "Contract disabled. History retained; re-enable via upsert_contracts with the same id."}
 
-    @serialized
+    @detached_operation
     def upsert_contracts(self, contracts: list[dict[str, Any] | ContractRule]) -> dict[str, Any]:
-        self.ensure_ready()
         assert self.contracts
         rules: list[ContractRule] = []
         for c in contracts:
@@ -409,9 +665,12 @@ class SelfDirectEngine:
             for pattern in (rule.regex, rule.before_regex):
                 if pattern:
                     re.compile(pattern)
-        self.contracts.load_if_changed()
-        updated = self.contracts.upsert(rules)
-        stored = self.contracts.list()
+        with self._publication_guard():
+            raw, token = self.contracts.capture()
+            document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
+            updated = self.contracts.prepare_upsert(document, rules)
+            payload = document.model_dump_json(indent=2)
+            self.contracts.publish_document(document, payload, token)
         return {
             "ok": True,
             "returned": "upserted",
@@ -419,11 +678,70 @@ class SelfDirectEngine:
             "contracts": [c.model_dump(mode="json") for c in updated],
             "counts": {
                 "upserted": len(updated),
-                "store": len(stored),
+                "store": len(document.contracts),
             },
         }
 
-    @serialized
+    def _verified_checklist_evidence(self, evidence_ids, chunks, complete) -> bool:
+        """Evidence IDs are claims until current, linked runtime results resolve."""
+        if not evidence_ids or not complete:
+            return False
+        positions = {chunk.chunk_id: index for index, chunk in enumerate(chunks)}
+        by_id = {chunk.chunk_id: chunk for chunk in chunks}
+        for identifier in evidence_ids:
+            result = by_id.get(identifier)
+            if result is None or result.kind != "tool_result" or result.meta.get("success") is not True:
+                return False
+            call_id = result.meta.get("call_id")
+            calls = [chunk for chunk in chunks if chunk.kind == "tool_call" and chunk.meta.get("call_id") == call_id]
+            outputs = [chunk for chunk in chunks if chunk.kind == "tool_result" and chunk.meta.get("call_id") == call_id]
+            if (not call_id or len(calls) != 1 or len(outputs) != 1
+                    or positions[calls[0].chunk_id] >= positions[result.chunk_id]):
+                return False
+        return True
+
+    def _capture_checklist(self, sid):
+        with self._publication_guard():
+            path = self.checklists._path(sid)
+            try:
+                raw = path.read_bytes()
+            except FileNotFoundError:
+                raw = None
+        return (ChecklistDocument.model_validate_json(raw) if raw is not None else ChecklistDocument(session_id=sid)), raw
+
+    def _evidence_current(self, sid, provider, refreshed):
+        observation = refreshed.get("_source_observation")
+        return (self.store.state_token(sid, provider) == refreshed["_metadata_token"]
+                and observation is not None and observation.validate_prefix(locked=True)
+                and self._receipt_token(sid, provider) == refreshed.get("_receipt_token"))
+
+    def _save_checklist(self, doc, original, provider, refreshed=None):
+        payload = doc.model_dump_json(indent=2)
+        source_ok = True
+        if refreshed is not None and refreshed.get("_source_observation") is not None:
+            source_ok = refreshed["_source_observation"].validate_prefix()  # full rehash off the shared lock
+        with self._publication_guard():
+            path = self.checklists._path(doc.session_id)
+            try:
+                current = path.read_bytes()
+            except FileNotFoundError:
+                current = None
+            if current != original:
+                raise ChecklistConflict("stale checklist preparation")
+            if refreshed is not None and (not source_ok or not self._evidence_current(doc.session_id, provider, refreshed)):
+                raise ChecklistConflict("checklist evidence changed during evaluation")
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            try:
+                temporary.write_text(payload, encoding="utf-8")
+                with publication():
+                    if refreshed is not None and (not source_ok or not self._evidence_current(doc.session_id, provider, refreshed)):
+                        raise ChecklistConflict("checklist evidence changed before publication")
+                    check_request()
+                    temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    @detached_operation
     def update_checklist(
         self,
         session_id: str,
@@ -437,11 +755,48 @@ class SelfDirectEngine:
         update: [{item_id, status?, evidence_chunk_ids?, blocked_reason?, verified?}]
         A completion claim without evidence stays pending_verification, not done.
         """
-        self.ensure_ready()
         assert self.checklists
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
-        doc = self.checklists.load(sid)
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
+        needs_evidence = any(change.get("status") == RequirementStatus.DONE.value or "evidence_chunk_ids" in change
+                             for change in update or [])
+        if not needs_evidence:
+            with self._publication_guard():
+                doc, original = self._capture_checklist(sid)
+                added, updated = self._apply_checklist_changes(doc, add, update, None, [])
+                self._save_checklist(doc, original, resolved_provider)
+        else:
+            for _attempt in range(CHECKLIST_EVALUATION_ATTEMPTS):
+                doc, original = self._capture_checklist(sid)
+                refreshed = self._refresh_evidence(sid, resolved_provider)
+                with self._publication_guard(), self.store._read_boundary():
+                    evidence = self.store.capture_evidence(sid, resolved_provider)
+                    if self.store.state_token(sid, resolved_provider) != refreshed["_metadata_token"]:
+                        refreshed["coverage"]["complete"] = False
+                evidence_chunks = evidence.list_chunks(sid, resolved_provider)
+                added, updated = self._apply_checklist_changes(doc, add, update, refreshed, evidence_chunks)
+                proof = refreshed if any(item.get("verified") and item.get("status") == RequirementStatus.DONE
+                                         for item in updated) else None
+                try:
+                    self._save_checklist(doc, original, resolved_provider, proof)
+                    break
+                except ChecklistConflict:
+                    continue
+            else:
+                return {"ok": False, "status": "checklist_conflict", "action_executed": False,
+                        "attempts": CHECKLIST_EVALUATION_ATTEMPTS,
+                        "message": "Checklist or evidence changed during every evaluation attempt; nothing was saved. Retry."}
+        remaining = [i for i in doc.items
+                     if i.status not in (RequirementStatus.DONE, RequirementStatus.REVOKED)]
+        return {
+            "ok": True,
+            "added": added,
+            "updated": updated,
+            "remaining": [i.model_dump(mode="json") for i in remaining],
+            "nudge": INCOMPLETE_NOTE if remaining else None,
+        }
+
+    def _apply_checklist_changes(self, doc, add, update, refreshed, evidence_chunks):
         added = []
         for item in add or []:
             entry = RequirementItem(
@@ -463,14 +818,14 @@ class SelfDirectEngine:
             before = item.status
             if "evidence_chunk_ids" in change:
                 item.evidence_chunk_ids = list(change["evidence_chunk_ids"])
-            if change.get("status") == RequirementStatus.DONE.value:
-                if item.evidence_chunk_ids:
-                    item.status = RequirementStatus.DONE
-                    item.verified = bool(change.get("verified", True))
-                else:
-                    # Completion claim without evidence never marks done.
-                    item.status = RequirementStatus.PENDING_VERIFICATION
-                    item.verified = False
+            if change.get("status") == RequirementStatus.DONE.value or (
+                    "evidence_chunk_ids" in change and item.status == RequirementStatus.DONE):
+                verified = (refreshed is not None and refreshed.get("ok") is True
+                            and change.get("verified") is not False
+                            and self._verified_checklist_evidence(item.evidence_chunk_ids, evidence_chunks,
+                                                                  refreshed["coverage"]["complete"]))
+                item.status = RequirementStatus.DONE if verified else RequirementStatus.PENDING_VERIFICATION
+                item.verified = verified
             elif change.get("status"):
                 item.status = change["status"]
             if change.get("blocked_reason"):
@@ -478,117 +833,146 @@ class SelfDirectEngine:
             item.history.append({"change": "updated", "from": before, "to": item.status,
                                  "evidence": len(item.evidence_chunk_ids)})
             updated.append(item.model_dump(mode="json"))
-        self.checklists.save(doc)
-        remaining = [i for i in doc.items
-                     if i.status not in (RequirementStatus.DONE, RequirementStatus.REVOKED)]
-        return {
-            "ok": True,
-            "added": added,
-            "updated": updated,
-            "remaining": [i.model_dump(mode="json") for i in remaining],
-            "nudge": INCOMPLETE_NOTE if remaining else None,
-        }
+        return added, updated
 
-    @serialized
+    @detached_operation
     def get_checklist(self, session_id: str, provider: str | None = None) -> dict[str, Any]:
         """Restore requirements and remaining items after compaction."""
-        self.ensure_ready()
         assert self.checklists
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
-        doc = self.checklists.load(sid)
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
+        doc, _original = self._capture_checklist(sid)
+        with self._publication_guard(), self.store._read_boundary():
+            record = self.store.cursor_record(sid, resolved_provider)
+            metrics = self.store.session_metrics(sid, resolved_provider)
+            metadata_token = self.store.state_token(sid, resolved_provider)
+            receipt_token = self._receipt_token(sid, resolved_provider)
+            evidence = self.store.capture_evidence(sid, resolved_provider)
+        try:
+            observation = capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],)) if record else None
+        except RequestStopped:
+            raise
+        except (OSError, ValueError):
+            observation = None
+        coverage = coverage_from_capture(sid, resolved_provider, record, metrics, observation)
+        if resolved_provider == "agy" and record and record.get("receipt_digest") != receipt_token[2]:
+            coverage["complete"] = False
+            coverage["issues"].append("receipts_not_indexed")
+        chunks = evidence.list_chunks(sid, resolved_provider)
+        for item in doc.items:
+            if item.status == RequirementStatus.DONE and (
+                    not item.verified or not self._verified_checklist_evidence(item.evidence_chunk_ids, chunks,
+                                                                               coverage["complete"])):
+                item.status = RequirementStatus.PENDING_VERIFICATION
+                item.verified = False
+        source_ok = observation is not None and observation.validate_prefix()  # full rehash off the shared lock
+        with self._publication_guard():
+            state = {"_metadata_token": metadata_token, "_source_observation": observation,
+                     "_receipt_token": receipt_token}
+            if not source_ok or not self._evidence_current(sid, resolved_provider, state):
+                for item in doc.items:
+                    if item.status == RequirementStatus.DONE:
+                        item.status, item.verified = RequirementStatus.PENDING_VERIFICATION, False
         return {"ok": True, "session_id": sid, "items": [i.model_dump(mode="json") for i in doc.items]}
 
-    @serialized
+    @detached_operation
     def analyze_activity(self, session_id: str, provider: str | None = None,
                          window_minutes: int = 60) -> dict[str, Any]:
         """SQLite-based activity time-series analysis with evidence ids."""
-        self.ensure_ready()
         assert self.store
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
-        return analyze_activity(self.store, session_id=sid, provider=resolved_provider,
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
+        with self._publication_guard():
+            snapshot = self.store.capture_evidence(sid, resolved_provider)
+            try:
+                checklist_raw = self.checklists._path(sid).read_bytes()
+            except FileNotFoundError:
+                checklist_raw = None
+        snapshot = replace(snapshot, checklist_raw=checklist_raw)
+        return analyze_activity(snapshot, session_id=sid, provider=resolved_provider,
                                 window_minutes=max(1, min(window_minutes, 1440)))
 
-    @serialized
+    @detached_operation
     def get_graph_context(
         self,
         session_id: str,
         node_id: str | None = None,
         provider: str | None = None,
         depth: int = 1,
+        path: str | None = None,
     ) -> dict[str, Any]:
         """Fetch GraphRAG context: entity neighbor subgraph or overall session graph."""
-        self.ensure_ready()
         assert self.graph is not None
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
+        if path is not None:
+            synced = self._refresh_evidence(sid, resolved_provider, path)
+            if not synced.get("ok") or not synced.get("coverage", {}).get("complete"):
+                return {"ok": False, "error": synced.get("error", "incomplete_history"), "nodes": [], "edges": []}
 
-        if node_id:
-            res = self.graph.neighbors(sid, resolved_provider, node_id, depth=depth)
-            if not res.get("edges"):
-                matches = self.graph.find_nodes_like(node_id, sid, resolved_provider)
-                if matches:
-                    matched_id = matches[0]["node_id"]
-                    res = self.graph.neighbors(sid, resolved_provider, matched_id, depth=depth)
-            return {
-                "ok": True,
-                "session_id": sid,
-                "provider": resolved_provider,
-                "node_id": node_id,
-                "subgraph": res,
-                "cursor": self.graph.cursor(sid, resolved_provider),
-            }
-        else:
+        source_ok = True
+        if path is not None and synced.get("_source_observation") is not None:
+            source_ok = synced["_source_observation"].validate_prefix()  # full rehash off the shared lock
+        with self._publication_guard():
+            if path is not None and (not source_ok or not self._evidence_current(sid, resolved_provider, synced)):
+                return {"ok": False, "error": "incomplete_history", "nodes": [], "edges": []}
+            cursor = self.graph.cursor(sid, resolved_provider)
+            if node_id:
+                res = self.graph.neighbors(sid, resolved_provider, node_id, depth=depth)
+                if not res.get("edges"):
+                    matches = self.graph.find_nodes_like(node_id, sid, resolved_provider)
+                    if matches:
+                        res = self.graph.neighbors(sid, resolved_provider, matches[0]["node_id"], depth=depth)
+                return {"ok": True, "session_id": sid, "provider": resolved_provider,
+                        "node_id": node_id, "subgraph": res, "cursor": cursor}
             graph_data = self.graph.get_session_graph(sid, resolved_provider)
-            return {
-                "ok": True,
-                "session_id": sid,
-                "provider": resolved_provider,
-                "nodes": graph_data["nodes"],
-                "edges": graph_data["edges"],
-                "cursor": self.graph.cursor(sid, resolved_provider),
-            }
+            return {"ok": True, "session_id": sid, "provider": resolved_provider,
+                    "nodes": graph_data["nodes"], "edges": graph_data["edges"], "cursor": cursor}
 
-    @serialized
+    @detached_operation
     @graph_operation("validate_graph_proposal")
     def propose_graph_update(self, session_id: str, proposal: dict[str, Any],
                              provider: str | None = None) -> dict[str, Any]:
         """Validate a node/edge proposal against indexed evidence; nothing stored here."""
-        self.ensure_ready()
         assert self.store and self.graph
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
-        verdict = validate_proposal(proposal, store=self.store, session_id=sid, provider=resolved_provider)
-        cursor = self.graph.cursor(sid, resolved_provider)
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
+        anchors = {cid for edge in proposal.get("edges", []) for cid in edge.get("evidence_chunk_ids", [])}
+        with self._publication_guard(), self.store._read_boundary():
+            snapshot = self.store.capture_evidence(sid, resolved_provider, history=False, anchors=anchors)
+            metadata_token = self.store.state_token(sid, resolved_provider)
+            cursor = self.graph.cursor(sid, resolved_provider)
+        verdict = validate_proposal(proposal, store=snapshot, session_id=sid, provider=resolved_provider)
+        with self._publication_guard():
+            if self.store.state_token(sid, resolved_provider) != metadata_token:
+                return {"ok": False, "status": "evidence_conflict", "cursor": cursor}
         return {"ok": verdict["ok"], **verdict, "cursor": cursor,
                 "nudge": None if verdict["ok"] else "Fix problems and resubmit; nothing was stored."}
 
-    @serialized
+    @detached_operation
     @graph_operation("commit_graph_proposal")
     def commit_graph_update(self, session_id: str, proposal: dict[str, Any],
                             base_graph_version: int, provider: str | None = None) -> dict[str, Any]:
-        """Apply a validated proposal atomically and advance the cursor idempotently."""
-        self.ensure_ready()
-        assert self.store and self.graph
+        """Validate detached evidence, then CAS the graph and metadata generations."""
         resolved_provider = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved_provider == "codex" else session_id
-        existing = self.graph.find_job(proposal.get("job_id", "") or "adhoc")
-        if existing and existing["status"] == "applied":
-            # Idempotent replay: same job id never double-applies.
-            return {"ok": True, "status": "already_applied", "job": existing}
-        cursor = self.graph.cursor(sid, resolved_provider)
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
+        anchors = {cid for edge in proposal.get("edges", []) for cid in edge.get("evidence_chunk_ids", [])}
+        with self._publication_guard(), self.store._read_boundary():
+            existing = self.graph.find_job(proposal.get("job_id", "") or "adhoc")
+            if existing and existing["status"] == "applied":
+                return {"ok": True, "status": "already_applied", "job": existing}
+            cursor = self.graph.cursor(sid, resolved_provider)
+            metadata_token = self.store.state_token(sid, resolved_provider)
+            snapshot = self.store.capture_evidence(sid, resolved_provider, history=False, anchors=anchors)
         if base_graph_version != cursor["graph_version"]:
-            # Stale base: the caller read an outdated graph state. Do not apply.
             return {"ok": False, "status": "version_conflict",
                     "expected_base_graph_version": cursor["graph_version"],
                     "provided_base_graph_version": base_graph_version,
                     "nudge": "Re-read the current graph and rebuild the proposal against it."}
-        verdict = validate_proposal(proposal, store=self.store, session_id=sid, provider=resolved_provider)
+        verdict = validate_proposal(proposal, store=snapshot, session_id=sid, provider=resolved_provider)
         if not verdict["ok"]:
             return {"ok": False, "status": "rejected", **verdict}
-        frames = self.store.event_frames(sid, resolved_provider)
-        through = len(frames) - 1 if frames else cursor["processed_through_order"]
+        through = snapshot.count - 1 if snapshot.count else cursor["processed_through_order"]
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         job = {"job_id": proposal.get("job_id", "adhoc"), "provider": resolved_provider,
@@ -596,33 +980,54 @@ class SelfDirectEngine:
                "range_end": through, "input_digest": str(hash(json.dumps(proposal, sort_keys=True))),
                "base_graph_version": base_graph_version, "status": "pending",
                "created_at": now, "updated_at": now}
-        result = self.graph.apply_proposal(proposal, session_id=sid, provider=resolved_provider,
-                                           base_version=base_graph_version, through_order=through)
-        job["status"] = result["status"]
-        job["detail"] = result.get("detail")
-        self.graph.record_job(job)
-        return result
+        with self._publication_guard():
+            existing = self.graph.find_job(proposal.get("job_id", "") or "adhoc")
+            if existing and existing["status"] == "applied":
+                return {"ok": True, "status": "already_applied", "job": existing}
+            current_version = self.graph.cursor(sid, resolved_provider)["graph_version"]
+            if current_version != base_graph_version:
+                return {"ok": False, "status": "version_conflict",
+                        "expected_base_graph_version": current_version,
+                        "provided_base_graph_version": base_graph_version,
+                        "nudge": "Re-read the current graph and rebuild the proposal against it."}
+            if self.store.state_token(sid, resolved_provider) != metadata_token:
+                return {"ok": False, "status": "evidence_conflict"}
+            result = self.graph.apply_proposal(proposal, session_id=sid, provider=resolved_provider,
+                                               base_version=base_graph_version, through_order=through)
+            job["status"], job["detail"] = result["status"], result.get("detail")
+            self.graph.record_job(job)
+            return result
 
-    @serialized
+    @detached_operation
     def _prepare_neograph_update(self, session_id, provider=None):
-        self.ensure_ready()
         resolved = self._resolve_provider(provider)
-        sid = session_id.lower() if resolved == "codex" else session_id
-        return sid, resolved, self.store.event_frames(sid, resolved), self.graph.cursor(sid, resolved)
+        sid = session_id.lower() if resolved in ("codex", "agy") else session_id
+        with self._publication_guard():
+            snapshot = self.store.capture_evidence(sid, resolved)
+            cursor = self.graph.cursor(sid, resolved)
+        return sid, resolved, snapshot.event_frames(sid, resolved), cursor
 
-    @serialized
+    @workflow_operation
     def _commit_neograph_snapshot(self, sid, provider, proposal, base_version, through,
-                                  cancel_event=None):
-        if cancel_event is not None and cancel_event.is_set():
-            raise TimeoutError("graph_update_cancelled_before_commit")
-        if self.graph.cursor(sid, provider)["graph_version"] != base_version:
-            return {"ok": False, "status": "version_conflict"}
-        verdict = validate_proposal(proposal, store=self.store, session_id=sid, provider=provider)
+                                  *, _deadline=None, cancel_event=None):
+        anchors = {cid for edge in proposal.get("edges", []) for cid in edge.get("evidence_chunk_ids", [])}
+        with self._publication_guard(), self.store._read_boundary():
+            if self.graph.cursor(sid, provider)["graph_version"] != base_version:
+                return {"ok": False, "status": "version_conflict"}
+            metadata_token = self.store.state_token(sid, provider)
+            snapshot = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
+        verdict = validate_proposal(proposal, store=snapshot, session_id=sid, provider=provider)
         if not verdict["ok"]:
             return {"ok": False, "status": "rejected", **verdict}
-        return self.graph.apply_proposal(proposal, session_id=sid, provider=provider,
-                                         base_version=base_version, through_order=through)
+        with self._publication_guard():
+            if self.graph.cursor(sid, provider)["graph_version"] != base_version:
+                return {"ok": False, "status": "version_conflict"}
+            if self.store.state_token(sid, provider) != metadata_token:
+                return {"ok": False, "status": "evidence_conflict"}
+            return self.graph.apply_proposal(proposal, session_id=sid, provider=provider,
+                                             base_version=base_version, through_order=through)
 
+    @workflow_operation
     def run_neograph_update(self, session_id: str, provider: str | None = None,
                             *, _deadline=None, cancel_event=None) -> dict[str, Any]:
         """Run the full update pipeline as a NeoGraph topology with the live LLM.
@@ -636,7 +1041,7 @@ class SelfDirectEngine:
             return {"ok": False, "error": "local_only",
                     "message": "LLM graph updates are unavailable in local-only mode."}
         sid, resolved_provider, frames, cursor = self._prepare_neograph_update(
-            session_id, provider, _deadline=_deadline)
+            session_id, provider, _deadline=_deadline, cancel_event=cancel_event)
         api_key = self.settings.resolve_api_key() or ""
         if not api_key:
             return {"ok": False, "error": "no_api_key",
@@ -665,12 +1070,10 @@ class SelfDirectEngine:
         proposal_result: dict[str, Any] = {}
 
         def on_proposal(step: str, proposal: Any) -> dict[str, Any]:
-            if (_deadline is not None and time.monotonic() >= _deadline) or (
-                    cancel_event is not None and cancel_event.is_set()):
-                raise TimeoutError("graph_update_expired_before_write")
+            check_request()
             if step == "validate":
                 verdict = self.propose_graph_update(sid, proposal, provider=resolved_provider,
-                                                      _deadline=_deadline)
+                                                      _deadline=_deadline, cancel_event=cancel_event)
                 proposal_result["verdict"] = verdict
                 return verdict
             verdict = proposal_result.get("verdict", {"ok": False})
@@ -684,19 +1087,43 @@ class SelfDirectEngine:
             session_id=sid, provider=resolved_provider, events=batch,
             api_key=api_key, model="deepseek/deepseek-v4-flash-0731",
             checkpoint_dir=Path(self.settings.index_dir), on_proposal=on_proposal,
-            deadline=_deadline, cancel_event=cancel_event)
-        pipeline["graph_cursor_after"] = self.graph.cursor(sid, resolved_provider)
+            _deadline=_deadline, cancel_event=cancel_event)
+        # Preserve actual completed workflow receipts even after response expiry.
+        with self._lock:
+            pipeline["graph_cursor_after"] = self.graph.observed_cursor(sid, resolved_provider)
         pipeline["batch_events"] = len(batch)
         applied = pipeline.get("apply_result", {}).get("status") == "applied"
         pipeline["ok"] = applied
         pipeline["remaining_events"] = len(pending) - (len(batch) if applied else 0)
         return pipeline
 
-    @serialized
+    @detached_operation
     def audit_status(self, session_id: str | None = None, provider: str | None = None) -> dict[str, Any]:
+        resolved = self._resolve_provider(provider)
+        sid = session_id.lower() if session_id and resolved in ("codex", "agy") else session_id
+        status, raw_contracts, record, metrics, metadata_token, receipt_token = self._capture_status(sid, resolved)
+        status["contract_count"] = len(ContractsDocument.model_validate_json(raw_contracts).contracts) if raw_contracts is not None else 0
+        if sid:
+            status["session"] = coverage_from_capture(sid, resolved, record, metrics)
+            if resolved == "agy" and record and record.get("receipt_digest") != receipt_token[2]:
+                status["session"]["complete"] = False
+                status["session"]["issues"].append("receipts_not_indexed")
+            with self._publication_guard():
+                if self.store.state_token(sid, resolved) != metadata_token:
+                    status["session"]["complete"] = False
+                    status["session"]["issues"].append("metadata_changed_during_status")
+                if self._receipt_token(sid, resolved) != receipt_token:
+                    status["session"]["complete"] = False
+                    status["session"]["issues"].append("receipts_changed_during_status")
+        return status
+
+    @serialized
+    def _capture_status(self, session_id=None, provider=None):
         self.ensure_ready()
         assert self.store and self.sparse
         s = self.settings
+        if self.dense is not None:
+            self.dense.refresh()
         status: dict[str, Any] = {
             "ok": True,
             "orchestration_backend": "neograph-engine",
@@ -717,27 +1144,36 @@ class SelfDirectEngine:
             "legacy_chunks_retained": self.store.legacy_count(),
             "index_schema": 2,
             "sparse_count": self.sparse.count(),
-            "contract_count": len(self.contracts.list()) if self.contracts else 0,
         }
         if self.embedder_degraded:
             status["degraded_flags"].append("embedder_fake_fallback")
         if self.dense_backend == "numpy":
             status["degraded_flags"].append("dense_numpy_fallback")
-        if session_id:
-            status["session"] = self.store.session_status(session_id.lower() if self._resolve_provider(provider) == "codex" else session_id, self._resolve_provider(provider))
+        raw_contracts, _contract_token = self.contracts.capture()
+        with self.store._read_boundary():
+            record = self.store.cursor_record(session_id, provider) if session_id else None
+            metrics = self.store.session_metrics(session_id, provider) if session_id else None
+            metadata_token = self.store.state_token(session_id, provider) if session_id else None
+            receipt_token = self._receipt_token(session_id, provider) if session_id else None
         status["nudge"] = (
             "NUDGE: Call sync_session at session start; audit_session before risky actions."
         )
-        return status
+        return status, raw_contracts, record, metrics, metadata_token, receipt_token
 
     def close(self) -> None:
-        """Release SQLite handles, including on Windows."""
-        # Closing process-local handles neither reads nor writes shared index state.
-        with self._lock:
-            for component in (self.store, self.sparse, self.dense, self.graph):
-                connection = getattr(component, "_conn", None)
-                if connection is not None:
-                    connection.close()
-            self.store = self.sparse = self.dense = self.retriever = self.contracts = None
-            self.graph = self.neograph = None
-            self._ready = False
+        """Wait for request-owned snapshots/preparation, then release local handles."""
+        with self._lifetime:
+            self._closing = True
+            try:
+                while self._active_operations:
+                    self._lifetime.wait()
+                for component in (self.store, self.sparse, self.dense, self.graph):
+                    connection = getattr(component, "_conn", None)
+                    if connection is not None:
+                        connection.close()
+                self.store = self.sparse = self.dense = self.retriever = self.contracts = None
+                self.graph = self.neograph = None
+                self._ready = False
+            finally:
+                self._closing = False
+                self._lifetime.notify_all()

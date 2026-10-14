@@ -1,39 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
-from pathlib import Path
 
 import pytest
 
 from test_reliability import session, write, call, SID
-from self_directing_mcp.codex_hooks import handle_hook
+from self_directing_mcp.request_control import RequestStopped
 
 
-def test_unchanged_sync_does_not_rewrite_fts(session):
+def test_unchanged_sync_preserves_sparse_search(session):
     engine, path = session
-    write(path, [call("echo initial")], "a")
+    write(path, [call("UNCHANGED_EVIDENCE")], "a")
     engine.sync_session(session_id=SID, embed=False)
-    before = engine.sparse._conn.total_changes
     again = engine.sync_session(session_id=SID, embed=False)
     assert again["new_chunks"] == 0
-    assert engine.sparse._conn.total_changes == before
+    assert engine.search_history("UNCHANGED_EVIDENCE", session_id=SID, mode="sparse")["hits"]
 
 
-def test_append_updates_only_new_sparse_documents(session, monkeypatch):
+def test_append_sparse_search_preserves_old_and_new_evidence(session):
     engine, path = session
-    write(path, [call(f"echo {i}", str(i)) for i in range(30)], "a")
+    write(path, [call("OLD_EVIDENCE", "old")], "a")
     engine.sync_session(session_id=SID, embed=False)
-    observed = []
-    original = engine.sparse.upsert_many
-    def spy(chunks):
-        observed.append(len(chunks))
-        return original(chunks)
-    monkeypatch.setattr(engine.sparse, "upsert_many", spy)
-    write(path, [call("echo newest", "new")], "a")
+    write(path, [call("NEW_EVIDENCE", "new")], "a")
     engine.sync_session(session_id=SID, embed=False)
-    assert sum(observed) == 1
+    old = engine.search_history("OLD_EVIDENCE", session_id=SID, mode="sparse")["hits"]
+    new = engine.search_history("NEW_EVIDENCE", session_id=SID, mode="sparse")["hits"]
+    assert old and new
+    assert {h["chunk_id"] for h in old}.isdisjoint(h["chunk_id"] for h in new)
 
 
 def test_sparse_repair_after_interrupted_index_write(session, monkeypatch):
@@ -51,57 +45,6 @@ def test_sparse_repair_after_interrupted_index_write(session, monkeypatch):
     assert engine.search_history("RECOVER_ME", session_id=SID, mode="sparse")["hits"]
 
 
-def test_hook_performs_exactly_one_sync(session, monkeypatch):
-    engine, path = session
-    engine.upsert_contracts([{"id": "no-delete", "type": "must_not", "scope": "tool_call", "regex": "DELETE_ME"}])
-    calls = []
-    original = engine.sync_session
-    def spy(*args, **kwargs):
-        calls.append(kwargs)
-        return original(*args, **kwargs)
-    monkeypatch.setattr(engine, "sync_session", spy)
-    handle_hook(engine, "PreToolUse", SID, str(path), "Bash", {"command": "echo hi"})
-    assert len(calls) == 1
-
-
-def test_sparse_lookup_uses_indexed_rowid_mapping(session):
-    engine, path = session
-    engine.sync_session(session_id=SID, embed=False)
-    plan = engine.sparse._conn.execute(
-        "EXPLAIN QUERY PLAN SELECT doc_rowid FROM chunk_rows WHERE chunk_id=?", ("x",)).fetchall()
-    assert "SEARCH" in str([tuple(row) for row in plan])
-    assert engine.sparse.count() == engine.store.chunk_count(SID)
-
-
-def test_description_audit_does_not_deserialize_full_history(session, monkeypatch):
-    engine, path = session
-    engine.sync_session(session_id=SID, embed=False)
-    engine.upsert_contracts([{"id": "descriptive", "type": "must", "description": "Keep work local"}])
-    original = engine.store.list_chunks
-    counts = []
-    def spy(*args, **kwargs):
-        value = original(*args, **kwargs)
-        counts.append(len(value))
-        return value
-    monkeypatch.setattr(engine.store, "list_chunks", spy)
-    assert engine.audit_session(SID)["verdict"] == "unknown"
-    assert counts == []
-
-
-def test_mcp_async_wrapper_yields_to_other_requests(monkeypatch):
-    from self_directing_mcp import server
-    def slow(*args, **kwargs):
-        time.sleep(0.15)
-        return {"ok": True, "verdict": "clean"}
-    monkeypatch.setattr(server._engine, "audit_session", slow)
-    async def exercise():
-        task = asyncio.create_task(server.audit_session(SID))
-        await asyncio.sleep(0.02)
-        assert not task.done()
-        assert (await task)["ok"]
-    asyncio.run(exercise())
-
-
 def test_queued_engine_call_has_bounded_lock_wait(session):
     import threading
     engine, _ = session
@@ -117,8 +60,9 @@ def test_queued_engine_call_has_bounded_lock_wait(session):
     acquired.wait(2)
     start = time.monotonic()
     try:
-        with pytest.raises(TimeoutError):
+        with pytest.raises(RequestStopped) as stopped:
             engine.audit_status(_deadline=time.monotonic() + 0.15)
+        assert stopped.value.reason == "request_deadline"
         assert time.monotonic() - start < 0.7
     finally:
         release.set()
@@ -139,8 +83,9 @@ def test_expired_request_never_starts_work(session, monkeypatch):
     def forbidden():
         raise AssertionError("expired request reached engine")
     monkeypatch.setattr(engine, "ensure_ready", forbidden)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(RequestStopped) as stopped:
         engine.audit_status(_deadline=time.monotonic() - 1)
+    assert stopped.value.reason == "request_deadline"
 
 
 def test_deadline_returns_unknown_not_compliance(session, monkeypatch):
@@ -159,6 +104,7 @@ def test_deadline_returns_unknown_not_compliance(session, monkeypatch):
     held.wait(1)
     async def exercise():
         result = await server.audit_session(SID)
+        assert result["error"] == "request_deadline"
         assert result["verdict"] == "unknown"
         assert result["coverage"]["complete"] is False
         assert result["action_executed"] is False

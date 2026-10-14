@@ -9,6 +9,7 @@ from self_directing_mcp.embed.embedder import Embedder
 from self_directing_mcp.index.sparse import SparseIndex
 from self_directing_mcp.index.vector import VectorIndex
 from self_directing_mcp.schemas import SearchHit
+from self_directing_mcp.request_control import check_request, request_operation
 
 
 @dataclass
@@ -30,6 +31,7 @@ def reciprocal_rank_fusion(
     dense_rank: dict[str, int] = {}
     dense_score: dict[str, float] = {}
     for i, (cid, score) in enumerate(dense, start=1):
+        check_request()
         if cid not in dense_rank:
             dense_rank[cid] = i
             dense_score[cid] = score
@@ -37,12 +39,14 @@ def reciprocal_rank_fusion(
     sparse_rank: dict[str, int] = {}
     sparse_score: dict[str, float] = {}
     for cid, score, rank in sparse:
+        check_request()
         if cid not in sparse_rank:
             sparse_rank[cid] = rank
             sparse_score[cid] = score
 
     fused: list[RRFResult] = []
     for cid in set(dense_rank) | set(sparse_rank):
+        check_request()
         score = 0.0
         dr = dense_rank.get(cid)
         sr = sparse_rank.get(cid)
@@ -88,6 +92,15 @@ class HybridRetriever:
         self.retrieve_top_k = retrieve_top_k
         self.store = store
 
+    @request_operation
+    def prepare_query(self, query: str, mode: str = "hybrid") -> np.ndarray | None:
+        """Prepare remote work before the caller acquires its storage lease."""
+        if mode == "sparse":
+            return None
+        from self_directing_mcp.security.mask import mask_secrets
+        return self.embedder.embed_queries([mask_secrets(query)])[0]
+
+    @request_operation
     def retrieve(
         self,
         query: str,
@@ -96,10 +109,12 @@ class HybridRetriever:
         session_id: str | None = None,
         mode: str = "hybrid",
         provider: str | None = None,
+        query_vector: np.ndarray | None = None,
     ) -> list[RRFResult]:
         top_k = top_k if top_k is not None else self.retrieve_top_k
         channel_k = max(self.retrieve_top_k, top_k)
-        allowed = {c.chunk_id for c in self.store.list_chunks(session_id, provider)} if self.store else None
+        allowed = set(self.store.chunk_ids(session_id, provider)) if self.store else None
+        check_request()
         from self_directing_mcp.security.mask import mask_secrets
         query = mask_secrets(query)
 
@@ -111,7 +126,7 @@ class HybridRetriever:
             ]
 
         if mode == "dense":
-            qvec = self.embedder.embed_queries([query])[0]
+            qvec = query_vector if query_vector is not None else self.prepare_query(query, mode)
             dense_hits = self.dense.search(qvec, top_k=channel_k, allowed_ids=allowed)
             return [
                 RRFResult(chunk_id=cid, ranking_score=score, dense_rank=i, sparse_rank=None, dense_score=score)
@@ -120,7 +135,7 @@ class HybridRetriever:
 
         # hybrid (default)
         sparse_hits = self.sparse.search(query, top_k=channel_k, session_id=session_id, allowed_ids=allowed)
-        qvec = self.embedder.embed_queries([query])[0]
+        qvec = query_vector if query_vector is not None else self.prepare_query(query, mode)
         dense_hits = self.dense.search(qvec, top_k=channel_k, allowed_ids=allowed)
         fused = reciprocal_rank_fusion(dense_hits, sparse_hits, k=self.rrf_k)
         return fused[: max(top_k, 1)]
@@ -131,6 +146,7 @@ def hits_to_schema(results: list[RRFResult], get_chunk) -> list[SearchHit]:
 
     out: list[SearchHit] = []
     for r in results:
+        check_request()
         chunk = get_chunk(r.chunk_id)
         snippet = mask_secrets(chunk.text)[:500] if chunk else None
         out.append(

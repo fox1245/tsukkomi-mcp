@@ -1,8 +1,8 @@
 // Opt-in OMP user extension. Register this file in OMP's user extensions and set
-// TSUKKOMI_OMP_MONITOR=1, SELF_DIRECT_OMP_SESSIONS_DIR and SELF_DIRECT_INDEX_DIR.
-// Remote retrieval is the default: set SELF_DIRECT_OPENROUTER_API_KEY_FILE and
-// SELF_DIRECT_SQLITE_VECTOR_PATH to authorized private files. Explicitly set
-// SELF_DIRECT_LOCAL_ONLY=true for offline-only use.
+// TSUKKOMI_OMP_MONITOR=1. Configure paths in Tsukkomi's user config.toml or
+// SELF_DIRECT_ environment overrides; Python owns their resolution and validation.
+// Remote retrieval requires an authorized key file and native vector library.
+// Explicitly set SELF_DIRECT_LOCAL_ONLY=true for offline-only use.
 // TSUKKOMI_OMP_PYTHON selects the Python interpreter with tsukkomi-mcp installed;
 // TSUKKOMI_OMP_SOURCE can point at a source checkout without changing OMP's PYTHONPATH.
 // SELF_DIRECT_CONTRACTS_PATH may select an existing private contracts file.
@@ -12,7 +12,8 @@
 // tool_result and turn_end re-audit the currently persisted JSONL snapshot (a
 // hook may precede disk flush). In-memory sessions, skipped hooks, and transport
 // failures are NOT monitored or evidence of compliance.
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { delimiter } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -34,7 +35,6 @@ type Audit = { ok: true; verdict: "violation" | "suspicious" | "clean" | "unknow
 type Session = { session_id: string; provider: "omp"; path: string };
 
 const enabled = process.env.TSUKKOMI_OMP_MONITOR === "1";
-const root = process.env.SELF_DIRECT_OMP_SESSIONS_DIR;
 const maxLine = 4 * 1024 * 1024;
 const maxRequest = 256 * 1024;
 const timeoutMs = 12000;
@@ -82,18 +82,14 @@ class LocalMcp {
     if (this.starting) return this.starting;
     if (this.child) return;
     this.starting = (async () => {
-      if (!root || !process.env.SELF_DIRECT_INDEX_DIR) throw new Error("private runtime locations not configured");
       const localOnly = process.env.SELF_DIRECT_LOCAL_ONLY === "true";
-      if (!localOnly && (!process.env.SELF_DIRECT_OPENROUTER_API_KEY_FILE || !process.env.SELF_DIRECT_SQLITE_VECTOR_PATH)) {
-        throw new Error("OpenRouter key file and native vector library not configured");
-      }
-      const env = { ...process.env, SELF_DIRECT_LOCAL_ONLY: localOnly ? "true" : "false", SELF_DIRECT_OMP_SESSIONS_DIR: root };
+      const env = { ...process.env, SELF_DIRECT_LOCAL_ONLY: localOnly ? "true" : "false" };
       const source = process.env.TSUKKOMI_OMP_SOURCE;
       if (source) env.PYTHONPATH = env.PYTHONPATH ? `${source}${delimiter}${env.PYTHONPATH}` : source;
       // Never pass ambient raw credentials; offline mode discards the file reference too.
       delete env.OPENROUTER_API_KEY;
       if (localOnly) delete env.SELF_DIRECT_OPENROUTER_API_KEY_FILE;
-      const child = spawn(process.env.TSUKKOMI_OMP_PYTHON || "python", ["-m", "self_directing_mcp.server"],
+      const child = spawn(process.env.TSUKKOMI_OMP_PYTHON || "python", ["-m", "self_directing_mcp.server", "--omp-bridge"],
         { env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
       this.child = child;
       child.stderr.on("data", () => { /* drain without logging potentially sensitive diagnostics */ });

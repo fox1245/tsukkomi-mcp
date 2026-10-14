@@ -1,3 +1,5 @@
+> Historical report: per-call `timeout_ms` is now supported. The separately reproduced shared-index contention and lost execution-deadline defects are tracked in [issue #3](https://github.com/fox1245/tsukkomi-mcp/issues/3) and [the current concurrency/deadline notes](docs/timeout-fix.md). This original report is retained as context, not the current runtime contract.
+
 ## Summary
 
 On very large sessions (a single JSONL rollout here exceeded 100 MB with ~26k chunks), `audit_session`, `check_action`, and `sync_session` calls are failing with a fixed 60-second timeout (`timed out awaiting tools/call after 60s`). The hooks populate the contract and index layers, but the audit never reaches a verdict, leaving coverage `unknown` instead of `clean`. The agent has no way to tell the MCP to wait longer.

@@ -10,6 +10,7 @@ import httpx
 import numpy as np
 
 from self_directing_mcp.security.mask import mask_secrets
+from self_directing_mcp.request_control import check_request, current_request, request_operation
 
 
 def format_query(
@@ -75,6 +76,7 @@ class FakeEmbedder(Embedder):
         raw = re.findall(r"[a-z0-9_\-]+", text.lower())
         out: list[str] = []
         for t in raw:
+            check_request()
             out.append(self.SYNONYMS.get(t, t))
             out.append(t)
         return out
@@ -86,6 +88,7 @@ class FakeEmbedder(Embedder):
             vec[0] = 1.0
             return l2_normalize(vec)
         for tok in toks:
+            check_request()
             h = hashlib.sha256(tok.encode("utf-8")).digest()
             idx = int.from_bytes(h[:4], "little") % self.dim
             sign = 1.0 if h[4] % 2 == 0 else -1.0
@@ -95,9 +98,11 @@ class FakeEmbedder(Embedder):
             vec[idx2] += 0.35 * sign
         return l2_normalize(vec)
 
+    @request_operation
     def embed_documents(self, texts: Sequence[str]) -> list[np.ndarray]:
         return [self._embed_one(t) for t in texts]
 
+    @request_operation
     def embed_queries(self, texts: Sequence[str]) -> list[np.ndarray]:
         return [self._embed_one(format_query(t)) for t in texts]
 
@@ -126,17 +131,30 @@ class OpenRouterEmbedder(Embedder):
         self.base_url = base_url.rstrip("/")
 
     def _call(self, texts: Sequence[str]) -> list[np.ndarray]:
-        payload = {"model": self.model, "input": [mask_secrets(t) for t in texts], "dimensions": self.dim}
+        check_request()
+        inputs = []
+        for text in texts:
+            check_request()
+            inputs.append(mask_secrets(text))
+        payload = {"model": self.model, "input": inputs, "dimensions": self.dim}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
         with httpx.Client(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
             for attempt in range(3):
+                check_request()
+                control = current_request()
+                remaining = 180.0
+                if control is not None and control.deadline is not None:
+                    remaining = min(remaining, max(.001, control.deadline - time.monotonic()))
                 try:
-                    resp = client.post(f"{self.base_url}/embeddings", json=payload, headers=headers)
+                    resp = client.post(f"{self.base_url}/embeddings", json=payload, headers=headers,
+                                       timeout=httpx.Timeout(remaining, connect=min(10.0, remaining)))
+                    check_request()
                     resp.raise_for_status()
                     data = resp.json()["data"]
+                    check_request()
                     break
                 except httpx.HTTPStatusError as exc:
                     if attempt == 2 or exc.response.status_code not in (429, 500, 502, 503, 504):
@@ -144,17 +162,27 @@ class OpenRouterEmbedder(Embedder):
                 except httpx.TransportError:
                     if attempt == 2:
                         raise
-                time.sleep(2 ** attempt)
+                check_request()
+                delay = float(2 ** attempt)
+                if control is None:
+                    time.sleep(delay)
+                else:
+                    if control.deadline is not None:
+                        delay = min(delay, max(0, control.deadline - time.monotonic()))
+                    control.cancel_event.wait(delay)
+                check_request()
         out: list[np.ndarray] = []
         if len(data) != len(texts) or sorted(item["index"] for item in data) != list(range(len(texts))):
             raise ValueError("embedding response indices mismatch")
         for item in sorted(data, key=lambda x: x["index"]):
+            check_request()
             arr = np.asarray(item["embedding"], dtype=np.float64)
             if arr.shape != (self.dim,) or not np.isfinite(arr).all():
                 raise ValueError("embedding response dimensions or values invalid")
             out.append(l2_normalize(arr))
         return out
 
+    @request_operation
     def embed_documents(self, texts: Sequence[str]) -> list[np.ndarray]:
         if not texts:
             return []
@@ -163,20 +191,26 @@ class OpenRouterEmbedder(Embedder):
         segments = []
         owners = []
         for index, original in enumerate(texts):
+            check_request()
             text = mask_secrets(original)
             parts = [text[i:i + self.document_chunk_chars]
                      for i in range(0, len(text), self.document_chunk_chars)] or [""]
             for part in parts:
+                check_request()
                 segments.append(part)
                 owners.append((index, max(1, len(part))))
         totals = np.zeros((len(texts), self.dim), dtype=np.float64)
         for offset in range(0, len(segments), self.request_batch_size):
+            check_request()
             batch = segments[offset:offset + self.request_batch_size]
             values = self._call(batch)
+            check_request()
             for (index, weight), value in zip(owners[offset:offset + len(batch)], values):
+                check_request()
                 totals[index] += weight * value
         return [l2_normalize(total) for total in totals]
 
+    @request_operation
     def embed_queries(self, texts: Sequence[str]) -> list[np.ndarray]:
         if not texts:
             return []

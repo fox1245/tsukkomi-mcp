@@ -199,8 +199,10 @@ def test_missing_anchor_and_incomplete_coverage_are_unknown(session):
     with path.open("ab") as stream:
         stream.write(b'{"partial":')
     audit = engine.audit_session(SID)
-    assert audit["verdict"] == "unknown"
+    # An unfinished trailing record is unread growth: clean only as of the judged offset.
+    assert audit["verdict"] == "clean"
     assert audit["coverage"]["complete"] is False
+    assert audit["coverage"]["unread_bytes"] == len(b'{"partial":')
 
 
 def test_malformed_line_never_yields_clean(session):

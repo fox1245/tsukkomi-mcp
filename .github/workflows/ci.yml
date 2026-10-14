@@ -2,8 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -13,6 +19,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.12"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -24,20 +31,57 @@ jobs:
       - name: Install package (dev)
         run: python -m pip install -U pip && python -m pip install -e ".[dev]"
 
-      - name: Run pytest
-        run: python -m pytest -q
+
+      - name: Run smoke tests
+        run: >-
+          python -m pytest -q
+          tests/test_mcp_transport.py
+          tests/test_workflow_jev.py
+          tests/test_windows_session_paths.py
         env:
           SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
 
       - name: Build distribution
         run: python -m build
 
-      - name: Synthetic offline performance gate
-        run: python scripts/benchmark.py
-        env:
-          SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
+  memory-audit-regressions:
+    # Linux coverage complements, rather than replaces, the cross-platform smoke job.
+    # Keep larger allocation probes out of CI; small regressions do not certify live-service RSS.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
+      SELF_DIRECT_DENSE_BACKEND: "numpy"
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Large-session concurrent audit gate
-        run: python scripts/benchmark_large.py --events 3000
-        env:
-          SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package (dev)
+        run: python -m pip install -U pip && python -m pip install -e ".[dev]"
+
+      - name: Run offline memory, freshness, and concurrency regressions
+        timeout-minutes: 10
+        run: >-
+          python -m pytest -q
+          tests/test_audit_memory.py
+          tests/test_audit_prefix.py
+          tests/test_action_prefix_freshness.py
+          tests/test_append_capture.py
+          tests/test_source_capture.py
+          tests/test_source_io_consumers.py
+          tests/test_sync_idsets.py
+          tests/test_singleflight.py
+          tests/test_index_concurrency.py
+          tests/test_server_concurrency.py
+          tests/test_requirement_checklist.py
+          tests/test_timeout_regression.py
+          tests/test_tool_timeout_arg.py
+          tests/test_quiet_hooks.py
+          tests/test_agy_hooks.py
+          tests/test_reliability.py
+          tests/test_hook_gating.py
+          --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file

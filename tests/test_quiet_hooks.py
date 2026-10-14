@@ -146,3 +146,20 @@ def test_valid_literal_wrapper_with_quoted_preprocessor_is_checked(hook_engine):
     code = "await tools.exec_command(" + json.dumps({"cmd": 'rg "--pre=DELETE_ME" foo README.md'}) + ");"
     assert _unwrap("functions.exec", code)[0] == "exec_command"
     assert "violation" in json.dumps(handle_hook(engine, "PreToolUse", sid, str(path), "functions.exec", code))
+
+
+def test_stop_hook_reports_judged_offset_for_a_growing_session(hook_engine, monkeypatch):
+    engine, sid, path = hook_engine
+    engine.upsert_contracts([{"id": "deny", "type": "must_not", "scope": "tool_call", "regex": "DELETE_ME"}])
+    real = engine.audit_session
+    def audit(*args, **kwargs):
+        value = real(*args, **kwargs)
+        value["verdict"] = "violation"
+        value["findings"] = [{"contract_id": "deny", "verdict": "violation", "reason": "x"}]
+        value["coverage"].update(judged_prefix=True, judged_through_byte=42, unread_bytes=7, complete=False)
+        return value
+    monkeypatch.setattr(engine, "audit_session", audit)
+    handle_hook(engine, "UserPromptSubmit", sid, str(path), prompt="설명해줘", turn_id="t")
+    handle_hook(engine, "PreToolUse", sid, str(path), "shell", {"cmd": "DELETE_ME"}, turn_id="t")
+    text = json.dumps(handle_hook(engine, "Stop", sid, str(path), turn_id="t"))
+    assert "judged_through_byte" in text and "unread_bytes" in text

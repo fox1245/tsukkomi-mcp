@@ -1,11 +1,73 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+
+_PATH_FIELDS = frozenset({
+    "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir",
+    "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file",
+})
+
+
+def get_config_path() -> Path:
+    selected = os.environ.get("SELF_DIRECT_CONFIG_FILE")
+    return Path(selected or Path.home() / ".config" / "tsukkomi-mcp" / "config.toml").expanduser().resolve()
+
+
+def _toml_path(value: object, directory: Path) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("TOML paths must be nonempty strings")
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else directory / path).resolve()
+
+
+def _toml_path_settings() -> dict[str, object]:
+    source = get_config_path()
+    try:
+        with source.open("rb") as stream:
+            document = tomllib.load(stream)
+    except FileNotFoundError:
+        if os.environ.get("SELF_DIRECT_CONFIG_FILE"):
+            raise ValueError("Configured TOML path file does not exist") from None
+        return {}
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        raise ValueError("Unable to read valid TOML path configuration") from None
+    if set(document) - {"paths"}:
+        raise ValueError("TOML path configuration only supports [paths]")
+    paths = document.get("paths", {})
+    if not isinstance(paths, dict) or set(paths) - _PATH_FIELDS:
+        raise ValueError("Invalid or unknown TOML path setting")
+    resolved: dict[str, object] = {}
+    for name, value in paths.items():
+        if name == "grokbot_transcripts_dir":
+            from self_directing_mcp.grokbot.discover import parse_transcripts_dirs
+            if isinstance(value, str):
+                if not value.strip():
+                    raise ValueError("TOML paths must be nonempty strings")
+                values = [str(path) for path in parse_transcripts_dirs(value)]
+            elif isinstance(value, list):
+                values = value
+            else:
+                raise ValueError("TOML Grokbot paths must be a string or array")
+            resolved[name] = [_toml_path(item, source.parent) for item in values]
+        elif name == "agy_app_data_dirs":
+            if not isinstance(value, list):
+                raise ValueError("TOML AGY paths must be an array")
+            resolved[name] = [_toml_path(item, source.parent) for item in value]
+        else:
+            resolved[name] = _toml_path(value, source.parent)
+    return resolved
+
+
+def _codex_environment_settings() -> dict[str, object]:
+    value = os.environ.get("CODEX_SESSIONS_DIR")
+    return {"codex_sessions_dir": value} if value else {}
 
 
 def _default_codex_sessions_dir() -> Path:
@@ -33,7 +95,7 @@ def _default_index_dir() -> Path:
     override = os.environ.get("SELF_DIRECT_INDEX_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    return _repo_root() / ".self_direct_index"
+    return Path.home() / ".self_direct_index"
 
 
 def _default_sqlite_vector_path() -> Path | None:
@@ -48,16 +110,6 @@ def _default_sqlite_vector_path() -> Path | None:
     return None
 
 
-def _default_openrouter_api_key_file() -> Path | None:
-    override = os.environ.get("SELF_DIRECT_OPENROUTER_API_KEY_FILE")
-    if override:
-        return Path(override).expanduser().resolve()
-    env_file = _repo_root() / ".env"
-    if env_file.is_file():
-        return env_file.resolve()
-    return None
-
-
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SELF_DIRECT_",
@@ -66,9 +118,14 @@ class Settings(BaseSettings):
     )
 
     codex_sessions_dir: Path = Field(default_factory=_default_codex_sessions_dir)
-    grokbot_transcripts_dir: str = Field(default_factory=_default_grokbot_transcripts_dir)
+    grokbot_transcripts_dir: str | list[Path] = Field(default_factory=_default_grokbot_transcripts_dir)
     omp_sessions_dir: Path = Field(default_factory=_default_omp_sessions_dir)
-    session_provider: Literal["codex", "grokbot", "omp"] = "codex"
+    agy_app_data_dirs: list[Path] = Field(default_factory=lambda: [
+        Path.home() / ".gemini" / name
+        for name in ("antigravity", "antigravity-cli", "antigravity-ide")
+    ])
+    agy_enforcement: Literal["enforced", "advisory"] = "enforced"
+    session_provider: Literal["codex", "grokbot", "omp", "agy"] = "codex"
     index_dir: Path = Field(default_factory=_default_index_dir)
     contracts_path: Path | None = Field(
         default=None,
@@ -83,7 +140,7 @@ class Settings(BaseSettings):
     dense_backend: Literal["sqlite-vector", "numpy"] = "sqlite-vector"
     sqlite_vector_path: Path | None = Field(default_factory=_default_sqlite_vector_path)
     openrouter_api_key_file: Path | None = Field(
-        default_factory=_default_openrouter_api_key_file,
+        default=None,
         description="Authorized dotenv file containing OPENROUTER_API_KEY; never log its contents",
     )
     seed_example_contracts: bool = False
@@ -96,9 +153,27 @@ class Settings(BaseSettings):
         gt=0,
         description="Upper bound for client-provided timeout_ms on long-running tools.",
     )
+    max_concurrent_calls: int = Field(
+        default=4,
+        ge=1,
+        description="Max heavy tool calls (sync/search/audit/checklist/hooks) running at once; "
+                    "excess requests queue within their own deadline. SELF_DIRECT_MAX_CONCURRENT_CALLS.",
+    )
     rrf_k: int = 60
     retrieve_top_k: int = 20
     search_top_k: int = 10
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource | Callable[[], dict[str, object]], ...]:
+        return (init_settings, env_settings, _codex_environment_settings,
+                _toml_path_settings, dotenv_settings, file_secret_settings)
 
     def resolve_api_key(self) -> str | None:
         if self.openrouter_api_key_file is not None:
@@ -113,27 +188,21 @@ class Settings(BaseSettings):
         return self.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
 
     def resolve_sessions_dir(self) -> Path:
-        # Re-check env each call so CODEX_SESSIONS_DIR works without prefix
-        override = os.environ.get("SELF_DIRECT_CODEX_SESSIONS_DIR") or os.environ.get("CODEX_SESSIONS_DIR")
-        if override:
-            return Path(override)
         return Path(self.codex_sessions_dir)
 
 
     def resolve_omp_sessions_dir(self) -> Path:
-        return Path(os.environ.get("SELF_DIRECT_OMP_SESSIONS_DIR") or self.omp_sessions_dir)
+        return Path(self.omp_sessions_dir)
+
+    def resolve_agy_app_data_dirs(self) -> list[Path]:
+        return [Path(root).expanduser().resolve() for root in self.agy_app_data_dirs]
 
     def resolve_grokbot_transcripts_dirs(self) -> list[Path]:
         from self_directing_mcp.grokbot.discover import parse_transcripts_dirs
 
-        override = os.environ.get("SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR")
-        raw = override if override is not None else self.grokbot_transcripts_dir
-        return parse_transcripts_dirs(raw)
+        return parse_transcripts_dirs(self.grokbot_transcripts_dir)
 
-    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp"]:
-        override = (os.environ.get("SELF_DIRECT_SESSION_PROVIDER") or "").strip().lower()
-        if override in ("codex", "grokbot", "omp"):
-            return override  # type: ignore[return-value]
+    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp", "agy"]:
         return self.session_provider
 
     def resolve_contracts_path(self) -> Path:

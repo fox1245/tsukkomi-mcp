@@ -46,7 +46,7 @@ uv pip install -e . --python .venv/bin/python
 ```
 
 Key installed packages:
-- `neograph-engine==0.12.1` (C++ graph agent execution engine)
+- `neograph-engine==0.14.1` (C++ graph agent execution engine)
 - `mcp>=1.0,<2` (Model Context Protocol SDK / FastMCP)
 - `pydantic>=2.0` & `pydantic-settings`
 - `numpy>=1.26`
@@ -97,11 +97,17 @@ OPENROUTER_API_KEY=
 
 SELF_DIRECT_USE_FAKE_EMBEDDER=false
 SELF_DIRECT_DENSE_BACKEND=sqlite-vector
-# Note: SELF_DIRECT_SQLITE_VECTOR_PATH, SELF_DIRECT_INDEX_DIR, and OPENROUTER_API_KEY_FILE
-# automatically resolve dynamically relative to the repository via pathlib.
+# Default persistent index: ~/.self_direct_index, independent of package location.
+# SELF_DIRECT_INDEX_DIR=/absolute/path/to/existing-or-managed/index
+# SELF_DIRECT_SQLITE_VECTOR_PATH=/absolute/path/to/native/vector.so
+# Set only when selecting an authoritative authorized key file:
+# SELF_DIRECT_OPENROUTER_API_KEY_FILE=/absolute/path/to/authorized/.env
+# Otherwise the key follows explicit Settings, environment, and cwd .env precedence.
 ```
 > [!NOTE]
 > If `OPENROUTER_API_KEY` is not provided, set `SELF_DIRECT_USE_FAKE_EMBEDDER=true` to enable offline bag-of-tokens embedding and local regex contracts.
+
+For user-custom paths, copy `config.example.toml` to `~/.config/tsukkomi-mcp/config.toml` and edit its `[paths]` values, or set `SELF_DIRECT_CONFIG_FILE` in the MCP/extension process environment. Relative paths use the TOML directory; explicit environment entries override them. Keep the edited TOML and authorized key file outside agent-writable workspaces, and put only credential file paths—not key values—in TOML. Restart the server/extension after changing selected paths.
 
 ### 6. Antigravity (`agy`) MCP Registration
 Register `self-directing-mcp` in `~/.gemini/config/mcp_config.json`:
@@ -162,6 +168,7 @@ Define strict prohibitions and required preconditions:
   "contracts": [
     {
       "id": "prevent-rm-rf",
+      "provider": "agy",
       "type": "must_not",
       "scope": "tool_call",
       "regex": "rm\\s+-rf\\s+[/~]",
@@ -169,6 +176,7 @@ Define strict prohibitions and required preconditions:
     },
     {
       "id": "tests-before-deploy",
+      "provider": "agy",
       "type": "must",
       "scope": "tool_call",
       "regex": "\\bpytest\\b",
@@ -184,7 +192,9 @@ Define strict prohibitions and required preconditions:
 Before executing high-risk shell commands or tool steps, verify the proposed action:
 ```json
 {
-  "session_id": "current-session-id",
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "provider": "agy",
+  "path": "/absolute/app-data/brain/11111111-1111-4111-8111-111111111111/.system_generated/logs/transcript.jsonl",
   "action": {
     "tool_name": "run_command",
     "arguments": {"CommandLine": "rm -rf /"}
@@ -194,43 +204,38 @@ Before executing high-risk shell commands or tool steps, verify the proposed act
 If the verdict is `violation` or `suspicious`, **immediately abort the tool call** and report to the user.
 
 ### Lifecycle Hooks Automation (`.agents/hooks.json`)
-Configure AGY to enforce `check_action`, deliver GraphRAG dependency context, and verify checklist completion automatically:
-```json
-{
-  "self-directing-guard": {
-    "enabled": true,
-    "PreInvocation": [
-      {
-        "type": "command",
-        "command": "~/.mcp-servers/self-directing-mcp/scripts/agy_hook.py --event PreInvocation",
-        "timeout": 10
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "run_command|write_to_file|replace_file_content",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.mcp-servers/self-directing-mcp/scripts/agy_hook.py --event PreToolUse",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "type": "command",
-        "command": "~/.mcp-servers/self-directing-mcp/scripts/agy_hook.py --event Stop",
-        "timeout": 10
-      }
-    ]
-  }
-}
-```
 
-- **`PreInvocation`**: Prior to model generation, automatically inspects `neograph-engine`'s SQLite GraphRAG store and injects active architectural relationships (e.g. `auth_service.py -[DEPENDS_ON]-> ...`), pending checklist items, and invariant contracts directly into the orchestrator context via `injectSteps` (`ephemeralMessage`).
-- **`PreToolUse`**: Before tool execution, validates contracts (`decision: deny|ask|allow`) and annotates the action with GraphRAG dependency notices so the orchestrator knows the blast radius of modifying related files.
-- **`Stop`**: Prevents premature loop termination (`decision: continue`) when requirements lack verified completion evidence.
-- **`get_graph_context`**: MCP tool allowing the agent to on-demand inspect GraphRAG neighbor subgraphs and dependency chains for any entity or file.
+Use the complete `docs/agy-hooks.example.json`, replacing its executable and
+checkout paths with absolute installed paths. Preserve unrelated hooks.
+Register exactly `PreToolUse`, `PostToolUse`, `PreInvocation`, and `Stop`, with
+`matcher: "*"` for both tool events. This covers restricted reads and
+`multi_replace_file_content`; never reinstate command-first-word or internal-name
+exemptions. Pass the event explicitly as `--event=EVENT`.
+
+- `PreToolUse`: applicable contracts gate every tool; violation/unknown -> deny,
+  suspicious -> force_ask (ignores Always Allow), clean -> allow. No contracts
+  permits independent actions without asserting compliance.
+- `PostToolUse`: local transcript refresh only; returns `{}`.
+- `PreInvocation`: provider-scoped contract/checklist/graph context injection.
+- `Stop`: pending, failed, or unknown obligations -> continue only for fully-idle
+  model_stop or CLI 1.2.9 NO_TOOL_CALL. Cancellation, error, and background work never restart.
+
+All AGY sync/check/audit/context calls must select `provider: "agy"` and use the
+host's actual UUID and transcriptPath. Official transcript roots are
+`~/.gemini/{antigravity,antigravity-cli,antigravity-ide}/brain/<UUID>/.system_generated/logs/transcript.jsonl`.
+CLI 1.2.9 passes `transcript_full.jsonl` in that same directory; both are accepted.
+Native logs omit call IDs. Separate Pre/Post host receipts bind exact step IDs,
+tool identity, transcript path, and prior-history hash to explicit native command
+exit evidence. Keep the receipt/index directory, hooks, and contracts outside
+agent write authority; same-user unrestricted access is not tamper isolation.
+`SELF_DIRECT_AGY_APP_DATA_DIRS` accepts a JSON array of app-data roots for isolated
+installs. `SELF_DIRECT_AGY_ENFORCEMENT=advisory` is an explicit non-enforcing mode,
+not evidence of compliance. Default enforced mode does not auto-allow missing
+history, broken JSON, or unavailable native verification.
+
+Follow `docs/agy-installation.md` for the full policy and host verification
+checklist. Run synthetic forbidden/read checks, failed and successful prerequisite
+transitions, checklist Stop, context injection, and cancellation in the actual
+host; verify force_ask with cached permissions. Do not claim actual-host coverage
+from offline tests. Keep keys, private histories, and indexes out of commits.
 

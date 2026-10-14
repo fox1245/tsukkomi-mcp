@@ -19,7 +19,7 @@ SearchMode = Literal["hybrid", "regex", "sparse", "dense"]
 class Chunk(BaseModel):
     chunk_id: str
     session_id: str
-    provider: Literal["codex", "grokbot", "omp"] = "codex"
+    provider: Literal["codex", "grokbot", "omp", "agy"] = "codex"
     kind: ChunkKind
     text: str
     content_hash: str
@@ -29,6 +29,17 @@ class Chunk(BaseModel):
     byte_start: int | None = None
     byte_end: int | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuditEvent:
+    """Read-only slim event for audits: identity, kind, role/call linkage and (only if needed) text.
+
+    ``text`` is empty for events no contract can inspect; nothing else of the stored chunk is kept.
+    """
+    __slots__ = ("chunk_id", "kind", "text", "meta")
+
+    def __init__(self, chunk_id, kind, text, meta):
+        self.chunk_id, self.kind, self.text, self.meta = chunk_id, kind, text, meta
 
 
 class ContractRule(BaseModel):
@@ -57,7 +68,7 @@ class ContractRule(BaseModel):
     )
     enabled: bool = True
     revision: int = Field(default=1, ge=1, description="Set on update; do not send manually.")
-    provider: Literal["codex", "grokbot", "omp"] | None = Field(
+    provider: Literal["codex", "grokbot", "omp", "agy"] | None = Field(
         default=None, description="Limit to one provider; omit for all."
     )
     session_id: str | None = Field(

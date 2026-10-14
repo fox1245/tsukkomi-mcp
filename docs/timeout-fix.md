@@ -1,37 +1,58 @@
-# Large-session timeout correction (v0.4)
+# Shared-index concurrency and request deadlines
 
-Baseline: 90b74de (v0.3.0). Actual local diagnostics found approximately 21,000 indexed events in a roughly 92 MB session and a locked sparse database. No real transcript content is used in this repository's tests or benchmarks.
+Current correction: [issue #3](https://github.com/fox1245/tsukkomi-mcp/issues/3), investigated against production source `7618028`. All reproductions use synthetic sources, isolated indexes and the real local engine/native graph. No live model call is needed to verify these boundaries.
 
-## Requirements and acceptance
+## Protected state and execution boundaries
 
-| ID | Requirement | Check |
-|---|---|---|
-| T1 | Unchanged sync must not rewrite FTS | SQLite total_changes remains unchanged |
-| T2 | New events only, with interrupted-write repair | One appended event updates one sparse document; missing FTS entries recover without new input |
-| T3 | One hook sync | PreToolUse invokes sync once with the supplied validated path |
-| T4 | Fast identity lookup | Persist chunk_id -> FTS rowid with a primary key; preserve existing FTS rowids when migrating |
-| T5 | Lightweight coverage and descriptive checks | Incremental metrics; no full Chunk deserialization for description-only audits |
-| T6 | Bounded contention and responsive transport | One-second combined local/file-lock wait; async MCP wrappers offload synchronous work; expired queued work does not start |
-| T7 | Preserve verdict/evidence meaning | Partial evidence stays unknown; invalid supplied paths never fall back to clean; original regression tests still pass |
-| T8 | Large concurrent regression | 20,000 4 KiB synthetic messages plus a small session: warm check <5 s, full audit <8 s, concurrent verified check including bounded retries <5 s |
+The engine retains its process-local lock and cross-process `.engine.lock` for initialization, scoped raw captures and publication. It no longer retains that lease across source parsing/hashing or detached audit evaluation. The source preparation owns a stable byte generation; commit compares exact cursor/parser/metrics/receipt inputs so delayed work cannot rewind newer state.
 
-The client MCP timeout remains 60 seconds and hook timeout remains 20 seconds. Internal local audit response budget defaults to 8 seconds; other tool responses default to 45 seconds. A busy/deadline response reports unknown, not clean, with incomplete coverage. An already-running indexing operation may finish bookkeeping after a response deadline; cancellation does not execute any proposed external action. New queued operations check their deadline before entering the engine.
+Deterministic audits refresh canonical metadata only. Their targeted snapshot contains immutable scoped raw event rows, a true event count, coverage, and detached rule content. JSON decoding, regex/temporal evaluation and request-local native graph stages run after the capture transaction/lease ends. Metadata, source observations, rule content and receipt authority are revalidated before publishing a current result. Changed/unavailable authority produces unknown/incomplete coverage; captured findings and any snapshot verdict remain evidence, not current compliance.
 
-Full-file fingerprints are still checked to detect transcript changes. This fix removes repeated FTS rewrites and unnecessary deserialization rather than weakening source verification. The FTS rowid map and session metrics are additive local migrations; existing evidence and contracts are preserved. Restart pre-v0.4 server processes before using the upgraded shared index.
+Explicit sync preserves delta FTS writes, content-addressed cache reuse and metadata-first interrupted repair. Sparse/hybrid search repairs a deferred FTS view from canonical metadata before querying. Derived preparation and remote work occur outside the canonical writer boundary; actual FTS/vector/NumPy persistence still needs guarded publication. Those writes and full raw captures are not claimed constant-time.
 
-## Local measured comparison
+AGY metadata publication also records the receipt digest used with the cursor timestamp in `session_receipt_versions`. The existing six-column cursor schema remains intact. Receipt indexed markers are published conditionally afterward; interruption is replayable, and an older writer's unmatched cursor timestamp invalidates the stamp. This is an additive startup schema change, not a journal-mode migration.
 
-Same synthetic 83,908,974-byte transcript and indexed event set:
+## Request stopping and errors
 
-- v0.3 check_action: did not complete within 65 seconds; isolated baseline subprocess was terminated.
-- v0.4 warm check_action: 0.336 s.
-- v0.4 full audit_session: 1.566 s.
-- Two processes / six checks: maximum 0.933 s.
-- Cold sync of both sessions: 12.106 s.
-- Unchanged FTS writes: zero.
+The unchanged default combined process/file-lease wait is 1 second, audit response budget 8 seconds, ordinary budget 45 seconds, and client-provided tool cap 600 seconds. Per-call `timeout_ms` does not extend the separate writer-lock cap.
 
-These are bounded synthetic measurements on the development PC, not universal latency guarantees. The large-session gate is included in CI on Windows and Linux.
+Ordinary requests/hooks share an absolute monotonic deadline and cancellation control with nested operations and native callbacks. Parsing, row/batch work, evaluation, and final publication check that control. Cancellation and publication admission are ordered by a tiny request-local gate released before I/O. An already-admitted commit may physically finish afterward; no response asserts rollback or thread termination.
 
-The concurrent gate exercises the public async MCP wrapper. It records explicit busy/unknown responses separately and allows at most three attempts per logical check, retaining the five-second end-to-end limit. Unknown outcomes unrelated to contention fail immediately; only a verified clean response counts as success. A Windows CI run exposed that the earlier direct-engine benchmark bypassed this documented busy-response handling.
+| Error | Meaning |
+| --- | --- |
+| `index_busy` | A live request exhausted the engine/file writer-lease wait |
+| `request_deadline` | The request's response/execution deadline expired |
+| `request_cancelled` | Its cancellation state was observed |
+| `operation_timeout` | A worker raised a separate, unclassified timeout |
 
-Commands: python -m pytest -q; python scripts/benchmark_large.py; python -m build.
+These responses are unknown/incomplete, not clean. Unrelated OS/SQLite errors remain failures; sparse search does not turn them into empty successful results. Native callbacks retain original stop exceptions. The owned workflow dispatch still records actual started process outcomes and cleanup receipts; request stopping must not erase them.
+
+Cooperative checks cannot preempt a single regex/JSON/native computation, SQLite statement/commit, HTTP call or filesystem syscall already in progress. They prevent later phases/publications after abandonment is observed. Genuine initialization, raw capture, FTS/vector mutation or external writer contention can still exhaust the configured wait.
+
+## Executed verification
+
+The bounded before/after diagnostic paused actual parser/evaluator boundaries, not mocked responses:
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| Resume parser after a 50 ms expired response | Two events and cursor published later | No events/cursor published; `request_deadline` |
+| Independent status during paused pure audit evaluation | Writer lease failed after about 1 second | Actual status completed while evaluation stayed paused |
+| Remove an already-loaded rule file | Cached rules yielded clean | Unknown, no cached rule acceptance |
+
+Permanent regressions cover snapshot rule add/upsert/revoke/loss/corruption, source changes, scoped completion evidence, request isolation, stale preparations, AGY receipt generations, derived repair and distinct failure classes. Actual MCP stdio smoke exercised 16 concurrent clean requests, successful prerequisite evidence, a newer failed prerequisite, and a forbidden proposal without executing proposed actions.
+
+The native queue PoC reports writer lease and evaluation activity separately and checks overlapping real native evaluations plus independent metadata progress. Its deliberate writer-hold fixture demonstrates residual serialization, not a universal throughput bound. It uses private temporary endpoint credentials, naturally shuts down its services and removes scratch state.
+
+```bash
+python -m pytest -q tests/test_index_concurrency.py tests/test_timeout_regression.py tests/test_tool_timeout_arg.py tests/test_mcp_transport.py
+python scripts/poc_shared_index_queue.py run --neograph-root ../NeoGraph --workers 4
+python -m build
+```
+
+These are local deep checks. CI remains only the explicit lightweight transport/JEV/session-path smoke files and distribution build; no performance, large-session, native compilation or paid-model gate is added.
+
+## Deployment and historical measurements
+
+Every process sharing an index must use the updated code from its actual configured source/package and be restarted through its owner's normal deployment procedure. Updating a checkout or passing a temporary-index PoC does not update running servers. This work does not terminate deployment processes or rewrite their indexes.
+
+Historical v0.3/v0.4 comparison: a synthetic 83,908,974-byte transcript reported a v0.4 warm action check of 0.336 s, full audit of 1.566 s and cold sync of 12.106 s. Those measurements were made before this snapshot/request-control correction and are not current performance guarantees or CI gates.
