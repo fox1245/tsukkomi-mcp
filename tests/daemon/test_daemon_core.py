@@ -399,6 +399,21 @@ def test_the_configuration_comes_from_the_environment_and_rejects_nonsense():
                 core.DaemonConfig.from_environment({name: bad})
 
 
+def test_holding_derived_rows_is_on_by_default_and_has_an_off_switch():
+    assert core.DaemonConfig.from_environment({}).defer_derived is True
+    for text, expected in (("on", True), ("ON", True), ("off", False), (" Off ", False)):
+        assert core.DaemonConfig.from_environment({"SELF_DIRECT_DAEMON_DEFER_DERIVED": text}).defer_derived is expected
+    for bad in ("", "yes", "1", "true", "0"):
+        with pytest.raises(ValueError):
+            core.DaemonConfig.from_environment({"SELF_DIRECT_DAEMON_DEFER_DERIVED": bad})
+    from self_directing_mcp.config import Settings
+    settings = Settings(_env_file=None, local_only=True, openrouter_api_key_file=None)
+    for flag in (True, False):
+        engine = core.Engines(defer_derived=flag)._create(settings)
+        assert engine.defer_derived is flag
+        engine.close()
+
+
 def test_a_second_daemon_cannot_take_the_lock_and_a_stale_socket_is_replaced(inproc, runtime):
     first = inproc(hook_runner=Gate())
     with rundir.open_runtime_dir(runtime.environ()) as other:
@@ -542,3 +557,53 @@ def test_an_unusable_configuration_fails_open_exactly_as_a_standalone_hook_does(
     _hello, answer = request(daemon, frame)
     assert answer["ok"] is True and "UNAVAILABLE" in json.dumps(answer["response"])
     assert len(daemon.daemon.engines) == 0                            # no engine was created for broken settings
+
+
+# --- rows an engine holds back -----------------------------------------------------------------------------------
+
+def test_the_daemons_engines_hold_derived_rows_and_the_daemon_writes_them_when_it_is_quiet(inproc, tmp_path, monkeypatch):
+    from self_directing_mcp.config import Settings
+    real = core.Engines()._create(Settings(_env_file=None, local_only=True, openrouter_api_key_file=None,
+                                           index_dir=tmp_path / "daemon-index"))
+    try:
+        assert real.defer_derived is True       # the daemon is the writer of its indexes: see index/deferred.py
+    finally:
+        real.close()
+
+    flushed = []
+
+    class Engine:
+        def flush_derived(self):
+            flushed.append(time.monotonic())
+            return 1
+
+        def close(self):
+            flushed.append("closed")
+
+    monkeypatch.setattr(core, "FLUSH_IDLE_SEC", 0.3)
+    daemon = inproc(core.DaemonConfig(idle_exit_sec=30), hook_runner=Gate(), engine_factory=lambda s: Engine())
+    settings = type("S", (), {"model_dump": lambda self: {"index_dir": "x", "openrouter_api_key": None}})()
+    daemon.daemon.engines.get(settings)
+    assert wait_for(lambda: len(flushed) == 1, 10)                    # written once the daemon had been quiet ...
+    time.sleep(1.5)
+    assert len(flushed) == 1                                          # ... and not again while it stays quiet
+    daemon.daemon.touch()                                             # activity re-arms it
+    assert wait_for(lambda: len(flushed) == 2, 10)
+
+
+def test_a_failing_flush_does_not_stop_the_daemon_or_the_other_engines(inproc, monkeypatch):
+    calls = []
+
+    class Broken:
+        def flush_derived(self):
+            calls.append("broken")
+            raise RuntimeError("synthetic")
+
+    class Fine:
+        def flush_derived(self):
+            calls.append("fine")
+            return 2
+
+    engines = core.Engines()
+    engines._engines = {"a": Broken(), "b": Fine()}
+    assert engines.flush_all() == 2 and calls == ["broken", "fine"]

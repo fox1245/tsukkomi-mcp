@@ -41,6 +41,26 @@ def explicit_test_backend(tmp_path, monkeypatch):
     monkeypatch.setenv("SELF_DIRECT_CONFIG_FILE", str(config_file))
 
 
+@pytest.fixture(autouse=True)
+def defer_derived_everywhere(monkeypatch):
+    """``TSUKKOMI_TEST_DEFER_DERIVED=1`` runs the suite with every engine holding its derived writes (the daemon's mode).
+
+    Nothing but the engine's default changes, so every audit, differential and shadow test then runs against monitor
+    states, verification stamps and AGY markers that are held in memory and written with a later commit. Tests that
+    look at those rows in the database, or at the ``"saved"`` receipt, depend on the writes being synchronous and are
+    marked ``synchronous_derived_writes``."""
+    if os.environ.get("TSUKKOMI_TEST_DEFER_DERIVED") != "1":
+        return
+    from self_directing_mcp import engine as engine_module
+    original = engine_module.SelfDirectEngine.__init__
+
+    def deferring(self, settings=None, **kwargs):
+        kwargs.setdefault("defer_derived", True)
+        original(self, settings, **kwargs)
+
+    monkeypatch.setattr(engine_module.SelfDirectEngine, "__init__", deferring)
+
+
 class HashMeter:
     """Counts the bytes fed to every ``hashlib.sha256`` object created while installed (copies included).
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 import json
 import sqlite3
 import tempfile
@@ -16,6 +16,7 @@ from typing import Any
 from self_directing_mcp._runtime import np
 
 from self_directing_mcp.compressed_source import CompressedSourceError
+from self_directing_mcp.index.deferred import DerivedBuffer
 from self_directing_mcp.schemas import AuditEvent, Chunk
 from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request, publication, request_operation
@@ -269,12 +270,45 @@ def session_flight(key):
                 del _flights[key]
 
 
+_STATE_FIELDS = ("monitor_id", "contract_revision", "fingerprint", "parser_version", "evaluator_version", "generation",
+                 "byte_offset", "prefix_hash", "event_count", "path")
+
+# One statement for every write of a monitor state: a state is never written over a newer one of the same generation.
+_UPSERT_STATE = (
+    "INSERT INTO audit_monitor_state VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " ON CONFLICT(provider,session_id,monitor_id,needs_digest) DO UPDATE SET"
+    " contract_revision=excluded.contract_revision, fingerprint=excluded.fingerprint,"
+    " parser_version=excluded.parser_version, evaluator_version=excluded.evaluator_version,"
+    " generation=excluded.generation, byte_offset=excluded.byte_offset,"
+    " prefix_hash=excluded.prefix_hash, event_count=excluded.event_count, path=excluded.path,"
+    " state=excluded.state, updated_at=excluded.updated_at"
+    " WHERE audit_monitor_state.generation < excluded.generation OR"
+    " (audit_monitor_state.generation = excluded.generation AND"
+    "  audit_monitor_state.byte_offset <= excluded.byte_offset)")
+
+
+def _decode_held_state(row):
+    """A held monitor-state row in the shape ``load_audit_states`` returns (the state parsed afresh, so a caller that
+    edits it cannot reach the held copy); ``None`` when the held text is unreadable."""
+    try:
+        state = json.loads(row["state"])
+    except ValueError:
+        return None
+    record = {name: row[name] for name in _STATE_FIELDS}
+    record["state"] = state
+    return record
+
+
 class SessionStore:
     """v2 events preserve every occurrence; legacy tables remain untouched for recovery."""
 
-    def __init__(self, db_path: Path, *, max_decompressed_bytes: int | None = None):
+    def __init__(self, db_path: Path, *, max_decompressed_bytes: int | None = None, defer_derived: bool = False):
         check_request()
         self.db_path = Path(db_path)
+        # A resident engine (the daemon) holds derived and advisory rows in memory and writes them with the next
+        # authority commit instead of committing each on its own; see ``index.deferred`` for why that is sound.
+        self.defer_derived = defer_derived
+        self.derived = DerivedBuffer()
         # Bound on the declared decompressed size of a .zst session source (None: compressed_source's default).
         self.max_decompressed_bytes = max_decompressed_bytes
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -443,14 +477,31 @@ class SessionStore:
         table = BlockTable(covered=row["covered"], lines=row["lines"], digests=bytes(row["digests"]),
                            tail=None if row["tail"] is None else bytes(row["tail"]), root=row["root"],
                            block_size=row["block_size"])
-        return BlockRecord(provider=provider, session_id=session_id, path=row["path"], dev=_unsigned64(row["dev"]),
-                           ino=_unsigned64(row["ino"]),
-                           size=row["size"], mtime_ns=row["mtime_ns"], table=table, synced_at=row["synced_at"],
-                           full_verified_at=row["full_verified_at"], full_verified_through=row["full_verified_through"])
+        record = BlockRecord(provider=provider, session_id=session_id, path=row["path"], dev=_unsigned64(row["dev"]),
+                             ino=_unsigned64(row["ino"]),
+                             size=row["size"], mtime_ns=row["mtime_ns"], table=table, synced_at=row["synced_at"],
+                             full_verified_at=row["full_verified_at"], full_verified_through=row["full_verified_through"])
+        stamp = self.derived.stamp_for(provider, session_id, row["synced_at"], row["root"])
+        if stamp is not None:
+            # A verification this process made and has not written yet; applied only to the table it was made for.
+            record = dataclass_replace(record, dev=stamp["dev"], ino=stamp["ino"], size=stamp["size"],
+                                       mtime_ns=stamp["mtime_ns"], full_verified_at=stamp["at"],
+                                       full_verified_through=stamp["through"])
+        return record
 
     def mark_full_verified(self, session_id, provider, record, *, at, through, dev, ino, size, mtime_ns):
         """Record that EVERY block of ``record``'s table matched the source at ``at``. Compare-and-set on the table's
         publication and root: a table replaced meanwhile is never stamped."""
+        if self.defer_derived:
+            with self._read_boundary():
+                current = self._conn.execute("SELECT synced_at,root FROM source_blocks WHERE provider=? AND session_id=?",
+                                             (provider, session_id)).fetchone()
+            if current is None or (current[0], current[1]) != (record.synced_at, record.table.root):
+                return False
+            self.derived.hold_stamp(provider, session_id, {
+                "synced_at": record.synced_at, "root": record.table.root, "at": at, "through": through,
+                "dev": dev, "ino": ino, "size": size, "mtime_ns": mtime_ns})
+            return True
         with self._conn, publication():
             changed = self._conn.execute(
                 "UPDATE source_blocks SET full_verified_at=?, full_verified_through=?, dev=?, ino=?, size=?, mtime_ns=?"
@@ -495,7 +546,10 @@ class SessionStore:
             if expected_token is not None and self.state_token(session_id, provider) != expected_token:
                 raise ValueError("stale session preparation")
             metrics = self.session_metrics(session_id, provider)
-            known = self.chunk_ids(session_id, provider)
+            # ``known``: stored ids of this session as they stand before this commit. A replacement needs all of them
+            # (those the new parse no longer has are journalled); an append only asks about the ids it brings.
+            known = (self.chunk_ids(session_id, provider) if replace
+                     else self.live_ids(session_id, provider, spool.ids))
             previous = self._conn.execute("SELECT byte_offset FROM session_cursors WHERE provider=? AND session_id=?",
                                           (provider, session_id)).fetchone()
             # An append only adds rows at or after the previous cursor. Anything else (a replacement, a row that
@@ -554,6 +608,11 @@ class SessionStore:
                 self._conn.execute("INSERT OR REPLACE INTO session_metrics VALUES (?,?,?,?,?)",
                                    (provider, session_id, *metrics))
                 self._record_commit(provider, session_id, offset, digest, metrics[0], synced_at, touched_prefix)
+                # The block table of this session was just replaced (or removed): a held stamp described the old one,
+                # and the new table carries the verification state its draft was built from.
+                self.derived.forget_stamp(provider, session_id)
+                if len(self.derived):
+                    self._write_pending()   # rides this commit: no synchronous commit of its own
                 check_request()
                 self._conn.commit()
 
@@ -569,6 +628,7 @@ class SessionStore:
                                (provider, session_id, generation))
             self._conn.execute("DELETE FROM session_commit_log WHERE provider=? AND session_id=?", (provider, session_id))
             self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=?", (provider, session_id))
+            self.derived.forget_session(provider, session_id)
         else:
             generation = row[0]
         self._conn.execute("INSERT OR REPLACE INTO session_commit_log VALUES (?,?,?,?,?,?,?)",
@@ -787,7 +847,7 @@ class SessionStore:
             except ValueError:
                 continue  # an unreadable cache row is the same as no row
             out[record["monitor_id"]] = record
-        return out
+        return self.derived.overlay_states(provider, session_id, needs_digest, out, _decode_held_state)
 
     def audit_health(self, session_id, provider, evaluator_version):
         return {row[0]: (row[1], row[2]) for row in self._conn.execute(
@@ -804,6 +864,7 @@ class SessionStore:
                                    (provider, session_id, monitor_id, evaluator_version, status, detail[:2000], now))
                 self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND monitor_id=?",
                                    (provider, session_id, monitor_id))
+            self.derived.forget_monitors(provider, session_id, monitor_ids)
             check_request()
 
     def drop_audit_states(self, session_id, provider, monitor_ids):
@@ -813,6 +874,7 @@ class SessionStore:
             for monitor_id in monitor_ids:
                 self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND monitor_id=?",
                                    (provider, session_id, monitor_id))
+            self.derived.forget_monitors(provider, session_id, monitor_ids)
             check_request()
 
     def save_audit_states(self, session_id, provider, needs_digest, rows, snapshot):
@@ -824,6 +886,8 @@ class SessionStore:
         state is never written over a newer one of the same generation.
         """
         now = datetime.now(timezone.utc).isoformat()
+        if self.defer_derived and snapshot["generation"] is not None:
+            return self._hold_audit_states(session_id, provider, needs_digest, rows, snapshot, now)
         with self._conn, publication():
             self._conn.execute("BEGIN IMMEDIATE")
             cursor = self._conn.execute(
@@ -850,34 +914,124 @@ class SessionStore:
                                    (provider, session_id, generation))
                 self._conn.execute("DELETE FROM session_commit_log WHERE provider=? AND session_id=?", (provider, session_id))
                 self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=?", (provider, session_id))
+                self.derived.forget_session(provider, session_id)
                 self._conn.execute("INSERT OR REPLACE INTO session_commit_log VALUES (?,?,?,?,?,?,?)",
                                    (provider, session_id, generation, snapshot["offset"], snapshot["prefix_hash"],
                                     snapshot["count"], snapshot["synced_at"]))
             for item in rows:
                 check_request()
-                self._conn.execute(
-                    "INSERT INTO audit_monitor_state VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                    " ON CONFLICT(provider,session_id,monitor_id,needs_digest) DO UPDATE SET"
-                    " contract_revision=excluded.contract_revision, fingerprint=excluded.fingerprint,"
-                    " parser_version=excluded.parser_version, evaluator_version=excluded.evaluator_version,"
-                    " generation=excluded.generation, byte_offset=excluded.byte_offset,"
-                    " prefix_hash=excluded.prefix_hash, event_count=excluded.event_count, path=excluded.path,"
-                    " state=excluded.state, updated_at=excluded.updated_at"
-                    " WHERE audit_monitor_state.generation < excluded.generation OR"
-                    " (audit_monitor_state.generation = excluded.generation AND"
-                    "  audit_monitor_state.byte_offset <= excluded.byte_offset)",
-                    (provider, session_id, item["monitor_id"], needs_digest, item["contract_revision"],
-                     item["fingerprint"], item["parser_version"], item["evaluator_version"], generation,
-                     snapshot["offset"], snapshot["prefix_hash"], snapshot["count"], snapshot["path"],
-                     json.dumps(item["state"], separators=(",", ":")), now))
-            # Keep the newest few needs variants of a monitor (audit and action checks differ), drop the rest.
-            self._conn.execute(
-                "DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND rowid IN ("
-                " SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY monitor_id ORDER BY updated_at DESC) AS n"
-                " FROM audit_monitor_state WHERE provider=? AND session_id=?) WHERE n > 4)",
-                (provider, session_id, provider, session_id))
+                self._conn.execute(_UPSERT_STATE, (
+                    provider, session_id, item["monitor_id"], needs_digest, item["contract_revision"],
+                    item["fingerprint"], item["parser_version"], item["evaluator_version"], generation,
+                    snapshot["offset"], snapshot["prefix_hash"], snapshot["count"], snapshot["path"],
+                    json.dumps(item["state"], separators=(",", ":")), now))
+            self._trim_state_variants(provider, session_id)
             check_request()
             return "saved"
+
+    def _hold_audit_states(self, session_id, provider, needs_digest, rows, snapshot, now):
+        """``save_audit_states`` for a store that defers its derived writes: the same checks against the lineage, then the
+        rows are held in memory (read back through ``load_audit_states``) instead of committed. Returns ``"deferred"``."""
+        with self._read_boundary():
+            row = self._conn.execute("SELECT generation FROM session_generations WHERE provider=? AND session_id=?",
+                                     (provider, session_id)).fetchone()
+            if row is None or row[0] != snapshot["generation"]:
+                return "stale_generation"
+            logged = self._conn.execute(
+                "SELECT prefix_hash,event_count FROM session_commit_log"
+                " WHERE provider=? AND session_id=? AND generation=? AND byte_offset=?",
+                (provider, session_id, snapshot["generation"], snapshot["offset"])).fetchone()
+            if logged is None or logged[0] != snapshot["prefix_hash"] or logged[1] != snapshot["count"]:
+                return "stale_lineage"
+        for item in rows:
+            check_request()
+            self.derived.hold_state(provider, session_id, needs_digest, item["monitor_id"], {
+                "monitor_id": item["monitor_id"], "needs_digest": needs_digest,
+                "contract_revision": item["contract_revision"], "fingerprint": item["fingerprint"],
+                "parser_version": item["parser_version"], "evaluator_version": item["evaluator_version"],
+                "generation": snapshot["generation"], "byte_offset": snapshot["offset"],
+                "prefix_hash": snapshot["prefix_hash"], "event_count": snapshot["count"], "path": snapshot["path"],
+                "state": json.dumps(item["state"], separators=(",", ":")), "updated_at": now})
+        if self.derived.full():
+            self.flush_derived()
+        return "deferred"
+
+    def _trim_state_variants(self, provider, session_id):
+        """Keep the newest few needs variants of a monitor (audit and action checks differ), drop the rest."""
+        self._conn.execute(
+            "DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND rowid IN ("
+            " SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY monitor_id ORDER BY updated_at DESC) AS n"
+            " FROM audit_monitor_state WHERE provider=? AND session_id=?) WHERE n > 4)",
+            (provider, session_id, provider, session_id))
+
+    # -- deferred writes (``defer_derived``) ------------------------------------------------------------------------
+
+    def has_pending_derived(self) -> bool:
+        return bool(len(self.derived))
+
+    def flush_derived(self) -> int:
+        """Write what ``defer_derived`` is holding, in one transaction; returns how many rows were written.
+
+        Callable at any time, from any thread that holds the engine's lease (``SelfDirectEngine.flush_derived``). A
+        failure loses cache rows, never authority, and is not raised for a SQLite error."""
+        if not len(self.derived):
+            return 0
+        try:
+            with self._conn, publication():
+                self._conn.execute("BEGIN IMMEDIATE")
+                written = self._write_pending()
+                check_request()
+            return written
+        except sqlite3.Error:
+            return 0
+
+    def _write_pending(self) -> int:
+        """Inside an open write transaction: validate every held row once more against the lineage as it stands NOW and
+        write those that still fit; the rest are dropped (they are cache). Nothing here may fail the transaction it
+        rides in, so the work runs in a savepoint that a SQLite error rolls back."""
+        states, stamps = self.derived.drain()
+        if not states and not stamps:
+            return 0
+        written, touched = 0, set()
+        self._conn.execute("SAVEPOINT derived_flush")
+        try:
+            lineage = {}
+            for provider, session_id, needs_digest, monitor_id, row in states:
+                key = (provider, session_id, row["generation"], row["byte_offset"])
+                if key not in lineage:
+                    current = self._conn.execute(
+                        "SELECT generation FROM session_generations WHERE provider=? AND session_id=?",
+                        (provider, session_id)).fetchone()
+                    logged = None
+                    if current is not None and current[0] == row["generation"]:
+                        logged = self._conn.execute(
+                            "SELECT prefix_hash,event_count FROM session_commit_log"
+                            " WHERE provider=? AND session_id=? AND generation=? AND byte_offset=?",
+                            (provider, session_id, row["generation"], row["byte_offset"])).fetchone()
+                    lineage[key] = logged
+                logged = lineage[key]
+                if logged is None or logged[0] != row["prefix_hash"] or logged[1] != row["event_count"]:
+                    continue    # the lineage moved on (a rewrite, a trimmed log row): this row describes nothing stored
+                self._conn.execute(_UPSERT_STATE, (
+                    provider, session_id, monitor_id, needs_digest, row["contract_revision"], row["fingerprint"],
+                    row["parser_version"], row["evaluator_version"], row["generation"], row["byte_offset"],
+                    row["prefix_hash"], row["event_count"], row["path"], row["state"], row["updated_at"]))
+                touched.add((provider, session_id))
+                written += 1
+            for provider, session_id in touched:
+                self._trim_state_variants(provider, session_id)
+            for provider, session_id, stamp in stamps:
+                written += self._conn.execute(
+                    "UPDATE source_blocks SET full_verified_at=?, full_verified_through=?, dev=?, ino=?, size=?, mtime_ns=?"
+                    " WHERE provider=? AND session_id=? AND synced_at=? AND root=?",
+                    (stamp["at"], stamp["through"], _signed64(stamp["dev"]), _signed64(stamp["ino"]), stamp["size"],
+                     stamp["mtime_ns"], provider, session_id, stamp["synced_at"], stamp["root"])).rowcount
+            self._conn.execute("RELEASE derived_flush")
+        except sqlite3.Error:
+            self._conn.execute("ROLLBACK TO derived_flush")
+            self._conn.execute("RELEASE derived_flush")
+            return 0
+        return written
 
     _CALL_INDEX = ("CREATE INDEX IF NOT EXISTS events_call ON session_events(provider, session_id,"
                    " json_extract(data,'$.meta.call_id')) WHERE json_extract(data,'$.meta.call_id') IS NOT NULL")
@@ -1474,7 +1628,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                     # Every receipt anchors to a prefix digest and the ledger to a verified length: hash the capture
                     # at those offsets and none of them costs a second read of the file.
                     from self_directing_mcp.agy_receipts import ReceiptStore
-                    hint += ReceiptStore(store.db_path.parent).checkpoints(sid_hint.lower(), path)
+                    hint += ReceiptStore(store.db_path.parent, held=store.derived if store.defer_derived else None
+                                         ).checkpoints(sid_hint.lower(), path)
             except (OSError, sqlite3.Error):
                 hint, known, record = (), None, None
         observation = _capture_observation(path, provider, known, record, hint, verify, policy,
@@ -1504,7 +1659,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 from self_directing_mcp.agy_receipts import ReceiptStore
                 fallback_retries = store.agy_fallback_retries(sid) if cursor else ()
                 cursor_deps = store.receipt_deps(sid, provider, cursor["synced_at"]) if cursor else None
-                receipt_store = ReceiptStore(store.db_path.parent)
+                receipt_store = ReceiptStore(store.db_path.parent, held=store.derived if store.defer_derived else None)
                 receipt_capture = receipt_store.read_capture(sid)
                 receipt_authority_before = receipt_store.authority_token(sid)
                 if (receipt_authority_before[0] != "present"

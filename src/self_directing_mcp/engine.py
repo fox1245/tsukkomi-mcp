@@ -20,9 +20,12 @@ from self_directing_mcp.tool_payload import tool_call_parts
 
 from self_directing_mcp.audit.contracts import (
     GLOBAL_CONTRACT_MEANING,
+    MEMO_MAX_BYTES,
+    ContentMemo,
     ContractStore,
     contract_scope,
     loosening_reasons,
+    parse_contracts,
     scope_counts,
     visible_contracts,
 )
@@ -63,6 +66,9 @@ from self_directing_mcp.request_control import (
 
 if TYPE_CHECKING:       # the pydantic Settings model is imported lazily: command hooks pass a light settings object
     from self_directing_mcp.config import Settings
+
+
+_OBLIGATIONS = ContentMemo(16)
 
 
 def serialized(method):
@@ -166,7 +172,10 @@ class ChecklistConflict(ValueError):
 
 
 class SelfDirectEngine:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, *, defer_derived: bool = False) -> None:
+        """``defer_derived``: a resident process (the daemon) holds the rows that carry no authority (monitor states,
+        verification stamps, the AGY indexed marker) in memory and writes them with the next authority commit, at idle
+        and at ``close`` instead of committing each synchronously; see ``index.deferred``. Off for every other use."""
         self._lock = RLock()
         self._lifetime = Condition(self._lock)
         self._active_operations = 0
@@ -181,6 +190,7 @@ class SelfDirectEngine:
             from self_directing_mcp.config import get_settings    # the server's pydantic settings; hooks pass their own
             settings = get_settings()
         self.settings = settings
+        self.defer_derived = defer_derived
         self.store: SessionStore | None = None
         self.sparse: SparseIndex | None = None
         self.dense = None
@@ -247,6 +257,27 @@ class SelfDirectEngine:
     def attach_integrity_worker(self, worker) -> None:
         self._integrity_worker = worker
 
+    def flush_derived(self) -> int:
+        """Write the derived rows a ``defer_derived`` engine is holding (the daemon calls it when idle). Cheap and lock-free
+        when nothing is held; never raises for a busy index or a stopped request (the rows stay held for the next call)."""
+        store = self.store
+        if store is None or not self._ready or not store.has_pending_derived():
+            return 0
+        try:
+            with self._publication_guard():
+                if self.store is not store or not self._ready:
+                    return 0                  # closed while this waited for the lease: close wrote what was held
+                from self_directing_mcp.agy_receipts import ReceiptStore
+                return (store.flush_derived()
+                        + ReceiptStore(Path(self.settings.index_dir), held=store.derived).flush_held())
+        except (IndexBusy, RequestStopped):
+            return 0
+
+    def _held_rows(self):
+        """The buffer a ``defer_derived`` engine holds its derived rows in, or None (nothing is deferred)."""
+        store = self.store
+        return store.derived if self.defer_derived and store is not None else None
+
     def accepts_background_work(self) -> bool:
         """False while closed or closing: a background worker must never reopen an engine that was shut down."""
         return self._ready and not self._closing
@@ -267,19 +298,33 @@ class SelfDirectEngine:
             agy.resolve_session_path(self.settings.resolve_agy_app_data_dirs(),
                                      session_id=sid, path=path, require_exists=False)
         path = self.settings.resolve_contracts_path()
-        doc = ContractsDocument.model_validate_json(path.read_bytes()) if path.exists() else ContractsDocument()
-        rules = [r for r in visible_contracts(doc.contracts, sid)
-                 if r.enabled and r.provider in (None, provider)]
+        raw = path.read_bytes() if path.exists() else None
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in sid)[:120]
         path = Path(self.settings.index_dir) / "checklists" / f"{safe}.json"
-        checklist = ChecklistDocument.model_validate_json(path.read_bytes()) if path.exists() else ChecklistDocument(session_id=sid)
-        pending = [item for item in checklist.items if item.status != "revoked"
-                   and (item.status != "done" or not item.verified or not item.evidence_chunk_ids)]
-        payload = {"contracts": [r.model_dump(mode="json") for r in rules],
-                   "pending": [i.model_dump(mode="json") for i in pending]}
-        return {"status": "applicable" if rules or pending else "not_applicable",
-                "contracts": rules, "pending": pending, "has_checklist": bool(checklist.items),
-                "snapshot": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}
+        checklist_raw = path.read_bytes() if path.exists() else None
+        # Everything below is a function of these four values, so they are the key: a changed contract file, a changed
+        # checklist, another session or provider is another entry, and an unchanged one costs no parsing, no
+        # serialization and no hashing (this runs on every hook).
+        key = (raw, checklist_raw, sid, provider)
+        memoize = len(raw or b"") + len(checklist_raw or b"") <= MEMO_MAX_BYTES
+        found = _OBLIGATIONS.get(key) if memoize else None
+        if found is None:
+            doc = parse_contracts(raw)
+            rules = [r for r in visible_contracts(doc.contracts, sid)
+                     if r.enabled and r.provider in (None, provider)]
+            checklist = (ChecklistDocument.model_validate_json(checklist_raw) if checklist_raw is not None
+                         else ChecklistDocument(session_id=sid))
+            pending = [item for item in checklist.items if item.status != "revoked"
+                       and (item.status != "done" or not item.verified or not item.evidence_chunk_ids)]
+            payload = {"contracts": [r.model_dump(mode="json") for r in rules],
+                       "pending": [i.model_dump(mode="json") for i in pending]}
+            found = {"status": "applicable" if rules or pending else "not_applicable",
+                     "contracts": rules, "pending": pending, "has_checklist": bool(checklist.items),
+                     "snapshot": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}
+            if memoize:
+                _OBLIGATIONS.put(key, found)
+        # A fresh dict with fresh lists each time; the rules and items inside are shared and read-only.
+        return {**found, "contracts": list(found["contracts"]), "pending": list(found["pending"])}
 
     @serialized
     def ensure_ready(self) -> None:
@@ -309,7 +354,8 @@ class SelfDirectEngine:
                 index_dir / ("vectors-v2-" + self.embedder.cache_key[:16]), dim=s.embedding_dim,
                 backend=s.dense_backend, extension_path=s.sqlite_vector_path)
         self.sparse = SparseIndex(index_dir / "sparse.sqlite")
-        self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes)
+        self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes,
+                                  defer_derived=self.defer_derived)
         self.contracts = ContractStore(s.resolve_contracts_path())
         self.checklists = ChecklistStore(index_dir)
         self.graph = GraphStore(index_dir / "graph.sqlite")
@@ -377,9 +423,13 @@ class SelfDirectEngine:
         provider: str | None = None,
         embed: bool = True,
         verify: str = "full",
+        derived: bool = True,
     ) -> dict[str, Any]:
+        """Index the appended events. ``derived=False`` publishes only the canonical events and the cursor (what every
+        audit reads); the sparse and dense search indexes are then left to the next ``derived`` sync or search, which
+        materialize whatever they lack (``_repair_sparse_for_search``). Host hooks use it: they judge, they do not search."""
         info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=embed,
-                                  verify=_check_verify(verify))
+                                  derived=derived, verify=_check_verify(verify))
         return {key: value for key, value in info.items() if not key.startswith("_")}
 
     @detached_operation
@@ -478,7 +528,7 @@ class SelfDirectEngine:
         path = agy.resolve_session_path(self.settings.resolve_agy_app_data_dirs(),
                                         session_id=sid, path=payload["transcriptPath"],
                                         require_exists=False)
-        ReceiptStore(Path(self.settings.index_dir)).record(
+        ReceiptStore(Path(self.settings.index_dir), held=self._held_rows()).record(
             sid, path, payload["stepIdx"], payload["toolCall"], event,
             error=payload.get("error", "") if event == "PostToolUse" else None,
             guard=self._publication_guard)
@@ -606,8 +656,7 @@ class SelfDirectEngine:
         with self._publication_guard():
             raw_contracts, contract_token = self.contracts.capture()
         try:
-            document = ContractsDocument.model_validate_json(raw_contracts) if raw_contracts is not None else ContractsDocument()
-            contracts = document.contracts
+            contracts = parse_contracts(raw_contracts).contracts   # shared and read-only: filtered below, never edited
         except ValueError:
             contracts = []
             coverage["complete"] = False
@@ -1195,6 +1244,11 @@ class SelfDirectEngine:
         resolved_provider = self._resolve_provider(provider)
         sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
         doc, _original = self._capture_checklist(sid)
+        if not any(item.status == RequirementStatus.DONE for item in doc.items):
+            # The evidence below can only ever demote a ``done`` item (to pending_verification); no other field of the
+            # reply depends on it. A checklist without a ``done`` item therefore needs neither the scan of every
+            # stored event (parsing each one) nor a second hash of the whole source, and the reply is the same.
+            return {"ok": True, "session_id": sid, "items": [i.model_dump(mode="json") for i in doc.items]}
         with self._publication_guard(), self.store._read_boundary():
             record = self.store.cursor_record(sid, resolved_provider)
             metrics = self.store.session_metrics(sid, resolved_provider)
@@ -1527,6 +1581,17 @@ class SelfDirectEngine:
             try:
                 while self._active_operations:
                     self._lifetime.wait()
+                if self.store is not None and self._ready and self.store.has_pending_derived():
+                    try:
+                        with self._publication_guard():
+                            from self_directing_mcp.agy_receipts import ReceiptStore
+                            self.store.flush_derived()
+                            ReceiptStore(Path(self.settings.index_dir), held=self.store.derived).flush_held()
+                    except Exception:
+                        pass    # held rows are a cache; closing must not fail because they could not be written
+                if self.defer_derived:
+                    from self_directing_mcp.agy_receipts import ReceiptStore
+                    ReceiptStore.release(Path(self.settings.index_dir))     # the persistent receipts reader, if any
                 for component in (self.store, self.sparse, self.dense, self.graph):
                     connection = getattr(component, "_conn", None)
                     if connection is not None:

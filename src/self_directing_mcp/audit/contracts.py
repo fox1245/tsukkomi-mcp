@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import hashlib
 from pathlib import Path
+import threading
 
 from self_directing_mcp.schemas import ContractRule, ContractsDocument
 from self_directing_mcp.request_control import check_request, publication
@@ -71,6 +73,59 @@ def loosening_reasons(previous: ContractRule, new: ContractRule) -> list[str]:
     if previous.auto_continue and not new.auto_continue:
         reasons.append("auto_continue removed")
     return reasons
+
+
+class ContentMemo:
+    """A small thread-safe LRU whose KEY IS THE CONTENT its values were computed from.
+
+    Used for derivations of a file's exact bytes (a validated contracts document, the obligations read out of one):
+    a changed byte is a different key, so a stale entry can never be returned, and nothing needs invalidating. Errors
+    are not cached (``put`` is only called with a finished value). Values are shared between callers and must be
+    treated as read-only; whoever edits a document validates a private copy of its own.
+    """
+
+    def __init__(self, size: int) -> None:
+        self._size, self._items, self._lock = size, OrderedDict(), threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            value = self._items.get(key)
+            if value is not None:
+                self._items.move_to_end(key)
+            return value
+
+    def put(self, key, value) -> None:
+        with self._lock:
+            self._items[key] = value
+            self._items.move_to_end(key)
+            while len(self._items) > self._size:
+                self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+MEMO_MAX_BYTES = 1024 * 1024   # a larger contracts file is validated every time rather than held (bounds what the memos keep)
+_DOCUMENTS = ContentMemo(8)
+
+
+def parse_contracts(raw: bytes | None) -> ContractsDocument:
+    """The validated contracts document of these exact bytes (an empty one for ``None``).
+
+    Read-only callers only: the document is shared by everyone who reads the same bytes, so a reader must not modify
+    it or hand its rules to code that does. ``ContractStore.load`` and the upsert/revoke paths, which edit, validate
+    their own copy. Invalid bytes raise ``ValueError`` on every call (failures are not remembered).
+    """
+    if raw is None:
+        return ContractsDocument()
+    memoize = len(raw) <= MEMO_MAX_BYTES
+    document = _DOCUMENTS.get(raw) if memoize else None
+    if document is None:
+        document = ContractsDocument.model_validate_json(raw)
+        if memoize:
+            _DOCUMENTS.put(raw, document)
+    return document
 
 
 class ContractStore:

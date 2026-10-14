@@ -70,6 +70,7 @@ def test_a_fast_check_that_escalates_to_a_full_verification_stores_state_once(ma
     assert fast["integrity"]["mode"] == "full" and fast["integrity"]["full_reason"] == "evidence_beyond_verified_region"
     assert fast["incremental"]["mode"] == "delta" and fast["incremental"]["events_read"] == 0  # the first pass stored it
     assert fast["verdict"] == reference.check_action(SID, DEPLOY, verify="full")["verdict"]
+    world.engine.flush_derived()
     rows = world.engine.store._conn.execute(
         "SELECT monitor_id, COUNT(*) FROM audit_monitor_state GROUP BY monitor_id").fetchall()
     assert rows and all(count == 1 for _id, count in rows), rows
@@ -84,6 +85,7 @@ def test_a_cursor_that_migrates_to_block_digests_rebuilds_the_states_once(make_w
     world = make_world()
     reference = twin(world)
     answers_agree(world, reference, verify="full")
+    world.engine.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows before they are read or edited
     state_rows = world.engine.store._conn.execute("SELECT COUNT(*) FROM audit_monitor_state").fetchone()[0]
     assert state_rows
     store = world.engine.store
@@ -107,6 +109,7 @@ def test_a_state_keyed_to_a_plain_digest_is_not_reused_after_the_migration(make_
     world = make_world()
     reference = twin(world)
     answers_agree(world, reference, verify="full")
+    world.engine.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows before they are read or edited
     store = world.engine.store
     plain = plain_digest(world)
     with store._conn:  # the whole chain as it would have been written under a plain cursor
@@ -125,6 +128,7 @@ def test_the_block_digest_of_an_unchanged_prefix_keeps_a_valid_state_through_a_r
     world = make_world()
     reference = twin(world)
     answers_agree(world, reference, verify="full")
+    world.engine.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows before they are read or edited
     store = world.engine.store
     with store._conn:  # the cursor loses its table and plain digest; the log and states keep the block digest
         store._conn.execute("UPDATE session_cursors SET prefix_hash=?", (plain_digest(world),))
@@ -141,6 +145,7 @@ def test_a_cursor_rewritten_by_an_older_process_never_changes_an_answer(make_wor
     world = make_world()
     reference = twin(world)
     answers_agree(world, reference, verify="full")
+    world.engine.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows before they are read or edited
     store = world.engine.store
     with store._conn:
         store._conn.execute("UPDATE session_cursors SET prefix_hash=?, synced_at='older-process-write'",
@@ -158,6 +163,7 @@ def test_a_tampered_source_is_reindexed_and_its_states_are_dropped(make_world, t
     world = make_world()
     reference = twin(world)
     answers_agree(world, reference, verify="full")
+    world.engine.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows before they are read or edited
     store = world.engine.store
     generation = store._conn.execute("SELECT generation FROM session_generations").fetchone()[0]
     world.tamper_prerequisite()

@@ -44,8 +44,10 @@ from self_directing_mcp.schemas import Evidence, Finding
 from self_directing_mcp.security.mask import mask_secrets
 
 # Bump when the semantics of any evaluation changes (rules, evidence classes, evidence text); it invalidates every
-# stored state and re-enables contracts that a shadow mismatch disabled.
-EVALUATOR_VERSION = 7
+# stored state and re-enables contracts that a shadow mismatch disabled. (8: the reference evaluator shares its position
+# index, call/result tables and rare-evidence lists between rules; results are identical, but the tripwire in
+# tests/test_incremental_evaluator_guard.py asks for a bump whenever a mirrored function changes.)
+EVALUATOR_VERSION = 8
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run

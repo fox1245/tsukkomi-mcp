@@ -52,6 +52,7 @@ REQUEST_MARGIN_SEC = 2.0          # the daemon's cooperative deadline is the req
 DEFAULT_REQUEST_TIMEOUT_SEC = 45.0
 LOG_ROTATE_BYTES = 256 * 1024
 SHUTDOWN_WATCHDOG_SEC = 20.0
+FLUSH_IDLE_SEC = 1.0              # idle this long (no request, no connection activity): write the rows engines are holding
 DRAIN_TIMEOUT_SEC = 150.0         # a drain never waits longer than this for in-flight requests
 SESSION_BOUND = 16                # queued + running hook requests per session
 TOTAL_BOUND = 128                 # ... and across all sessions
@@ -72,14 +73,21 @@ class DaemonConfig:
     total_bound: int = TOTAL_BOUND
     hook_workers: int = HOOK_WORKERS
     heavy_workers: int = HEAVY_WORKERS
+    defer_derived: bool = True       # hold derived rows and write them with the next authority commit (index.deferred)
 
     @classmethod
     def from_environment(cls, environ=None) -> "DaemonConfig":
-        """``SELF_DIRECT_DAEMON_IDLE_EXIT_SEC`` (900), ``..._MAX_RSS_MB`` (400), ``..._SESSION_BOUND`` (16).
+        """``SELF_DIRECT_DAEMON_IDLE_EXIT_SEC`` (900), ``..._MAX_RSS_MB`` (400), ``..._SESSION_BOUND`` (16) and
+        ``..._DEFER_DERIVED`` (``on``, or ``off`` to write every derived row synchronously as a standalone process does).
 
         A malformed value is an error (``ValueError``), never a silent default."""
         environ = os.environ if environ is None else environ
         config = cls()
+        text = environ.get("SELF_DIRECT_DAEMON_DEFER_DERIVED")
+        if text is not None:
+            if text.strip().lower() not in ("on", "off"):
+                raise ValueError("invalid value for SELF_DIRECT_DAEMON_DEFER_DERIVED")
+            config.defer_derived = text.strip().lower() == "on"
         for name, attribute, kind in (("SELF_DIRECT_DAEMON_IDLE_EXIT_SEC", "idle_exit_sec", float),
                                       ("SELF_DIRECT_DAEMON_MAX_RSS_MB", "max_rss_mb", float),
                                       ("SELF_DIRECT_DAEMON_SESSION_BOUND", "session_bound", int)):
@@ -172,8 +180,9 @@ class Engines:
     """One engine per resolved-settings key, created lazily and kept for reuse. The daemon is the only writer of its
     indexes, and the resident integrity worker starts once per engine (not per connection)."""
 
-    def __init__(self, factory=None, log: DaemonLog | None = None) -> None:
+    def __init__(self, factory=None, log: DaemonLog | None = None, *, defer_derived: bool = True) -> None:
         self._factory = factory
+        self._defer_derived = defer_derived
         self._lock = threading.Lock()
         self._engines: dict[str, object] = {}
         self._creating: dict[str, threading.Lock] = {}
@@ -201,7 +210,9 @@ class Engines:
         if self._factory is not None:
             return self._factory(settings)
         from self_directing_mcp.engine import SelfDirectEngine
-        return SelfDirectEngine(settings)
+        # The daemon is the long-lived writer of its indexes: it may hold the rows that carry no authority and write them
+        # with the next authority commit (see index.deferred); it writes the rest when idle and at shutdown.
+        return SelfDirectEngine(settings, defer_derived=self._defer_derived)
 
     def _start_worker(self, key, engine) -> None:
         if self._factory is not None:
@@ -216,6 +227,17 @@ class Engines:
 
     def worker_count(self) -> int:
         return len(self._workers)
+
+    def flush_all(self) -> int:
+        """Ask every engine to write the derived rows it is holding (see ``SelfDirectEngine.flush_derived``)."""
+        written = 0
+        for engine in list(self._engines.values()):
+            flush = getattr(engine, "flush_derived", None)
+            try:
+                written += flush() if flush is not None else 0
+            except Exception:
+                pass                                       # held rows are a cache; the next flush or close retries
+        return written
 
     def close_all(self) -> None:
         with self._lock:
@@ -240,7 +262,7 @@ class Daemon:
         self.config = config or DaemonConfig()
         self.version, self.proto = version, proto
         self.log = DaemonLog(runtime)
-        self.engines = Engines(engine_factory, self.log)
+        self.engines = Engines(engine_factory, self.log, defer_derived=self.config.defer_derived)
         self.ledger = ServedLedger()
         self._hook_runner = hook_runner or self._run_hook
         self._install_signals = install_signals
@@ -261,6 +283,7 @@ class Daemon:
         self.inflight = 0
         self.inflight_by_session: Counter = Counter()
         self.last_activity = time.monotonic()
+        self._flushed_for = None         # the ``last_activity`` at which the engines' held rows were last written
         self.started_at = time.time()
         self.stats: Counter = Counter()
         self.info = {"index_schema": None, "parser_versions": None, "evaluator_version": None}
@@ -560,6 +583,10 @@ class Daemon:
                 return
             if self.ledger.due():
                 self._loop.run_in_executor(None, self.ledger.flush)
+            if (not self.draining and self.inflight == 0 and self._flushed_for != self.last_activity
+                    and time.monotonic() - self.last_activity >= FLUSH_IDLE_SEC):
+                self._flushed_for = self.last_activity      # once per quiet period; a request re-arms it
+                self._loop.run_in_executor(None, self.engines.flush_all)
 
     def begin_drain(self, reason: str) -> None:
         """Stop accepting (the socket path disappears, so new clients start a successor), finish in-flight
