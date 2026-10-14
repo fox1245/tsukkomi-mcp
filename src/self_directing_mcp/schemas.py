@@ -31,6 +31,17 @@ class Chunk(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
+class AuditEvent:
+    """Read-only slim event for audits: identity, kind, role/call linkage and (only if needed) text.
+
+    ``text`` is empty for events no contract can inspect; nothing else of the stored chunk is kept.
+    """
+    __slots__ = ("chunk_id", "kind", "text", "meta")
+
+    def __init__(self, chunk_id, kind, text, meta):
+        self.chunk_id, self.kind, self.text, self.meta = chunk_id, kind, text, meta
+
+
 class ContractRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(description="Stable unique contract id used for updates (revision increments).")

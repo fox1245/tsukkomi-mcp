@@ -139,7 +139,17 @@ def test_source_change_without_index_refresh_invalidates_audit(session, monkeypa
         else:
             path.unlink()
         release.set()
-        incomplete(audit.result(5))
+        value = audit.result(5)
+    if change == "append":
+        # Pure growth is judged as of the captured offset (see test_audit_prefix.py); it is never "reviewed".
+        assert value["verdict"] == "clean" and value["coverage"]["unread_bytes"] > 0
+        assert value["coverage"]["complete"] is False and not _delete_evidence(value)
+    else:
+        incomplete(value)
+
+
+def _delete_evidence(value):
+    return [e for f in value["findings"] for e in f.get("evidence", []) if "DELETE" in e["snippet"]]
 
 
 def test_stale_snapshot_retains_actual_violation_evidence(session, monkeypatch):

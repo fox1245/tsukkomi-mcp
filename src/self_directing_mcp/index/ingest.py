@@ -11,10 +11,35 @@ from typing import Any
 
 import numpy as np
 
-from self_directing_mcp.schemas import Chunk
+from self_directing_mcp.schemas import AuditEvent, Chunk
 from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request, publication, request_operation
 from self_directing_mcp.session_events import capture_source, observed_source, source_scope
+
+
+@dataclass(frozen=True)
+class AuditEventSnapshot:
+    """Detached ordered slim events of one session; see ``SessionStore.capture_audit_events``."""
+    session_id: str | None
+    provider: str | None
+    events: tuple
+    count: int
+
+    def list_chunks(self, session_id=None, provider=None):
+        if session_id not in (None, self.session_id) or provider not in (None, self.provider):
+            return []
+        return list(self.events)
+
+    def get_chunk(self, chunk_id):
+        return next((event for event in self.events if event.chunk_id == chunk_id), None)
+
+    def chunk_count(self, session_id=None, provider=None):
+        if session_id not in (None, self.session_id) or provider not in (None, self.provider):
+            return 0
+        return self.count
+
+
+_SCOPE_KINDS = {"tool_call": "tool_call", "tool_result": "tool_result", "message": "turn"}
 
 
 @dataclass(frozen=True)
@@ -328,6 +353,50 @@ class SessionStore:
         rows = tuple(tuple(row) for row in self._conn.execute(
             "SELECT chunk_id,data FROM session_events" + where + " ORDER BY provider,session_id,byte_start,sub_index", params).fetchall())
         return AuditEvidenceSnapshot(session_id, provider, rows, count)
+
+    def capture_audit_events(self, session_id, provider, needs, *, link_calls=False):
+        """Ordered slim events; text is loaded only for events some ``(scope, roles)`` need can inspect.
+
+        ``link_calls`` also keeps text for tool calls/results (evidence of success-linked obligations).
+        Rows are paged through a cursor and never held as raw JSON or pydantic models.
+        """
+        with self._read_boundary():
+            terms, term_params = [], []
+            for scope, roles in needs:
+                kind = _SCOPE_KINDS.get(scope)
+                parts = []
+                if kind is not None:
+                    parts.append("json_extract(data,'$.kind')=?")
+                    term_params.append(kind)
+                parts.append("json_extract(data,'$.meta.role') IN (" + ",".join("?" for _ in roles) + ")" if roles else "0")
+                term_params.extend(roles)
+                terms.append("(" + " AND ".join(parts) + ")")
+            if link_calls:
+                terms.append("json_extract(data,'$.kind') IN ('tool_call','tool_result')")
+            wanted = " OR ".join(terms) if terms else "0"
+            count = self.chunk_count(session_id, provider)
+            check_request()
+            cursor = self._conn.execute(
+                "SELECT chunk_id, json_extract(data,'$.kind'), json_extract(data,'$.meta.role'),"
+                " json_extract(data,'$.meta.call_id'), json_type(data,'$.meta.success'),"
+                " json_extract(data,'$.meta.success'), CASE WHEN " + wanted + " THEN json_extract(data,'$.text') END"
+                " FROM session_events WHERE session_id=? AND provider=?"
+                " ORDER BY provider,session_id,byte_start,sub_index", term_params + [session_id, provider])
+            events = []
+            while True:
+                check_request()
+                page = cursor.fetchmany(512)
+                if not page:
+                    break
+                for cid, kind, role, call_id, success_type, success, text in page:
+                    if success_type == "true":
+                        success = True
+                    elif success_type == "false":
+                        success = False
+                    elif success_type in (None, "null"):
+                        success = None
+                    events.append(AuditEvent(cid, kind, text or "", {"role": role, "call_id": call_id, "success": success}))
+            return AuditEventSnapshot(session_id, provider, tuple(events), count)
 
     def session_metrics(self, session_id, provider):
         row = self._conn.execute(
