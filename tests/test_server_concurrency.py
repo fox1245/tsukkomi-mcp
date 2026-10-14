@@ -151,6 +151,8 @@ def test_trim_interval_still_bounds_how_often_short_calls_trim(monkeypatch):
     calls = _trim_env(monkeypatch, "linux")
     monkeypatch.setattr(server, "TRIM_MIN_CALL_SEC", 0.01)
     monkeypatch.setattr(server, "TRIM_MIN_INTERVAL_SEC", 60)
+    # The monotonic clock of a freshly booted CI machine can be below the interval: start "long ago".
+    monkeypatch.setattr(server, "_last_trim", float("-inf"))
 
     async def scenario():
         for _ in range(5):
