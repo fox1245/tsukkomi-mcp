@@ -177,6 +177,8 @@ def main():
         print("building the index ...", flush=True)
         measure("warmup", here, args, base_index, 1, index_only=True)
     import shutil
+    sys.path.insert(0, str(here))
+    from self_directing_mcp.journal import copy_index_dir
     runs = [("incremental", here, 1, 0)]
     if args.baseline_src:
         runs.append(("baseline-tree", Path(args.baseline_src), 1, 0))
@@ -190,7 +192,7 @@ def main():
         index = work / f"index-{label}"
         if index.exists():
             shutil.rmtree(index)
-        shutil.copytree(base_index, index)
+        copy_index_dir(base_index, index)   # databases through the backup API: a plain copy would lose what is in a -wal
         shutil.copy(snapshot, session)
         print(f"measuring {label} ...", flush=True)
         out[label] = measure(label, src, args, index, incremental, shadow)

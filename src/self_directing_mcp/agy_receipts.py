@@ -21,6 +21,7 @@ import sqlite3
 import threading
 from uuid import uuid4
 
+from self_directing_mcp import journal as _journal
 from self_directing_mcp.agy import RESULT_TYPES, load_line
 from self_directing_mcp.session_events import capture_source, iter_raw_lines, same_identity, source_scope
 from self_directing_mcp.request_control import check_request, publication
@@ -338,13 +339,16 @@ def _drop_reader(path: Path, reader) -> None:
 
 
 class ReceiptStore:
-    def __init__(self, index_dir: Path, *, held=None):
+    def __init__(self, index_dir: Path, *, held=None, journal: str | None = None):
         """``held``: the ``index.deferred.DerivedBuffer`` of a resident engine, or None. The "indexed" marker (which receipts
         digest the index was built on) is advisory, so such an engine holds it there and writes it with the next
         receipt it records, at idle or at close, instead of committing it by itself; every read goes through
         ``_indexed``, which sees the held value first."""
         self.path = Path(index_dir) / "agy-receipts.sqlite"
         self.held = held
+        # ``journal``: "auto" or "delete" (``None``: ``journal.DEFAULT_POLICY``); applied to every connection this store
+        # opens, always with ``synchronous=FULL``. See the module ``journal``.
+        self.journal = _journal.validate_policy(_journal.DEFAULT_POLICY if journal is None else journal)
 
     @staticmethod
     def release(index_dir: Path) -> None:
@@ -354,6 +358,15 @@ class ReceiptStore:
             reader = _READERS.pop(str(path), None)
         if reader is not None:
             reader.close()
+
+    def journal_report(self) -> dict:
+        """The journal mode the receipts database is in now, what the policy and file system call for, and whether
+        they differ (``pending``). Reads the file; creates nothing."""
+        return _journal.inspect_journal(self.path, self.journal)
+
+    def checkpoint(self) -> bool:
+        """Fold the write-ahead log into the main file (engine close, daemon idle exit); cheap without a ``-wal``."""
+        return _journal.checkpoint_file(self.path)
 
     def _cached(self, key, load):
         """``load(connection)`` through a persistent reader (resident engines only, i.e. with ``held``), else ``_MISS``:
@@ -407,6 +420,7 @@ class ReceiptStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.path)
         try:
+            _journal.apply_journal(conn, self.path, self.journal)    # before any transaction; never fails the request
             with publication():
                 conn.execute("CREATE TABLE IF NOT EXISTS receipts (session_id TEXT, step INTEGER, data TEXT NOT NULL, PRIMARY KEY(session_id,step))")
                 conn.execute("CREATE TABLE IF NOT EXISTS indexed (session_id TEXT PRIMARY KEY, digest TEXT NOT NULL)")

@@ -296,6 +296,7 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_RETRIEVE_TOP_K`, `SELF_DIRECT_SEARCH_TOP_K`, `SELF_DIRECT_RRF_K` | `20`, `10`, `60` | Retrieval tuning. |
 | `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS` | `false` | Seed disabled demonstration contracts. |
 | `SELF_DIRECT_DAEMON` | `off` | **Experimental.** `on` makes hooks and the MCP entry point clients of the resident daemon (Linux only; read from the process environment by the entry points). See [Resident daemon](#resident-daemon-experimental-off-by-default), which also lists the daemon's own `SELF_DIRECT_DAEMON_*` limits. |
+| `SELF_DIRECT_SQLITE_JOURNAL` | `delete` | Journal mode of the authority databases `meta.sqlite` and `agy-receipts.sqlite`: `delete` (the rollback journal) or `auto` (write-ahead logging on a verified local file system, the rollback journal elsewhere). Always `synchronous=FULL`. Faster for resident processes only; see [SQLite journal mode](#sqlite-journal-mode-index-files-and-backups). |
 
 #### Credentials
 
@@ -581,6 +582,37 @@ Cheap signals only ever escalate to full: a different file identity (a new inode
 
 **Compatibility.** The cursor's `prefix_hash` is a plain SHA-256 until a source gets a table: the first full request after this version migrates it in place, without a reindex (`full_reason: "migration"`). A process of an older version that meets a block cursor does not understand it, treats it as a changed source and reindexes once; restart every process that shares an index after upgrading (see [Upgrading to 0.6.0](#upgrading-to-060)). A plain rollout and its `.jsonl.zst` twin still share one cursor: the cursor's hash form follows the source form.
 
+### SQLite journal mode, index files and backups
+
+The index directory (`SELF_DIRECT_INDEX_DIR`) holds these SQLite files and one JSON file:
+
+| File | What it is | Journal mode |
+|---|---|---|
+| `meta.sqlite` | **Authority.** Events, cursors, and for AGY the digest of the receipts each session was indexed with. Also derived audit state. | `SELF_DIRECT_SQLITE_JOURNAL` |
+| `agy-receipts.sqlite` | **Authority.** AGY host hook receipts and the receipts ledger. | `SELF_DIRECT_SQLITE_JOURNAL` |
+| `sparse.sqlite`, `graph.sqlite`, `dense.sqlite` / `vectors-v2-*`, `neograph_checkpoints.sqlite`, `workflow.sqlite` | Derived indexes, GraphRAG and checkpoints. | rollback journal, never changed |
+| `claude-hook-state.sqlite`, `agy-hook-state.sqlite` | Hook health and the continue budget. Not authority records; they use the standard library only so that hooks can still report when the runtime cannot import. | rollback journal, never changed |
+| `contracts.json`, `checklists/` | Own publication protocol (atomic replace). Not SQLite. | not applicable |
+
+**`SELF_DIRECT_SQLITE_JOURNAL`** is `delete` (the default: the rollback journal, as before this setting existed) or `auto` (write-ahead logging, "WAL", for `meta.sqlite` and `agy-receipts.sqlite` on a file system that is positively identified as local, the rollback journal everywhere else). Both policies use `synchronous=FULL`, set explicitly on every connection. `synchronous=NORMAL` is never used for events, cursors or receipts: in WAL mode it can lose the last acknowledged commits at power loss, and `scripts/bench_commit.py` measures it for reference only.
+
+**Why `auto` is not the default.** WAL makes the commit itself cheaper (one `fsync` of an appended log instead of the journal file, the database and the journal's deletion), but a command hook is a new process that opens the database, commits once and closes it, and SQLite folds the log into the database when the last connection closes: the saving moves to the end of the process. Measured on ext4 (the tables below; 300 interleaved samples per cell), a resident engine (the experimental daemon, the stdio server) is clearly faster, and a fresh process is not: the append transaction (`commit_events`) has a p50 of 21.0 ms with the rollback journal and 6.8 ms with WAL in a resident engine (-68 %; the whole append operation -56 %), but 25.3 ms against 20.4 ms in a fresh process (-20 %) and the whole operation, which is what a command hook experiences, goes from 29.2 ms to 32.2 ms (+10 %). The roundtable's rule asked for at least 25 % lower p50 on the append commit on ext4 on the real paths; the standalone command hook, the default install, does not meet it, so the default stays `delete` and the chooser, the reporting and the WAL-aware copy helpers ship switched off. `auto` is for resident processes: set it together with `SELF_DIRECT_DAEMON=on`, or for a long-running stdio server. Skipping the fold at process exit was tried and is worse (the log grows to the autocheckpoint size and every next process has to recover it; see the benchmark below).
+
+**What `auto` does.**
+
+- **Which file systems.** `journal.choose_journal(path)` returns `JournalChoice(mode, reason)`. On Linux it reads the mount that holds the (symlink-resolved) directory from `/proc/self/mountinfo` after an `os.statvfs` check. Allowed: ext2/3/4, xfs, btrfs, tmpfs, f2fs, zfs, and an `overlay` only when the mount holding its `upperdir` can be shown (same device, one of those types). Denied: `9p` (WSL drive mounts, also reported as `drvfs`), `nfs*`, `cifs`, `smb*`, `fuse*` and `virtiofs`. Anything else (`ntfs3`, `vfat`, an unrecognised type, an unreadable mount table, a read-only file system, another operating system) is `unknown`. On Windows the volume must be a fixed drive (`GetDriveTypeW` is `DRIVE_FIXED`); UNC paths, `\\?\UNC\`, device paths and mapped network drives are refused. The Windows branch is verified by tests that fake the Win32 calls and by the Windows CI job; it could not be measured. **Unknown means DELETE.** That is the old behaviour, not a statement that DELETE is safe on that file system.
+- **Reporting.** `audit_status` returns `journal` (policy, `synchronous: "FULL"`, and per database the actual mode, the wanted mode, the reason, a `pending` reason when they differ, and `fallback`) and `journal_fallback`, a list of the databases that use the rollback journal because the file system is `denied:*` or `unknown:*` under `auto` (empty under `delete`, where the reason is `setting:delete`). The same fact is logged once per directory and reason as `journal_fallback ...` at INFO.
+- **When the mode changes.** Only when a connection is opened (`apply_journal`), never inside a transaction, and never by waiting longer than 50 ms for another connection. A refused switch (another connection, possibly an older process, holds the file: `SQLITE_BUSY`) keeps the existing mode, is recorded in `pending` and is tried again at the next open (every receipts connection; the next process for the index; for a resident engine, once it has been idle for 30 s or more, from its idle flush). It never fails a request. Switching back with `delete` (or on a file system that is no longer allowed) works the same way, in the other direction. The mode is stored in the database file, so every later connection finds it.
+- **Older processes.** A release that knows nothing about this setting opens a WAL database with plain `sqlite3`, reads and writes it, and sees every committed row (`tests/test_journal.py` does exactly that with a second plain connection). Two processes may even use different policies on one index; the file's mode is whatever was set last.
+- **Checkpoints.** SQLite's automatic checkpoint (1000 pages) is unchanged. A clean `engine.close()` folds the log of both databases into the files (`PRAGMA wal_checkpoint(TRUNCATE)` with a 250 ms bound for readers), and so does a resident daemon when its idle exit closes its engines. A process that dies without closing leaves a log that the next connection recovers; the kill test below shows nothing acknowledged is lost.
+
+**Copying, moving, backing up and deleting index files.** With `auto` a committed row can live only in `meta.sqlite-wal`. Copying `meta.sqlite` by itself then loses the most recent commits, and a stale `-wal` next to a replaced database file would be replayed into it. Therefore:
+
+- Copy a live index with SQLite's online backup API, never with `cp`: `journal.copy_database(src, dst)` / `journal.copy_index_dir(src, dst)` (every `*.sqlite` / `*.db` through `sqlite3.Connection.backup`, sidecars skipped, other files copied as is), or the `sqlite3` shell's `.backup`. `scripts/bench_audit.py`, `scripts/bench_agy_hooks.py`, `scripts/benchmark_large.py` and the AGY equivalence test use them. A directory can also be copied after every process using it has closed cleanly (its logs are then empty), or after `PRAGMA wal_checkpoint(TRUNCATE)`.
+- Delete or replace a database together with its `-wal`, `-shm` and `-journal` files (`journal.remove_database(path)`). The installers (`scripts/install_codex.py`, `scripts/install_claude_hooks.py`) back up configuration files only and never touch the index.
+
+**Receipt and event pairing (AGY).** The receipts live in their own database file, so an event commit and a receipt commit are two commits. They are tied by content, not by a request id: with every cursor the index stores the SHA-256 of the receipt rows the events were derived from (`session_receipt_versions.digest`) and the receipts those events depend on (`session_receipt_deps`), and every status, sync and judgement compares that digest with the digest of the receipts database as it stands. A receipt committed without the events commit that follows it, or an events commit whose receipt commit is missing, differ in that digest and report `receipts_not_indexed` (the coverage is incomplete, so a verdict that depends on it is `unknown`) until a sync brings the two together. Receipts are written before the events that cite them, each with `synchronous=FULL`, so the order survives a crash in either journal mode. A receipt for a step whose result is not indexed yet is still a plain append. Nothing about what a receipt may prove changed; `tests/test_journal_engine.py` pins both directions.
+
 ---
 
 ## Resident daemon (experimental, off by default)
@@ -682,7 +714,7 @@ What the daemon removes is the process cost: interpreter start, imports, setting
 
 Idle MCP sessions (12, one shared index, after the handshake and one tool call): twelve standalone servers use 971 MB resident (588 MB proportional); twelve relays plus one daemon use **251 MB** (119 MB proportional): each relay 13.7 to 14.4 MB, the daemon 83.5 MB. After the hook runs above the daemon, holding two engines, was at 99.9 MB. (Measured before the warm-path work; it holds a few more kilobytes per session and is not expected to change.)
 
-Against the roundtable's provisional targets: relay at most 15 MB, met (14.4 MB); daemon at most 120 MB, met (83.5 to 99.9 MB); 12 sessions at most 300 MB in total, met (251 MB); the new-process hook p95 of at most 40 ms is **met for events without a judgement** (`UserPromptSubmit`: 23 ms) and **not met** for the judging events (Claude Code `PreToolUse` 58 / 66 ms, `Stop` 33 / 81 ms; AGY 42 to 90 ms); the daemon-side processing p95 of at most 15 ms is **met for the daemon's own work** (0.3 ms beyond the judgement, 1 ms for `UserPromptSubmit`) and for a warm judgement that appends nothing and is not shadowed (Claude Code `PreToolUse` 4 ms, `Stop` 9.7 ms, AGY `Stop` 16 ms), and **not met** wherever a request appends events or is shadowed (one commit is 10 to 15 ms before any CPU; the shadow comparison is a full evaluation). A `Stop` with 100 contracts (`bench_warm.py --contracts 100`, 60 requests per cell) is 15 / 18 ms at p50 / p95 with nothing appended and 40 / 51 ms with 4 KB appended on Claude Code (112 / 136 ms before), 57 / 66 ms on AGY with the shadow sample off, against the target of 80 ms at p95, **met** except in a window that holds a shadowed request (310 ms on Claude Code and 420 ms on AGY with 100 contracts when every request is shadowed). Two things would still move these numbers and were deliberately not done here: write-ahead logging for `meta.sqlite` and the receipts database (a commit measured 4 ms instead of 10 on this machine, a durability-preserving but file-format-visible change) and a faster or rarer shadow comparison (a weaker check).
+Against the roundtable's provisional targets: relay at most 15 MB, met (14.4 MB); daemon at most 120 MB, met (83.5 to 99.9 MB); 12 sessions at most 300 MB in total, met (251 MB); the new-process hook p95 of at most 40 ms is **met for events without a judgement** (`UserPromptSubmit`: 23 ms) and **not met** for the judging events (Claude Code `PreToolUse` 58 / 66 ms, `Stop` 33 / 81 ms; AGY 42 to 90 ms); the daemon-side processing p95 of at most 15 ms is **met for the daemon's own work** (0.3 ms beyond the judgement, 1 ms for `UserPromptSubmit`) and for a warm judgement that appends nothing and is not shadowed (Claude Code `PreToolUse` 4 ms, `Stop` 9.7 ms, AGY `Stop` 16 ms), and **not met** wherever a request appends events or is shadowed (one commit is 10 to 15 ms before any CPU; the shadow comparison is a full evaluation). A `Stop` with 100 contracts (`bench_warm.py --contracts 100`, 60 requests per cell) is 15 / 18 ms at p50 / p95 with nothing appended and 40 / 51 ms with 4 KB appended on Claude Code (112 / 136 ms before), 57 / 66 ms on AGY with the shadow sample off, against the target of 80 ms at p95, **met** except in a window that holds a shadowed request (310 ms on Claude Code and 420 ms on AGY with 100 contracts when every request is shadowed). Two things would still move these numbers: write-ahead logging for `meta.sqlite` and the receipts database, now implemented as the opt-in `SELF_DIRECT_SQLITE_JOURNAL=auto` and measured in the [commit benchmark](#commit-benchmark) (a resident engine's append transaction is 68 % cheaper at p50, a fresh process's whole append is 10 % slower, which is why it is not the default), and a faster or rarer shadow comparison (a weaker check, deliberately not done).
 
 ---
 
@@ -871,6 +903,7 @@ python scripts/benchmark.py
 python scripts/bench_hooks.py --out bench-hooks.json --markdown bench-hooks.md   # hook cost, see below
 python scripts/bench_daemon.py --out bench-daemon.json --markdown bench-daemon.md  # resident daemon, Linux (experimental)
 python scripts/bench_warm.py --defer --spans claude:Stop:4096                      # the warm judgement of one engine, in-process
+python scripts/bench_commit.py --samples 300 --kill 50 --tmpdir /path/on/ext4  # commit latency and crash survival by journal mode
 TSUKKOMI_TEST_DEFER_DERIVED=1 python -m pytest -q                                 # the whole suite with every engine holding its derived writes
 ```
 
@@ -1033,6 +1066,60 @@ AGY costs grow with the number of receipts in the conversation (every request re
 | 1,857 | 5.3 / 23.9, 20.4 / 37.1 | 8.9 / 48.4, 24.2 / 60.0 | 5.5 / 22.3, 31.7 / 36.5 | 9.3 / 49.0, 48.0 / 71.8 |
 
 For a resident engine keeping state costs the same as keeping none up to about 250 events (for `Stop` it is cheaper from the start) and is cheaper beyond; on a one-shot engine the extra commit makes it dearer until about 500 events (`Stop`) and 1,500 (`PreToolUse`). The default of 500 is therefore right for `Stop` on both, a little conservative for a resident engine between 250 and 500 events (a few milliseconds at most) and a little low for a one-shot `PreToolUse`; it was left unchanged.
+
+### Commit benchmark
+
+`scripts/bench_commit.py` measures the commit latency of the two authority databases on the real code paths, under three journal modes, and runs a crash test. It is the measurement behind the default of [`SELF_DIRECT_SQLITE_JOURNAL`](#sqlite-journal-mode-index-files-and-backups).
+
+```bash
+python scripts/bench_commit.py --samples 300 --warmup 15 --kill 50 --tmpdir /path/on/ext4 --shm /dev/shm \
+    --slow-dir /path/on/9p --out report.json --markdown report.md
+```
+
+- **Operations.** *append*: `ingest_session` of a synthetic Codex transcript that grew by 3 KB, the way a hook syncs it (`derived=False`, no embedding), timed as a whole, as `SessionStore.commit_events` (events, cursor, block table and audit bookkeeping in one transaction) and as the `commit()` call inside it. *receipt*: `ReceiptStore.record` (`PreToolUse` and `PostToolUse` of a synthetic AGY transcript). *hookstate*: `HookState.record_error`, which is not an authority record and is not switched; WAL is set on it by hand to show what it would buy.
+- **Process models.** *resident*: one store and its connections stay open (the daemon, the stdio server). *fresh*: every sample opens the store, does one operation and closes it (a command hook; with WAL the last connection to close folds the log into the database).
+- **Modes**, sampled in random order round-robin so drift hits all of them: `delete_full` (today), `wal_full` (the candidate), `wal_normal` (**reference only, not shippable**: after power loss it can lose acknowledged commits) and `wal_keep` (an experiment that is not in the package: WAL without the fold at close).
+- **File systems.** The scratch directory (ext4), `/dev/shm` (tmpfs, the CPU-only floor) and the project checkout on WSL (9p/drvfs, which `choose_journal` denies: DELETE only, WAL is never enabled there).
+
+Median / p95 / p99 in ms, 300 samples per cell after 15 warm-up samples, one machine (AMD Ryzen 7 5800X, WSL2 ext4 on a virtual disk, Linux 6.18, SQLite 3.53.1, Python 3.12), 1-minute load average 5.4 to 6.1 during the ext4 cells (5-minute 4.8 to 5.2; the machine was busy with other work, and the modes are interleaved so it hits all of them alike). Windows could not be measured.
+
+| ext4, append | measure | DELETE + FULL (today) | WAL + FULL | WAL + NORMAL (reference only) | WAL + FULL vs today, p50 |
+|---|---|---|---|---|---|
+| resident | whole operation | 24.5 / 31.6 / 36.2 | 10.7 / 15.6 / 20.1 | 5.2 / 10.2 / 24.3 | -56 % |
+| resident | `commit_events` | 21.0 / 28.2 / 31.0 | 6.8 / 10.3 / 15.7 | 1.8 / 4.5 / 21.2 | -68 % |
+| resident | `commit()` | 18.6 / 26.6 / 29.9 | 4.9 / 9.0 / 13.9 | 0.1 / 0.2 / 18.1 | -74 % |
+| fresh | whole operation | 29.2 / 37.8 / 43.0 | 32.2 / 39.6 / 42.5 | 32.1 / 39.4 / 44.9 | **+10 %** |
+| fresh | `commit_events` | 25.3 / 32.2 / 38.0 | 20.4 / 25.8 / 27.5 | 12.5 / 17.3 / 19.9 | **-20 %** |
+| fresh | `commit()` | 23.2 / 29.8 / 34.5 | 18.3 / 23.1 / 24.7 | 10.6 / 15.2 / 17.8 | -21 % |
+
+| ext4, receipt | measure | DELETE + FULL | WAL + FULL | WAL + NORMAL (reference only) | WAL + FULL vs today, p50 |
+|---|---|---|---|---|---|
+| resident | whole `record()` | 24.6 / 31.9 / 33.6 | 12.0 / 16.7 / 18.4 | 1.6 / 2.4 / 2.8 | -51 % |
+| resident | `commit()` | 22.7 / 30.1 / 31.7 | 10.4 / 15.2 / 17.1 | 0.0 / 0.1 / 0.2 | -54 % |
+| fresh | whole `record()` | 22.8 / 27.3 / 31.2 | 25.2 / 33.1 / 38.4 | 25.6 / 30.9 / 33.0 | **+10 %** |
+| fresh | `commit()` | 20.9 / 25.3 / 29.6 | 15.0 / 20.7 / 23.3 | 9.7 / 12.6 / 14.2 | -28 % |
+
+| other file systems | operation | model | measure | DELETE + FULL | WAL + FULL |
+|---|---|---|---|---|---|
+| tmpfs | append | resident | whole / `commit_events` | 4.1 / 8.5 / 10.6 and 1.7 / 3.2 / 4.1 | 3.9 / 8.3 / 10.6 and 1.6 / 3.2 / 3.8 |
+| tmpfs | append | fresh | whole / `commit_events` | 4.8 / 7.7 / 8.3 and 1.7 / 2.9 / 3.3 | 4.8 / 7.2 / 8.4 and 1.7 / 2.7 / 3.2 |
+| tmpfs | receipt | resident / fresh | whole | 1.2 / 1.7 / 1.9 and 1.2 / 1.8 / 2.0 | 1.1 / 1.5 / 1.7 and 1.4 / 1.9 / 2.1 |
+| 9p (`denied:9p`) | append | resident / fresh | whole | 187.7 / 286.6 / 326.7 and 206.7 / 288.3 / 306.4 | not run: denied |
+| 9p (`denied:9p`) | append | resident / fresh | `commit_events` | 144.7 / 230.9 / 269.3 and 144.8 / 220.8 / 234.0 | not run: denied |
+| 9p (`denied:9p`) | receipt | resident / fresh | whole | 97.5 / 116.6 / 126.5 and 155.0 / 176.8 / 187.5 | not run: denied |
+
+What the tables say. (1) With the process kept open WAL halves the cost of an append or a receipt and the synchronous commit stops being the dominant cost; `NORMAL` would halve what is left again, which is why it is tempting and why it is excluded. (2) With a fresh process per operation the transaction is 20 to 28 % cheaper, but opening and closing the database costs it back (a new log file, recovery or the fold at close), and the whole operation is 10 % slower; on tmpfs, where there is no `fsync` to save, WAL is neutral. (3) Keeping the log at the end of a short-lived process (`wal_keep`) is not a way out: the log grows to the 1000-page autocheckpoint and every next process recovers it (ext4 whole append 37.4 ms against 32.2 ms with the fold; tmpfs `commit_events` 2.05 times slower). (4) On the 9p mount of this checkout one append takes about 190 to 210 ms with the rollback journal, seven to eight times the ext4 figure and the reason to keep the index on a local disk; WAL is denied there (it needs shared memory in a `-shm` file that network and virtual file systems do not keep coherent) and is not measured. (5) The hook-state database in WAL (set by hand) is 15 % slower for a fresh process; it stays as it is.
+
+**Crash test (`--kill 50`).** A writer process loops over real commits (three index appends and one receipt record per round, each printing its id after the commit returned), the script sends `SIGKILL` after a random number of acknowledgements and a random 0 to 40 ms, then runs `PRAGMA integrity_check` on both databases, checks that every acknowledged id is present, and reopens them through the package's own classes. 50 kills per mode on ext4:
+
+| mode | acknowledged appends / receipts | lost | integrity failures | reopen failures | committed but not acknowledged | killed with a hot journal / a non-empty `-wal` |
+|---|---|---|---|---|---|---|
+| `delete_full` | 1244 / 389 | 0 | 0 | 0 | 37 | 47 / 0 |
+| `wal_full` | 1257 / 396 | 0 | 0 | 0 | 119 | 0 / 50 |
+| `wal_keep` (experiment) | 1138 / 350 | 0 | 0 | 0 | 163 | 0 / 50 |
+| `wal_normal` (reference) | 1103 / 339 | 0 | 0 | 0 | 145 | 0 / 50 |
+
+No acknowledged commit was lost in any mode. That is **process-kill survival, not power-loss durability**: a killed process leaves everything the operating system already holds in its page cache, so every mode passes by construction. What `synchronous=FULL` buys over `NORMAL` is the case this test cannot show, and the reason the package never sets `NORMAL`.
 
 ### Memory verification
 
