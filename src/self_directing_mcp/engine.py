@@ -761,7 +761,7 @@ class SelfDirectEngine:
             receipt_token = self._receipt_token(sid, resolved_provider)
             evidence = self.store.capture_evidence(sid, resolved_provider)
         try:
-            observation = capture_source(Path(record["path"])) if record else None
+            observation = capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],)) if record else None
         except RequestStopped:
             raise
         except (OSError, ValueError):

@@ -445,11 +445,12 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
         if record["parser_version"] != current_parser_version(provider):
             issues.append("parser_outdated")
         try:
-            observation = observation or capture_source(Path(record["path"]))
-            if str(observation.path) != record["path"] or not observation.validate():
+            observation = observation or capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],))
+            if str(observation.path) != record["path"] or not observation.validate_prefix():
                 issues.append("source_changed")
-            result["file_size"] = len(observation.data)
-            result["pending_bytes"] = max(0, len(observation.data) - record["byte_offset"])
+            # Bytes appended after the observation are unread, never reviewed or lost.
+            result["file_size"] = max(observation.length, observation.current_size())
+            result["pending_bytes"] = max(0, result["file_size"] - record["byte_offset"])
             if result["pending_bytes"]:
                 issues.append("unread_bytes")
             if observation.prefix_digest(record["byte_offset"]) != record["prefix_hash"]:
@@ -480,7 +481,15 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
     else:
         from self_directing_mcp.codex.parse import parse_session_chunks, peek_session_id
     path = Path(path).resolve()
-    observation = capture_source(path)
+    hint = ()
+    if session_id:
+        try:
+            with store._read_boundary():
+                known = store.cursor_record(session_id.lower() if provider in ("codex", "agy") else session_id, provider)
+            hint = (known["byte_offset"],) if known else ()
+        except (OSError, sqlite3.Error):
+            hint = ()
+    observation = capture_source(path, checkpoints=hint)
     with source_scope(observation):
         sid = session_id or peek_session_id(path)
         if not sid:
@@ -497,7 +506,7 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
             cursor = store.cursor_record(sid, provider)
             expected_token = store.state_token(sid, provider)
             prior_calls = (store.prior_calls(sid, provider)
-                           if provider == "omp" and cursor and len(observation.data) > cursor["byte_offset"] else ())
+                           if provider == "omp" and cursor and observation.complete_end > cursor["byte_offset"] else ())
             if provider == "agy":
                 from self_directing_mcp.agy_receipts import ReceiptStore
                 receipt_store = ReceiptStore(store.db_path.parent)
@@ -539,6 +548,9 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
         if parsed_sid != sid:
             raise ValueError("session id changed while parsing")
         digest = observation.prefix_digest(offset)
+        # Large comparison stays outside the publication lock; the lock only re-checks the file stamp.
+        if not observation.validate_prefix():
+            raise ValueError("source changed during preparation")
         prepared_rows = []
         for chunk in chunks:
             check_request()
@@ -546,7 +558,7 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
                                   chunk.meta.get("sub_index", 0), chunk.model_dump_json()))
     check_request()
     with guard():
-        if not observation.validate():
+        if not observation.validate_prefix():
             raise ValueError("source changed during preparation")
         current = store.cursor_record(sid, provider)
         changed_token = store.state_token(sid, provider) != expected_token
@@ -596,8 +608,11 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
             issues = []
             if store.state_token(sid, provider) != committed_token:
                 issues.append("metadata_changed_during_derived_work")
-            if not observation.validate():
+            if not observation.validate_prefix():
                 issues.append("source_changed_during_derived_work")
+            elif observation.current_size() > info["coverage"].get("file_size", 0) and "unread_bytes" not in info["coverage"]["issues"]:
+                info["coverage"]["pending_bytes"] = max(0, observation.current_size() - offset)
+                issues.append("unread_bytes")
             if receipt_store is not None and receipt_store.authority_token(sid) != receipt_authority:
                 issues.append("receipts_changed_during_derived_work")
             if issues:

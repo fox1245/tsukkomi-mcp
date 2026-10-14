@@ -4,8 +4,6 @@ from __future__ import annotations
 import hashlib
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
-import io
 import os
 import json
 import re
@@ -21,41 +19,171 @@ def source_stamp(path: Path) -> tuple[int, ...]:
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
-@dataclass(frozen=True)
+def _stamp(stat) -> tuple[int, ...]:
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+_BLOCK = 1024 * 1024
+
+
 class SourceObservation:
-    path: Path
-    stamp: tuple[int, ...]
-    data: bytes
+    """One captured prefix generation of an append-only session file.
+
+    The file may keep growing. Only bytes ``[0, length)`` were observed; ``complete_end`` is the last record
+    boundary inside them. No file bytes are retained: the observation keeps device/inode, a streaming
+    SHA-256 state per requested checkpoint (with its line count) and the digest of the whole prefix.
+    ``validate()`` is the strict "file untouched since capture" test; ``validate_prefix()`` accepts pure
+    growth after verifying the captured prefix still hashes identically.
+    """
+
+    def __init__(self, path, stamp, length, complete_end, full_digest, checkpoints):
+        self.path = path
+        self.stamp = stamp
+        self.length = length
+        self.complete_end = complete_end
+        self._full_digest = full_digest
+        self._checkpoints = checkpoints  # offset -> (sha256 state, newline count)
+        self._verified_stamp = stamp
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        return self.stamp[0], self.stamp[1]
+
+    def _checkpoint(self, offset):
+        found = self._checkpoints.get(offset)
+        if found is not None:
+            return found
+        if offset < 0 or offset > self.length:
+            raise ValueError("source truncated during read")
+        digest, lines = hashlib.sha256(), 0
+        with self.path.open("rb") as stream:
+            if _identity(os.fstat(stream.fileno())) != self.identity:
+                raise ValueError("source replaced during read")
+            remaining = offset
+            while remaining:
+                check_request()
+                block = stream.read(min(remaining, _BLOCK))
+                if not block:
+                    raise ValueError("source truncated during read")
+                digest.update(block)
+                lines += block.count(b"\n")
+                remaining -= len(block)
+        self._checkpoints[offset] = (digest, lines)
+        return digest, lines
 
     def prefix_digest(self, length: int) -> str:
-        if length < 0 or length > len(self.data):
+        if length < 0 or length > self.length:
             raise ValueError("source truncated during read")
-        return hashlib.sha256(memoryview(self.data)[:length]).hexdigest()
+        return self._checkpoint(length)[0].hexdigest()
+
+    def line_state(self, offset: int):
+        """Hash state (a copy) and line count of ``[0, offset)``."""
+        digest, lines = self._checkpoint(offset)
+        return digest.copy(), lines
 
     def validate(self) -> bool:
+        """Strict: the file's identity, size and timestamps are exactly the captured ones."""
         check_request()
         try:
             return source_stamp(self.path) == self.stamp
         except OSError:
             return False
 
+    def current_size(self) -> int:
+        return self.path.stat().st_size
 
-def capture_source(path: Path) -> SourceObservation:
-    """Read one stable source generation; parsers and receipt hashes share its bytes."""
+    def validate_prefix(self) -> bool:
+        """Growth tolerant: same file, and the captured prefix is byte-for-byte what was hashed."""
+        check_request()
+        try:
+            with self.path.open("rb") as stream:
+                before = os.fstat(stream.fileno())
+                if _identity(before) != self.identity or before.st_size < self.length:
+                    return False
+                if _stamp(before) == self._verified_stamp:
+                    return True
+                digest, remaining = hashlib.sha256(), self.length
+                while remaining:
+                    check_request()
+                    block = stream.read(min(remaining, _BLOCK))
+                    if not block:
+                        return False
+                    digest.update(block)
+                    remaining -= len(block)
+                after = os.fstat(stream.fileno())
+        except OSError:
+            return False
+        if digest.hexdigest() != self._full_digest or _identity(after) != self.identity or after.st_size < self.length:
+            return False
+        if _stamp(after) == _stamp(before):
+            self._verified_stamp = _stamp(after)
+        return True
+
+
+def _identity(stat) -> tuple[int, int]:
+    return stat.st_dev, stat.st_ino
+
+
+def _hash_prefix(stream, length, checkpoints):
+    """Stream ``[0, length)`` once. Returns (full digest, last record boundary, {offset: (state, lines)}).
+
+    States are kept for every requested checkpoint and for the last record boundary; memory is O(1) in
+    the file size apart from those small hash states.
+    """
+    wanted = sorted({o for o in checkpoints if 0 < o <= length})
+    digest, lines, position, boundary = hashlib.sha256(), 0, 0, 0
+    states = {0: (digest.copy(), 0)}
+    boundary_state = states[0]
+    while position < length:
+        check_request()
+        block = stream.read(min(_BLOCK, length - position))
+        if not block:
+            raise ValueError("source truncated during read")
+        newline = block.rfind(b"\n")
+        splits = {o - position for o in wanted if position < o <= position + len(block)}
+        if newline >= 0:
+            splits.add(newline + 1)
+        cursor = 0
+        for split in sorted(splits | {len(block)}):
+            piece = block[cursor:split]
+            digest.update(piece)
+            lines += piece.count(b"\n")
+            cursor = split
+            absolute = position + split
+            if absolute in wanted:
+                states[absolute] = (digest.copy(), lines)
+            if newline >= 0 and split == newline + 1:
+                boundary, boundary_state = absolute, (digest.copy(), lines)
+        position += len(block)
+    states.setdefault(length, (digest.copy(), lines))
+    states.setdefault(boundary, boundary_state)
+    return digest.hexdigest(), boundary, states
+
+
+def capture_source(path: Path, *, checkpoints=()) -> SourceObservation:
+    """Observe the first ``size`` bytes of a possibly growing source in one streaming pass.
+
+    Bytes are hashed, not retained. Growth after the initial ``fstat`` is not an error; an overwrite,
+    truncation or replacement during the pass is.
+    """
     check_request()
     path = Path(path).resolve()
     with path.open("rb") as stream:
         before = os.fstat(stream.fileno())
-        blocks = []
-        while block := stream.read(1024 * 1024):
-            check_request()
-            blocks.append(block)
+        length = before.st_size
+        full_digest, boundary, states = _hash_prefix(stream, length, checkpoints)
         after = os.fstat(stream.fileno())
-    stamp = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-    data = b"".join(blocks)
-    observation = SourceObservation(path, stamp(after), data)
-    if stamp(before) != observation.stamp or len(data) != after.st_size or not observation.validate():
+    if _identity(after) != _identity(before) or after.st_size < length:
         raise ValueError("source changed during preparation")
+    observation = SourceObservation(path, _stamp(after), length, boundary, full_digest, states)
+    if after.st_size == length:
+        if _stamp(after) != _stamp(before):
+            raise ValueError("source changed during preparation")  # same size, new mtime: rewritten in place
+    else:
+        # Grew while hashing: appended bytes are fine, a rewritten prefix is not.
+        observation._verified_stamp = None
+        if not observation.validate_prefix():
+            raise ValueError("source changed during preparation")
     return observation
 
 
@@ -87,25 +215,57 @@ def content_hash(text: str) -> str:
 
 
 def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, int, int, str]]:
-    """Cursors point to the start of a record. Leave unfinished final records unread."""
+    """Cursors point to the start of a record. Leave unfinished final records unread.
+
+    Under a ``source_scope`` the read is bounded to the observed prefix and every consumed byte is hashed
+    against the capture, so a rewrite between capture and parse is an error, not silent wrong evidence.
+    """
     check_request()
+    if start_byte < 0:
+        raise ValueError("negative byte cursor")
     observation = observed_source(path)
-    with (io.BytesIO(observation.data) if observation else Path(path).open("rb")) as stream:
-        if start_byte < 0:
-            raise ValueError("negative byte cursor")
-        prefix = stream.read(start_byte)
-        if len(prefix) != start_byte or (start_byte and not prefix.endswith(b"\n")):
-            raise ValueError("cursor is not on a complete record boundary")
-        line_no = prefix.count(b"\n")
+    limit = observation.complete_end if observation else None
+    if observation is not None and start_byte > observation.complete_end:
+        raise ValueError("cursor is not on a complete record boundary")
+    with Path(path).open("rb") as stream:
+        if observation is not None and _identity(os.fstat(stream.fileno())) != observation.identity:
+            raise ValueError("source replaced during read")
+        check_digest = None
+        if start_byte:
+            stream.seek(start_byte - 1)
+            if stream.read(1) != b"\n":
+                raise ValueError("cursor is not on a complete record boundary")
+        if observation is not None:
+            check_digest, line_no = observation.line_state(start_byte)
+        else:
+            line_no = 0
+            stream.seek(0)
+            remaining = start_byte
+            while remaining:
+                check_request()
+                block = stream.read(min(remaining, _BLOCK))
+                if len(block) == 0:
+                    raise ValueError("cursor is not on a complete record boundary")
+                line_no += block.count(b"\n")
+                remaining -= len(block)
+        stream.seek(start_byte)
+        position = start_byte
         while True:
             check_request()
-            start = stream.tell()
-            raw = stream.readline()
+            if limit is not None and position >= limit:
+                break
+            raw = stream.readline() if limit is None else stream.readline(limit - position)
             if not raw or not raw.endswith(b"\n"):
-                return
+                break
+            start, position = position, position + len(raw)
             line_no += 1
+            if check_digest is not None:
+                check_digest.update(raw)
             # Invalid UTF-8 remains detectable instead of silently altering evidence.
-            yield line_no, start, stream.tell(), raw.decode("utf-8", errors="surrogateescape")
+            yield line_no, start, position, raw.decode("utf-8", errors="surrogateescape")
+    if observation is not None and position == observation.complete_end and check_digest is not None:
+        if check_digest.hexdigest() != observation.prefix_digest(position):
+            raise ValueError("source changed during read")
 
 
 def make_chunk(provider, sid, kind, text, meta, line, start, end, sub=0, timestamp=None):

@@ -95,7 +95,7 @@ class ReceiptStore:
                         row["result_hash"] = observed
         payload = json.dumps(row, sort_keys=True)
         with guard(), closing(self._connect()) as conn, conn:
-            if (observation is not None and not observation.validate()) or (observation is None and path.is_file()):
+            if (observation is not None and not observation.validate_prefix()) or (observation is None and path.is_file()):
                 raise ValueError("source changed during receipt preparation")
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute("SELECT data FROM receipts WHERE session_id=? AND step=?", (session_id, step)).fetchone()
