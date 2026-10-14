@@ -6,11 +6,19 @@ import time
 from abc import ABC, abstractmethod
 from typing import Sequence
 
-import httpx
 from self_directing_mcp._runtime import np
 
 from self_directing_mcp.security.mask import mask_secrets, register_secret
 from self_directing_mcp.request_control import check_request, current_request, request_operation
+
+
+def __getattr__(name: str):
+    """PEP 562: ``httpx`` loads on first use. Only the OpenRouter client needs it; local-only command hooks import
+    this module (for the ``Embedder`` base class) and must not pay for an HTTP stack they never use."""
+    if name == "httpx":
+        import httpx
+        return httpx
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def format_query(
@@ -132,6 +140,7 @@ class OpenRouterEmbedder(Embedder):
         self.base_url = base_url.rstrip("/")
 
     def _call(self, texts: Sequence[str]) -> list[np.ndarray]:
+        import httpx
         check_request()
         inputs = []
         for text in texts:

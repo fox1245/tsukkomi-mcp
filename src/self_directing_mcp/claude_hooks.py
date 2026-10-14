@@ -32,6 +32,7 @@ import sys
 from typing import Any, TYPE_CHECKING
 
 from self_directing_mcp import claude_hook_state as hook_state
+from self_directing_mcp import claude_ids
 from self_directing_mcp import hook_policy
 from self_directing_mcp.agy_hook_state import AUDIT_UNAVAILABLE, CHECK_FAILED
 from self_directing_mcp.claude_hook_state import CONTEXT_EVENTS, EVENTS, STOP_EVENTS, ClaudeHookState
@@ -87,13 +88,12 @@ def _text(payload: dict, key: str) -> str | None:
 
 def _validate_payload(payload: Any, event: str | None) -> HookCall:
     """Validate only what the event uses; every other field is tolerated and never trusted."""
-    from self_directing_mcp import claude
     if event not in EVENTS or not isinstance(payload, dict):
         raise ValueError("unsupported hook event or payload")
     declared = payload.get("hook_event_name")
     if declared is not None and declared != event:
         raise ValueError("hook_event_name does not match the registered event")
-    parts = claude.session_parts(payload.get("session_id"))
+    parts = claude_ids.session_parts(payload.get("session_id"))
     if parts is None or parts[1] is not None:
         raise ValueError("session_id must be a Claude Code session UUID")
     path = _text(payload, "transcript_path")
@@ -298,18 +298,18 @@ def render(event: str, reply: dict[str, Any]) -> dict[str, Any]:
 # --- dispatch ----------------------------------------------------------------------------------------------
 
 def _new_settings():
-    from self_directing_mcp.config import hook_settings
+    from self_directing_mcp.settings_core import load_hook_settings
     try:
-        return hook_settings()
+        return load_hook_settings()
     except Exception as exc:
         raise HookRuntimeError("settings unavailable") from exc
 
 
 def _new_engine():
-    from self_directing_mcp.config import hook_settings
     from self_directing_mcp.engine import SelfDirectEngine
+    from self_directing_mcp.settings_core import load_hook_settings
     try:
-        return SelfDirectEngine(hook_settings())
+        return SelfDirectEngine(load_hook_settings())
     except Exception as exc:
         raise HookRuntimeError("settings or engine unavailable") from exc
 

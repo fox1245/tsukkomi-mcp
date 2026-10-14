@@ -17,8 +17,11 @@ import sysconfig
 import tempfile
 import time
 
-from self_directing_mcp import config
-from self_directing_mcp.config import Settings
+
+def Settings():  # noqa: N802  (kept as a callable name: tests replace it)
+    """The server's pydantic settings, imported only when a sandbox is prepared (hooks never get here)."""
+    from self_directing_mcp.config import Settings as _Settings
+    return _Settings()
 
 
 class SandboxError(RuntimeError):
@@ -33,6 +36,7 @@ def _environment() -> dict[str, str]:
 
 
 def _runtime_paths(extra: tuple[Path, ...], workspace: Path) -> list[Path]:
+    from self_directing_mcp import config
     # Do not mount /, /home, /etc, a repository parent, or a whole venv parent.
     paths = {Path(p) for p in ("/usr/bin", "/usr/lib", "/usr/lib64", "/bin", "/lib", "/lib64")
              if Path(p).exists()}

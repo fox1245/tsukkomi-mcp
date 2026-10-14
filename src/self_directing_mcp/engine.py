@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TYPE_CHECKING
 from functools import wraps
 from threading import Condition, RLock
 from collections import OrderedDict
@@ -34,7 +34,6 @@ from self_directing_mcp.checklist import (
 from self_directing_mcp.codex import discover as codex_discover
 from self_directing_mcp.grokbot import discover as grokbot_discover
 from self_directing_mcp import omp, agy, claude
-from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
 from self_directing_mcp.index.ingest import AmbiguousSessionSource, SessionStore, ingest_session, coverage_from_capture
 from self_directing_mcp.index.sparse import SparseIndex
@@ -52,6 +51,9 @@ from self_directing_mcp.request_control import (
     IndexBusy, RequestStopped, check_request, current_request, publication, request_operation, request_scope,
 )
 from self_directing_mcp.session_events import capture_source
+
+if TYPE_CHECKING:       # the pydantic Settings model is imported lazily: command hooks pass a light settings object
+    from self_directing_mcp.config import Settings
 
 
 def serialized(method):
@@ -119,7 +121,10 @@ class SelfDirectEngine:
         self._operation_depth = 0
         self._hook_lock = RLock()
         self._hook_states = OrderedDict()
-        self.settings = settings or get_settings()
+        if settings is None:
+            from self_directing_mcp.config import get_settings    # the server's pydantic settings; hooks pass their own
+            settings = get_settings()
+        self.settings = settings
         self.store: SessionStore | None = None
         self.sparse: SparseIndex | None = None
         self.dense = None

@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from functools import wraps
-import urllib.request
 import time
 import threading
 import uuid
@@ -106,6 +105,7 @@ class _Transport:
             "reasoning": {"exclude": True, "effort": "low"},
             "max_tokens": max_tokens,
         }).encode()
+        import urllib.request       # network client: loaded when a graph update calls out, never by hooks
         req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions",
             data=body, headers={"Authorization": "Bearer " + self.api_key,
                                 "Content-Type": "application/json"})

@@ -20,13 +20,18 @@ import tempfile
 import time
 from typing import Any
 
-from self_directing_mcp.config import Settings
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.neograph_runtime import graph_operation, run_stages
 from self_directing_mcp.workflow_jev import MAPPING_HASH, classify
 from self_directing_mcp.workflow_lean import LeanPolicy, policy_digest, verify_proof
 from self_directing_mcp.workflow_process import run_process
 from self_directing_mcp.workflow_requirements import ApprovalError, ApprovedProject
+
+
+def Settings():  # noqa: N802  (kept as a callable name: tests replace it)
+    """The server's pydantic settings, imported only when a classification needs them (hooks never do)."""
+    from self_directing_mcp.config import Settings as _Settings
+    return _Settings()
 
 
 def _json(value: Any) -> str:
