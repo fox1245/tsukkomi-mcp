@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from contextlib import contextmanager
 
+from self_directing_mcp.compressed_source import open_source
 from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.session_events import as_text
 from self_directing_mcp.codex.discover import ensure_under_root
@@ -156,7 +157,8 @@ def _evidence_stamp(engine, path, rules):
     checked = ensure_under_root(Path(path), Path(engine.settings.codex_sessions_dir))
     messages = any(r.regex and r.scope in ("message", "any") for r in rules)
     digest = hashlib.sha256()
-    with checked.open("rb") as source:
+    # A compressed (archived) transcript is decoded as a stream; the active rollout is a plain file.
+    with open_source(checked, max_bytes=engine.settings.max_decompressed_session_bytes) as source:
         for line in source:
             check_request()
             try:

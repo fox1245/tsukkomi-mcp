@@ -8,6 +8,8 @@ from typing import Callable, Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES
+
 
 _PATH_FIELDS = frozenset({
     "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
@@ -170,6 +172,13 @@ class Settings(BaseSettings):
         ge=1,
         description="Max heavy tool calls (sync/search/audit/checklist/hooks) running at once; "
                     "excess requests queue within their own deadline. SELF_DIRECT_MAX_CONCURRENT_CALLS.",
+    )
+    max_decompressed_session_bytes: int = Field(
+        default=DEFAULT_MAX_DECOMPRESSED_BYTES,
+        ge=1,
+        description="Upper bound on the declared decompressed size of a zstd-compressed Codex session "
+                    "(rollout-*.jsonl.zst). A larger file is reported as zstd_too_large and not decoded. "
+                    "SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES.",
     )
     rrf_k: int = 60
     retrieve_top_k: int = 20
