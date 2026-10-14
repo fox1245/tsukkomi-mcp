@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-import numpy as np
+from self_directing_mcp._runtime import np
 
 from self_directing_mcp.embed.embedder import Embedder
 from self_directing_mcp.index.sparse import SparseIndex

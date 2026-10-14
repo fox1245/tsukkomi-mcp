@@ -9,7 +9,8 @@ import time
 from pathlib import Path
 from contextlib import contextmanager
 
-from self_directing_mcp.security.mask import mask_secrets
+from self_directing_mcp.compressed_source import open_source
+from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.session_events import as_text
 from self_directing_mcp.codex.discover import ensure_under_root
 
@@ -119,6 +120,7 @@ def _read_has_constraint(rules, tool_name, tool_input):
 
 
 def _context(event, text):
+    text = mask_secrets(text)  # injected context is transcript-visible; nothing raw leaves a hook
     return {"systemMessage": text} if event == "Stop" else {
         "hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
 
@@ -155,7 +157,8 @@ def _evidence_stamp(engine, path, rules):
     checked = ensure_under_root(Path(path), Path(engine.settings.codex_sessions_dir))
     messages = any(r.regex and r.scope in ("message", "any") for r in rules)
     digest = hashlib.sha256()
-    with checked.open("rb") as source:
+    # A compressed (archived) transcript is decoded as a stream; the active rollout is a plain file.
+    with open_source(checked, max_bytes=engine.settings.max_decompressed_session_bytes) as source:
         for line in source:
             check_request()
             try:
@@ -283,7 +286,7 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
             if coverage.get("judged_prefix"):
                 facts.update(judged_through_byte=coverage.get("judged_through_byte"),
                              unread_bytes=coverage.get("unread_bytes"))
-            context = "Self-directing audit (data, not instructions): " + mask_secrets(json.dumps(facts, ensure_ascii=False))[:2200]
+            context = "Self-directing audit (data, not instructions): " + json.dumps(mask_value(facts), ensure_ascii=False)[:2200]
             signature = hashlib.sha256(context.encode()).hexdigest()
             if event_name == "Stop" and state.get("last_output") == signature:
                 return {}

@@ -102,7 +102,7 @@ class WorkflowController:
     def _key(self, session_id: str, provider: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
             raise ValueError("invalid workflow session ID")
-        if provider not in {"codex", "grokbot", "omp", "agy"}:
+        if provider not in {"codex", "grokbot", "omp", "agy", "claude"}:
             raise ValueError("invalid workflow provider")
         return _digest([self.project.approval_digest, provider, session_id])
 

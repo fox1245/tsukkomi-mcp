@@ -90,6 +90,7 @@ def _trim_env(monkeypatch, platform):
     monkeypatch.setattr(server, "TRIM_MIN_CALL_SEC", 0)
     monkeypatch.setattr(server, "TRIM_MIN_INTERVAL_SEC", 0)
     monkeypatch.setattr(server, "_last_trim", 0.0)
+    monkeypatch.setattr(server, "_busy_since_trim", 0.0)
     monkeypatch.setattr(server.sys, "platform", platform)
 
     class Libc:
@@ -125,6 +126,41 @@ def test_malloc_trim_skipped_off_linux_and_for_light_calls(monkeypatch):
 
     asyncio.run(scenario())
     assert calls == []
+
+
+def test_many_short_heavy_calls_trim_once_their_total_reaches_the_threshold(monkeypatch):
+    # Each call is far below the threshold on its own; hook-driven servers mostly see calls like these.
+    calls = _trim_env(monkeypatch, "linux")
+    monkeypatch.setattr(server, "TRIM_MIN_CALL_SEC", 0.1)
+
+    async def scenario():
+        for _ in range(3):
+            await server._dispatch(Spy(hold=0.02), budget_override=10)
+        await asyncio.sleep(0.1)
+        assert calls == []                         # 0.06 s of work so far
+        for _ in range(3):
+            await server._dispatch(Spy(hold=0.02), budget_override=10)
+        await asyncio.sleep(0.2)
+
+    asyncio.run(scenario())
+    assert calls == [0]
+    assert server._busy_since_trim < 0.1          # the total restarts after a trim
+
+
+def test_trim_interval_still_bounds_how_often_short_calls_trim(monkeypatch):
+    calls = _trim_env(monkeypatch, "linux")
+    monkeypatch.setattr(server, "TRIM_MIN_CALL_SEC", 0.01)
+    monkeypatch.setattr(server, "TRIM_MIN_INTERVAL_SEC", 60)
+    # The monotonic clock of a freshly booted CI machine can be below the interval: start "long ago".
+    monkeypatch.setattr(server, "_last_trim", float("-inf"))
+
+    async def scenario():
+        for _ in range(5):
+            await server._dispatch(Spy(hold=0.02), budget_override=10)
+        await asyncio.sleep(0.2)
+
+    asyncio.run(scenario())
+    assert calls == [0]
 
 
 def test_malloc_trim_failure_is_ignored(monkeypatch):

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
+from self_directing_mcp.compressed_source import CompressedSourceError, is_compressed, open_source
 from self_directing_mcp.session_events import (
     as_text, iter_raw_lines, make_chunk, parse_error, result_success,
 )
@@ -15,23 +17,36 @@ _WEB_TERMINAL = {"completed": True, "failed": False, "cancelled": False, "incomp
 _WEB_PENDING = {"in_progress", "searching", "queued"}
 
 
+def _header_id(stream):
+    for i, line in enumerate(stream):
+        if i > 50:
+            break
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "session_meta":
+            payload = obj.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("id"), str):
+                return payload["id"]
+    return None
+
+
+def read_session_id(path: Path) -> str | None:
+    """``session_meta.payload.id`` from the first lines of a rollout. A ``.zst`` rollout is decoded as a stream
+    (only its first lines); an unreadable one raises ``CompressedSourceError``."""
+    if is_compressed(path):
+        with io.TextIOWrapper(open_source(path, max_bytes=None), encoding="utf-8", errors="replace") as stream:
+            return _header_id(stream)
+    with Path(path).open(encoding="utf-8", errors="replace") as stream:
+        return _header_id(stream)
+
+
 def peek_session_id(path: Path) -> str | None:
     try:
-        with Path(path).open(encoding="utf-8", errors="replace") as stream:
-            for i, line in enumerate(stream):
-                if i > 50:
-                    break
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(obj, dict) and obj.get("type") == "session_meta":
-                    payload = obj.get("payload")
-                    if isinstance(payload, dict) and isinstance(payload.get("id"), str):
-                        return payload["id"]
-    except OSError:
-        pass
-    return None
+        return read_session_id(path)
+    except (OSError, CompressedSourceError):
+        return None
 
 
 _TOP_FIELDS = {"timestamp", "type", "payload", "ordinal", "metadata"}

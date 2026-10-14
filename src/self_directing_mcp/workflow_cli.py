@@ -23,7 +23,7 @@ def main() -> None:
             continue
         sub.add_argument("--state", type=Path, default=os.environ.get("TSUKKOMI_WORKFLOW_STATE"))
         sub.add_argument("--session", required=True)
-        sub.add_argument("--provider", choices=("agy", "codex", "omp", "grokbot"), default="agy")
+        sub.add_argument("--provider", choices=("agy", "codex", "omp", "grokbot", "claude"), default="agy")
         sub.add_argument("--lean", default=os.environ.get("TSUKKOMI_LEAN"))
         if name == "run-checks":
             sub.add_argument("--kind", choices=("all", "proof", "test"), default="all")
@@ -62,7 +62,9 @@ def main() -> None:
                     result = controller.authorize(**common, classification_id=args.classification, action=action)
                 else:
                     result = controller.execute(**common, grant=args.grant, action=action)
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
+        from self_directing_mcp.security.mask import mask_value
+        # The single-use grant is the one credential this command must hand to its caller.
+        print(json.dumps(mask_value(result, skip_keys={"grant"}), ensure_ascii=False, sort_keys=True, allow_nan=False))
         if not result.get("ok"):
             raise SystemExit(1)
     except (ValueError, OSError, RuntimeError, TimeoutError) as exc:

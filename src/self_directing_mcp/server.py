@@ -4,8 +4,10 @@ from typing import Any
 import argparse
 import asyncio
 import ctypes
+import logging
 import sys
 import time
+import traceback
 from threading import Event
 
 from mcp.server.fastmcp import FastMCP
@@ -16,6 +18,7 @@ from self_directing_mcp.config import get_settings
 from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.schemas import ContractRule, ProposedAction
 from self_directing_mcp.codex_hooks import handle_hook
+from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.request_control import (
     IndexBusy, RequestControl, RequestStopped, check_request, request_scope,
 )
@@ -28,10 +31,52 @@ HOOK_INSTRUCTIONS = (
     "A skipped hook is not clean or authorization. Session text stays local unless remote retrieval is authorized."
 )
 
-mcp = FastMCP(
+
+
+class _MaskedFastMCP(FastMCP):
+    """Tool failures embed argument values and exception text; mask them before the client sees them."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]):
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as exc:
+            raise ToolError(mask_secrets(str(exc))) from None
+
+
+mcp = _MaskedFastMCP(
     "self-directing-mcp",
     instructions=HOOK_INSTRUCTIONS,
 )
+
+# Rule logic must round-trip exactly (list -> edit -> upsert) and single-use grants are credentials the
+# caller must replay; every other string leaving a tool is masked.
+_RULE_KEYS = frozenset({"regex", "before_regex", "exception_regex"})
+_GRANT_KEYS = frozenset({"grant"})
+
+
+class _MaskingFilter(logging.Filter):
+    """Mask log messages and formatted tracebacks on every handler that receives them."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg, record.args = mask_secrets(record.getMessage()), None
+            if record.exc_info and not record.exc_text:
+                record.exc_text = mask_secrets("".join(traceback.format_exception(*record.exc_info)))
+            if record.stack_info:
+                record.stack_info = mask_secrets(record.stack_info)
+        except Exception:
+            record.msg, record.args, record.exc_info = "log record withheld (masking failed)", None, None
+        return True
+
+
+def _mask_logging() -> None:
+    mask = next((f for f in logging.getLogger().filters if isinstance(f, _MaskingFilter)), None)
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(f, _MaskingFilter) for f in handler.filters):
+            handler.addFilter(mask or _MaskingFilter())
+
+
+_mask_logging()
 
 _engine = SelfDirectEngine()
 
@@ -75,9 +120,12 @@ def _collect_worker_exception(worker):
         worker.exception()
 
 
+# Heavy work since the last trim, summed over calls: many short calls (hook checks) fragment the heap as much as
+# one long call, so the threshold applies to the total, not to a single call.
 TRIM_MIN_CALL_SEC = 0.5
 TRIM_MIN_INTERVAL_SEC = 5.0
 _last_trim = 0.0
+_busy_since_trim = 0.0
 
 
 def _libc():
@@ -124,11 +172,12 @@ class _HeavyGate:
         if sem is not self._sem:
             return
         self.running -= 1
-        global _last_trim
+        global _last_trim, _busy_since_trim
         now = time.monotonic()
-        if (self.running == 0 and now - started >= TRIM_MIN_CALL_SEC
+        _busy_since_trim += now - started
+        if (self.running == 0 and _busy_since_trim >= TRIM_MIN_CALL_SEC
                 and now - _last_trim >= TRIM_MIN_INTERVAL_SEC):
-            _last_trim = now
+            _last_trim, _busy_since_trim = now, 0.0
             self._loop.run_in_executor(None, _trim_heap)
 
 
@@ -163,6 +212,7 @@ async def _dispatch(method, *args, audit=False, **kwargs):
     """Bound the response and share cooperative stop state with its worker."""
     budget = kwargs.pop("budget_override", None)
     heavy = kwargs.pop("heavy", True)
+    keep = kwargs.pop("keep_keys", frozenset())
     if budget is None:
         budget = _engine.settings.audit_timeout_sec if audit else _engine.settings.request_timeout_sec
     control = RequestControl(deadline=time.monotonic() + budget)
@@ -182,7 +232,7 @@ async def _dispatch(method, *args, audit=False, **kwargs):
             return result
 
     try:
-        return await _await_request(work, control, budget, heavy)
+        return mask_value(await _await_request(work, control, budget, heavy), skip_keys=keep)
     except (IndexBusy, RequestStopped) as exc:
         return _incomplete_response(exc.reason)
     except TimeoutError:
@@ -217,7 +267,7 @@ async def _dispatch_hook(*args, **kwargs):
             check_request()
             return result
     try:
-        return await _await_request(work, control, budget)
+        return mask_value(await _await_request(work, control, budget))
     except (IndexBusy, RequestStopped, TimeoutError) as exc:
         reason = exc.reason if isinstance(exc, (IndexBusy, RequestStopped)) else "operation_timeout"
         event = args[0]
@@ -253,7 +303,7 @@ async def sync_session(
 
     Audit/check_action refresh automatically; do not sync separately before them.
     Provide session_id or path under the configured root.
-    provider: "codex" (default), "grokbot", "omp" (OMP JSONL), or "agy".
+    provider: "codex" (default), "grokbot", "omp" (OMP JSONL), "agy" or "claude" (Claude Code transcripts).
     When omitted, uses SELF_DIRECT_SESSION_PROVIDER or auto-detects from path layout.
     Every event occurrence is retained; only new sanitized text hashes are embedded.
     Set embed=False for local indexing. SELF_DIRECT_LOCAL_ONLY=true disables
@@ -280,7 +330,7 @@ async def search_history(
     Use when relevant evidence is missing. Do NOT treat retrieval
     alone as compliance proof — call audit_session; contracts/regex are authoritative.
     top_k defaults from settings (search_top_k). Never treat top-1 alone as a violation.
-    provider filters the index (codex|grokbot|omp|agy). Local-only supports regex/sparse, not dense/hybrid.
+    provider filters the index (codex|grokbot|omp|agy|claude). Local-only supports regex/sparse, not dense/hybrid.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.search_history,
@@ -300,7 +350,7 @@ async def audit_session(session_id: str, provider: str | None = None, path: str 
     Rules/regex are primary; hybrid is auxiliary only.
     Refreshes local JSONL first and returns coverage and a contracts snapshot.
     Unknown means evidence/verification is missing; it must not be called compliance.
-    provider filters the audit (codex|grokbot|omp|agy).
+    provider filters the audit (codex|grokbot|omp|agy|claude).
     timeout_ms: optional per-call budget in milliseconds for large sessions.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=True)
@@ -336,13 +386,13 @@ async def list_contracts(session_id: str | None = None) -> dict[str, Any]:
     Other sessions' contracts are not returned. This is a view over the
     shared store, not a per-session store split.
     """
-    return await _dispatch(_engine.list_contracts, heavy=False, session_id=session_id)
+    return await _dispatch(_engine.list_contracts, heavy=False, keep_keys=_RULE_KEYS, session_id=session_id)
 
 
 @mcp.tool()
 async def revoke_contract(contract_id: str) -> dict[str, Any]:
     """Disable a contract by id. History and the user's source quote are retained."""
-    return await _dispatch(_engine.revoke_contract, contract_id, heavy=False)
+    return await _dispatch(_engine.revoke_contract, contract_id, heavy=False, keep_keys=_RULE_KEYS)
 
 
 @mcp.tool()
@@ -357,6 +407,12 @@ async def upsert_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
     applies_from_event_id (exclusive), before_regex, requires_success. before_regex
     and requires_success apply to must tool_call rules with regex. Revisions increment
     on update. Description-only rules return unknown until a verifier exists.
+    Set risk="high", auto_continue=true or when={"tool_call_regex": ...} only when
+    the user asked for that: risk="high" marks actions the user named high-risk (a
+    host may ask instead of allowing when verification fails); auto_continue=true
+    (must with regex only) lets a confirmed, fully observed miss resume a stopping
+    agent once per session; when limits a must obligation to sessions where a
+    matching tool call was observed (otherwise it is reported not_applicable).
     The response contains only the contracts from this call after save,
     not the full store. session_id=null means a global rule that applies
     to every audited session. Use list_contracts(session_id=...) to inspect
@@ -366,7 +422,7 @@ async def upsert_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
         validated = _contract_list_adapter.validate_python(contracts)
     except ValidationError as exc:
         raise ToolError(_format_contract_errors(contracts, exc))
-    return await _dispatch(_engine.upsert_contracts, validated, heavy=False)
+    return await _dispatch(_engine.upsert_contracts, validated, heavy=False, keep_keys=_RULE_KEYS)
 
 
 # Replace the auto-generated input schema with a typed one that exposes
@@ -504,13 +560,13 @@ async def _dispatch_workflow(method: str, *args, timeout_ms=None, **kwargs):
     try:
         done, _ = await asyncio.wait({worker}, timeout=budget)
         if done:
-            return worker.result()
+            return mask_value(worker.result(), skip_keys=_GRANT_KEYS)
         abandoned.set()
         # A process already running must be killed and its observed result kept.
         # A worker still waiting on a host lock must never launch after expiry.
         done, _ = await asyncio.wait({worker}, timeout=.25)
         if done:
-            return worker.result()
+            return mask_value(worker.result(), skip_keys=_GRANT_KEYS)
         may_have_run = method == "execute" and entered.is_set()
         return {"ok": False, "error": "workflow_deadline", "outcome": "outcome_unknown" if may_have_run else "not_started",
                 "outcome_unknown": may_have_run, "started": None if may_have_run else False,
@@ -603,7 +659,13 @@ def main(argv: list[str] | None = None) -> None:
         # Bind the shared source to the singleton used by every MCP handler.
         # Indexes, native loading, and remote clients remain lazy.
         _engine.settings = settings
-    mcp.run(transport="stdio")
+    _mask_logging()
+    try:
+        mcp.run(transport="stdio")
+    except Exception:
+        # A crash traceback can quote request content; emit it masked.
+        print(mask_secrets(traceback.format_exc()), file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

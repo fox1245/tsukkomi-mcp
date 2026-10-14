@@ -18,7 +18,7 @@ from pathlib import Path
 import httpx
 from dotenv import dotenv_values
 
-from .security.mask import mask_secrets
+from .security.mask import mask_secrets, register_secret
 
 MAPPING_VERSION = "1"
 MODEL = "typesafe/jev-1.13"
@@ -192,6 +192,7 @@ def classify(context: dict, *, api_key: str | None = None,
     if not isinstance(key, str) or not key.strip():
         return _failure("missing_key", "OPENROUTER_API_KEY is required; no other provider key is accepted.", model, input_hash)
     key = key.strip()
+    register_secret(key)
     if not key.isascii() or any(ord(char) < 33 or ord(char) == 127 for char in key):
         return _failure("invalid_key", "OpenRouter API key is not a valid bearer credential.", model, input_hash)
     if key in body.decode("utf-8"):

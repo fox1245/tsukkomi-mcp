@@ -12,7 +12,7 @@ The adapter uses provider `agy` and the host's `conversationId` and `transcriptP
 for local evidence. It never searches Codex history for an AGY conversation.
 - `PreToolUse` checks all tools with applicable contracts, including restricted reads and `multi_replace_file_content`.
 - `PostToolUse` refreshes local history; hook payloads are not substituted for transcript evidence.
-- `Stop` checks contracts and checklist evidence on normal fully-idle `model_stop` / `NO_TOOL_CALL` only.
+- `Stop` checks contracts and checklist evidence on normal fully-idle `model_stop` / `NO_TOOL_CALL` only. It continues the agent only for a confirmed, fully observed miss of an `auto_continue` contract, once per conversation.
 - `PreInvocation` injects active contracts, pending checklist items, and stored graph context.
 
 ---
@@ -37,9 +37,13 @@ Register the server in `~/.gemini/config/mcp_config.json`:
   }
 }
 ```
-Use `~/.config/tsukkomi-mcp/config.toml` with a `[paths]` table, or set `SELF_DIRECT_CONFIG_FILE` in the server environment to select another file. See [config.example.toml](../config.example.toml) and the [path source contract](../README.md#user-path-configuration-toml). Relative TOML paths use the configuration file's directory; explicit arguments/environment override them.
+The `python` in the entry must be the interpreter of an environment where this package is installed. Its dependencies include the exact `neograph-engine==0.14.1`; a missing native NeoGraph runtime is an error, not a fallback.
 
-Without an override, the index remains `~/.self_direct_index`, not the installed package. Preserve an existing/managed index by selecting its absolute `index_dir` in TOML or `SELF_DIRECT_INDEX_DIR`. No stored evidence or rules are automatically migrated.
+Configure paths and credentials with explicit `SELF_DIRECT_*` variables in the server entry's `env`, or with `~/.config/tsukkomi-mcp/config.toml` and a `[paths]` table (set `SELF_DIRECT_CONFIG_FILE` in the server environment to select another file). A `.env` is read only from the server process's working directory, which the host chooses, so do not rely on it. See [config.example.toml](../config.example.toml) and the [path source contract](../README.md#user-path-configuration-toml). Relative TOML paths use the configuration file's directory; explicit arguments/environment override them.
+
+Lifecycle hooks do not read a `.env` at all. Hosts run them inside the project being edited, and that file is content the audited agent can write, so the hook process builds its settings from its own environment and the user TOML only (`config.hook_settings()`). Set the index directory, the contracts path and `SELF_DIRECT_AGY_ENFORCEMENT` for the hooks through the environment of the hook command or in the TOML, and keep them consistent with the MCP server that holds the contracts.
+
+Without an override, the index is `~/.self_direct_index`, not a directory inside the installed package or checkout (older versions defaulted to one inside the checkout). Preserve an existing/managed index by selecting its absolute `index_dir` in TOML or `SELF_DIRECT_INDEX_DIR`. No stored evidence or rules are automatically migrated.
 
 Select `sqlite_vector_path` and `openrouter_api_key_file` in TOML or their `SELF_DIRECT_` environment equivalents. Only the authorized key file's path belongs in TOML, not the key value. Missing or keyless selected files still fail closed. Keep the TOML and credentials outside writable workflow workspaces.
 
@@ -57,33 +61,41 @@ prove absence of side effects. Check the host's loaded hooks with `/hooks`.
 
 ### Enforcement and failures
 
-The default `SELF_DIRECT_AGY_ENFORCEMENT=enforced` maps:
+The default `SELF_DIRECT_AGY_ENFORCEMENT=confirmed_only` gates only confirmed findings. `advisory` never blocks, and `enforced` is the strict opt-in that also denies an unverifiable `PreToolUse`. The mode is independent of `SELF_DIRECT_CLAUDE_ENFORCEMENT`. The verdict-to-decision table is shared with the [Claude Code adapter](claude-installation.md#4-what-the-hooks-decide) (`src/self_directing_mcp/hook_policy.py`); only the host's way of expressing a decision differs.
 
-| Event / outcome | Response |
+| PreToolUse outcome | `advisory` | `confirmed_only` (default) | `enforced` |
+| --- | --- | --- | --- |
+| Confirmed `violation` | `allow`, `ADVISORY (not compliance)` reason | `deny` | `deny` |
+| `suspicious` (an exception that needs confirmation) | `allow`, advisory reason | `force_ask` (ignores Always Allow) | `force_ask` |
+| `unknown` or unavailable verification | `allow`, advisory reason | `allow` with a visible `WARNING - unverified, not a compliance verdict` reason | `deny` |
+| `unknown`, and an applicable contract has `risk: "high"` | `allow`, advisory reason | `ask` | `deny` |
+| `clean` | `allow` | `allow`, limited to the inspected contracts and history | `allow` |
+| No applicable action contract | `allow`, reason says this is not a compliance verdict | same | same |
+
+`suspicious` beside an `unknown` prerequisite stays `force_ask` in `confirmed_only` and becomes `deny` in `enforced`, because confirming an exception cannot waive another unverified prerequisite in strict mode. An `unknown` that is allowed in `confirmed_only` is also queued and shown once as an ephemeral message at the next `PreInvocation`, so the model sees it even though the host does not show an allow's reason to it. An owner-approved workflow adds one rule: a direct completion action that the workflow maps to its own executor is denied in `confirmed_only` and `enforced`. In `advisory` it is allowed with an advisory reason; advisory never gates workflows either.
+
+| Other events | Response |
 | --- | --- |
-| PreToolUse, confirmed violation | `deny` |
-| PreToolUse, exception requiring confirmation (`suspicious`) | `force_ask` (ignores Always Allow) |
-| PreToolUse, enforced unknown / unavailable verification | `deny` |
-| PreToolUse, clean | `allow`, limited to inspected contracts/history |
-| PreToolUse, no applicable action contracts | `allow`, explicitly not a compliance verdict |
-| Stop, normal fully-idle model stop with pending/unknown/failed obligations | `continue` |
-| Stop, cancellation, error, step limit, or active background work | `allow`; never restart cancellation |
-| PreInvocation failure | Ephemeral warning, not a permission decision |
-| PostToolUse | `{}`; failures are diagnosed on stderr, never fabricated successful results |
+| `Stop`, a normal fully-idle `model_stop` / `NO_TOOL_CALL`, with an `auto_continue` obligation confirmed unmet on complete, current evidence | `continue`, once per conversation |
+| `Stop`, an incomplete owner-approved workflow | `continue`, sharing the same once-per-conversation budget; `allow` in `advisory` |
+| `Stop`, anything else on a normal stop (unknown evidence, an unmet obligation without `auto_continue`, pending checklist items, incomplete history, budget spent) | `allow`, with a note that completion was not verified |
+| `Stop`, cancellation, error, step limit, or active background work | `allow`; never restart cancellation |
+| `PreInvocation` | Ephemeral message with the health banner, queued warnings, workflow status, up to 8 contracts, up to 8 pending items and up to 8 graph relations (all marked as data). When it fails: an ephemeral warning, not a permission decision |
+| `PostToolUse` | `{}`; refreshes local history. Failures are diagnosed on stderr and queued as a warning, never fabricated as successful results |
 
-Explicit `SELF_DIRECT_AGY_ENFORCEMENT=advisory` allows actions/stops while reporting
-non-clean findings as advisory, not compliance. Invalid input, broken imports,
-native runtime failures, and corrupt configuration are not converted to permission:
-before policy can be loaded, PreToolUse fails closed even if advisory was intended.
-Malformed Stop metadata does not restart the host, since it cannot establish a
-normal model stop. Unsupported events are rejected. Always register the event
-explicitly (`--event=PreToolUse`, etc.); tool payload shape cannot distinguish pre/post.
+The stop policy is the same in `confirmed_only` and `enforced`; `advisory` never continues.
+
+**The `continue` budget.** At most one continuation per conversation, persisted in `<index_dir>/agy-hook-state.sqlite` so turns and process restarts never reset it. The same reason (contract ids and revisions) is never used twice, and an unreadable or unwritable counter means "do not continue". Unknown evidence, legacy defects (see below), pending checklist items, description-only contracts and hook errors never continue.
+
+**Failures fail open.** Invalid input, a malformed or unsupported event, a broken import, a native runtime failure, an unreadable index and corrupt configuration produce a visible warning and never a block, in every mode. `PreToolUse` answers `allow` with the warning, except that when the mode is not `advisory` and an enabled `risk: "high"` contract applies to the call (read with the standard library, so it works without the package) the answer is `ask`. `Stop` answers `allow`, `PostToolUse` answers `{}`, and `PreInvocation` skips the injection and says so. A failed host-receipt write does not skip the check; the response notes the missing receipt and later success evidence for that call may stay unlinked. `scripts/agy_hook.py` has a standard-library fallback that does the same after an import failure. Malformed Stop metadata cannot establish a normal model stop, so it never restarts the host. Always register the event explicitly (`--event=PreToolUse`, etc.); tool payload shape cannot distinguish pre/post.
+
+**`hook_health` and the banner.** Each outcome updates a table in `<index_dir>/agy-hook-state.sqlite` that stores error classes, counts and timestamps, never payload text. It separates `audit_unavailable` (nothing can be checked) from `check_failed` (one event's check failed). After three consecutive failures, `PreInvocation` adds a `Tsukkomi audit INACTIVE` or `Tsukkomi audit DEGRADED` banner. A working call ends the streak. Claude Code keeps its own state file, so the two hosts never share a budget or a banner.
 
 Temporal `must` rules use `regex` for the required predecessor and `before_regex`
 for the gated action. A `must` without `before_regex` is a Stop/checkpoint obligation,
 not a barrier preventing the test needed to satisfy it. Action applicability is
 computed from the actual rule, role, scope, tool, and arguments—not a command-verb
-allowlist. An exception cannot waive an independently unknown prerequisite.
+allowlist. An exception cannot waive an independently unknown prerequisite. The contract fields `risk`, `auto_continue` and `when` are described in the [README](../README.md#contract-fields-risk-auto_continue-and-when).
 
 ### Transcript roots and evidence
 
@@ -102,7 +114,8 @@ the repository and use a private index.
 
 The parser is grounded in isolated synthetic Antigravity CLI 1.2.9 runs:
 `USER_INPUT`, `PLANNER_RESPONSE`, `SYSTEM_SDK/EPHEMERAL_MESSAGE`, and `GENERIC`
-command results with an explicit runtime exit-code prefix. Display arguments
+command results with an explicit runtime exit-code prefix. Parser version 7 also
+reads the IDE's typed result steps (see [parser version 7](#parser-version-7-ide-result-steps-context-steps-and-host-padding)). Display arguments
 are JSON-encoded strings; full-log arguments are ordinary JSON values.
 Both log formats omit tool call IDs and result references. Therefore the hook
 stores separate host receipts in `SELF_DIRECT_INDEX_DIR/agy-receipts.sqlite`.
@@ -137,16 +150,84 @@ CLI 1.2.9 emits `NO_TOOL_CALL` for normal Stop; the documented `model_stop` is
 also accepted. All other termination reasons pause/stop without restarting.
 Other native record formats remain unsupported until observed and validated.
 
+### Parser version 6: truncated fields, result statuses and legacy results
+
+The display log (`transcript.jsonl`) can cut a long field and list it in the record's `truncated_fields`. Parser version 6 handles that explicitly instead of treating the visible prefix as the whole value. Raising the parser version reparses each already-indexed AGY session once, on its next sync or audit.
+
+**Fallback to `transcript_full.jsonl`.** For `USER_INPUT.content`, `PLANNER_RESPONSE.content`, `PLANNER_RESPONSE.tool_calls` and `GENERIC.content` (and `content` of the IDE's typed results), the parser looks up the same `step_index` in the sibling `transcript_full.jsonl` in the same directory (a symlink or a file of another conversation is refused). The full log is indexed in one streaming pass that keeps, per complete line, only the step, its byte range and a short digest, so memory grows with the number of records, not the file size; nothing about the full log is persisted. A restore must pass these checks: the record at that step has the same type, source and status; the field is complete and longer than the visible text and starts with the same text (for `tool_calls`, with the same call names); and the file still has the identity and digest it was indexed with. When it passes, the field is restored within the same step: the chunk carries the full text, `restored_fields`, a `full_ref` (byte range and digest in the full log) and, when no other judged field of that record is still cut, `source: "full"`. The restored field has no truncation marker.
+
+**When the fallback fails.** The chunk keeps its visible text, keeps the field in `truncated_fields`, has `source: "display"` and records `fallback: {reason, retryable, full_size}`. The reasons are `full_missing`, `full_unavailable`, `full_changed`, `full_missing_step`, `full_duplicate_step`, `full_step_mismatch`, `full_truncated`, `full_field_missing`, `full_field_invalid`, `full_prefix_mismatch`, `full_not_longer` and `source_is_full` (the log being parsed is itself `transcript_full.jsonl`, so there is no sibling). Only transient failures are retryable: the full log is missing, has not reached that step yet, changed or could not be read. A retryable failure is retried once for each change of the full log's size (`reindex_reason: truncated_fallback_retry`); a permanent failure is never retried on every growth.
+
+`thinking`, `CHECKPOINT`, `SYSTEM_MESSAGE` and `EPHEMERAL_MESSAGE` text is context, not evidence. Truncation of those fields is counted as `ignored` and never changes a verdict.
+
+**Partial-observation rules.** A field that is still cut changes what the evidence can prove, never what it matched:
+
+- A visible match still counts. A forbidden command in the visible part of a call is a `violation`.
+- A contract that would be `clean` only for lack of a match, or unmet only for lack of evidence, while a field it depends on is still cut, is `unknown` with the reason `truncated_content` or `truncated_tool_calls` (in general `truncated_<field>`).
+- A truncated `USER_INPUT` never grants a permission: it cannot extend an exception (the finding stays a `violation` with that reason) and cannot satisfy a user-role requirement.
+- A truncated tool result never establishes success (`success_withheld: truncated_content`), but it does not hide a failure.
+
+`coverage.agy_evidence.truncation` counts `restored_from_full`, `unrestored` (judged fields still cut) and `ignored` fields by `<type>.<field>`.
+
+**Statuses and record types.** A `GENERIC` result (or one of the IDE's typed results) has a `status` of `DONE`, `RUNNING`, `ERROR`, `INVALID` or `CANCELED`; a recorded status outside that set is an unsupported event (a missing status is accepted).
+
+| Record | Handling |
+| --- | --- |
+| `RUNNING` result | Pending: `success` is unset and `pending: true`. An obligation that depends on it is `unknown` with the reason `pending_running` until a final record for that step arrives. |
+| `ERROR`, `INVALID`, `CANCELED` result | Never success evidence. The attempt remains: a forbidden command that was proposed is still a violation. An attempt that the pre-tool hook blocked (`tool call denied by pre-tool hook:` plus the anchored Pre receipt) is recorded as non-execution and is not counted as a violation. |
+| `CHECKPOINT` | A context projection (`[checkpoint]`, runtime role): never a new user instruction and never observed execution. |
+| `ERROR_MESSAGE` | Runtime text (`[host_error_message]`), not part of the default judgement. |
+| Media on a result | One placeholder per item, `[media #N type=<mime> chars=<n> sha256=<12 hex>]`, and `media_count` in the metadata. The payload is never indexed; data URIs and long base64 runs elsewhere in text become `[blob omitted: N chars]`. |
+
+**Legacy results.** The native logs omit call ids, so a result is linked to its call only through a host receipt. A tool result (`GENERIC` or a typed IDE result) without a receipt that comes before the conversation's first receipt (or in a conversation that has none) is `legacy_unlinked`. It is a known limitation of that history, not a current-session defect: it does not make `coverage.complete` false. A result without a receipt after the first receipt stays an unsupported-event defect. Coverage reports:
+
+| Field | Meaning |
+| --- | --- |
+| `receipts_since` | `{step_index, byte_offset}` of the conversation's first receipt, or `null` if it has none. |
+| `legacy_unlinked_count` | Number of legacy results. |
+| `result_dependent_complete` | `false` while any result is legacy; evidence that depends on results is not complete. |
+| `unknown_breakdown` | Count of `unknown` findings split into `current_session` and `unsupported_legacy`. |
+| `agy_evidence` | Counts of legacy and running results, media placeholders, host-padded records (`host_padded_records`, parser version 7) and truncation by class. |
+
+In an audit, an obligation that needs the executed call or its result and can only rest on legacy results is `unknown` with the reason `unsupported_legacy`: never unmet and never clean. Judgement of the call side (a forbidden command proposed by the model) is unaffected. Hooks add receipts from the moment they are installed; they do not create them retroactively.
+
 For manual MCP calls pass `provider: "agy"`, the real `session_id`, and `path`
 on sync/check/audit operations. Codex remains the shared API default.
+
+### Parser version 7: IDE result steps, context steps and host padding
+
+Version 7 adds three things. Raising the parser version reparses each already-indexed AGY session once, on its next sync or audit; event ids, anchors and cached vectors of unchanged events survive, and `embed=false` calls no embedding API. A running MCP process or hook process only picks the new parser up after a restart.
+
+**IDE typed result steps.** The Antigravity IDE (`antigravity-ide` app data) writes the result of a tool call as a step whose type names the tool, where the CLI writes `GENERIC`. These five types are tool results with the same evidence rules as `GENERIC`:
+
+| Step type | Carries | Notes |
+| --- | --- | --- |
+| `RUN_COMMAND` | `content`, `exit_code` | The only typed result that can be success evidence (below). |
+| `VIEW_FILE` | `content`, `truncated_fields` | Output of reading a file. |
+| `CODE_ACTION` | `content` | Result of an edit. |
+| `MCP_TOOL` | `content` | Result of an MCP tool. |
+| `LIST_DIRECTORY` | `content` | Result of a directory listing. |
+
+- **Linkage.** No call ids exist, so a result is linked to its call only through a host receipt (`linkage: host_step_receipt`, with the call emitted as a `tool_call` event). A result without a receipt is `legacy_unlinked` when it comes before the conversation's first receipt (or in a conversation that has none) and a current-session defect (`native_log_omits_call_id`, an unsupported event) after it, exactly as for `GENERIC`. Hook receipts bind to a typed result the same way: a result that already existed when the Pre hook ran, or that was rewritten afterwards, cannot be linked. The chunk metadata keeps the step type as `result_type` (the `GENERIC` chunk is unchanged), and `result_type` is part of the slim event metadata audits see.
+- **Truncation.** `content` falls back to the same step of `transcript_full.jsonl` under the checks above; what stays cut is marked, counted in `coverage.agy_evidence.truncation` (`VIEW_FILE.content`, `RUN_COMMAND.content`, ...) and leaves a dependent verdict `unknown` with the reason `truncated_content`. A visible match still counts. A cut result that cannot carry success (`VIEW_FILE`, `CODE_ACTION`, `MCP_TOOL`, `LIST_DIRECTORY`) does not affect a success obligation.
+- **Status.** `RUNNING` is pending (`pending_running` until a final record for that step arrives; a command that is still running when the session ends stays `unknown`), `ERROR`, `INVALID` and `CANCELED` are never success, and an unrecognized status is an unsupported event.
+- **`RUN_COMMAND` exit codes.** `exit_code` is the host-recorded execution status, read from the structured field and never from output text, and not at all while the command is `RUNNING`. A `DONE` command with `exit_code` 0 that is linked to its call by a host receipt (a `run_command` call) is success evidence wherever a `GENERIC` success would be: it satisfies `requires_success` and checklist evidence. A nonzero `exit_code` is a failure (`success: false`, recorded as `exit_code` in the metadata) whether or not the result is linked; that can only make a verdict worse. An unlinked result is never success (`success_withheld: unlinked`). Success is also withheld, as for `GENERIC`, when the output is still cut (`truncated_content`) and is `false` when the Post hook reported an error. A linked `DONE` `RUN_COMMAND` without an `exit_code` is an unsupported event; a present `exit_code` that is not an integer is a parse error.
+- **Other typed results** can be linked to their call but are never proof that the tool met its objective: their `success` stays unset (a failed status gives `false`).
+- A typed result is accepted only from `source: "MODEL"`. A typed result from another source, or with a status outside the known set, stays an unsupported event.
+
+**Context steps.** `CONVERSATION_HISTORY` and `KNOWLEDGE_ARTIFACTS` (source `SYSTEM`, no content) record that the IDE loaded context. They are runtime metadata (`role: runtime`, `evidence_origin: conversation_history` or `knowledge_artifacts`): never a user instruction, never observed execution, and not unsupported. Any other unknown step type stays `unsupported_event`, as before.
+
+**Host padding.** One CLI transcript contained a line made of a contiguous run of NUL bytes immediately followed by a complete JSON record, between two consecutive steps. The parser strips a *leading* NUL run from a line; if the remainder parses as a valid record, the record is accepted and its chunks carry `host_padding_bytes` (the run length; the byte range and anchors still cover the host's own bytes). `coverage.agy_evidence.host_padded_records` counts padded lines once each. The same reader is used for `transcript_full.jsonl` (the fallback) and for hook-receipt anchoring. Nothing else changes: a line that is only NULs, NULs followed by something that is not a valid record, NULs after or inside a record, and a padding run that is not at the very start of the line all stay parse errors that make coverage incomplete. Neighbouring step indexes never excuse a bad line, so a missing step stays visible.
 
 ### Host verification checklist
 
 With isolated synthetic workspace/history, verify forbidden commands and restricted
 reads are blocked, a failed prerequisite remains blocked, a successful prerequisite
-unlocks its dependent action, unverified checklist work continues a normal Stop,
-cancel still stops, and PreInvocation context appears. Verify `force_ask` with a
-cached Always Allow grant. Offline tests do not establish host registration,
+unlocks its dependent action, an `unknown` call is allowed with a warning that
+appears at the next PreInvocation (and asks when a `risk: "high"` contract applies),
+a confirmed unmet `auto_continue` obligation continues a normal Stop once and not a
+second time, unverified checklist work only produces a note, cancel still stops, and
+PreInvocation context appears. Verify `force_ask` with a cached Always Allow grant. Offline tests do not establish host registration,
 cached-grant behavior, or UI behavior. Never claim these without observing them.
 The official contract is [Google's hooks documentation](https://antigravity.google/docs/hooks).
 

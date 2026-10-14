@@ -4,11 +4,15 @@ import re
 import os
 from pathlib import Path, PureWindowsPath
 
-# rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl (uuid may be dashed)
+from self_directing_mcp.compressed_source import SUFFIX, CompressedSourceError, is_compressed
+
+# rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl (uuid may be dashed). Codex compresses older rollouts in place to
+# rollout-...-<uuid>.jsonl.zst, and a forked or sub-agent rollout can carry a second "_<uuid>" suffix.
 _UUID_RE = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
 _ROLLOUT_RE = re.compile(r"^rollout-.*\.jsonl$", re.IGNORECASE)
+_ROLLOUT_ZST_RE = re.compile(r"^rollout-.*\.jsonl\.zst$", re.IGNORECASE)
 
 
 class PathTraversalError(ValueError):
@@ -54,12 +58,20 @@ def ensure_under_root(path: Path, root: Path) -> Path:
 
 
 def session_id_from_filename(path: Path) -> str | None:
-    m = _UUID_RE.search(path.name)
-    return m.group(1).lower() if m else None
+    """The one UUID in a rollout file name. Two UUIDs (a ``_<uuid>`` suffix) do not say which one is the
+    session, so the answer is None and the ``session_meta`` header decides."""
+    found = {m.lower() for m in _UUID_RE.findall(path.name)}
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _discovery_key(path: Path):
+    # A plain rollout sorts before its compressed twin: while both exist the plain file is the live one.
+    compressed = is_compressed(path)
+    return (str(path)[:-len(SUFFIX)] if compressed else str(path), compressed)
 
 
 def discover_session_files(sessions_dir: Path) -> list[Path]:
-    """Find Codex rollout JSONL files under YYYY/MM/DD/ layout (or flat)."""
+    """Find Codex rollout files under YYYY/MM/DD/ layout (or flat): ``*.jsonl`` and ``rollout-*.jsonl.zst``."""
     root = Path(sessions_dir)
     if not root.exists():
         return []
@@ -68,30 +80,51 @@ def discover_session_files(sessions_dir: Path) -> list[Path]:
         if _ROLLOUT_RE.match(p.name) or p.suffix.lower() == ".jsonl":
             if p.is_file():
                 found.append(p)
-    return sorted(found)
+    for p in root.rglob("*" + SUFFIX):
+        if _ROLLOUT_ZST_RE.match(p.name) and p.is_file():
+            found.append(p)
+    return sorted(found, key=_discovery_key)
 
 
 def find_session_by_id(sessions_dir: Path, session_id: str) -> Path | None:
-    """Resolve session by UUID in filename (preferred) under sessions root."""
+    """Resolve session by UUID in filename (preferred) under sessions root.
+
+    A compressed rollout whose header cannot be inspected is never skipped silently: when no other file
+    matches, the failure is raised as a ``CompressedSourceError`` instead of "not found".
+    """
     root = Path(sessions_dir)
     sid = session_id.strip().lower()
     if not sid:
         return None
-    for p in discover_session_files(root):
+    files = discover_session_files(root)
+    for p in files:
         fid = session_id_from_filename(p)
         if fid and fid == sid:
             return ensure_under_root(p, root)
-    # Fallback: scan session_meta.payload.id (lazy import to avoid cycles)
-    from self_directing_mcp.codex.parse import peek_session_id
+    # Fallback: scan session_meta.payload.id (lazy import to avoid cycles). Names with no single UUID
+    # (the "_<uuid>" suffix form) are the likeliest matches, so they go first.
+    from self_directing_mcp.codex.parse import read_session_id
 
-    for p in discover_session_files(root):
+    unreadable: list[CompressedSourceError] = []
+    for p in sorted(files, key=lambda q: session_id_from_filename(q) is not None):
         try:
             ensure_under_root(p, root)
         except PathTraversalError:
             continue
-        meta_id = peek_session_id(p)
+        try:
+            meta_id = read_session_id(p)
+        except CompressedSourceError as exc:
+            unreadable.append(exc)
+            continue
+        except OSError:
+            continue
         if meta_id and meta_id.lower() == sid:
             return p.resolve()
+    if unreadable:
+        raise CompressedSourceError(
+            unreadable[0].code,
+            f"{len(unreadable)} compressed session file(s) under the sessions root could not be inspected, so "
+            f"session {sid} may be among them: {unreadable[0]}")
     return None
 
 

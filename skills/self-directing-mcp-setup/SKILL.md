@@ -51,6 +51,7 @@ Key installed packages:
 - `pydantic>=2.0` & `pydantic-settings`
 - `numpy>=1.26`
 - `httpx` & `python-dotenv`
+- `zstandard>=0.23` on Python before 3.14 (reads compressed Codex sessions, `rollout-*.jsonl.zst`; 3.14+ uses `compression.zstd`)
 
 ### 3. Native `sqlite-vector` Extension Provisioning
 Dense vector search requires the official `sqliteai/sqlite-vector` v1.1.0 release library. Download and verify the AVX2 checksum-pinned binary:
@@ -90,7 +91,9 @@ with zipfile.ZipFile(io.BytesIO(data)) as z:
 ```
 
 ### 5. Environment & API Key Configuration
-Create a `.env` file in the project root:
+Settings are read from the environment and from a `.env` file in the server's working directory
+(not the package or checkout directory). For hosts that start the server elsewhere, set the
+`SELF_DIRECT_*` variables in the host's MCP/hook configuration or use the TOML path config:
 ```env
 # OpenRouter API Key (sk-or-v1-...)
 OPENROUTER_API_KEY=
@@ -105,7 +108,9 @@ SELF_DIRECT_DENSE_BACKEND=sqlite-vector
 # Otherwise the key follows explicit Settings, environment, and cwd .env precedence.
 ```
 > [!NOTE]
-> If `OPENROUTER_API_KEY` is not provided, set `SELF_DIRECT_USE_FAKE_EMBEDDER=true` to enable offline bag-of-tokens embedding and local regex contracts.
+> Without an OpenRouter key, setup is incomplete: fix the key instead of substituting a fake embedder. A key-free
+> installation must be chosen explicitly with `SELF_DIRECT_LOCAL_ONLY=true` (no embedder, no dense or hybrid search,
+> regex/sparse retrieval and local audits only). `SELF_DIRECT_USE_FAKE_EMBEDDER=true` is for offline tests only.
 
 For user-custom paths, copy `config.example.toml` to `~/.config/tsukkomi-mcp/config.toml` and edit its `[paths]` values, or set `SELF_DIRECT_CONFIG_FILE` in the MCP/extension process environment. Relative paths use the TOML directory; explicit environment entries override them. Keep the edited TOML and authorized key file outside agent-writable workspaces, and put only credential file paths—not key values—in TOML. Restart the server/extension after changing selected paths.
 

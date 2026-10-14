@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Sequence
 import tempfile
 
-import numpy as np
+from self_directing_mcp._runtime import np
 
 from self_directing_mcp.index.native import NativeVectorStore
 from self_directing_mcp.request_control import check_request, publication, request_operation

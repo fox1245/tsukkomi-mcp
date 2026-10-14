@@ -8,9 +8,11 @@ from typing import Callable, Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES
+
 
 _PATH_FIELDS = frozenset({
-    "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir",
+    "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
     "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file",
 })
 
@@ -87,6 +89,14 @@ def _default_omp_sessions_dir() -> Path:
     return Path(os.environ.get("SELF_DIRECT_OMP_SESSIONS_DIR") or Path.home() / ".omp" / "sessions")
 
 
+def _default_claude_projects_dir() -> Path:
+    # Claude Code keeps its projects under CLAUDE_CONFIG_DIR when set; the MCP server and hooks inherit it.
+    configured = os.environ.get("SELF_DIRECT_CLAUDE_PROJECTS_DIR")
+    if configured:
+        return Path(configured)
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -103,10 +113,12 @@ def _default_sqlite_vector_path() -> Path | None:
     if override:
         return Path(override).expanduser().resolve()
     repo = _repo_root()
-    for ext in ("vector.so", "vector.dll", "vector.dylib"):
-        cand = repo / "native" / ext
-        if cand.is_file():
-            return cand.resolve()
+    # scripts/setup_sqlite_vector.py defaults to .native/; older installs used native/.
+    for directory in ("native", ".native"):
+        for ext in ("vector.so", "vector.dll", "vector.dylib"):
+            cand = repo / directory / ext
+            if cand.is_file():
+                return cand.resolve()
     return None
 
 
@@ -120,12 +132,14 @@ class Settings(BaseSettings):
     codex_sessions_dir: Path = Field(default_factory=_default_codex_sessions_dir)
     grokbot_transcripts_dir: str | list[Path] = Field(default_factory=_default_grokbot_transcripts_dir)
     omp_sessions_dir: Path = Field(default_factory=_default_omp_sessions_dir)
+    claude_projects_dir: Path = Field(default_factory=_default_claude_projects_dir)
     agy_app_data_dirs: list[Path] = Field(default_factory=lambda: [
         Path.home() / ".gemini" / name
         for name in ("antigravity", "antigravity-cli", "antigravity-ide")
     ])
-    agy_enforcement: Literal["enforced", "advisory"] = "enforced"
-    session_provider: Literal["codex", "grokbot", "omp", "agy"] = "codex"
+    agy_enforcement: Literal["confirmed_only", "advisory", "enforced"] = "confirmed_only"
+    claude_enforcement: Literal["confirmed_only", "advisory", "enforced"] = "confirmed_only"
+    session_provider: Literal["codex", "grokbot", "omp", "agy", "claude"] = "codex"
     index_dir: Path = Field(default_factory=_default_index_dir)
     contracts_path: Path | None = Field(
         default=None,
@@ -158,6 +172,13 @@ class Settings(BaseSettings):
         ge=1,
         description="Max heavy tool calls (sync/search/audit/checklist/hooks) running at once; "
                     "excess requests queue within their own deadline. SELF_DIRECT_MAX_CONCURRENT_CALLS.",
+    )
+    max_decompressed_session_bytes: int = Field(
+        default=DEFAULT_MAX_DECOMPRESSED_BYTES,
+        ge=1,
+        description="Upper bound on the declared decompressed size of a zstd-compressed Codex session "
+                    "(rollout-*.jsonl.zst). A larger file is reported as zstd_too_large and not decoded. "
+                    "SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES.",
     )
     rrf_k: int = 60
     retrieve_top_k: int = 20
@@ -194,6 +215,9 @@ class Settings(BaseSettings):
     def resolve_omp_sessions_dir(self) -> Path:
         return Path(self.omp_sessions_dir)
 
+    def resolve_claude_projects_dir(self) -> Path:
+        return Path(self.claude_projects_dir)
+
     def resolve_agy_app_data_dirs(self) -> list[Path]:
         return [Path(root).expanduser().resolve() for root in self.agy_app_data_dirs]
 
@@ -202,7 +226,7 @@ class Settings(BaseSettings):
 
         return parse_transcripts_dirs(self.grokbot_transcripts_dir)
 
-    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp", "agy"]:
+    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp", "agy", "claude"]:
         return self.session_provider
 
     def resolve_contracts_path(self) -> Path:
@@ -211,9 +235,17 @@ class Settings(BaseSettings):
         return Path(self.index_dir) / "contracts.json"
 
 
+def hook_settings() -> Settings:
+    """Settings for lifecycle hooks: environment and the user TOML only, never a ``.env`` in the working directory.
+
+    Hosts run hooks in the project being worked on, so a ``.env`` there is content the audited agent can write.
+    Reading it would let that agent point the hook at an empty index or another mode and silence its own checks.
+    The hook state modules resolve the same keys from the same two sources.
+    """
+    return Settings(_env_file=None)
+
+
 def get_settings(**overrides) -> Settings:
-    key_file = os.environ.get("SELF_DIRECT_OPENROUTER_API_KEY_FILE")
-    if key_file and Path(key_file).is_file():
-        from dotenv import load_dotenv
-        load_dotenv(key_file)
+    # The key file is read by resolve_api_key() for OPENROUTER_API_KEY only. It is never loaded into
+    # os.environ, where subprocesses and native hosts would inherit every variable it holds.
     return Settings(**overrides)

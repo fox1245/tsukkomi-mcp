@@ -57,12 +57,16 @@ def test_restricted_reads_edits_and_internal_looking_names(engine, tool):
     assert result["decision"] == "deny"
 
 
-def test_no_rules_differs_from_enforced_unknown_and_advisory(engine):
+def test_no_rules_differs_from_unknown_in_each_mode(engine):
     obj, path = engine
     call = {"name": "run_command", "args": {"CommandLine": "deploy"}}
     assert handle_pre_tool_use(obj, SID, call, str(path))["decision"] == "allow"
     obj.upsert_contracts([{"id": "precondition", "provider": "agy", "type": "must", "scope": "tool_call",
                           "regex": "npm test", "before_regex": "deploy", "requires_success": True}])
+    assert obj.settings.agy_enforcement == "confirmed_only"
+    warned = handle_pre_tool_use(obj, SID, call, str(path))
+    assert warned["decision"] == "allow" and "WARNING" in warned["reason"]
+    obj.settings.agy_enforcement = "enforced"
     assert handle_pre_tool_use(obj, SID, call, str(path))["decision"] == "deny"
     obj.settings.agy_enforcement = "advisory"
     assert handle_pre_tool_use(obj, SID, call, str(path))["decision"] == "allow"
@@ -88,7 +92,9 @@ def test_stop_pending_and_cancellation(engine, normal_reason):
     obj, path = engine
     obj.update_checklist(SID, provider="agy", add=[{"text": "Verify integration"}])
     payload = {"transcriptPath": str(path), "fullyIdle": True, "terminationReason": normal_reason}
-    assert handle_stop(obj, SID, payload)["decision"] == "continue"
+    # An unverified checklist is reported, never a reason to restart the model.
+    pending = handle_stop(obj, SID, payload)
+    assert pending["decision"] == "allow" and "Verify integration" in pending["reason"]
     for reason in ("user_cancel", "cancelled", "error", "max_steps_exceeded"):
         payload["terminationReason"] = reason
         assert handle_stop(obj, SID, payload)["decision"] == "allow"
@@ -139,10 +145,11 @@ def test_invalid_payload_is_not_permission(payload):
 
 
 def test_event_specific_failure_controls():
-    assert failure_response("PreToolUse")["decision"] == "deny"
+    # Internal errors fail open with a warning in every mode; Stop never restarts the host.
+    assert failure_response("PreToolUse")["decision"] == "allow"
     assert failure_response("PostToolUse") == {}
     assert "injectSteps" in failure_response("PreInvocation")
-    assert failure_response("Stop", {"terminationReason": "model_stop", "fullyIdle": True})["decision"] == "continue"
+    assert failure_response("Stop", {"terminationReason": "model_stop", "fullyIdle": True})["decision"] == "allow"
     assert failure_response("Stop", {"terminationReason": "cancelled", "fullyIdle": True})["decision"] == "allow"
 
 
@@ -158,9 +165,9 @@ def test_wrapper_import_has_no_input_or_reexec(tmp_path):
 
 
 @pytest.mark.parametrize("event,payload,key,decision", [
-    ("PreToolUse", "broken JSON", "decision", "deny"),
-    ("Stop", '{"fullyIdle":true,"terminationReason":"model_stop"}', "decision", "continue"),
-    ("Stop", '{"fullyIdle":true,"terminationReason":"NO_TOOL_CALL"}', "decision", "continue"),
+    ("PreToolUse", "broken JSON", "decision", "allow"),
+    ("Stop", '{"fullyIdle":true,"terminationReason":"model_stop"}', "decision", "allow"),
+    ("Stop", '{"fullyIdle":true,"terminationReason":"NO_TOOL_CALL"}', "decision", "allow"),
     ("Stop", '{"fullyIdle":true,"terminationReason":"cancelled"}', "decision", "allow"),
     ("PreInvocation", "{}", "injectSteps", None),
     ("PostToolUse", "{}", None, None),
@@ -186,12 +193,14 @@ def test_wrapper_native_import_failure_is_event_specific(tmp_path, event, payloa
         assert response[key] == decision
 
 
-def test_real_wrapper_rejects_malformed_json_without_echoing_input():
+def test_real_wrapper_fails_open_on_malformed_json_without_echoing_input(tmp_path, monkeypatch):
+    monkeypatch.setenv("SELF_DIRECT_INDEX_DIR", str(tmp_path / "index"))  # health is recorded; keep it off the real index
     result = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "agy_hook.py"), "--event=PreToolUse"],
         input="do-not-echo-this-malformed-payload", capture_output=True, text=True, timeout=15)
     assert result.returncode == 0
-    assert json.loads(result.stdout)["decision"] == "deny"
+    response = json.loads(result.stdout)
+    assert response["decision"] == "allow" and "not a compliance verdict" in response["reason"]
     assert "do-not-echo" not in result.stdout + result.stderr
 
 
@@ -207,10 +216,14 @@ def test_unrelated_recovery_action_is_not_blocked_by_missing_prerequisite_histor
 
 def test_completion_only_must_does_not_prevent_its_own_test(engine):
     obj, path = engine
-    obj.upsert_contracts([{"id": "finish-with-tests", "provider": "agy", "type": "must",
+    obj.upsert_contracts([{"id": "finish-with-tests", "provider": "agy", "type": "must", "auto_continue": True,
                           "scope": "tool_call", "regex": "npm test", "requires_success": True}])
     assert handle_pre_tool_use(obj, SID, {"name": "run_command", "args": {"CommandLine": "npm test"}}, str(path))["decision"] == "allow"
-    assert handle_stop(obj, SID, {"transcriptPath": str(path), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"})["decision"] == "continue"
+    stop = {"transcriptPath": str(path), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"}
+    # No history file yet: the obligation cannot be confirmed unmet, so it is reported but never resumes the model.
+    assert handle_stop(obj, SID, stop)["decision"] == "allow"
+    _clean_history(path)
+    assert handle_stop(obj, SID, stop)["decision"] == "continue"
 
 
 def test_exception_confirmation_cannot_waive_unknown_prerequisite(engine):
@@ -218,8 +231,10 @@ def test_exception_confirmation_cannot_waive_unknown_prerequisite(engine):
     prohibit(obj, "deploy", exception_regex="staging")
     obj.upsert_contracts([{"id": "tests-first", "provider": "agy", "type": "must", "scope": "tool_call",
                           "regex": "npm test", "before_regex": "deploy", "requires_success": True}])
-    response = handle_pre_tool_use(obj, SID, {"name": "run_command", "args": {"CommandLine": "deploy staging"}}, str(path))
-    assert response["decision"] == "deny"
+    action = {"name": "run_command", "args": {"CommandLine": "deploy staging"}}
+    assert handle_pre_tool_use(obj, SID, action, str(path))["decision"] == "force_ask"   # concrete exception, shown to the user
+    obj.settings.agy_enforcement = "enforced"
+    assert handle_pre_tool_use(obj, SID, action, str(path))["decision"] == "deny"        # strict mode keeps the old waiver rule
 
 
 def test_forged_checklist_result_ids_do_not_unlock_stop(engine):
@@ -228,7 +243,8 @@ def test_forged_checklist_result_ids_do_not_unlock_stop(engine):
     claimed = obj.update_checklist(SID, provider="agy", update=[
         {"item_id": "req-001", "status": "done", "verified": True, "evidence_chunk_ids": ["invented-result"]}])
     assert claimed["updated"][0]["status"] == "pending_verification"
-    assert handle_stop(obj, SID, {"transcriptPath": str(path), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"})["decision"] == "continue"
+    response = handle_stop(obj, SID, {"transcriptPath": str(path), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"})
+    assert response["decision"] == "allow" and "Verify the result" in response["reason"]
 
 
 def _clean_history(path):
@@ -246,7 +262,7 @@ def test_stop_judges_a_growing_transcript_up_to_its_captured_prefix(engine):
     assert handle_stop(obj, SID, payload) == {"decision": "allow"}
 
 
-def test_stop_still_continues_when_history_has_gaps_beyond_growth(engine):
+def test_stop_reports_gaps_beyond_growth_without_continuing(engine):
     obj, path = engine
     prohibit(obj, "private-file")
     _clean_history(path)
@@ -254,4 +270,4 @@ def test_stop_still_continues_when_history_has_gaps_beyond_growth(engine):
         stream.write("not json\n")
     payload = {"transcriptPath": str(path), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"}
     response = handle_stop(obj, SID, payload)
-    assert response["decision"] == "continue" and "incomplete" in response["reason"]
+    assert response["decision"] == "allow" and "incomplete" in response["reason"]

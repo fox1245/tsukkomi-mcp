@@ -8,6 +8,7 @@
 index_dir = "~/.self_direct_index"
 codex_sessions_dir = "~/.codex/sessions"
 omp_sessions_dir = "~/.omp/sessions"
+claude_projects_dir = "~/.claude/projects"
 grokbot_transcripts_dir = []
 agy_app_data_dirs = [
   "~/.gemini/antigravity",

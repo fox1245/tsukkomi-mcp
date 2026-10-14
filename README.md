@@ -1,24 +1,21 @@
-# 💥 Tsukkomi MCP (ツッコミ)
+# Tsukkomi MCP (ツッコミ)
 
-> **The Deterministic "No-BS" Governance & Tsukkomi Harness for Autonomous AI Agents**  
-> *When your AI coding agent tries to delete files, leak secrets, write fake "done" reports, or touch unauthorized repos, Tsukkomi immediately slaps it down.*  
-> *Enforce hard invariant contracts, verifiable evidence gates, and session GraphRAG across Google Antigravity (AGY), OpenAI Codex, and Cursor/Grok Bot.*
-
----
+> A deterministic governance and evidence server for autonomous coding agents, version 0.6.0.
+> The distribution is `tsukkomi-mcp`; the Python package is `self_directing_mcp`.
 
 ## Overview
 
-Autonomous coding agents are powerful, but prompt-based instructions alone are vulnerable to hallucination, context drift, false completion claims, and unintended destructive actions.
+Prompt instructions alone do not keep an agent from context drift, false completion reports or a forbidden command. Tsukkomi MCP indexes the agent's own session history on the local machine, checks proposed actions and finished work against explicit, user-registered contracts, tracks requirement checklists that need linked evidence, and optionally maintains a session knowledge graph.
 
-**Tsukkomi MCP** is an authoritative, deterministic governance harness. It runs alongside your agent, intercepting tool calls at the lifecycle hook level, checking actions against explicit invariant contracts, maintaining verifiable evidence checklists, and injecting live architectural knowledge graphs into agent context.
+Every check returns one of four verdicts: `clean`, `violation`, `suspicious` or `unknown`. `unknown` means the evidence needed for a verdict is missing or has changed, and it is never reported as `clean`. The one incomplete input that can still yield `clean` is a pure append to a growing session, which is judged as of the captured offset and reports that offset (see [Coverage and verdicts](#coverage-and-verdicts)). Whether a verdict blocks anything depends on the host (see [Supported hosts](#supported-hosts-and-parser-versions)). Rules are matched with regular expressions and structured evidence, not with an LLM judge.
 
 ```
                   ┌──────────────────────────────────────────────┐
                   │          Autonomous Agent Client             │
-                  │   (Google Antigravity / Codex / Cursor)      │
+                  │ (Claude Code / AGY / Codex / OMP / Grok Bot) │
                   └──────────────────────┬───────────────────────┘
                                          │
-                               Lifecycle Hooks (PreToolUse / Stop)
+                      Lifecycle hooks (host dependent) or MCP calls
                                          │
                                          ▼
 ┌────────────────────────────────────────────────────────────────────────────────┐
@@ -26,74 +23,434 @@ Autonomous coding agents are powerful, but prompt-based instructions alone are v
 ├───────────────────────┬────────────────────────┬───────────────────────────────┤
 │  Invariant Contracts  │   Verifiable Evidence  │      Session GraphRAG         │
 │  - must / must_not    │   Checklist Gate       │  - Entity dependencies        │
-│  - Hard deny / ask    │   - No done without    │  - NeoGraph engine            │
-│  - Session isolation  │     linked evidence    │  - Context injection          │
+│  - Session isolation  │   - No done without    │  - NeoGraph engine            │
+│  - Regex + temporal   │     linked evidence    │  - Context injection (AGY)    │
 ├───────────────────────┴────────────────────────┴───────────────────────────────┤
-│                 Privacy-Preserving Local Index & SQLite-Vector                 │
-│      - Cosine vector search (native AVX2)  - FTS5 BM25  - Secret Masking       │
+│                 Local session index (SQLite, FTS5, sqlite-vector)              │
+│     - Cosine vector search  - FTS5 BM25 and regex  - Known-secret masking      │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+Session evidence stays on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter. The canonical index keeps raw text so audits see the truth; everything that leaves it (tool results, errors, hook output, logs, remote payloads) is masked for known secret patterns, and the workflow classifier refuses context in which a secret pattern is found. See the [masking contract](SECURITY.md#masking-contract), [SECURITY.md](SECURITY.md) and [Verification scope](#verification-scope).
+
+## What is new in 0.6.0
+
+Version 0.6.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly fixes memory growth, append handling and concurrency in long-running servers. It also adds a Claude Code integration, a shared hook policy and an egress masking contract.
+
+- **Dependency:** `neograph-engine==0.14.1` (was 0.12.1). `zstandard>=0.23` is new on Python before 3.14, for compressed Codex sessions.
+- **Compressed Codex sessions.** Codex CLI 0.156 compresses older rollouts in place to `rollout-*.jsonl.zst`. They are discovered, synced, audited and searched like plain rollouts, streamed through a bounded decoder and never held in memory. See [Compressed Codex sessions](#compressed-codex-sessions).
+- **Appending sessions sync normally ([#4](https://github.com/fox1245/tsukkomi-mcp/issues/4)).** Source capture streams a SHA-256 over the file up to its length at the first measurement and keeps no bytes. Records appended afterwards are reported as `unread_bytes` instead of failing the sync.
+- **Audits judge a growing session as of the captured offset.** Results carry `judged_through_byte`, `unread_bytes` and `judged_prefix`; absence-based `must` obligations stay `unknown` while bytes are unread. See [Coverage and verdicts](#coverage-and-verdicts).
+- **`check_action` does not trust older history for a proposed action ([#8](https://github.com/fox1245/tsukkomi-mcp/issues/8)).** A prerequisite that requires success stays `unknown` while required history is unread, because a newer failed run may be in the unread part.
+- **Bounded memory ([#5](https://github.com/fox1245/tsukkomi-mcp/issues/5)).** Single-flight sync per session, streaming reparse, per-session id queries, float32 vectors, a cap on concurrent heavy calls (`SELF_DIRECT_MAX_CONCURRENT_CALLS`, default 4) and `malloc_trim` on glibc. See [Memory and concurrency](#memory-concurrency-and-deadlines).
+- **Concurrent checklist updates ([#6](https://github.com/fox1245/tsukkomi-mcp/issues/6)).** `update_checklist` serializes plain edits and returns a `checklist_conflict` status instead of raising or overwriting.
+- **Duplicate session sources ([#10](https://github.com/fox1245/tsukkomi-mcp/issues/10)).** Copies and continuations of an indexed session are recognised instead of reparsed on every sync (`alias_of`, `ambiguous_session_source`).
+- **Parsers.** OMP parser v8 (host notices, images, steering attribution, `session_init`, `model_usage`, `branch_summary`, `redactedThinking`; [#9](https://github.com/fox1245/tsukkomi-mcp/issues/9)) and Codex parser v3 (multi-agent messages, tool search, new `session_meta` fields). Each bump reparses lazily, one session at a time.
+- **CI.** A new Linux `memory-audit-regressions` job runs small offline memory, freshness and concurrency tests next to the existing smoke job.
+- **Claude Code ([docs/claude-installation.md](docs/claude-installation.md)).** A `claude` provider (parser version 2) for Claude Code session and subagent transcripts, and opt-in command hooks installed by `scripts/install_claude_hooks.py` for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop` and `SubagentStop`. By default (`SELF_DIRECT_CLAUDE_ENFORCEMENT=confirmed_only`) they deny only a confirmed `violation` and ask on `suspicious`; they never answer `allow`, `SubagentStop` only reports, and every internal error fails open with a visible warning.
+- **One hook policy for AGY and Claude Code ([docs/agy-installation.md](docs/agy-installation.md)).** The AGY hook default is now `confirmed_only` (it was `enforced`): `unknown` passes with a visible warning unless the contract is marked `risk: "high"`, a `Stop` continues the agent at most once per conversation and only for a confirmed `auto_continue` miss, and hook errors fail open with a `hook_health` banner. `enforced` stays an explicit opt-in, and `advisory` never gates an approved workflow either.
+- **AGY parser version 7.** Truncated fields fall back to the same step of `transcript_full.jsonl`; what stays cut is `unknown`, never `clean`. `RUNNING`, `ERROR`, `INVALID`, `CHECKPOINT` and media records are handled, and results from before a conversation's first hook receipt are classified as `legacy_unlinked`. Version 7 adds the Antigravity IDE's typed result steps (`RUN_COMMAND` with its host `exit_code`, `VIEW_FILE`, `CODE_ACTION`, `MCP_TOOL`, `LIST_DIRECTORY`) and context-loading steps (`CONVERSATION_HISTORY`, `KNOWLEDGE_ARTIFACTS`), and accepts a host-written run of NUL bytes in front of an otherwise valid record.
+- **Contract fields `risk`, `auto_continue` and `when`**, and four disabled high-risk presets. See [Contract fields](#contract-fields-risk-auto_continue-and-when).
+- **Masking contract.** Every egress path is masked, the sparse text index is masked for new rows, and a logging filter covers server logs. See the [masking contract](SECURITY.md#masking-contract).
+- **Also in this release since 0.5.0:** the shared-index snapshot and request-deadline work ([#3](https://github.com/fox1245/tsukkomi-mcp/issues/3)), the AGY evidence workflow and approved-workflow layer, user path configuration in TOML, and a default index directory outside the checkout. Read [Upgrading to 0.6.0](#upgrading-to-060) before restarting existing servers.
+
 ---
 
-## Key Capabilities
+## Key capabilities
 
-### 1. 🛑 Deterministic Invariant Contracts (`upsert_contracts`)
-- Define explicit, non-negotiable rules for your agent:
-  - **Prohibitions (`must_not`)**: Intercept dangerous commands, unapproved pushes, or directory escapes before execution (`decision: deny`).
-  - **Mandatory Prerequisites (`must`)**: Enforce testing before deployment (`requires_success: true`).
-- **Confirmation Prompts**: AGY returns `force_ask` for suspicious exceptions so a cached Always Allow grant does not replace confirmation.
-- Contracts can be **global** or strictly **scoped per session**.
+### 1. Invariant contracts (`upsert_contracts`)
+- **Prohibitions (`must_not`)** match a regex against proposed or recorded actions (`decision: deny` on hosts that enforce).
+- **Obligations (`must`)** require matching evidence before a gated action (`before_regex`) or at a completion checkpoint, optionally with a successful linked tool result (`requires_success: true`).
+- AGY returns `force_ask` for suspicious exceptions so a cached Always Allow grant does not replace confirmation; Claude Code, which has no force-ask, returns `ask`.
+- Contracts are global or scoped to one session. A description-only contract stays `unknown`, and search rankings are never violation evidence.
 
-### 2. 📋 Verifiable Checklist with Evidence Gating (`update_checklist`)
-- Track user requirements with provenance and strict completion criteria.
-- **Evidence Gating**: An agent cannot mark an item as `done` simply by claiming "I did it." The harness automatically downgrades unbacked completion claims to `pending_verification`.
-- Only when verifiable `evidence_chunk_ids` (tool results, test artifacts, subagent logs) are attached can a requirement transition to `done (verified=True)`.
+#### Contract fields: `risk`, `auto_continue` and `when`
 
-### 3. 🕸️ Session-Scoped GraphRAG & Context Injection (`get_graph_context`)
-- Maintain an active entity dependency graph (nodes, relations, and cursors) powered by SQLite and the **NeoGraph** execution engine.
-- Supported strictly-typed relations: `IMPLEMENTS`, `DEPENDS_ON`, `MODIFIES`, `PRODUCES`, `CHECKS_VERSION`, `EVIDENCED_BY`, `SUPERSEDES`.
-- Graph updates are validated against session history and applied idempotently.
+Three optional fields refine how hosts act on a contract. They never change what a regex matched. At their defaults they are omitted from the stored contract, so existing `contracts.json` files load and are rewritten unchanged and older processes keep reading files that do not use them.
+
+| Field | Values | Applies to | Effect |
+|---|---|---|---|
+| `risk` | `normal` (default) or `high` | any contract | Declares that the actions the contract applies to are high-risk. When such an action cannot be verified (`unknown`), the AGY and Claude Code hooks ask the user instead of silently allowing it (`confirmed_only`), including after an internal hook error unless the mode is `advisory`. It does not change the verdict. Codex hooks are advisory and the OMP extension blocks only confirmed findings, so `risk` does not change their behavior. |
+| `when` | `{"tool_call_regex": "<regex>"}` | `must` only | The obligation applies only if some tool call observed earlier in the same session matches the regex (case-insensitive, multiline). Otherwise the finding is reported as `clean` with `applicability: "not_applicable"` and a reason, never dropped. While coverage is incomplete, an unmet condition becomes `unknown` because the call may be in unread evidence. An AGY model proposal counts as the condition being met. |
+| `auto_continue` | `true` or `false` (default) | `must` with a `regex` and no `before_regex` | A confirmed, fully observed miss of this completion obligation may resume a stopping agent: once per conversation on AGY (`continue`) and once per session on Claude Code (`block`). Unknown evidence, partial coverage and hook errors never resume it. Any other contract shape is rejected when it is saved. |
+
+Set these only when the user asked for them. The high-risk presets in [`src/self_directing_mcp/resources/high_risk_presets.json`](src/self_directing_mcp/resources/high_risk_presets.json) are four example `must_not` contracts with `risk: "high"`: `preset-no-recursive-delete`, `preset-no-write-outside-workspace` (a path-pattern approximation to replace with your own boundary), `preset-no-force-push` and `preset-no-branch-delete`. They ship with `enabled: false` and exist in the contract store only when `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS=true`, where they are added if their id is missing and are never altered or re-enabled. The owner enables the ones they want.
+
+### 2. Checklist with evidence gating (`update_checklist`)
+- Track user requirements with provenance and completion criteria.
+- A completion claim without evidence is downgraded to `pending_verification`. An item becomes `done` (`verified=true`) only when its `evidence_chunk_ids` resolve to successful tool results linked to their calls **and** session coverage is complete. While appended bytes are unread, coverage is incomplete, so the item stays `pending_verification` until a later call sees the caught-up history.
+- Concurrent updates do not lose each other's edits. An update that needs evidence evaluation is retried up to three times; if the checklist or evidence keeps changing, the call returns `{"ok": false, "status": "checklist_conflict", "action_executed": false}` and saves nothing.
+
+### 3. Session GraphRAG and context injection (`get_graph_context`)
+- Entity dependency graph (nodes, relations, cursors) in SQLite, executed through the **NeoGraph** engine.
+- Typed relations: `IMPLEMENTS`, `DEPENDS_ON`, `MODIFIES`, `PRODUCES`, `CHECKS_VERSION`, `EVIDENCED_BY`, `SUPERSEDES`.
+- Graph updates are validated against session history and applied idempotently. Updates require an explicit `run_neograph_update` call; lifecycle hooks never send session text to a model.
 - In Google Antigravity, active graph relationships are delivered into agent context before each tool invocation.
 
-### 4. 🔒 Multi-Runtime Lifecycle Hooks
-- **Google Antigravity (AGY)**: Stdio hooks cover every tool, local transcript synchronization, host-observed Pre/Post execution receipts, normal-stop checklist enforcement, and pre-invocation context. Unknown verification denies in enforced mode; advisory mode must be explicitly selected. See [installation and host boundaries](docs/agy-installation.md).
-- **OpenAI Codex**: Native lifecycle hook installer (`scripts/install_codex.py`) with advisory UserPromptSubmit, PreToolUse, and Stop hooks.
-- **Cursor / Grok Bot**: Dynamic transcript detection and multi-root parsing.
-
-### 5. 🔍 Privacy-Preserving Hybrid Search
-- Dense cosine similarity using native `sqlite-vector` (AVX2-accelerated C extension) combined with SQLite FTS5 BM25 and Regex.
-- **Secret Masking**: Known credential patterns are masked before embedding or retrieval. This is not a guarantee that arbitrary personal data or every secret format is removed.
+### 4. Hybrid history search
+- Dense cosine similarity (`sqlite-vector`, native), SQLite FTS5 BM25 and regex, fused with reciprocal-rank fusion.
+- **Secret masking:** known credential patterns are masked before embedding, in sparse search text and in everything returned to the client. This is not a guarantee that arbitrary personal data or every secret format is removed; see the [masking contract](SECURITY.md#masking-contract).
 
 ---
 
-## MCP Tools Reference
+## Supported hosts and parser versions
+
+| Host | Provider id | Evidence source | Lifecycle integration | Blocks actions? | Parser version |
+|---|---|---|---|---|---|
+| Google Antigravity (AGY) | `agy` | `brain/<conversation-id>/.system_generated/logs/transcript*.jsonl` plus hook receipts | Stdio hooks: `PreToolUse`, `PostToolUse`, `PreInvocation`, `Stop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`force_ask`); `unknown` passes with a warning, or asks for a `risk: "high"` contract. `advisory` and `enforced` are explicit. See [docs/agy-installation.md](docs/agy-installation.md) | 7 |
+| Claude Code | `claude` | `<projects>/<project>/<session-uuid>.jsonl` plus `<session-uuid>/subagents/agent-*.jsonl` | Opt-in command hooks from `scripts/install_claude_hooks.py`: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`ask`); never an explicit `allow`. A `Stop` blocks at most once per session for a confirmed `auto_continue` miss. `SubagentStop` never blocks. See [docs/claude-installation.md](docs/claude-installation.md) | 2 |
+| OpenAI Codex CLI | `codex` | Rollout JSONL in the Codex sessions directory, plain or zstd-compressed (`rollout-*.jsonl.zst`) | Three `mcp_tool` hooks installed by `scripts/install_codex.py`: `UserPromptSubmit`, `PreToolUse`, `Stop` | No. Hooks are advisory | 3 |
+| OMP | `omp` | OMP session JSONL | Opt-in extension `extensions/tsukkomi-omp.ts` | Only confirmed `violation`/`suspicious` on model-issued tools. `unknown` and transport failures never block | 8 |
+| Cursor / Grok Bot | `grokbot` | `agent-transcripts` roots | None; call the MCP tools manually | No | 1 (unversioned) |
+
+A parser version is recorded per session. When a provider's version is raised, each already-indexed session is reparsed from byte 0 on its next sync or audit, one session at a time. Unchanged event ids, anchors and cached vectors survive, and no embedding API is called when `embed=false`. A running MCP process only picks up a new parser after it is restarted.
+
+### AGY parser (version 7)
+
+Fields the host cut (`truncated_fields`) are restored from the same step of the sibling `transcript_full.jsonl` when it matches; otherwise the visible text is kept, marked as truncated, and any verdict that depends on the cut field is `unknown` with a `truncated_<field>` reason. A match that is visible still counts. `RUNNING` results are pending (`pending_running`), `ERROR`, `INVALID` and `CANCELED` results are never success, `CHECKPOINT` and `ERROR_MESSAGE` records are runtime context, and media payloads become placeholders. Results from before the conversation's first hook receipt are `legacy_unlinked` and leave dependent obligations `unknown` (`unsupported_legacy`); coverage reports `receipts_since`, `legacy_unlinked_count` and `result_dependent_complete`. Details are in [docs/agy-installation.md](docs/agy-installation.md#parser-version-6-truncated-fields-result-statuses-and-legacy-results).
+
+Version 7 reads two more shapes. The IDE writes a tool result as a step of its own type, `RUN_COMMAND`, `VIEW_FILE`, `CODE_ACTION`, `MCP_TOOL` or `LIST_DIRECTORY`, and the parser treats it exactly like the CLI's `GENERIC` result: it is linked to its call only through a host receipt, truncated content falls back to `transcript_full.jsonl` or leaves dependent verdicts `unknown`, and `RUNNING` is pending. A linked `RUN_COMMAND` with status `DONE` and host `exit_code` 0 is success evidence, a nonzero `exit_code` is a failure, and an unlinked result is never success. `CONVERSATION_HISTORY` and `KNOWLEDGE_ARTIFACTS` are runtime metadata. A contiguous run of NUL bytes at the start of a line is stripped when the rest is a valid record (`host_padding_bytes`, counted in `agy_evidence.host_padded_records`); any other NUL use, and any other unknown step type, stays a parse error or an unsupported event. See [docs/agy-installation.md](docs/agy-installation.md#parser-version-7-ide-result-steps-context-steps-and-host-padding).
+
+### Claude Code parser (version 2)
+
+Only a record the host stamped `origin.kind == "human"` (or, in a main transcript, a legacy prompt from before origin stamps, or a human `queued_command` prompt) is a user turn. Task notifications, peer and coordinator messages, injected meta messages, compaction summaries, attachments, hook output, tool results and a subagent's task prompt are runtime evidence. Unknown record, attachment, block and origin shapes are unsupported events that keep coverage incomplete. Opaque payloads (thinking, images, hook output) are placeholders. A subagent transcript is its own session, `<session-uuid>_agent-<agent-id>`. Version 2 accepts the `system` record `scheduled_task_fire` (a scheduled task fired) as runtime metadata: its `prompt` is automation text, not something the user said, so it is validated, never indexed, and cannot satisfy or violate a user-role contract; every other unknown system subtype stays unsupported. See [docs/claude-installation.md](docs/claude-installation.md#9-how-the-claude-parser-decides-who-is-the-user).
+
+### OMP parser (version 8)
+
+Runtime records are indexed as metadata or `runtime`-role events. They are never user instructions and never proof that a tool ran.
+
+- Host notices, `mode_change`, `ttsr_injection`, developer messages, `session_init`, `model_usage` and `branch_summary` are runtime metadata. Only the parent's task text of `session_init` is searchable; its prompt, tools and schema are not indexed.
+- Image blocks become `[image:<mime-type>]` placeholders and `thinking`/`redactedThinking` blocks become placeholders; base64 and opaque reasoning payloads are never indexed, including inside blocks of an unsupported shape (only their key names are kept).
+- **Attribution:** among steering messages only `attribution: "user"` is a user turn. Any user-role message with `attribution: "agent"`, with or without steering metadata, is runtime text and cannot satisfy or violate a user-role contract.
+- Partial steering metadata (`steering` or `liveSteered` without the full valid shape) and unknown attribution values are rejected as parse errors, which makes coverage incomplete.
+- Unknown event shapes and unmatched execution-start markers still make coverage incomplete. `service_tier_change` is metadata only when `serviceTier` is `null` or a map from the known providers (`openai`, `anthropic`, `google`) to known tiers.
+
+### Codex parser (version 3)
+
+- `response_item` `agent_message` (multi-agent messaging) and `inter_agent_communication_metadata` are runtime metadata, neither user authority nor tool evidence. `encrypted_content` blocks become a placeholder.
+- `tool_search_call` / `tool_search_output` are runtime metadata. The search query is indexed; the returned `tools` list is not.
+- `session_meta` headers, including the newer fields, are shape- and type-checked, and only a fixed subset of identifying fields is indexed. `base_instructions`, `dynamic_tools`, `context_window`, `git`, `history_base`, account ids and workspace roots are never indexed. The older behaviour of indexing a legacy header's whole payload is gone.
+- A complete new-style `session_meta` for another thread in the middle of a sub-agent file (an inherited parent header) is accepted as inherited metadata. A first-line id mismatch is still an error.
+- For these newly supported record types, an envelope with `metadata.client_authored: true` is treated as unsupported because its meaning is unclear.
+- Earlier support remains: `world_state`, `token_usage_record`, `compacted` and native `web_search_call` records. Unknown event types stay visible as unsupported.
+
+### Compressed Codex sessions
+
+Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl.zst`, one zstd frame that declares its content size. A forked or sub-agent rollout may carry a second `_<uuid>` suffix. Session discovery, `session_id` lookup and explicit `path` arguments accept `rollout-*.jsonl.zst` under the configured Codex root with the same root, symlink and traversal checks as `.jsonl`. The session id comes from the `session_meta` header, as for plain files; a file name with two different UUIDs never names a session by itself. While a plain rollout and its compressed twin both exist, a lookup by id returns the plain (live) one.
+
+- **Offsets address the decompressed stream.** Event ids, anchors, `byte_offset`, `judged_through_byte` and the stored prefix hash are exactly what the plain file with the same bytes yields, so Codex compressing a rollout in place, or a resume decompressing it and appending, is the same session: nothing is reparsed, no event id, anchor or cached vector changes, and no duplicate session or `ambiguous_session_source` appears. If the compressed file holds more records than the plain file had when it was indexed, only the new part is parsed. Plain and compressed copies that exist together follow the [duplicate source](#duplicate-session-sources) rules.
+- **A compressed file is an immutable snapshot.** There is no growing tail: coverage is complete when the stream has been read to its end (`unread_bytes` stays absent unless the file ends with an unterminated record, which is never parsed). A changed compressed file is a rewrite like any other: identical decompressed content (for example recompressed at another level) is no change, a changed earlier record is reindexed (`source_changed`), and more records after an identical prefix are a continuation. Growth of the compressed file itself is never treated as pure append.
+- **Streaming only.** The decoder reads in bounded blocks; a cursor in the middle of a compressed source is reached by decoding and discarding from the first byte, so memory does not depend on the session size. On a 54.5 MB synthetic session (28 MB compressed) a full sync peaks at the same traced memory as the identical plain file, 16 MB, and an audit-style refresh at 3.5 MB; a 60 MB stream that compresses to 6 KB is decoded with a 2.4 MB peak. Source observation validates a compressed snapshot by the SHA-256 of the compressed bytes (no second decode); each audit or status check of an indexed compressed session decodes the file once.
+- **Strict frames and visible errors.** A compressed source must be exactly one zstd frame that declares its content size, without a dictionary and with a window of at most 128 MiB (zstd's own default). Anything else, and every unreadable file, is an explicit error with a code, never a skipped file or a short read: `zstd_corrupt`, `zstd_truncated`, `zstd_size_mismatch` (more or fewer bytes than the header declares), `zstd_unsupported_frame`, `zstd_too_large` and `zstd_unavailable`. `sync_session` returns `ok: false` with that `error`, nothing is indexed or changed, and an audit is `unknown` with the code in `coverage.issues`. A source that was indexed and later goes bad reports the code in coverage instead of `source_unavailable_or_truncated`.
+- **Size limit.** `SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES` (default 4 GiB, about ten times the largest observed session) bounds the size the frame header declares; a larger file is refused as `zstd_too_large` before any byte is decoded, and a stream that disagrees with its header stops at the declared size. A plain `.jsonl` has no such limit.
+- **Decoder.** Python 3.14+ uses the standard library `compression.zstd`; older interpreters use the `zstandard` package (`zstandard>=0.23`, installed with the project). Without either, a `.zst` source reports `zstd_unavailable` and plain `.jsonl` sessions keep working. The Codex parser stays at version 3: the parsed records and event ids are unchanged, so existing indexes are not reparsed.
+
+---
+
+## MCP tools reference
 
 | Category | Tool | Description |
 |---|---|---|
-| **Governance & Contracts** | `upsert_contracts` | Create/update explicit invariant rules (`must` / `must_not`). |
-| | `list_contracts` | Inspect active contracts for current session and global scope. |
-| | `revoke_contract` | Safely disable a contract while preserving history. |
-| | `check_action` | Pre-flight test a proposed action against current contracts. |
-| | `audit_session` | Audit executed session history against active invariant rules. |
-| | `audit_status` | Health check: vector extension, index schema, and degraded flags. |
+| **Governance & Contracts** | `upsert_contracts` | Create or update explicit invariant rules (`must` / `must_not`). |
+| | `list_contracts` | Inspect active contracts for the current session and global scope. |
+| | `revoke_contract` | Disable a contract while preserving history. |
+| | `check_action` | Pre-flight test of a proposed action against current contracts. |
+| | `audit_session` | Audit executed session history against active contracts. |
+| | `audit_status` | Health check: vector extension, index schema, degraded flags, per-session coverage. |
 | **Checklist & Evidence** | `update_checklist` | Update requirements; enforces evidence gating for completion. |
-| | `get_checklist` | Inspect requirement checklist status, history, and linked evidence. |
-| **GraphRAG & Architecture** | `get_graph_context` | Query entity dependencies and active knowledge graph. |
-| | `propose_graph_update`| Validate node/edge additions with evidence chunk requirements. |
+| | `get_checklist` | Inspect checklist status, history and linked evidence. |
+| **GraphRAG & Architecture** | `get_graph_context` | Query entity dependencies and the active knowledge graph. |
+| | `propose_graph_update` | Validate node/edge additions with evidence chunk requirements. |
 | | `commit_graph_update` | Atomically commit validated graph updates with cursor progression. |
-| | `run_neograph_update` | Execute live LLM GraphRAG extraction pipeline via NeoGraph. |
-| **Search & Analytics** | `sync_session` | Incremental evidence sync across Codex, Grok Bot, OMP, and AGY transcripts. |
-| | `search_history` | Hybrid retrieval (Dense vector + BM25 + Regex) over history. |
-| | `get_chunk` | Retrieve raw evidence chunk with automatic secret masking. |
+| | `run_neograph_update` | Run the LLM GraphRAG extraction pipeline through NeoGraph. |
+| **Search & Analytics** | `sync_session` | Incremental evidence sync for Codex, Grok Bot, OMP, AGY and Claude Code transcripts. |
+| | `search_history` | Hybrid retrieval (dense vector + BM25 + regex) over history. |
+| | `get_chunk` | Retrieve a raw evidence chunk with secret masking. |
 | | `analyze_activity` | SQLite time-series analysis: retry gaps, error bursts, stalled items. |
 | **Hooks** | `codex_session_hook` | Adapter for Codex lifecycle events and local audit context. |
-| **Approved Workflows** | `workflow_status` | Current state, requirements, versions, and observed verification records. |
-| | `workflow_run_checks` | Execute owner-approved test commands and kernel-check approved Lean statements. |
+| **Approved Workflows** | `workflow_status` | Current state, requirements, versions and observed verification records. |
+| | `workflow_run_checks` | Run owner-approved test commands and kernel-check approved Lean statements. |
 | | `workflow_classify` | Request a versioned JEV Choice using approved synthetic context. |
 | | `workflow_transition` | Evaluate the current classification through the compiled Lean transition function. |
 | | `workflow_authorize` | Issue a single-use, action/version/state-bound execution grant. |
 | | `workflow_execute` | Recheck and consume the grant, run the exact argv, then record success or failure. |
+
+---
+
+## Quickstart
+
+### Prerequisites
+- Python 3.12+ and `uv` (recommended) or `venv`
+- The official `sqlite-vector` 1.1.0 native library (the setup script below downloads and verifies it)
+- An OpenRouter key for the default embedding and retrieval path; not needed in explicit local-only mode
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/fox1245/tsukkomi-mcp.git ~/.mcp-servers/tsukkomi-mcp
+cd ~/.mcp-servers/tsukkomi-mcp
+
+uv venv .venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+```
+
+### 2. Provision sqlite-vector
+
+```bash
+python scripts/setup_sqlite_vector.py --output-dir /absolute/path/to/native
+```
+
+The script pins release 1.1.0, verifies the official archive's SHA-256 and checks native cosine search. Without `--output-dir` it writes to `.native/` in the current directory. Set `SELF_DIRECT_SQLITE_VECTOR_PATH` (or `sqlite_vector_path` in TOML) to the resulting `vector.so`, `vector.dll` or `vector.dylib`. With no setting, the runtime only looks for `native/vector.*` inside the source checkout. If the library cannot be loaded, engine initialization fails with an error; it does not fall back to NumPy. NumPy (`SELF_DIRECT_DENSE_BACKEND=numpy`) and `SELF_DIRECT_USE_FAKE_EMBEDDER=true` are explicit offline and test options.
+
+### 3. Configure
+
+Settings come from, in order of precedence: explicit `Settings` arguments, environment variables, the TOML path file, a `.env` in the **current working directory**, then defaults. A server started by an MCP host usually has an unrelated working directory, so do not depend on a `.env` there; use explicit `SELF_DIRECT_*` variables in the host's server entry or the TOML file below. Lifecycle hooks (AGY and Claude Code) never read a working-directory `.env`: they use the environment and the TOML only, because that file is content the audited agent can write.
+
+#### User path configuration (TOML)
+
+Use `~/.config/tsukkomi-mcp/config.toml` on any supported platform, or set `SELF_DIRECT_CONFIG_FILE` in the process environment to select another file. Copy and edit [config.example.toml](config.example.toml); the edited file belongs outside the repository and agent-writable workspaces.
+
+```toml
+[paths]
+index_dir = "~/private-tsukkomi/index"
+omp_sessions_dir = "~/.omp/agent/sessions"
+openrouter_api_key_file = "../credentials/openrouter.env"
+sqlite_vector_path = "native/vector.so"
+```
+
+The nine supported keys are `index_dir`, `codex_sessions_dir`, `omp_sessions_dir`, `claude_projects_dir`, `grokbot_transcripts_dir`, `agy_app_data_dirs`, `contracts_path`, `sqlite_vector_path` and `openrouter_api_key_file`. AGY roots use a string array; Grokbot accepts its existing delimiter-separated string or an array of individual paths. Empty arrays disable those optional roots.
+
+TOML paths expand `~`; relative paths resolve against the canonical TOML file's directory, not the working directory or a symlink's directory. `${ENV_VAR}` interpolation is not performed. The selector `SELF_DIRECT_CONFIG_FILE` is environment-only, so a `.env` cannot silently select another TOML file. An absent default file keeps the defaults. An explicitly selected missing file, malformed TOML, an unknown section or key, or an invalid path value fails instead of silently selecting another index. Settings capture the selected sources, so restart affected servers and extensions after changing them.
+
+#### Environment settings
+
+All settings use the `SELF_DIRECT_` prefix except the key itself. The names below are the runtime fields in `src/self_directing_mcp/config.py`; [.env.example](.env.example) lists the commonly used ones.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SELF_DIRECT_INDEX_DIR` | `~/.self_direct_index` | Private index directory (events, FTS, vectors, contracts, checklists). |
+| `SELF_DIRECT_CONTRACTS_PATH` | `<index_dir>/contracts.json` | Contracts file. |
+| `SELF_DIRECT_SESSION_PROVIDER` | `codex` | Provider used when a tool call omits `provider`: `codex`, `grokbot`, `omp`, `agy` or `claude`. |
+| `SELF_DIRECT_CODEX_SESSIONS_DIR`, `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Codex session root. |
+| `SELF_DIRECT_OMP_SESSIONS_DIR` | `~/.omp/sessions` | OMP session root. |
+| `SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR` | empty (disabled) | Cursor / Grok Bot transcript roots. |
+| `SELF_DIRECT_AGY_APP_DATA_DIRS` | `~/.gemini/antigravity`, `-cli`, `-ide` | JSON array of AGY app-data directories. |
+| `SELF_DIRECT_CLAUDE_PROJECTS_DIR` | `$CLAUDE_CONFIG_DIR/projects` if `CLAUDE_CONFIG_DIR` is set, else `~/.claude/projects` | Claude Code projects root (TOML `claude_projects_dir`). The environment variable wins over TOML, and TOML over the default. |
+| `SELF_DIRECT_AGY_ENFORCEMENT` | `confirmed_only` | AGY hook policy: `confirmed_only`, `advisory` (never blocks) or `enforced` (also denies an unverifiable `PreToolUse`). Hook errors fail open in every mode. |
+| `SELF_DIRECT_CLAUDE_ENFORCEMENT` | `confirmed_only` | Claude Code hook policy, same values, independent of the AGY setting. `scripts/install_claude_hooks.py` writes it into the Claude Code settings `env`. |
+| `SELF_DIRECT_USE_FAKE_EMBEDDER` | `false` | Offline/test embedder; never a silent fallback. |
+| `SELF_DIRECT_LOCAL_ONLY` | `false` | Explicit offline mode: no embedder or dense index; embedding, dense/hybrid search and LLM graph updates are rejected. |
+| `SELF_DIRECT_DENSE_BACKEND` | `sqlite-vector` | `sqlite-vector` or `numpy`. |
+| `SELF_DIRECT_SQLITE_VECTOR_PATH` | `native/vector.*` in the checkout, if present | Native library path. |
+| `SELF_DIRECT_OPENROUTER_API_KEY_FILE` | unset | Authoritative dotenv file with `OPENROUTER_API_KEY`. |
+| `SELF_DIRECT_EMBEDDING_MODEL`, `SELF_DIRECT_EMBEDDING_DIM`, `SELF_DIRECT_EMBEDDING_BASE_URL` | `qwen/qwen3-embedding-8b`, `1024`, `https://openrouter.ai/api/v1` | Embedding model, dimension and endpoint. |
+| `SELF_DIRECT_LOCK_WAIT_TIMEOUT_SEC` | `1` | Combined process/file writer-lease wait. |
+| `SELF_DIRECT_AUDIT_TIMEOUT_SEC` | `8` | Response budget for audits and hooks. |
+| `SELF_DIRECT_REQUEST_TIMEOUT_SEC` | `45` | Response budget for ordinary calls. |
+| `SELF_DIRECT_GRAPH_UPDATE_TIMEOUT_SEC` | `300` | Budget for `run_neograph_update`. |
+| `SELF_DIRECT_MAX_TOOL_TIMEOUT_SEC` | `600` | Upper bound for a client-supplied `timeout_ms`. |
+| `SELF_DIRECT_MAX_CONCURRENT_CALLS` | `4` | **New in 0.6.0.** Heavy tool calls that may run at once (minimum 1); excess calls wait within their own deadline. |
+| `SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES` | `4294967296` | **New in 0.6.0.** Largest decompressed size a `.jsonl.zst` Codex session may declare; larger files are refused as `zstd_too_large`. |
+| `SELF_DIRECT_RETRIEVE_TOP_K`, `SELF_DIRECT_SEARCH_TOP_K`, `SELF_DIRECT_RRF_K` | `20`, `10`, `60` | Retrieval tuning. |
+| `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS` | `false` | Seed disabled demonstration contracts. |
+
+#### Credentials
+
+Credential values are not TOML options. A key file selected in TOML or by `SELF_DIRECT_OPENROUTER_API_KEY_FILE` is authoritative: a missing, unreadable or keyless file is an error, never a fallback to another key. Without a selected key file, `OPENROUTER_API_KEY` follows the precedence above (explicit argument, environment, working-directory `.env`). Keep the key file outside the repository and agent-writable workspaces. Workflow sandboxes reject mounts that expose the selected TOML, a host dotenv or the selected credential file.
+
+---
+
+## Platform configuration
+
+### Google Antigravity (AGY)
+
+Configure `tsukkomi-mcp` in your `mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "tsukkomi-mcp": {
+      "command": "~/.mcp-servers/tsukkomi-mcp/.venv/bin/python",
+      "args": ["-m", "self_directing_mcp"]
+    }
+  }
+}
+```
+
+To enable lifecycle interception in AGY, register `scripts/agy_hook.py` as your workspace hook command. By default only confirmed findings gate a tool call. See [docs/agy-installation.md](docs/agy-installation.md) for the hook file, enforcement modes and host boundaries.
+
+### OpenAI Codex CLI
+
+Install advisory lifecycle hooks and register the MCP server in one command:
+
+```bash
+python scripts/install_codex.py --trust-hooks
+python scripts/install_codex.py --verify
+```
+
+The installer registers explicit `SELF_DIRECT_INDEX_DIR`, session-root, backend and key-file settings in the Codex MCP entry, so it is not affected by the default index location. See [docs/codex-installation.md](docs/codex-installation.md).
+
+### Claude Code
+
+Register the MCP server and, if the user wants lifecycle controls, review and then install the opt-in hooks:
+
+```bash
+claude mcp add --scope user tsukkomi-mcp -- /absolute/path/to/venv/bin/python -m self_directing_mcp
+python scripts/install_claude_hooks.py --print --python /absolute/path/to/venv/bin/python
+python scripts/install_claude_hooks.py --apply --settings /absolute/path/to/settings.json --python /absolute/path/to/venv/bin/python
+```
+
+`--print` is the default and changes nothing; `--apply` merges into the settings file you name, keeps unrelated hooks, backs the file up when it changes and replaces it atomically. Add `--index-dir /absolute/path/to/index` to point the hooks at the index whose contracts should apply (the one the MCP server writes to); hooks never read a project `.env`. See [docs/claude-installation.md](docs/claude-installation.md) for the policy table, the Stop budget, subagents, fail-open behavior and verification steps, and [docs/claude-hooks.example.json](docs/claude-hooks.example.json) for the complete hooks block.
+
+### OMP (OpenRouter-backed retrieval, deterministic contract hooks)
+
+Register this server in OMP's **user** `mcp.json` and opt in to `extensions/tsukkomi-omp.ts` as an OMP user extension. Configure both processes with the same private TOML file (or environment overrides) for the index, OMP session root and authorized credential/vector references. The extension starts Python in `--omp-bridge` mode, so the shared Python settings source owns validation; TOML-only paths need not be duplicated in the extension environment.
+
+```text
+SELF_DIRECT_LOCAL_ONLY=false
+SELF_DIRECT_CONFIG_FILE=<private TOML path>  # omit to use the default user file
+TSUKKOMI_OMP_MONITOR=1
+TSUKKOMI_OMP_PYTHON=<Python with tsukkomi-mcp dependencies>
+TSUKKOMI_OMP_SOURCE=<source checkout>/src  # omit when installed in that Python
+```
+
+Interpreter/source bootstrap and `SELF_DIRECT_LOCAL_ONLY` remain environment options, not `[paths]` keys. Remote bridge startup requires a usable explicitly selected key file and an existing native-library path; it does not make an API call or eagerly initialize the index. Environment paths already present in managed registrations override TOML until the owner removes or changes those entries.
+
+OpenRouter-backed hybrid/dense history search, `sync_session(embed=True)` and NeoGraph updates are available by default; embedding uploads sanitized session chunks, so use an authorized key and session root. The hook's `check_action` and `audit_session` stay deterministic and refresh JSONL without embedding; they do **not** call OpenRouter on every tool or turn. Explicit offline-only mode is `SELF_DIRECT_LOCAL_ONLY=true`, which disables those remote functions. NeoGraph extraction also masks known secret patterns in session events before sending a prompt to OpenRouter; keep the original session files and local index private.
+
+Keep machine-specific values in local OMP configuration or a private extension copy, not this repository. Start a **new persisted OMP session**; `--no-session` cannot provide history. Register only user-stated, machine-checkable contracts with `upsert_contracts` (`provider: "omp"` and the actual OMP session ID for session scope). The extension checks pending model-issued tools through local MCP before execution, blocks confirmed `violation`/`suspicious`, and re-audits after results and turns. `unknown` and transport failure are reported but do **not** block; zero applicable contracts is not `clean`. Direct shell or host actions outside OMP's tool pipeline, skipped hooks, in-memory sessions and a result not yet flushed to disk are not covered.
+
+The extension also registers the read-only `tsukkomi_session_context` tool. Call it before creating a session-scoped contract or checklist item: its `session_id` comes from the active OMP session manager. Never infer a session ID from `PI_SESSION_FILE` or a shell variable, which can belong to a parent OMP process. If no persisted session is available, do not silently create a global contract. `AGENTS.md` instructions alone are not audit contracts: register the user's explicit, machine-checkable prohibitions; broader subjective mistakes are not automatically judged by an LLM.
+
+### Cursor / Grok Bot
+
+Set `SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR` (or `grokbot_transcripts_dir` in TOML) and pass `provider="grokbot"` to the MCP tools. There is no lifecycle hook for this host in this repository.
+
+---
+
+## Coverage and verdicts
+
+`sync_session`, `audit_session` and `check_action` report a `coverage` object (`audit_status` reports the same data under `session` when given a session id). It holds the indexed source `path`, `byte_offset` (how far the index has parsed), `file_size`, `chunk_count`, `parser_version`, an `issues` list and `complete`, which is true only when `issues` is empty.
+
+| Verdict | Meaning |
+|---|---|
+| `violation` | A contract is broken by evidence in the judged history or by the proposed action. |
+| `suspicious` | An exception that needs confirmation. |
+| `unknown` | The evidence needed to decide is missing, incomplete or changed. Resolve the gap; it is not permission. |
+| `clean` | No problem was found **in the returned evidence and contract snapshot**. It is not a new authorization. |
+
+Audit and `check_action` results also carry `requires_attention`, which is `true` whenever the verdict is not `clean`.
+
+### Growing sessions
+
+Agents append to their own session file while they work, so an audit usually sees a file that is still growing. The audit judges the bytes captured at the start and says so.
+
+| Field (in `coverage`) | Meaning |
+|---|---|
+| `judged_through_byte` | Offset up to which the verdict was computed. |
+| `unread_bytes` | Bytes after that offset (appended records, or an unfinished final line) that were not reviewed. Also listed in `issues` as `unread_bytes`. |
+| `judged_prefix` | `true` when appended, unread bytes are the only coverage gap. |
+| `complete` | `false` while any bytes are unread. |
+
+The result's `notes` then contain `Judged as of byte N; M appended byte(s) were not reviewed.` Within that prefix:
+
+- A `must_not` violation seen in the captured range is reported as `violation`.
+- Otherwise the verdict is `clean` **as of that offset**. Appended records are judged by the next audit.
+- A `must` obligation that would be a violation only because evidence is absent, or failed, becomes `unknown` while bytes are unread. An obligation already evidenced inside the prefix stays `clean` as of the offset.
+- Any other gap (parse errors, unsupported events, an outdated parser, a missing source) is not a pure append. The verdict follows the normal incomplete-coverage rules and `judged_prefix` is absent.
+
+A rewrite of earlier bytes, truncation, file replacement or deletion is never judged as growth. It stays `unknown` (`source_changed`, `source_unavailable_or_truncated`, `source_changed_during_evaluation`). If metadata, contracts or AGY receipts change while an audit is evaluating, the result is `unknown` with the earlier result kept as `snapshot_verdict`.
+
+### `check_action` and current prerequisites
+
+A proposed action runs now, so unread records come before it, not after it. When a contract with a gated prerequisite (`must` with `before_regex`) applies to the proposed action and the history is incomplete:
+
+- With `requires_success: true`, a `clean` finding becomes `unknown` and the overall verdict is raised to at least `unknown`, because a newer failed or pending run may be in the unread part ([#8](https://github.com/fox1245/tsukkomi-mcp/issues/8)).
+- A presence-only prerequisite (`requires_success: false`) stays `clean` while the only gap is appended bytes, because an observed earlier run is not undone by later records. For any other coverage gap it becomes `unknown`.
+- A `must_not` violation already found is not hidden by this rule.
+
+### Duplicate session sources
+
+Several files can carry the same session id, for example when sub-agent session files are copied under another parent folder. Codex, OMP and Grok Bot compare the stored prefix hash with the requested file using streaming hashes, without loading either file. AGY is excluded because its hook receipts bind to an exact path, so a changed AGY path is still reindexed.
+
+| Relation of the requested file to the indexed one | Result |
+|---|---|
+| Identical copy | Not reparsed. The response has `alias_of` (indexed path) and `coverage.indexed_path` / `coverage.requested_path`; the cursor stays on the indexed file. |
+| Continuation (starts with the indexed prefix and is longer) | Only the part after the cursor is parsed and the cursor path moves to the longer file. |
+| Strict prefix of the indexed file | The cursor is kept. Coverage reports the indexed source, adds the issue `requested_source_is_prefix_of_indexed` and sets `complete=false`, because the index holds events the requested file lacks. |
+| Diverged (neither file is a prefix of the other) | The index is preserved. The call fails with `error: "ambiguous_session_source"` (with `indexed_path` and `requested_path`) and an audit is `unknown`, with `ambiguous_session_source` in `coverage.issues`. |
+| Indexed file gone, requested file continues it | The new path is adopted without reparsing. If it does not continue the indexed history, the session is reindexed (`source_changed`). |
+
+A rewrite or truncation of the same path is still reparsed or rejected as before. A plain rollout and its zstd-compressed twin (`.jsonl` and `.jsonl.zst`) are compared by their decompressed bytes, so every row above applies to that pair too; see [Compressed Codex sessions](#compressed-codex-sessions).
+
+### Source capture
+
+Sync captures at most the length measured at the first `fstat`, in 1 MiB blocks, keeping only SHA-256 states at the cursor, at the last complete record and at the end. No file bytes are retained, so memory does not scale with the session size.
+
+- Growth after the first measurement is not an error. An overwrite, truncation or replacement during the pass is.
+- `validate_prefix()` accepts pure growth after re-hashing the captured prefix; it runs outside the shared publication lock. Under the lock, only identity, size and a SHA-256 of the last 64 KiB are re-checked. A mismatch, once detected, stays failed.
+- `validate()` compares metadata only (device, inode, size, mtime, ctime). Equal stamps do not prove equal content.
+- `stat` and `fstat` can give `st_ctime` different meaning on some runtimes (for example 9p/drvfs), so full stamps are compared only within the same API and identity, size and mtime across them. When either side reports `st_ino` 0, which some Windows filesystems do, the inode comparison is skipped and size, mtime and the hash decide.
+- Limits: capture and validation are not an atomic snapshot. A rewrite outside the final 64 KiB between the last full hash and the lock is accepted at that moment, and the next sync reindexes because the stored cursor's prefix hash no longer matches. On Windows `st_ctime` is the creation time, so a same-size rewrite that restores mtime is invisible to `stat` and is caught by the same prefix-hash check on the next sync.
+
+---
+
+## Memory, concurrency and deadlines
+
+Long-running servers sharing one index had grown to many gigabytes in a real deployment ([#5](https://github.com/fox1245/tsukkomi-mcp/issues/5)). The causes were whole-file captures per request, concurrent reparses of the same session and heap that was freed but not returned. 0.6.0 changes:
+
+- **No retained source bytes** (see Source capture).
+- **Single-flight per (index, provider, session id).** Concurrent hooks for one session wait for one capture/parse/publish, then find the cursor current. Copies of one session id in several folders share the same flight. Across processes, a state-token compare-and-swap still decides which writer publishes, and a stale capture is retaken instead of rewinding a cursor that another process already moved forward.
+- **Streaming reparse.** Parsed rows go through a disk-backed spool (`RowSpool`, memory below 1 MiB) and are published in batches inside one transaction.
+- **Per-session id queries.** Sparse and dense catch-up query only the synced session's ids, in batches. Candidate vectors are held as float32 (the optional NumPy backend still stores float64).
+- **Slim audit loading.** An audit pages in only the rows its contracts inspect, 512 at a time, and prerequisite search is linear rather than quadratic.
+- **Bounded heavy calls.** At most `SELF_DIRECT_MAX_CONCURRENT_CALLS` (default 4) heavy calls run at once: sync, search, audit, `check_action`, checklist, graph, activity and hook calls. A request waits for a slot only within its own deadline; one that expires while queued returns `request_deadline` without starting work. A slot is held until the worker thread really finishes, even if its caller timed out. `list_contracts`, `upsert_contracts`, `revoke_contract`, `get_chunk`, `audit_status` and the `workflow_*` tools bypass the limit.
+- **`malloc_trim` on glibc.** When the last running heavy call that took at least 0.5 s finishes (at most once per 5 s), the server calls `malloc_trim(0)`. It is skipped on Windows, macOS and musl, and failures are ignored.
+- **`audit_status` no longer scans FTS.** The `sparse_count` reads the `chunk_rows` mirror table instead of counting the FTS5 table while holding the shared lock.
+
+### Measurements
+
+Measured by the maintainer; the real-session figures use private corpora that are not in this repository.
+
+| Case | Before | After |
+|---|---|---|
+| 100 MB synthetic OMP session, `check_action` and `audit_session` repeated 3 times, 1 thread: peak RSS (VmHWM) | 705 MB | 134 MB |
+| Same, 4 concurrent threads | 1,750 MB; first sync `index_busy` after 48.7 s | 198 MB; first sync clean in 12.1 s |
+| Same, 8 concurrent threads | 2,304 MB; first sync `index_busy` after 48.0 s | 193 MB; first sync clean in 14.9 s |
+| Idle RSS after `gc` (1, 4, 8 threads) | 505, 926, 941 MB | 104, 144, 151 MB |
+| First sync of the 100 MB session, 1 thread | 10.4 s | 10.8 s |
+| Three processes calling `audit_status` 5 times each on a 365k-chunk Codex index | 2.1 s for the sparse count under the lock | 15 of 15 succeeded, no `index_busy`, 0.045 s per call |
+| 733 real OMP sessions synced three times in a row | 178 s per pass (repeated reparse of duplicate session ids) | 7 s per pass, 0 reparses, 27 duplicate pairs recognised as aliases |
+| 571 real Codex sessions reparsed with parser v3 | v2: unsupported events in 401 sessions, parse errors in 121 | 0 unsupported, 0 parse errors; peak working set 225 MB in 876 s |
+
+The issue's 19.9 GB observation came from one process after about 3.5 days with a growing ~310 MB session. The roughly 7 GB figure for that case in #5 is an extrapolation from the 100 MB synthetic run, and the PR did not measure a 310 MB live session. Memory under such a session has to be confirmed by observation after deployment.
+
+### Deadlines and errors
+
+The [shared-index fix (#3)](https://github.com/fox1245/tsukkomi-mcp/issues/3) separates stable source preparation, guarded publication and detached audit evaluation. Audit snapshots contain only scoped authoritative event rows and counts plus detached rule content, and deterministic checks do not repair FTS or restore embedding caches. Explicit sync still repairs derived indexes, and sparse/hybrid search materializes deferred canonical evidence before querying.
+
+Audit evaluation and source hashing or parsing do not hold the shared writer lease. Before a result is published, metadata, source observations, rules and AGY receipts are revalidated; changed authority makes the result incomplete (`unknown`) while keeping the captured findings. Startup may add the AGY receipt-version side table without rewriting the six-column cursor schema or changing SQLite journal modes.
+
+Requests share an absolute deadline and cancellation control through nested calls and native callbacks. Non-authorizing responses distinguish `index_busy`, `request_deadline`, `request_cancelled` and `operation_timeout`; unrelated SQLite failures are not converted into successful empty searches. A stopped request cannot begin a later publication, but an admitted commit or one already-running blocking call may finish. This is cooperative stopping, not forced thread termination or proof of rollback.
+
+Default combined writer-lock wait (1 second), audit budget (8 seconds), ordinary budget (45 seconds) and explicit-tool cap (600 seconds) are unchanged. Real writes, initialization, raw captures and derived persistent mutations remain guarded and can still contend. See [implementation and verification boundaries](docs/timeout-fix.md).
+
+---
+
+## Upgrading to 0.6.0
+
+1. **Restart every process that uses the index.** Stop and restart all MCP servers and extensions that share an index (Codex, OMP, AGY, any manual `python -m self_directing_mcp`) from the new package. A running process keeps the old code and old parser, and a process on an older version can write cursors that a newer one must then reparse. Updating a checkout or a wheel does not update processes that are already running.
+2. **Parser bumps reparse lazily.** The OMP parser is now version 8 (0.5.0 had 2) and the Codex parser version 3 (was 2). The AGY parser is version 7 and the new Claude Code parser is version 2. Each session is reparsed once, on its next sync or audit, within the bounded-memory path. There is no upfront migration step and no storm of reparses.
+3. **Existing indexes are preserved.** Events, anchors, model-specific vector caches, contracts and checklists are kept. Unchanged event ids and cached vectors survive a reparse. Obsolete entries are cleaned through a durable journal, so an interrupted upgrade resumes.
+4. **Check the index location.** The default index is `~/.self_direct_index` unless `SELF_DIRECT_INDEX_DIR` or `index_dir` in TOML overrides it. Older versions defaulted to a `.self_direct_index` inside the checkout. An install that relied on that default must set `SELF_DIRECT_INDEX_DIR` (or TOML `index_dir`) to the existing absolute directory before restarting; nothing is moved or copied automatically. The Codex installer and managed OMP registrations already pass an explicit path.
+5. **Check how the key file is selected.** A checkout `.env` is no longer treated as an authoritative key file. Select it explicitly with `SELF_DIRECT_OPENROUTER_API_KEY_FILE` or TOML `openrouter_api_key_file`, or supply `OPENROUTER_API_KEY` through the environment or a `.env` in the server's working directory.
+6. **Reinstall dependencies.** `neograph-engine` must be exactly 0.14.1, and Python before 3.14 now needs `zstandard>=0.23` to read compressed Codex sessions (`.jsonl.zst`). `pip install -e ".[dev]"` or `scripts/install_codex.py` takes care of both; without the package, plain sessions work and compressed ones report `zstd_unavailable`.
+7. **AGY hook policy.** The default is now `confirmed_only`. An install that relied on the earlier `enforced` default (an unverifiable `PreToolUse` denied, unverified items continuing a `Stop`, an unavailable runtime denying `PreToolUse`) must set `SELF_DIRECT_AGY_ENFORCEMENT=enforced` explicitly, and even then hook errors fail open.
+8. **Sparse index masking.** Sparse (FTS) rows written before 0.6.0 hold raw text. Delete `sparse.sqlite` while the servers are stopped to have it rebuilt, masked, from the canonical store; see the [masking contract](SECURITY.md#masking-contract).
+9. **Re-verify.** Run `python scripts/install_codex.py --verify` for Codex and `audit_status` for any host. Confirm `neograph_version`, `embedder`, `dense_backend` and that `degraded_flags` is empty.
+
+---
 
 ## Approved workflows: PRD, JEV, Lean, and NeoGraph
 
@@ -197,7 +554,7 @@ Use a fresh classification ID for each `workflow_transition`. A completion choic
 
 Pass the returned grant and the **identical action** to `workflow_execute`. It rechecks state, versions, classification, cancellation, and Lean policy immediately before consuming the grant. Only successful owned execution sets `complete`. Started, succeeded, failed, and uncertain outcomes are distinct; a crash after consumption cannot replay the grant. A timeout after launch never claims that no action ran. The local completion sandbox permits writes to the actual approved project, but not private host state/credentials or network access. No shell interpolation is performed, and cancellation/timeout terminates the sandbox process group and descendants.
 
-AGY rejects direct mapped completion actions and directs the agent to the owned executor; its normal Stop hook holds an incomplete workflow and provides requirements, evidence, and permitted recovery actions. Cancellation, error stops, and pauses for background work are not restarted. Reads, repairs, and checks remain available unless a separate explicit contract restricts them. **Unmapped tools, direct shell access outside registered hooks, and the advisory Codex adapter are not an enforcement boundary.**
+The AGY and Claude Code hooks reject direct mapped completion actions and direct the agent to the owned executor; on a normal stop they continue an incomplete workflow once (the same once-per-conversation or once-per-session budget as `auto_continue`) and provide requirements, evidence, and permitted recovery actions. In `advisory` mode they neither reject nor continue. Cancellation, error stops, and pauses for background work are not restarted. Reads, repairs, and checks remain available unless a separate explicit contract restricts them. **Unmapped tools, direct shell access outside registered hooks, and the advisory Codex adapter are not an enforcement boundary.**
 
 Lean proves the policy/model under its stated assumptions; it does not prove arbitrary Python/TypeScript implementations equivalent to that model. Real tests supply implementation evidence only for exercised cases. The workflow is separate from session GraphRAG extraction and does not require an LLM to decide whether recorded tests passed.
 
@@ -210,142 +567,64 @@ python scripts/benchmark_workflow.py --lean lean
 
 The benchmark compares 640 finite stage/class/evidence combinations with an independent reference, measures false allowances/blocks and per-stage latency, and exercises correction of each missing mandatory fact. It is an adversarial **policy** evaluation, not live JEV accuracy or a whole-host coverage claim. Live JEV validation requires an OpenRouter key; offline transport fixtures never count as live service evidence. A real low-confidence Choice remains nonauthorizing: the proposed label and observed probabilities are retained, but completion stays locked.
 
-
----
-
-## 🚀 Quickstart
-
-### Prerequisites
-- Python 3.12+
-- `uv` (recommended) or `venv`
-- `sqlite-vector` native extension (optional for dense embeddings; setup script included)
-
-### 1. Clone & Install
-
-```bash
-git clone https://github.com/fox1245/tsukkomi-mcp.git ~/.mcp-servers/tsukkomi-mcp
-cd ~/.mcp-servers/tsukkomi-mcp
-
-uv venv .venv --python 3.12
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-```
-
-### 2. Setup SQLite-Vector (Optional, for Dense Search)
-
-```bash
-python scripts/setup_sqlite_vector.py
-```
-
-Downloads the platform-appropriate binary release verified with SHA-256 checksums into `.native/`.
-
-### User path configuration (TOML)
-
-Use `~/.config/tsukkomi-mcp/config.toml` on any supported platform, or set `SELF_DIRECT_CONFIG_FILE` in the process environment to select another file. Copy and edit [config.example.toml](config.example.toml); the edited file belongs outside the repository and agent-writable workspaces.
-
-```toml
-[paths]
-index_dir = "~/private-tsukkomi/index"
-omp_sessions_dir = "~/.omp/agent/sessions"
-openrouter_api_key_file = "../credentials/openrouter.env"
-sqlite_vector_path = "native/vector.so"
-```
-
-The eight supported keys are `index_dir`, `codex_sessions_dir`, `omp_sessions_dir`, `grokbot_transcripts_dir`, `agy_app_data_dirs`, `contracts_path`, `sqlite_vector_path`, and `openrouter_api_key_file`. AGY roots use a string array; Grokbot accepts its existing delimiter-separated string or an array of individual paths. Empty arrays disable those optional roots.
-
-Path precedence is explicit Settings arguments, environment overrides (including the existing `CODEX_SESSIONS_DIR` alias), TOML, working-directory `.env`, then defaults. TOML paths expand `~`; relative paths resolve against the canonical TOML file's directory, not the working directory or a symlink's directory. `${ENV_VAR}` interpolation is not performed. The selector itself is environment-only; a `.env` cannot silently select another TOML file.
-
-An absent default file preserves the existing defaults. An explicitly selected missing file, malformed TOML, unknown section/key, or invalid path value fails instead of silently selecting another index. Settings capture the selected sources; restart affected servers/extensions after configuration changes.
-
-Without an index override, the default remains `~/.self_direct_index`. Managed Codex/OMP registrations keep their higher-priority environment paths. To retain a checkout-local index, explicitly select its existing absolute path in TOML or environment before upgrading; no evidence or rules are automatically moved or copied.
-
-Credential values are not TOML options. Without a selected key file, `OPENROUTER_API_KEY` follows explicit Settings, environment, then working-directory `.env` precedence. A key file selected in TOML or environment remains authoritative and fails closed when missing, unreadable, or keyless. Workflow sandboxes reject mounts exposing the selected TOML, host dotenv, or selected credential file.
-
----
-
-## 🔌 Platform Configuration
-
-### Google Antigravity (AGY)
-
-Configure `tsukkomi-mcp` in your `mcp_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "tsukkomi-mcp": {
-      "command": "~/.mcp-servers/tsukkomi-mcp/.venv/bin/python",
-      "args": ["-m", "self_directing_mcp"]
-    }
-  }
-}
-```
-
-To enable deterministic pre-tool lifecycle interception in AGY, register `scripts/agy_hook.py` as your workspace hook command.
-
-### OpenAI Codex CLI
-
-Install advisory lifecycle hooks and register the MCP server in one command:
-
-```bash
-python scripts/install_codex.py --trust-hooks
-python scripts/install_codex.py --verify
-```
-
-### OMP (OpenRouter-backed retrieval, deterministic contract hooks)
-
-Register this server in OMP's **user** `mcp.json` and opt in to `extensions/tsukkomi-omp.ts` as an OMP user extension. Configure both processes with the same private TOML file (or environment overrides) for the index, OMP session root, and authorized credential/vector references. The extension starts Python in `--omp-bridge` mode, so the shared Python settings source owns validation; TOML-only paths need not be duplicated in the extension environment.
-
-```text
-SELF_DIRECT_LOCAL_ONLY=false
-SELF_DIRECT_CONFIG_FILE=<private TOML path>  # omit to use the default user file
-TSUKKOMI_OMP_MONITOR=1
-TSUKKOMI_OMP_PYTHON=<Python with tsukkomi-mcp dependencies>
-TSUKKOMI_OMP_SOURCE=<source checkout>/src  # omit when installed in that Python
-```
-
-Interpreter/source bootstrap and `SELF_DIRECT_LOCAL_ONLY` remain environment options, not `[paths]` keys. Remote bridge startup requires a usable explicitly selected key file and an existing native-library path; it does not make an API call or eagerly initialize the index. Environment paths already present in managed registrations override TOML until the owner removes or changes those entries.
-
-OpenRouter-backed hybrid/dense history search, `sync_session(embed=True)`, and NeoGraph updates are available by default; embedding uploads sanitized session chunks, so use an authorized key and session root. The hook's `check_action`/`audit_session` stay deterministic and refresh JSONL without embedding; they do **not** call OpenRouter on every tool/turn. Explicit offline-only mode is `SELF_DIRECT_LOCAL_ONLY=true`, which disables those remote functions.
-NeoGraph extraction also masks known secret patterns in session events before sending a prompt to OpenRouter; keep the original session files and local index private.
-
-Keep machine-specific values in local OMP configuration or a private extension copy, not this repository. Start a **new persisted OMP session**; `--no-session` cannot provide history. Register only user-stated, machine-checkable contracts with `upsert_contracts` (`provider: "omp"` and the actual OMP session ID for session scope). The extension checks pending model-issued tools through local MCP before execution, blocks confirmed `violation`/`suspicious`, and re-audits after results and turns. `unknown` and transport failure are reported but do **not** block; zero applicable contracts is not `clean`. The OMP JSONL parser treats unrecognized events as incomplete coverage. Direct shell/host actions outside OMP's tool pipeline, skipped hooks, in-memory sessions, and a result not yet flushed to disk are not covered.
-
-Known OMP presentation changes, compaction records, agent notifications, empty messages, and UI metadata are indexed without treating them as assistant tool actions. Execution-start markers are matched against earlier indexed tool calls even when the session is synced between the call and marker. Unknown event shapes and unmatched markers still make coverage incomplete; restart the OMP MCP process after a parser upgrade so the parser version triggers a full local reindex.
-
-OMP v18.4.8 `service_tier_change` records are metadata only when `serviceTier` is explicitly `null` or a map with known `openai`, `anthropic`, and `google` keys and known tier values (`auto`, `default`, `flex`, `scale`, `priority`, `ultrafast`). Missing fields, other types, unknown keys/values, and extra payload remain unsupported; a tier setting cannot satisfy a required tool action. OMP parser version 4 reindexes previously indexed, unchanged session files on their next evidence refresh after the MCP process is upgraded/restarted. Original session bytes are not rewritten, and unrelated parse errors or unknown events still prevent complete coverage.
-
-The extension also registers the read-only `tsukkomi_session_context` tool. Call it before creating a session-scoped contract or checklist item: its `session_id` comes from the active OMP session manager. Never infer a session ID from `PI_SESSION_FILE` or a shell variable, which can belong to a parent OMP process. If no persisted session is available, do not silently create a global contract. `AGENTS.md` instructions alone are not audit contracts: register the user's explicit, machine-checkable prohibitions; broader subjective mistakes are not automatically judged by an LLM.
-
 ---
 
 ## Testing and verification
 
-The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, workflow version/grant invalidation, proof rejection, path isolation, and MCP transport. Lean integration tests report a skip when the native toolchain is unavailable; install it to exercise the new workflow layer.
-
-CI is intentionally lightweight on Linux and Windows: it runs only the explicit MCP transport, Jev boundary, and session-path smoke tests, then builds the source distribution and wheel. Pushes and pull requests trigger it; superseded runs for the same ref are cancelled, and each job is capped at 10 minutes. No API keys or paid model calls are used.
-
-The full regression suite, real Lean proof/kernel checks, and all performance/large-session/concurrency benchmarks are **local deep checks**, not CI gates. A green CI result does not establish full workflow/native proof coverage or performance guarantees. Run the following locally when the changed surface requires it; live model validation still requires separate model/budget approval.
+The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, append capture and prefix judgement, duplicate session sources, single-flight and concurrency, workflow version/grant invalidation, proof rejection, path isolation and MCP transport. Tests use synthetic sessions and offline embeddings. Lean integration tests, Windows-only path tests and bubblewrap tests report a skip when the toolchain or platform is unavailable, and symlink tests report a skip with a reason where Windows denies symlink creation (`WinError 1314`, Developer Mode off).
 
 ```bash
-pytest -q
+python -m pytest -q
+python -m build
 python scripts/benchmark.py
 ```
 
-### Shared-index concurrency and deadlines
+### CI
 
-The [shared-index fix (#3)](https://github.com/fox1245/tsukkomi-mcp/issues/3) separates stable source preparation, guarded publication, and detached audit evaluation. Audit snapshots contain only scoped authoritative event rows/counts and detached rule content; deterministic checks do not repair FTS or restore embedding caches. Explicit sync still repairs derived indexes, and sparse/hybrid search materializes deferred canonical evidence before querying.
+GitHub Actions runs two workflows. Superseded runs for the same ref are cancelled, and no API keys or paid model calls are used.
 
-Audit evaluation and source hashing/parsing do not retain the shared writer lease. Before a result is published, metadata, source observations, rules, and AGY receipts are revalidated; changed authority makes the result incomplete/unknown while retaining captured findings. Startup may add the AGY receipt-version side table without rewriting the six-column cursor schema or changing SQLite journal modes.
+The `CI` workflow runs two jobs on every push and pull request:
 
-Requests share an absolute deadline/cancellation control through nested calls and native callbacks. Non-authorizing responses distinguish `index_busy`, `request_deadline`, `request_cancelled`, and `operation_timeout`; unrelated SQLite failures are not converted into successful empty searches. A stopped request cannot begin a later publication, but an admitted commit or one already-running blocking call may finish. This is cooperative stopping, not forced thread termination or proof of rollback.
+- **`test`** (Ubuntu and Windows, Python 3.12, 10 minutes): the explicit MCP transport, Jev boundary and Windows session-path smoke tests and the compressed Codex session tests (without their two 50 MB allocation probes), then builds the source distribution and wheel.
+- **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, checklist conflicts, quiet hooks, AGY and Claude Code hooks, the Claude Code installer and provider, and hook gating. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
 
-Default combined writer-lock wait (1 second), audit budget (8 seconds), ordinary budget (45 seconds), and explicit-tool cap (600 seconds) are unchanged. Real writes, initialization, raw captures, and derived persistent mutations remain guarded and can still contend. Upgrade/restart every process using the shared index from its actual configured source/package; a branch fix does not update already-running servers. See [implementation and verification boundaries](docs/timeout-fix.md).
+The `Memory` workflow (pull requests to `main`, `main`, nightly and on demand) is described in [Memory verification](#memory-verification).
 
-Heavy tool calls (sync, search, audit, check_action, checklist, graph, hooks) run in worker threads bounded by `SELF_DIRECT_MAX_CONCURRENT_CALLS` (default 4). A request waits for a slot only within its own deadline; a request that expires while queued returns `request_deadline` without starting work (distinct from `index_busy`). A slot is held until the worker thread really finishes, even if its caller timed out. Cheap metadata calls (`list_contracts`, `upsert_contracts`, `revoke_contract`, `get_chunk`, `audit_status`) and `workflow_*` calls bypass the limit. On glibc Linux, when the last running heavy call that took at least 0.5 s finishes (at most once per 5 s) the server calls `malloc_trim(0)` to return freed heap to the OS; it is skipped on Windows/macOS/musl and failures are ignored.
+Real Lean proof checks and the performance, large-session and concurrency benchmarks are local deep checks, not CI gates. A green CI run does not establish full workflow or native-proof coverage or performance guarantees. Live model validation needs a separate model and budget approval.
+
+### Memory verification
+
+tsukkomi is Python, but it runs native code: neograph-engine (the audit and GraphRAG graphs) and the sqlite-vector extension (dense search). After the 0.5.x memory incident the project checks both the native code and the long-running server, modelled on NeoGraph's sanitizer CI. `.github/workflows/memory.yml` runs three jobs:
+
+| Job | What runs | Fails on |
+|---|---|---|
+| `asan` | neograph-engine and sqlite-vector rebuilt with AddressSanitizer + UndefinedBehaviorSanitizer; the whole suite with the runtime preloaded, `PYTHONMALLOC=malloc` and the native vector backend | any ASan or UBSan report; a direct leak allocated by neograph or sqlite-vector code |
+| `tsan` | the same libraries rebuilt with ThreadSanitizer; the whole suite under `setarch -R` | any data race or deadlock report |
+| `soak` | `scripts/memory_soak.py` with the official sqlite-vector release: one long-lived process drives the MCP tool entry points through steady, growing and churning sessions | retained Python heap growing in both measured windows of a phase, or growing file descriptors or threads |
+
+How the sanitizer jobs work (`scripts/verify_memory.py`, standard library only, Linux and GCC):
+
+- `native` downloads the neograph-engine sdist pinned in `pyproject.toml` and checks its SHA-256 against both PyPI and the digest pinned in the script, clones sqlite-vector `1.1.0` and checks that it resolves to the pinned commit, and builds both with the profile's flags. The builds are cached by these pins; a cold build of neograph-engine takes about 45 minutes on a hosted runner.
+- `canary` builds a small library with one deliberate defect per check (heap overflow, signed overflow, a leak, a data race) and requires the sanitizer to report each. A run without reports therefore means the sanitizer was live, not that it was missing.
+- `test` refuses to run unless the installed neograph module links the sanitizer runtime, so the release wheel can never be tested by mistake. It then runs the suite and scans the sanitizer logs and the test output.
+- LeakSanitizer does not run at interpreter exit, where CPython leaves thousands of objects unfreed by design. `tests/conftest.py` runs LSan's recoverable check when the pytest session finishes, while live Python objects are still reachable. Each direct leak is attributed to the first frame above the allocator: neograph or sqlite-vector code fails the run, while CPython and third-party leaks are counted and printed.
+- Under TSan, `/bin/sh` itself crashes with the runtime preloaded, so the two installer tests that start hook commands through a shell are deselected there.
+
+Run them locally:
+
+```bash
+python scripts/verify_memory.py native --profile asan --out build/memory/asan
+python -m pip install build/memory/asan/wheels/neograph_engine-*.whl && python -m pip install -e ".[dev]"
+python scripts/verify_memory.py canary --profile asan --out build/memory/asan
+python scripts/verify_memory.py test --profile asan --out build/memory/asan    # same for --profile tsan, in its own venv
+python scripts/memory_soak.py --check --dense-backend sqlite-vector --vector-path /absolute/path/to/vector.so
+```
+
+Use a separate virtual environment per profile, because the sanitizer build replaces the release wheel. `TSUKKOMI_TEST_DENSE_BACKEND=sqlite-vector` with `SQLITE_VECTOR_TEST_PATH` runs any suite against a native vector library. Known limit: CPython 3.12 builds where interned strings are immortal (Ubuntu 24.04's 3.12.3, for example) keep each path component that `pathlib` interns, about 150 bytes per distinct session path. This is bounded by the number of sessions; newer 3.12 releases and 3.13 release them.
 
 ### Shared-index queue PoC
 
-The opt-in `scripts/poc_shared_index_queue.py` experiment connects separate client processes to one authenticated IPv4 loopback service. It uses the real NeoGraph `RequestQueue` through a small C++/ctypes bridge and runs real `SelfDirectEngine` operations against a temporary synthetic index. It does not replace the deployed MCP transport, touch existing indexes, load API keys, or add a CI gate.
+The opt-in `scripts/poc_shared_index_queue.py` experiment connects separate client processes to one authenticated IPv4 loopback service. It uses the real NeoGraph `RequestQueue` through a small C++/ctypes bridge and runs real `SelfDirectEngine` operations against a temporary synthetic index. It does not replace the deployed MCP transport, touch existing indexes, load API keys or add a CI gate.
 
 Requirements: a POSIX host, an installed GCC-compatible C++20 compiler, the project Python dependencies, and a NeoGraph source checkout containing `include/neograph/util/request_queue.h` and `deps/concurrentqueue.h`. No dependencies are downloaded by the PoC.
 
@@ -353,9 +632,9 @@ Requirements: a POSIX host, an installed GCC-compatible C++20 compiler, the proj
 python scripts/poc_shared_index_queue.py run --neograph-root ../NeoGraph --workers 4
 ```
 
-The runner compiles only the bridge, compares 16 independent clients with one worker and the selected multiworker count, and checks real clean/violation verdicts, bounded rejection, queued expiry, disconnect cancellation, running deadlines, and shutdown settlement. It separately reports `writer_lease_peak`, actual native audit `evaluation_peak`, metadata progress during evaluation, and `residual_writer_contention`. Deliberate writer/native-stage holds are labeled diagnostic fixtures, not production latency. Wall throughput includes client startup and IPC and has no performance pass/fail threshold.
+The runner compiles only the bridge, compares 16 independent clients with one worker and the selected multiworker count, and checks real clean/violation verdicts, bounded rejection, queued expiry, disconnect cancellation, running deadlines and shutdown settlement. It separately reports `writer_lease_peak`, actual native audit `evaluation_peak`, metadata progress during evaluation and `residual_writer_contention`. Deliberate writer/native-stage holds are labeled diagnostic fixtures, not production latency. Wall throughput includes client startup and IPC and has no performance pass/fail threshold.
 
-For an interactive experiment, use `serve --neograph-root ../NeoGraph --workers 1 --capacity 32`; its readiness line gives a private endpoint-file path. The `client --endpoint-file <path> --request '<JSON>'` mode supports `check_action`, `sync_session` with `embed=false`, `audit_session`, and `audit_status` for the synthetic session. `{"op":"stop"}` closes the queue, settles accepted futures, and shuts the service down naturally. Endpoint credentials and compiled libraries are temporary; do not commit an endpoint file.
+For an interactive experiment, use `serve --neograph-root ../NeoGraph --workers 1 --capacity 32`; its readiness line gives a private endpoint-file path. The `client --endpoint-file <path> --request '<JSON>'` mode supports `check_action`, `sync_session` with `embed=false`, `audit_session` and `audit_status` for the synthetic session. `{"op":"stop"}` closes the queue, settles accepted futures and shuts the service down naturally. Endpoint credentials and compiled libraries are temporary; do not commit an endpoint file.
 
 A queued request that expires never enters the engine. An already-started request can temporarily outlive its response deadline: it reports `still_running`/unknown, then settles at a cooperative checkpoint or returns an actual admitted-work outcome. Multiple workers can overlap detached evaluation, but cannot bypass a genuinely held writer lease. The PoC never claims forced cancellation of a running syscall.
 
@@ -364,6 +643,10 @@ A queued request that expires never enters the engine. An already-started reques
 Test results and staged secret-pattern scans are bounded evidence, not certification that arbitrary secrets or every host bypass are absent. Inspect matched staged lines before committing, keep credentials in an external authorized dotenv file, and never commit raw personal transcripts or local runtime state.
 
 ---
+
+## Security and changelog
+
+See [SECURITY.md](SECURITY.md) for supported versions and how to report a vulnerability, and [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## License
 

@@ -13,6 +13,7 @@ import sqlite3
 import re
 import time
 
+from self_directing_mcp.compressed_source import CompressedSourceError
 from self_directing_mcp.session_events import as_text, make_chunk
 
 from self_directing_mcp.audit.contracts import (
@@ -32,7 +33,7 @@ from self_directing_mcp.checklist import (
 )
 from self_directing_mcp.codex import discover as codex_discover
 from self_directing_mcp.grokbot import discover as grokbot_discover
-from self_directing_mcp import omp, agy
+from self_directing_mcp import omp, agy, claude
 from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
 from self_directing_mcp.index.ingest import AmbiguousSessionSource, SessionStore, ingest_session, coverage_from_capture
@@ -232,7 +233,7 @@ class SelfDirectEngine:
                 index_dir / ("vectors-v2-" + self.embedder.cache_key[:16]), dim=s.embedding_dim,
                 backend=s.dense_backend, extension_path=s.sqlite_vector_path)
         self.sparse = SparseIndex(index_dir / "sparse.sqlite")
-        self.store = SessionStore(index_dir / "meta.sqlite")
+        self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes)
         self.contracts = ContractStore(s.resolve_contracts_path())
         self.checklists = ChecklistStore(index_dir)
         self.graph = GraphStore(index_dir / "graph.sqlite")
@@ -241,6 +242,8 @@ class SelfDirectEngine:
         seed = Path(__file__).resolve().parent / "resources" / "examples.json"
         if s.seed_example_contracts:
             self.contracts.seed_from(seed)
+            # Disabled high-risk presets; the owner enables the ones they want.
+            self.contracts.seed_missing(seed.with_name("high_risk_presets.json"))
 
         if not s.local_only:
             self.retriever = HybridRetriever(
@@ -258,13 +261,13 @@ class SelfDirectEngine:
         provider: str | None,
         *,
         path: str | None = None,
-    ) -> Literal["codex", "grokbot", "omp", "agy"]:
+    ) -> Literal["codex", "grokbot", "omp", "agy", "claude"]:
         """Explicit arg > settings/env > light auto-detect from path layout."""
         if provider:
             p = provider.strip().lower()
-            if p in ("codex", "grokbot", "omp", "agy"):
+            if p in ("codex", "grokbot", "omp", "agy", "claude"):
                 return p  # type: ignore[return-value]
-            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot|omp|agy)")
+            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot|omp|agy|claude)")
         # Auto-detect: path under a configured grokbot root, or <id>/<id>.jsonl layout
         if path:
             try:
@@ -275,6 +278,9 @@ class SelfDirectEngine:
                 path_r.is_relative_to(root) for root in self.settings.resolve_agy_app_data_dirs()
             ):
                 return "agy"
+            if claude.peek_session_id(path_r) and path_r.is_relative_to(
+                    self.settings.resolve_claude_projects_dir().expanduser().resolve()):
+                return "claude"
             for root in self.settings.resolve_grokbot_transcripts_dirs():
                 try:
                     path_r.relative_to(Path(root).resolve())
@@ -312,6 +318,10 @@ class SelfDirectEngine:
                 resolved = agy.resolve_session_path(
                     self.settings.resolve_agy_app_data_dirs(), session_id=session_id, path=path
                 )
+            elif resolved_provider == "claude":
+                resolved = claude.resolve_session_path(
+                    self.settings.resolve_claude_projects_dir(), session_id=session_id, path=path
+                )
             elif resolved_provider == "omp":
                 resolved = omp.resolve_session_path(
                     self.settings.resolve_omp_sessions_dir(), session_id=session_id, path=path
@@ -326,10 +336,13 @@ class SelfDirectEngine:
                 resolved = codex_discover.resolve_session_path(
                     sessions_root, session_id=session_id, path=path
                 )
-        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError, omp.PathTraversalError, agy.PathTraversalError) as e:
+        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError, omp.PathTraversalError,
+                agy.PathTraversalError, claude.PathTraversalError) as e:
             return {"ok": False, "error": "path_traversal", "message": str(e)}
         except FileNotFoundError as e:
             return {"ok": False, "error": "not_found", "message": str(e)}
+        except CompressedSourceError as e:
+            return {"ok": False, "error": e.code, "message": str(e), "provider": resolved_provider}
         except ValueError as e:
             return {"ok": False, "error": "bad_request", "message": str(e)}
 
@@ -345,10 +358,17 @@ class SelfDirectEngine:
                 embed=embed,
                 derived=derived,
                 guard=self._publication_guard,
+                # A local-only process (a hook) may share a server's index: leave vector cleanup journalled for it.
+                retain_dense_deletions=self.dense is None and any(Path(self.settings.index_dir).glob("vectors-v2-*")),
             )
         except AmbiguousSessionSource as exc:
             return {"ok": False, "error": "ambiguous_session_source", "message": str(exc), "provider": resolved_provider,
                     "session_id": exc.session_id, "indexed_path": exc.indexed_path, "requested_path": exc.requested_path}
+        except CompressedSourceError as exc:
+            # An unreadable .zst source (missing module, corrupt or truncated frame, size mismatch, over the limit):
+            # visible, nothing indexed or published, coverage stays incomplete.
+            return {"ok": False, "error": exc.code, "message": str(exc), "provider": resolved_provider,
+                    "path": str(resolved)}
         info["ok"] = True
         info["dense_backend"] = self.dense_backend
         info["embedder"] = type(self.embedder).__name__ if self.embedder else None
@@ -466,7 +486,7 @@ class SelfDirectEngine:
             record = self.store.cursor_record(sid, provider)
             metrics = self.store.session_metrics(sid, provider)
             token = self.store.state_token(sid, provider)
-        coverage = coverage_from_capture(sid, provider, record, metrics)
+        coverage = coverage_from_capture(sid, provider, record, metrics, max_bytes=self.store.max_decompressed_bytes)
         coverage["complete"] = False
         coverage["issues"].append(failure)
         coverage.update({key: failed[key] for key in ("indexed_path", "requested_path") if key in failed})
@@ -589,7 +609,7 @@ class SelfDirectEngine:
                             and (rule.requires_success or not payload["coverage"].get("judged_prefix"))}
                 for item in payload["findings"]:
                     if item["contract_id"] in gate_ids and item["verdict"] == "clean":
-                        item.update(verdict="unknown",
+                        item.update(verdict="unknown", applicability="applicable",
                                     reason="incomplete current history cannot establish the proposed action's prerequisite",
                                     basis=(item.get("basis") or "") + "; captured prerequisite evidence does not establish current compliance")
                 if gate_ids:
@@ -668,7 +688,7 @@ class SelfDirectEngine:
             else:
                 rules.append(ContractRule.model_validate(c))
         for rule in rules:
-            for pattern in (rule.regex, rule.before_regex):
+            for pattern in (rule.regex, rule.before_regex, rule.when.tool_call_regex if rule.when else None):
                 if pattern:
                     re.compile(pattern)
         with self._publication_guard():
@@ -855,12 +875,14 @@ class SelfDirectEngine:
             receipt_token = self._receipt_token(sid, resolved_provider)
             evidence = self.store.capture_evidence(sid, resolved_provider)
         try:
-            observation = capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],)) if record else None
+            observation = (capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],),
+                                          max_bytes=self.store.max_decompressed_bytes) if record else None)
         except RequestStopped:
             raise
         except (OSError, ValueError):
             observation = None
-        coverage = coverage_from_capture(sid, resolved_provider, record, metrics, observation)
+        coverage = coverage_from_capture(sid, resolved_provider, record, metrics, observation,
+                                         max_bytes=self.store.max_decompressed_bytes)
         if resolved_provider == "agy" and record and record.get("receipt_digest") != receipt_token[2]:
             coverage["complete"] = False
             coverage["issues"].append("receipts_not_indexed")
@@ -1110,7 +1132,8 @@ class SelfDirectEngine:
         status, raw_contracts, record, metrics, metadata_token, receipt_token = self._capture_status(sid, resolved)
         status["contract_count"] = len(ContractsDocument.model_validate_json(raw_contracts).contracts) if raw_contracts is not None else 0
         if sid:
-            status["session"] = coverage_from_capture(sid, resolved, record, metrics)
+            status["session"] = coverage_from_capture(sid, resolved, record, metrics,
+                                                      max_bytes=self.store.max_decompressed_bytes)
             if resolved == "agy" and record and record.get("receipt_digest") != receipt_token[2]:
                 status["session"]["complete"] = False
                 status["session"]["issues"].append("receipts_not_indexed")
@@ -1137,6 +1160,7 @@ class SelfDirectEngine:
             "sessions_dir": str(s.resolve_sessions_dir()),
             "grokbot_transcripts_dirs": [str(p) for p in s.resolve_grokbot_transcripts_dirs()],
             "omp_sessions_dir": str(s.resolve_omp_sessions_dir()),
+            "claude_projects_dir": str(s.resolve_claude_projects_dir()),
             "session_provider": s.resolve_session_provider(),
             "index_dir": str(Path(s.index_dir).resolve()),
             "dense_backend": self.dense_backend,
