@@ -152,6 +152,35 @@ class RowSpool:
         self._file.close()
 
 
+_flights, _flights_gate = {}, threading.Lock()
+
+
+@contextmanager
+def session_flight(key):
+    """Single-flight per (index, provider, source): at most one capture/parse/publish at a time.
+
+    Waiters poll with their own request control, so a waiter's deadline or cancellation raises for that waiter
+    only, and a leader's failure just passes the baton: the next caller becomes leader and finds the cursor
+    current (no second parse) or retries. Cross-process safety is still the state token/CAS at publication.
+    """
+    with _flights_gate:
+        entry = _flights.setdefault(key, [threading.Lock(), 0])
+        entry[1] += 1
+    try:
+        while not entry[0].acquire(timeout=0.05):
+            check_request()
+        try:
+            check_request()
+            yield
+        finally:
+            entry[0].release()
+    finally:
+        with _flights_gate:
+            entry[1] -= 1
+            if not entry[1] and _flights.get(key) is entry:
+                del _flights[key]
+
+
 class SessionStore:
     """v2 events preserve every occurrence; legacy tables remain untouched for recovery."""
 
@@ -548,8 +577,14 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
 @request_operation
 def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider="codex",
                    embed=True, derived=True, guard=nullcontext):
-    return _ingest_session(path=path, session_id=session_id, store=store, sparse=sparse, dense=dense,
-                           embedder=embedder, provider=provider, embed=embed, derived=derived, guard=guard)
+    """Serialize per (index, provider, source). Later callers find the cursor current and skip the parse.
+
+    A parser-version bump therefore reparses a session once per process no matter how many hooks race on it;
+    other sessions reparse lazily, each on its own first sync, never in a storm.
+    """
+    with session_flight((str(store.db_path), provider, str(Path(path).resolve()))):
+        return _ingest_session(path=path, session_id=session_id, store=store, sparse=sparse, dense=dense,
+                               embedder=embedder, provider=provider, embed=embed, derived=derived, guard=guard)
 
 
 def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard):
@@ -567,9 +602,9 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
     hint = ()
     if session_id:
         try:
-            with store._read_boundary():
+            with guard(), store._read_boundary():
                 known = store.cursor_record(session_id.lower() if provider in ("codex", "agy") else session_id, provider)
-            hint = (known["byte_offset"],) if known else ()
+            hint = (known["byte_offset"],) if known and type(known["byte_offset"]) is int else ()
         except (OSError, sqlite3.Error):
             hint = ()
     observation = capture_source(path, checkpoints=hint)
@@ -617,7 +652,9 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 start, reindexed, reindex_reason = 0, True, "hook_receipts_changed"
         chunks = RowSpool()
         try:
-            if provider == "agy":
+            if cursor and not reindexed and provider != "agy" and start >= observation.complete_end:
+                offset, parsed_sid = start, sid
+            elif provider == "agy":
                 _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, receipts=receipts,
                                                              sink=chunks)
             elif provider == "omp" and start:

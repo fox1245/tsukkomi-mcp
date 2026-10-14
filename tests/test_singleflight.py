@@ -87,4 +87,26 @@ def test_waiter_deadline_and_leader_cancel_do_not_poison(session, monkeypatch):
         with pytest.raises(RequestStopped):
             leader.result(10)
         info = waiter.result(10)
-    assert info["ok"] and engine.store.chunk_count(SID) == 1
+    assert info["ok"] and engine.store.chunk_count(SID) == 2
+
+
+def test_cursor_hint_peek_runs_under_the_engine_lock(session, monkeypatch):
+    from self_directing_mcp.index.ingest import SessionStore
+    engine, path = session
+    write(path, [message("one")], "a")
+    engine.sync_session(session_id=SID, embed=False)
+    write(path, [message("two")], "a")
+    unlocked = []
+    for name in ("cursor_record", "state_token"):
+        original = getattr(SessionStore, name)
+
+        def spy(self, *args, _original=original, _name=name, **kwargs):
+            if not engine._lock._is_owned():
+                unlocked.append(_name)
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(SessionStore, name, spy)
+    assert engine.sync_session(session_id=SID, embed=False)["ok"]
+    assert unlocked == []
+    run_parallel(lambda: engine.sync_session(session_id=SID, embed=False))
+    assert unlocked == []
