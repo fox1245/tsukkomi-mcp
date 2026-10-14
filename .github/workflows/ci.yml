@@ -72,6 +72,7 @@ jobs:
           tests/test_action_prefix_freshness.py
           tests/test_append_capture.py
           tests/test_source_capture.py
+          tests/test_source_io_consumers.py
           tests/test_sync_idsets.py
           tests/test_singleflight.py
           tests/test_index_concurrency.py
