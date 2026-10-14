@@ -77,6 +77,8 @@ def test_handle_larger_than_path_is_rejected(source, monkeypatch):
         capture_source(source)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows st_ctime is the creation time, so a same-size rewrite "
+                    "that restores mtime is invisible to stat; the cursor prefix hash catches it on the next sync")
 def test_rewrite_after_capture_invalidates_observation(source):
     observation = capture_source(source)
     st = source.stat()
