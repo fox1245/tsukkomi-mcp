@@ -13,6 +13,13 @@ only acceptable difference is time, so these tests build the same session two wa
 Every chunk (id, text, meta incl. ``linkage``, ``legacy_unlinked``, truncation and fallback fields, byte ranges),
 the AGY evidence stats, the coverage and the audit verdicts must be identical.
 
+One thing is deliberately not generated: a truncated field whose fallback to ``transcript_full.jsonl`` fails *for good*
+while the full log keeps growing (a step missing from it that is below its highest step). That failure records the size
+of the full log at the moment it was evaluated (``fallback.full_size``, part of the event id), and nothing re-evaluates it
+because the failure is permanent; so an index kept by plain appends, hooks or not, differs from a fresh reindex in that
+one field once the full log has grown. Before this change every hook happened to reparse and refresh it. Failures that
+can be retried (the full log missing, or not yet at that step) and every success are deterministic and generated.
+
 Two independent references guard what the module under test could get wrong together with itself: the receipts a
 hook records are compared with the old whole-file algorithm (``reference_*`` below, copied from the previous
 implementation), and the set of results the index links to a call is compared with the anchor rule restated on raw
