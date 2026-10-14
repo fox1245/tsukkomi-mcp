@@ -22,6 +22,7 @@ from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.schemas import ContractRule, ProposedAction
 from self_directing_mcp.codex_hooks import handle_hook
 from self_directing_mcp.integrity_worker import start_integrity_worker
+from self_directing_mcp.shadow_worker import start_shadow_worker
 from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.request_control import (
     IndexBusy, RequestControl, RequestStopped, check_request, request_scope,
@@ -780,6 +781,8 @@ def main(argv: list[str] | None = None) -> None:
     # A resident server closes the gap that fast hook-time checks leave: it verifies watched sources in full while
     # idle. Hook processes (one event each) never do this.
     start_integrity_worker(_engine)
+    # Likewise the idle comparison of incremental audits against the full evaluator (shadow_worker): resident servers only.
+    start_shadow_worker(_engine)
     try:
         mcp.run(transport="stdio")
     except Exception:

@@ -292,6 +292,7 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_INTEGRITY_FAST_RECENT_BLOCKS`, `SELF_DIRECT_INTEGRITY_FAST_SAMPLE_BLOCKS` | `4`, `8` | Fast (hook-time) source verification: the latest complete 1 MiB blocks and the random sample compared with their stored digests. `0` for either disables that part (the tail block is always compared). See [Source integrity](#source-integrity-full-and-fast-verification). |
 | `SELF_DIRECT_INTEGRITY_FULL_VERIFY_INTERVAL_SEC` | `300` | A fast check is allowed only this long after the last verification of every block; then the next check is full. `0`: always full. |
 | `SELF_DIRECT_INTEGRITY_BACKGROUND_VERIFY`, `SELF_DIRECT_INTEGRITY_BACKGROUND_IDLE_SEC`, `SELF_DIRECT_INTEGRITY_BACKGROUND_MAX_SCANS` | `true`, `2`, `1` | Resident servers verify watched sources in full on one background thread after this much idleness; at most this many scans per wake-up. Hook processes never do background work. |
+| `SELF_DIRECT_AUDIT_SHADOW_EVERY`, `SELF_DIRECT_AUDIT_SHADOW_IDLE_SEC` | `adaptive`, `2` | How incremental audits are compared with the full evaluator: `adaptive` (rate 1/4 down to 1/64 plus forced comparisons) or an integer that pins the fixed rate (`1` every audit, `0` only the forced comparisons, `N` about one in `N`); resident servers compare the latest state of a session after this many idle seconds (`0` off). See [Incremental audits](#incremental-audits). |
 | `SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES` | `4294967296` | **New in 0.6.0.** Largest decompressed size a `.jsonl.zst` Codex session may declare; larger files are refused as `zstd_too_large`. |
 | `SELF_DIRECT_RETRIEVE_TOP_K`, `SELF_DIRECT_SEARCH_TOP_K`, `SELF_DIRECT_RRF_K` | `20`, `10`, `60` | Retrieval tuning. |
 | `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS` | `false` | Seed disabled demonstration contracts. |
@@ -445,7 +446,7 @@ evaluation, which remains the reference. The audit still runs through the native
 `load_evidence` and `evaluate_contracts` stages do changes.
 
 - **What is stored.** `meta.sqlite` gains derived tables (`audit_monitor_state`, `session_commit_log`,
-  `session_generations`, `audit_incremental_health`) and, once a `requires_success` contract or a Claude Code result
+  `session_generations`, `audit_incremental_health`, `audit_shadow_state`, `audit_review_ranges`) and, once a `requires_success` contract or a Claude Code result
   contract is audited, an index on tool-call ids. Nothing in them is authority: the events and the cursor are. A missing,
   unreadable or disagreeing row only means the contract is evaluated in full again.
 - **Per contract kind** the state holds: anchors and the activation point (`applies_from_event_id`); whether a
@@ -472,13 +473,69 @@ evaluation, which remains the reference. The audit still runs through the native
   disabled by a shadow mismatch (below). Adding a contract that needs text of events no other contract reads changes the
   `needs` and rebuilds every state once. An AGY conversation rebuilds when a hook receipt changes an event that is already
   indexed (see [AGY hook cost](docs/agy-installation.md#hook-cost-what-a-hook-reads)); an ordinary receipt is an append.
-- **Shadow verification.** About every `SELF_DIRECT_AUDIT_SHADOW_EVERY`th audit (default 16; `1` compares every audit,
-  `0` only after state was rebuilt) also runs the full evaluator on the same events and compares findings, verdict, notes,
-  coverage and trace. On a difference the **full result is returned**, `incremental.incremental_mismatch` names the contracts, a row with status
-  `incremental_mismatch` is written to `audit_incremental_health` and that contract is evaluated in full in that session
-  until the evaluator version changes. The comparison is skipped (`incremental.shadow_skipped: "deadline"`) when the request's
-  remaining time budget could not cover the full evaluation. The test suite compares every audit and fails on any
-  difference.
+- **Shadow verification is a sample with forced exceptions, not a proof.** Some requests also run the full evaluator on the
+  same stored events and compare it with the incremental result: the findings and, when every contract is compared, the
+  verdict, notes, coverage and trace. On a difference the **full result is returned**, `incremental.incremental_mismatch`
+  names the contracts, a row with status `incremental_mismatch` is written to `audit_incremental_health`, that contract is
+  evaluated in full in that session until the evaluator version changes, and the schedule below starts again at 1/4. The
+  comparison is skipped (`incremental.shadow_skipped: "deadline"`) when the request's remaining time budget could not cover
+  the full evaluation. Which requests are compared (`incremental.shadow_reasons` says why):
+  - **Forced, whatever the rate.** `rebuild`, `premise`, `warmup`: a state was rebuilt in this request, and for the first 8 compared
+    requests after a rebuild or a change of premise (below), the session is compared in full. `violation`: the incremental
+    answer holds a `violation` or `suspicious` finding of a contract it decides (a wrong block is the costly error; for an action check
+    only the contracts that apply to the action count, since only those can block it). `flip`: a contract that the previous request
+    of the same kind and action (an audit, or the same proposed action) judged `violation` or `suspicious` is `clean` now (events only
+    append, so a real flip is rare, and a wrongly missed violation is the costly error). `high_risk`: a `risk: high` contract applies to the proposed
+    action, or this request changed its stored summary. The last three compare **only the contracts that call for it**
+    (`incremental.shadow_scope`: a reference evaluation of those contracts alone), so a high-risk contract in the session
+    makes no unrelated request compare anything and does not make the other contracts dearer; a scoped comparison does not count
+    towards the rate below, and a scoped mismatch is settled by a full comparison in the same request. These three are not repeated for
+    an input that was already compared and matched (the same stored events, contracts, request and incremental answer:
+    `shadow_skipped: "verified_before"`): the reference is deterministic, so a repeat could find nothing.
+  - **Sampled, for everything else, at an adaptive rate.** The rate starts at 1/4 and halves (1/8, 1/16, 1/32, 1/64) after
+    every 32 consecutive comparisons that actually ran, covered every contract and matched; the floor is 1/64. It returns to 1/4
+    only when a premise of the verification changes (`incremental.shadow_reset` names it): the contract set or one contract's
+    revision, the parser or evaluator version, the session generation (a reindex or a rewrite) or a mismatch. A normal append does not
+    reset it. A comparison that was skipped for lack of time is no match and does not interrupt the streak. The draw is a hash of
+    the schedule state and the cursor, so it is deterministic and reproducible. The schedule is kept per session and provider in
+    `audit_shadow_state`, written with the monitor states (a resident engine holds it with them), so a restarted process continues
+    it; an unreadable row only means "start again at 1/4 with the warm-up", which compares more, never less. The action-check and the
+    audit variants keep monitor states of their own, so the first request of each variant is a rebuild and owes the warm-up again.
+  - **Settings.** `SELF_DIRECT_AUDIT_SHADOW_EVERY` is `adaptive` by default. An integer pins the previous fixed behaviour and switches
+    adaptation off, the forced comparisons stay: `1` compares every audit (the test suite does), `0` only the forced comparisons,
+    `N` about one audit in `N` (`16` was the previous default). `audit_status` reports the policy, the schedule of a session
+    (`rate`, `streak`, `forced_comparisons_left`, `last_match_*`, `reset_reason`), the contracts whose incremental path is switched off and
+    the ranges that need review under `incremental_verification`.
+  - **Idle comparison (resident engines only).** The daemon's engines and the stdio MCP server (never a hook process) compare the latest state of a
+    session with a full evaluation once the engine has been idle for `SELF_DIRECT_AUDIT_SHADOW_IDLE_SEC` seconds (default 2; `0` switches
+    it off), if the session answered requests without a full comparison since its last match. One job is pending per session and one runs at a
+    time; it never blocks a request (a request that arrives cancels the running job at its next cooperative check, and the session stays
+    pending). On a mismatch the contract's incremental path is disabled, the rate returns to 1/4 and the requests answered since the
+    last match are recorded as a range that **needs review** (`audit_review_ranges`, reported by `audit_status`; a mismatch found by
+    a request records one too, with the count of unverified requests known only to a resident engine). It does not retroactively guarantee
+    earlier responses: a match says the latest state agrees with the full evaluator, nothing about the answers given before it.
+  - **What this does not promise.** Not every response equals the full evaluation. An answer that is wrongly **clean** passes between
+    two comparisons unnoticed; a violation, a violation that turns clean and a high-risk contract are checked in the request that
+    carries them, a silent miss is not. Fault injection (`scripts/measure_shadow_detection.py`: a monitor that ignores forbidden
+    events, 200 seeds of a synthetic Codex session with five contracts; requests counted from the one that carries the violation,
+    1 = noticed in it) gives, as median / p95 / max requests until the defect was noticed, and the wrong answers returned before that
+    are one fewer:
+
+    | defect | previous fixed 1/16 | adaptive, in the warm-up (request 3) | adaptive, just after it (request 9) | adaptive, at the floor 1/64 |
+    |---|---|---|---|---|
+    | a violation the monitor misses (answers `clean`) | 11.5 / 53 / 92 | 1 / 1 / 1 | 3 / 11 / 23 | 42.5 / 179 / 471 |
+    | a block the full evaluator would not give (`violation` for `clean`) | 12 / 46 / 92 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+    | a violation that turns clean | 10 / 41 / 88 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+    | a high-risk obligation that wrongly says `clean` | 12 / 52 / 113 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+
+    The last three rows do not depend on the rate (the 200 seeds ran from a cold start; `tests/test_shadow_detection.py` repeats them at the floor and with `SELF_DIRECT_AUDIT_SHADOW_EVERY=0`).
+    The adaptive schedule trades a longer worst case for a lower steady cost: after a long clean streak a silently missed
+    violation is noticed after 45 requests at the median, 188 at p95 and 627 at most (`--simulate`, 20,000 draws of the same
+    schedule), against 11, 47 and 138 under 1/16, and every request in between returns the wrong `clean`. It also compares
+    *more* than 1/16 did at first: the share of a session's requests that are compared is 85% over the first 10, 31% over 100, 19% over
+    300, 10% over 1,000 and 6.5% over 2,000 requests (`--share`), and falls below the 6.25% of 1/16 only after about 2,000 requests with an
+    unchanged premise (4.8% over 3,000, 3.5% over 5,000, 1.6% at the floor). The constants are `audit.shadow.RATE_DENOMINATORS`,
+    `HALVE_AFTER` and `WARMUP_REQUESTS`.
 - **Small sessions.** A session with fewer than `SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS` stored events (default 500)
   is evaluated in full and no state is kept (`incremental.mode: "full"`, `below_min_events`). Below that size one full
   evaluation costs less than storing states, rebuilding them and shadow-checking the rebuild; on the scripted evaluation
@@ -487,7 +544,7 @@ evaluation, which remains the reference. The audit still runs through the native
   events; the default is unchanged (see [Warm judgement benchmark](#warm-judgement-benchmark)).
 - **Reporting.** Results carry an `incremental` object: `mode` (`delta` reads only appended events, `full` reads all),
   `events_read`, `rebuilt` (contract to reason), `fallback` (contracts on full evaluation and why), `shadow`,
-  `shadow_compared`, `incremental_mismatch`, `retry` and `state` (`saved`; `unchanged`; `deferred` when a resident engine holds the write, see [Held writes](#lifecycle); or why it was not written). `SELF_DIRECT_AUDIT_INCREMENTAL=false` switches the whole feature off.
+  `shadow_reasons`, `shadow_scope`, `shadow_rate`, `shadow_reset`, `shadow_compared`, `incremental_mismatch`, `retry` and `state` (`saved`; `unchanged`; `deferred` when a resident engine holds the write, see [Held writes](#lifecycle); or why it was not written). `SELF_DIRECT_AUDIT_INCREMENTAL=false` switches the whole feature off.
 - **With source verification.** A state describes the stored events, not how the source was verified: it is written
   before the fast-verification gate and is the same whether the request verified `fast` or `full`. If a later full
   verification finds a rewrite, the reindex starts a new generation and deletes the states. A cursor that migrates from a
@@ -592,7 +649,7 @@ Claude Code / AGY hook event ─ scripts/*_hook.py (stdlib client) ┐
 OMP / AGY MCP server ───────── self-directing-mcp (stdlib relay) ┼─ Unix socket ─ python -m self_directing_mcp.daemon
                                                                  ┘                 ├─ hook lane: claude_hooks.run_hook / agy_hooks.run_hook
                                                                                    ├─ heavy lane: the FastMCP tool functions of server.py
-                                                                                   └─ one SelfDirectEngine (+ integrity worker) per resolved-settings key
+                                                                                   └─ one SelfDirectEngine (+ integrity and shadow workers) per resolved-settings key
 ```
 
 ### Turning it on, and off
@@ -617,8 +674,8 @@ The authentication boundary is **the operating-system user**, and nothing finer.
 - **Start.** The first client that finds no daemon takes a non-blocking lock, starts one detached (own session, stdio on `/dev/null`) and waits for its socket for a bounded time (`AVAILABILITY_FAST_SEC` 0.3 s for `PreToolUse`, `PostToolUse`, `UserPromptSubmit` and `PreInvocation`; `AVAILABILITY_SLOW_SEC` 3 s for `Stop`, `SubagentStop` and `SessionStart`; an MCP relay waits up to 15 s). The interpreter is the checkout's `.venv` Python, else the client's own; `SELF_DIRECT_DAEMON_PYTHON` overrides it. The daemon's environment carries no settings: every request brings its own.
 - **One instance.** A lock file (`flock`) is held for the daemon's lifetime; a second daemon exits at once, and a successor started while its predecessor drains waits up to 10 s for the lock. Never two writers.
 - **Leaving.** After `SELF_DIRECT_DAEMON_IDLE_EXIT_SEC` (900) with no connection and no request; after a request when its resident set exceeds `SELF_DIRECT_DAEMON_MAX_RSS_MB` (400): it stops accepting, finishes what is running and exits, and the next client starts a new one; on SIGTERM/SIGINT; and when a newer client asks (below). Each exit flushes its counters, closes its engines and removes the socket and the pid file.
-- **Judging.** Hook requests run on their own thread pool and MCP tool calls on another, so a long `sync_session` never queues a `PreToolUse`. Requests are bounded per session (`SELF_DIRECT_DAEMON_SESSION_BOUND`, 16) and in total (128); beyond the bound the answer is `unknown(queue_full)`. Each request's environment is a per-request view of `os.environ` (managed names come from the request alone), settings are resolved with `settings_core.load_hook_settings` (hooks) or `Settings` (MCP; `--omp-bridge` validation through the same `server.omp_bridge_settings`), and engines are created lazily, one per resolved-settings key and reused, each with one resident integrity worker. An engine serializes its own operations exactly as in a standalone process.
-- **Held writes.** A hook that appends events and judges them used to make up to five synchronous SQLite commits, an `fsync` each (10 to 25 ms on the benchmark machine; the CPU work of the whole judgement is 4 to 21 ms, and was 4 to 75 ms before the `Stop` hooks stopped reading every stored event for an empty checklist and writing the full-text index): the events and the cursor, the incremental monitor states, the "verified in full at T" stamp of the block table, and for AGY the receipt and the receipts-indexed marker. The daemon's engines (`SelfDirectEngine(defer_derived=True)`) keep the authority commits synchronous (the events and cursor, the AGY receipt) and **hold the three rows that carry no authority**: the monitor states, the verification stamp and the AGY indexed marker are validated against the commit log, the generation, the cursor and the block table whenever they are read, and a missing, stale or lost one only ever means "rebuild from the events" or "verify in full again", never `clean`. A held row is read back in the same process through the merge rule the database applies (the newer `(generation, byte_offset)` wins; a stamp applies only to the exact table, `synced_at` and `root`, it was made for) and is written in the transaction of the next authority commit of that database, after the daemon has been idle for 1 s, at shutdown, or when 2048 rows or 16 MiB are held. A rewrite or reindex of a session, a dropped or demoted monitor and a replaced block table remove the rows they invalidate at once; a row whose lineage moved on by flush time is dropped instead of written. Another process that shares the index (a standalone hook) sees only what was written, so it rebuilds, which is correct and costs only time. A crash loses a cache. `incremental.state` reports `deferred` for a held write. `SELF_DIRECT_DAEMON_DEFER_DERIVED=off` makes the daemon write everything synchronously, as a standalone process does. Shadow comparison, source verification and coverage are not touched: the whole test suite also passes with every engine deferring (`TSUKKOMI_TEST_DEFER_DERIVED=1 python -m pytest`).
+- **Judging.** Hook requests run on their own thread pool and MCP tool calls on another, so a long `sync_session` never queues a `PreToolUse`. Requests are bounded per session (`SELF_DIRECT_DAEMON_SESSION_BOUND`, 16) and in total (128); beyond the bound the answer is `unknown(queue_full)`. Each request's environment is a per-request view of `os.environ` (managed names come from the request alone), settings are resolved with `settings_core.load_hook_settings` (hooks) or `Settings` (MCP; `--omp-bridge` validation through the same `server.omp_bridge_settings`), and engines are created lazily, one per resolved-settings key and reused, each with one resident integrity worker and one idle shadow-comparison worker (see [Incremental audits](#incremental-audits)). An engine serializes its own operations exactly as in a standalone process.
+- **Held writes.** A hook that appends events and judges them used to make up to five synchronous SQLite commits, an `fsync` each (10 to 25 ms on the benchmark machine; the CPU work of the whole judgement is 4 to 21 ms, and was 4 to 75 ms before the `Stop` hooks stopped reading every stored event for an empty checklist and writing the full-text index): the events and the cursor, the incremental monitor states, the "verified in full at T" stamp of the block table, and for AGY the receipt and the receipts-indexed marker. The daemon's engines (`SelfDirectEngine(defer_derived=True)`) keep the authority commits synchronous (the events and cursor, the AGY receipt) and **hold the four rows that carry no authority**: the monitor states, the verification stamp, the AGY indexed marker and the shadow-comparison schedule (which carries its own premise and epoch) are validated against the commit log, the generation, the cursor and the block table whenever they are read, and a missing, stale or lost one only ever means "rebuild from the events" or "verify in full again", never `clean`. A held row is read back in the same process through the merge rule the database applies (the newer `(generation, byte_offset)` wins; a stamp applies only to the exact table, `synced_at` and `root`, it was made for) and is written in the transaction of the next authority commit of that database, after the daemon has been idle for 1 s, at shutdown, or when 2048 rows or 16 MiB are held. A rewrite or reindex of a session, a dropped or demoted monitor and a replaced block table remove the rows they invalidate at once; a row whose lineage moved on by flush time is dropped instead of written. Another process that shares the index (a standalone hook) sees only what was written, so it rebuilds, which is correct and costs only time. A crash loses a cache. `incremental.state` reports `deferred` for a held write. `SELF_DIRECT_DAEMON_DEFER_DERIVED=off` makes the daemon write everything synchronously, as a standalone process does. Shadow comparison, source verification and coverage are not touched: the whole test suite also passes with every engine deferring (`TSUKKOMI_TEST_DEFER_DERIVED=1 python -m pytest`).
 - **Receipts read once per change.** An AGY request read all the receipts of the conversation a dozen times (the authority tokens that detect a change between two phases, the capture of a sync, the checkpoint list). A daemon engine keeps one read-only connection to the receipts database and re-reads a conversation's receipts only after SQLite's own change witness (`PRAGMA data_version`, which differs exactly when another connection committed) moved; the file's identity is compared with the path on every use, so a deleted, replaced or recreated database is never served from the old connection. A write that bypasses SQLite moves no witness (the index store's row-count cache makes the same assumption).
 
 ### Failure behaviour: never an in-process fallback
@@ -653,7 +710,7 @@ MCP tool results the daemon served carry `served_by: "daemon"` (a standalone ser
 | `SELF_DIRECT_DAEMON_IDLE_EXIT_SEC` | `900` | Daemon-side: leave after this long with no connection and no request. |
 | `SELF_DIRECT_DAEMON_MAX_RSS_MB` | `400` | Daemon-side: drain and exit after a request when the resident set exceeds this. |
 | `SELF_DIRECT_DAEMON_SESSION_BOUND` | `16` | Daemon-side: queued plus running hook requests per session before `queue_full`. |
-| `SELF_DIRECT_DAEMON_DEFER_DERIVED` | `on` | Daemon-side: hold the rows that carry no authority (monitor states, verification stamps, the AGY indexed marker) and write them with the next authority commit, when idle and at exit. `off`: write each synchronously, as a standalone process does. See "Held writes". |
+| `SELF_DIRECT_DAEMON_DEFER_DERIVED` | `on` | Daemon-side: hold the rows that carry no authority (monitor states, verification stamps, the AGY indexed marker, the shadow-comparison schedule) and write them with the next authority commit, when idle and at exit. `off`: write each synchronously, as a standalone process does. See "Held writes". |
 | `SELF_DIRECT_DAEMON_PYTHON` | the `.venv` Python, else the client's | Client-side: interpreter that starts the daemon. |
 
 The `SELF_DIRECT_DAEMON_*` limits are read from the daemon's own environment (clients pass them on when they start it); a malformed value stops the daemon with an error instead of using a default.
@@ -678,7 +735,7 @@ Measured with `scripts/bench_daemon.py --runs 30` on synthetic data (AMD Ryzen 7
 | AGY `Stop` (nothing appended) | 295 / 327 → 229 / 278 | 101 / 115 → **35 / 42** | 79 / 91 → **14 / 16** | 0.2 / 0.3 |
 | AGY `Stop` (4 KB appended) | 355 / 392 → 261 / 301 | 154 / 180 → **54 / 61** | 133 / 159 → **33 / 38** | 0.2 / 0.3 |
 
-What the daemon removes is the process cost: interpreter start, imports, settings, engine and index setup (about 190 ms of a 250 ms Claude Code `PreToolUse`). The thin client alone costs about 20 ms end to end (12.6 ms of it is the bare interpreter start; the client adds the standard-library imports and one socket round trip), its peak resident set is about 14 MB (a bare interpreter: 11 MB; a standalone judging hook: 68 to 77 MB), and the daemon's own handling beyond the judgement is about 0.25 ms. What is left is the judgement, and the warm-path work cut it from 32 to 133 ms to 9 to 59 ms by removing commits and repeated work, never checks. Profiled with `scripts/bench_warm.py` (below), what remains of a judgement is: one synchronous `fsync`-ed commit for every request that appends events (10 to 15 ms on this machine; AGY makes a second one for the host receipt, and a third when a result binds to its receipt), 4 to 21 ms of CPU, and the **shadow comparison**. `Claude Code PreToolUse (nothing appended)` is a request whose offset the deterministic 1-in-16 shadow sample selects; with nothing appended every request is at that offset, so this cell measures the comparison (a full evaluation of the same events) in every request: 25 ms, against 4 ms without it (`SELF_DIRECT_AUDIT_SHADOW_EVERY=0`). Because 1 in 16 is more than the 5% a p95 leaves out, the p95 of every cell with appended events is the cost of a request that was shadowed, which is a full evaluation more: with 10 contracts 17 ms on Claude Code `PreToolUse`, 42 ms on `Stop` and 64 ms on AGY `Stop` (its evidence classes make the full evaluation dearer); with 100 contracts 270 ms on Claude Code `Stop` and 360 ms on AGY `Stop`. Which of the 30 requests of a cell are shadowed is chance, so the p95 of those cells moves by 10 to 15 ms between two runs (a second run of this benchmark gave `Stop` with 4 KB appended 29 / 73 ms instead of 27 / 60). The sample rate is a safety setting and was not changed.
+What the daemon removes is the process cost: interpreter start, imports, settings, engine and index setup (about 190 ms of a 250 ms Claude Code `PreToolUse`). The thin client alone costs about 20 ms end to end (12.6 ms of it is the bare interpreter start; the client adds the standard-library imports and one socket round trip), its peak resident set is about 14 MB (a bare interpreter: 11 MB; a standalone judging hook: 68 to 77 MB), and the daemon's own handling beyond the judgement is about 0.25 ms. What is left is the judgement, and the warm-path work cut it from 32 to 133 ms to 9 to 59 ms by removing commits and repeated work, never checks. Profiled with `scripts/bench_warm.py` (below), what remains of a judgement is: one synchronous `fsync`-ed commit for every request that appends events (10 to 15 ms on this machine; AGY makes a second one for the host receipt, and a third when a result binds to its receipt), 4 to 21 ms of CPU, and the **shadow comparison**. Under the fixed 1-in-16 sample these tables were measured with, `Claude Code PreToolUse (nothing appended)` is a request whose offset the deterministic sample selects; with nothing appended every request is at that offset, so this cell measures the comparison (a full evaluation of the same events) in every request: 25 ms, against 4 ms without it (`SELF_DIRECT_AUDIT_SHADOW_EVERY=0`). Because 1 in 16 is more than the 5% a p95 leaves out, the p95 of every cell with appended events is the cost of a request that was shadowed, which is a full evaluation more: with 10 contracts 17 ms on Claude Code `PreToolUse`, 42 ms on `Stop` and 64 ms on AGY `Stop` (its evidence classes make the full evaluation dearer); with 100 contracts 270 ms on Claude Code `Stop` and 360 ms on AGY `Stop`. Which of the 30 requests of a cell are shadowed is chance, so the p95 of those cells moves by 10 to 15 ms between two runs (a second run of this benchmark gave `Stop` with 4 KB appended 29 / 73 ms instead of 27 / 60). That was the fixed sample. The default is now adaptive (see [Incremental audits](#incremental-audits)), and [Shadow comparison cost](#shadow-comparison-cost) repeats these cells before and after.
 
 Idle MCP sessions (12, one shared index, after the handshake and one tool call): twelve standalone servers use 971 MB resident (588 MB proportional); twelve relays plus one daemon use **251 MB** (119 MB proportional): each relay 13.7 to 14.4 MB, the daemon 83.5 MB. After the hook runs above the daemon, holding two engines, was at 99.9 MB. (Measured before the warm-path work; it holds a few more kilobytes per session and is not expected to change.)
 
@@ -862,7 +919,7 @@ The benchmark compares 640 finite stage/class/evidence combinations with an inde
 
 ## Testing and verification
 
-The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, append capture and prefix judgement, duplicate session sources, single-flight and concurrency, workflow version/grant invalidation, proof rejection, path isolation and MCP transport. Tests use synthetic sessions and offline embeddings. Lean integration tests, Windows-only path tests and bubblewrap tests report a skip when the toolchain or platform is unavailable, and symlink tests report a skip with a reason where Windows denies symlink creation (`WinError 1314`, Developer Mode off).
+The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, append capture and prefix judgement, duplicate session sources, single-flight and concurrency, workflow version/grant invalidation, proof rejection, path isolation and MCP transport, the adaptive shadow schedule (`tests/test_shadow_schedule.py`) and the fault injection that measures how long a defect of the incremental path goes unnoticed (`tests/test_shadow_detection.py`). The suite compares every audit with the full evaluator (`SELF_DIRECT_AUDIT_SHADOW_EVERY=1`). Tests use synthetic sessions and offline embeddings. Lean integration tests, Windows-only path tests and bubblewrap tests report a skip when the toolchain or platform is unavailable, and symlink tests report a skip with a reason where Windows denies symlink creation (`WinError 1314`, Developer Mode off).
 
 ```bash
 python -m pytest -q
@@ -871,6 +928,7 @@ python scripts/benchmark.py
 python scripts/bench_hooks.py --out bench-hooks.json --markdown bench-hooks.md   # hook cost, see below
 python scripts/bench_daemon.py --out bench-daemon.json --markdown bench-daemon.md  # resident daemon, Linux (experimental)
 python scripts/bench_warm.py --defer --spans claude:Stop:4096                      # the warm judgement of one engine, in-process
+python scripts/measure_shadow_detection.py --scenario missed --every adaptive --floor  # fault injection: requests until a defect of the incremental path is noticed
 TSUKKOMI_TEST_DEFER_DERIVED=1 python -m pytest -q                                 # the whole suite with every engine holding its derived writes
 ```
 
@@ -989,7 +1047,7 @@ Windows, reported separately (Windows 11, Python 3.13, the same machine, 12 inte
 
 ### Warm judgement benchmark
 
-`scripts/bench_warm.py` measures what is left of a hook judgement once the process and its imports are gone (the daemon case): one `SelfDirectEngine` kept between requests, 1 MB synthetic Claude Code and AGY sessions, 10 contracts, `claude_hooks.run_hook` / `agy_hooks.run_hook` called repeatedly with nothing appended and with 4 KB appended before each request, under an isolated `HOME`, index and config file. Per cell it prints p50 / p95 / minimum wall time and the **durable SQLite commits per request** (counted through SQLite's statement trace: a commit that wrote something is an `fsync`, 10 to 25 ms on the benchmark machine and most of what a warm judgement costs once the CPU work is gone). `--defer` builds the engine as the daemon does; `--tmpdir /dev/shm/...` puts the index on a RAM disk, which removes the `fsync` and leaves the CPU cost; `--profile host:event:bytes` prints a `cProfile`; `--spans host:event:bytes` (or `all`) times the stages the judgement is made of, per request; `--exact-size` cuts the session to `--session-mb` at a record boundary (tens or hundreds of events); `--shadow-every N` and `--min-events N` set the incremental-audit settings. It runs against an older checkout too (`--defer` is then ignored), which is how the before/after below was made.
+`scripts/bench_warm.py` measures what is left of a hook judgement once the process and its imports are gone (the daemon case): one `SelfDirectEngine` kept between requests, 1 MB synthetic Claude Code and AGY sessions, 10 contracts, `claude_hooks.run_hook` / `agy_hooks.run_hook` called repeatedly with nothing appended and with 4 KB appended before each request, under an isolated `HOME`, index and config file. Per cell it prints p50 / p95 / minimum wall time and the **durable SQLite commits per request** (counted through SQLite's statement trace: a commit that wrote something is an `fsync`, 10 to 25 ms on the benchmark machine and most of what a warm judgement costs once the CPU work is gone). `--defer` builds the engine as the daemon does; `--tmpdir /dev/shm/...` puts the index on a RAM disk, which removes the `fsync` and leaves the CPU cost; `--profile host:event:bytes` prints a `cProfile`; `--spans host:event:bytes` (or `all`) times the stages the judgement is made of, per request; `--exact-size` cuts the session to `--session-mb` at a record boundary (tens or hundreds of events); `--shadow-every adaptive|N`, `--min-events N` and `--warmup N` (the untimed requests before a cell, default 3) set the incremental-audit settings and the warm-up; each cell also reports p99 and how many shadow comparisons its requests carried. It runs against an older checkout too (`--defer` is then ignored), which is how the before/after below was made.
 
 ```bash
 python scripts/bench_warm.py --defer --runs 50                                  # the daemon's engine
@@ -1010,7 +1068,7 @@ Median over three interleaved rounds of 50 requests (before = the commit this wo
 | AGY `Stop`, nothing appended | 83.8 / 100.7, 2 | 16.4 / 21.1, 0 | **14.9 / 20.6**, 0 |
 | AGY `Stop`, 4 KB appended | 146.9 / 252.6, 5 | 51.4 / 132.2, 2 | **35.5 / 117.8**, 1 |
 
-With the shadow comparison off (`--shadow-every 0`), which isolates the steady state, the same cells are 4 / 5, 34 / 49, 57 / 69, 98 / 110, 52 / 57, 81 / 90, 84 / 104 and 144 / 172 ms before and 3.7 / 4.3, 22 / 27, 9.5 / 12, 28 / 31, 35 / 41, 57 / 64, 15 / 19 and 35 / 42 ms after (daemon engine). Of what is left, the CPU work is 4 to 21 ms (measure it with `--tmpdir` on a RAM disk; it was 4 to 75 ms before) and the rest is the commits in the table: one for the events and cursor, and for AGY the host receipt and the binding of results to receipts. The p95 of the cells that append events is a shadowed request (see [Measurements](#measurements)). The first two cells' p50 is the shadow comparison too: that synthetic session's offset is one the deterministic sample selects, and with nothing appended every request is at it.
+With the shadow comparison off (`--shadow-every 0`, under the fixed schedule these tables were measured with), which isolates the steady state, the same cells are 4 / 5, 34 / 49, 57 / 69, 98 / 110, 52 / 57, 81 / 90, 84 / 104 and 144 / 172 ms before and 3.7 / 4.3, 22 / 27, 9.5 / 12, 28 / 31, 35 / 41, 57 / 64, 15 / 19 and 35 / 42 ms after (daemon engine). Of what is left, the CPU work is 4 to 21 ms (measure it with `--tmpdir` on a RAM disk; it was 4 to 75 ms before) and the rest is the commits in the table: one for the events and cursor, and for AGY the host receipt and the binding of results to receipts. The p95 of the cells that append events is a shadowed request (see [Measurements](#measurements)). Under that fixed schedule the first two cells' p50 is the shadow comparison too: that synthetic session's offset is one the deterministic sample selects, and with nothing appended every request is at it.
 
 Where the time went in the slowest cells (per-request inclusive spans of `--spans`, p50 ms; spans nest, so the commit is inside the sync):
 
@@ -1033,6 +1091,61 @@ AGY costs grow with the number of receipts in the conversation (every request re
 | 1,857 | 5.3 / 23.9, 20.4 / 37.1 | 8.9 / 48.4, 24.2 / 60.0 | 5.5 / 22.3, 31.7 / 36.5 | 9.3 / 49.0, 48.0 / 71.8 |
 
 For a resident engine keeping state costs the same as keeping none up to about 250 events (for `Stop` it is cheaper from the start) and is cheaper beyond; on a one-shot engine the extra commit makes it dearer until about 500 events (`Stop`) and 1,500 (`PreToolUse`). The default of 500 is therefore right for `Stop` on both, a little conservative for a resident engine between 250 and 500 events (a few milliseconds at most) and a little low for a one-shot `PreToolUse`; it was left unchanged.
+
+### Shadow comparison cost
+
+A shadow comparison runs the full evaluator beside the incremental one (see [Incremental audits](#incremental-audits)). It is the largest cost the warm path has left, and the requests that carry one are the p95 and p99 of a cell: the fixed 1 in 16 compared more than the 5% a p95 leaves out. The tables repeat the cells above with `scripts/bench_warm.py --runs 30` (10 contracts, 1 MB sessions), **before** (the fixed 1 in 16, the commit this work started from) and **after** (the adaptive schedule), as the median of three interleaved rounds. Each entry is `p50 / p95 / p99 ms [shadow comparisons among the cell's 30 requests]`. *Default schedule* is the benchmark's usual 3 untimed requests per cell; *past the warm-up* is `--warmup 12`. The machine was busier than for the measurements above, so absolute values are higher than in those tables; before and after ran in the same rounds, interleaved.
+
+
+**Daemon engine (`--defer`), load average 5.2 to 7.3:**
+
+| Cell | before: fixed 1/16 | after, default schedule | after, past the warm-up |
+|---|---|---|---|
+| Claude Code `PreToolUse`, nothing appended | 27.4 / 41.8 / 51 [30] | 4.6 / 25.4 / 35 [5] | 4.0 / 4.7 / 5 [0] |
+| Claude Code `PreToolUse`, 4 KB appended | 33.6 / 62.0 / 66 [3] | 32.3 / 55.1 / 57 [4] | 31.7 / 51.0 / 56 [4] |
+| Claude Code `Stop`, nothing appended | 10.9 / 15.5 / 16 [0] | 10.1 / 63.3 / 65 [5] | 10.1 / 14.0 / 15 [0] |
+| Claude Code `Stop`, 4 KB appended | 38.3 / 46.0 / 87 [1] | 36.4 / 92.5 / 93 [4] | 40.5 / 86.6 / 94 [4] |
+| AGY `PreToolUse`, nothing appended | 47.4 / 62.2 / 69 [0] | 47.1 / 89.0 / 98 [5] | 55.4 / 61.5 / 64 [0] |
+| AGY `PreToolUse`, 4 KB appended | 76.8 / 95.5 / 132 [1] | 79.2 / 116.3 / 128 [9] | 87.8 / 136.3 / 137 [9] |
+| AGY `Stop`, nothing appended | 17.3 / 22.6 / 34 [0] | 17.1 / 97.8 / 114 [5] | 15.8 / 18.7 / 32 [0] |
+| AGY `Stop`, 4 KB appended | 44.1 / 52.0 / 57 [0] | 46.0 / 156.2 / 158 [5] | 47.3 / 140.9 / 158 [5] |
+
+**Synchronous engine (a one-shot hook process's), load average 5.6 to 8.0:**
+
+| Cell | before: fixed 1/16 | after, default schedule | after, past the warm-up |
+|---|---|---|---|
+| Claude Code `PreToolUse`, nothing appended | 29.7 / 49.3 / 52 [30] | 4.4 / 47.2 / 60 [5] | 4.8 / 6.4 / 7 [0] |
+| Claude Code `PreToolUse`, 4 KB appended | 54.5 / 78.9 / 96 [3] | 55.5 / 78.6 / 83 [4] | 49.1 / 72.1 / 90 [4] |
+| Claude Code `Stop`, nothing appended | 54.0 / 63.5 / 65 [0] | 55.4 / 131.1 / 136 [5] | 56.3 / 62.3 / 63 [0] |
+| Claude Code `Stop`, 4 KB appended | 87.9 / 107.1 / 155 [1] | 87.2 / 148.5 / 158 [4] | 80.0 / 126.9 / 135 [4] |
+| AGY `PreToolUse`, nothing appended | 76.4 / 86.8 / 95 [0] | 74.3 / 138.6 / 149 [5] | 75.1 / 85.6 / 86 [0] |
+| AGY `PreToolUse`, 4 KB appended | 129.9 / 157.4 / 178 [1] | 135.1 / 188.7 / 190 [9] | 124.7 / 165.5 / 177 [9] |
+| AGY `Stop`, nothing appended | 16.8 / 21.3 / 30 [0] | 19.5 / 128.4 / 130 [5] | 16.4 / 23.3 / 26 [0] |
+| AGY `Stop`, 4 KB appended | 71.1 / 88.6 / 116 [0] | 69.2 / 172.2 / 211 [5] | 66.7 / 168.9 / 176 [5] |
+
+Which cells still contain a comparison, and why:
+
+- **Nothing appended, past the warm-up: none.** The fixed schedule compared *every* request of `Claude Code PreToolUse (nothing appended)` (the cell's offset is one the sample selects, and with nothing appended every request is at it). The adaptive draw depends on the schedule state as well as the cursor, so a repeated request is not repeatedly selected, and the cell is back at its floor.
+- **Every cell of the default column: the warm-up.** The benchmark builds the monitor states of an event kind just before it times it (the audit and the action check keep states of their own), and a rebuild owes the first 8 compared requests, so 5 of a cell's 30 requests (what is left of the warm-up) carry a forced comparison, and more in the cells that also append events. This is the policy working as decided; a session that lives for hundreds of requests pays it once per variant and per change of premise.
+- **Appended cells, past the warm-up: sampled at 1/4.** A session starts at 1/4 and needs 32 matching comparisons per step to reach 1/8, 1/16, 1/32 and 1/64, so a short session compares 4 to 9 of 30 requests where 1/16 compared 0 to 3. The p95 and p99 of such a cell are a request that carried a full evaluation, as under 1/16 when it happened to compare one, and **higher where 1/16 happened to compare none** (AGY `Stop` with 4 KB appended, daemon engine: p95 52 ms before, 156 ms with the default schedule and 141 ms past the warm-up). The adaptive schedule compares less than 1/16 only after about 2,000 requests with an unchanged premise (the share over the first 10, 100, 300, 1,000, 2,000 and 3,000 requests is 85%, 31%, 19%, 10%, 6.5% and 4.8%). These sessions have no violation, flip or high-risk contract, so no forced comparison of that kind appears here; a request that has one adds a scoped comparison of just those contracts.
+- **A resident engine writes no commit for the schedule** (`--defer`: the schedule is held with the monitor states); a synchronous engine writes it with the states when a request writes states, and in a commit of its own otherwise (the 0.2 durable commits per request of the nothing-appended cells).
+
+The resident daemon through `scripts/bench_daemon.py --runs 30 --only hooks` (cold hook processes through a warm daemon; one run per side, load average 5.2 at the start of the run before and 4.3 after; the cells of a host share one session and one daemon engine, so the first `Stop` cells build the audit variant's states in the middle of the run). Wall time of the whole new process and the daemon-side time, p50 / p95 / p99 ms:
+
+| Event (new process) | through the daemon, before: wall p50 / p95 / p99 ms | after | daemon-side before: p50 / p95 / p99 ms | after |
+|---|---|---|---|---|
+| Claude Code `PreToolUse (+0 B)` | 51.0 / 70.0 / 87.2 | 28.1 / 73.7 / 77.5 | 27.87 / 40.25 / 59.72 | 6.06 / 42.54 / 52.45 |
+| Claude Code `PreToolUse (+4096 B)` | 48.3 / 63.7 / 69.7 | 55.7 / 77.4 / 94.4 | 26.31 / 43.05 / 46.85 | 32.15 / 55.77 / 70.67 |
+| Claude Code `UserPromptSubmit (+0 B)` | 22.7 / 31.0 / 32.0 | 22.1 / 27.1 / 30.2 | 0.93 / 1.16 / 1.21 | 0.92 / 1.19 / 1.76 |
+| Claude Code `UserPromptSubmit (+4096 B)` | 23.4 / 30.3 / 31.3 | 21.2 / 29.2 / 29.5 | 0.92 / 1.24 / 1.3 | 0.89 / 1.12 / 1.17 |
+| Claude Code `Stop (+0 B)` | 32.1 / 45.5 / 63.4 | 33.4 / 109.2 / 141.4 | 10.29 / 14.1 / 41.54 | 10.88 / 87.95 / 120.16 |
+| Claude Code `Stop (+4096 B)` | 50.4 / 61.9 / 103.2 | 58.6 / 137.5 / 142.9 | 27.7 / 37.96 / 80.52 | 37.27 / 110.47 / 119.61 |
+| AGY `PreToolUse (+0 B)` | 57.4 / 67.1 / 71.8 | 75.6 / 126.0 / 142.5 | 35.77 / 41.4 / 49.63 | 52.95 / 102.58 / 119.8 |
+| AGY `PreToolUse (+4096 B)` | 94.2 / 135.1 / 162.4 | 94.8 / 149.9 / 150.0 | 72.79 / 100.14 / 138.99 | 70.81 / 127.07 / 127.79 |
+| AGY `Stop (+0 B)` | 35.6 / 47.9 / 53.2 | 38.8 / 233.3 / 271.7 | 14.78 / 23.28 / 29.34 | 16.05 / 192.94 / 194.47 |
+| AGY `Stop (+4096 B)` | 65.5 / 82.8 / 89.9 | 66.9 / 186.0 / 214.2 | 43.02 / 55.76 / 59.26 | 43.4 / 160.34 / 184.23 |
+
+It is the pattern of the in-process tables. The cell the fixed sample compared in every request (Claude Code `PreToolUse`, nothing appended) falls from 51 / 70 ms wall and 27.9 ms daemon-side at p50 to 28 / 74 ms and 6.1 ms; the cells the fixed sample never compared among these 30 requests (`Stop`, and AGY) now carry the warm-up and the 1/4 sample of a young session, so their p95 and p99 are a request that ran a full evaluation (Claude Code `Stop`, nothing appended: daemon-side p95 14.1 → 88 ms; AGY `Stop`: 23 → 193 ms). One run per side, so the p95 and p99 of 30 requests move by tens of milliseconds between runs; the number of comparisons, not the milliseconds, is what the schedule decides.
 
 ### Memory verification
 

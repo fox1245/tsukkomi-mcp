@@ -60,7 +60,8 @@ DEFAULT_INTEGRITY_FAST_SAMPLE_BLOCKS = 8
 DEFAULT_INTEGRITY_FULL_VERIFY_INTERVAL_SEC = 300.0
 DEFAULT_INTEGRITY_BACKGROUND_IDLE_SEC = 2.0
 DEFAULT_INTEGRITY_BACKGROUND_MAX_SCANS = 1
-DEFAULT_AUDIT_SHADOW_EVERY = 16
+DEFAULT_AUDIT_SHADOW_EVERY = "adaptive"
+DEFAULT_AUDIT_SHADOW_IDLE_SEC = 2.0
 DEFAULT_AUDIT_INCREMENTAL_MIN_EVENTS = 500
 DEFAULT_RRF_K = 60
 DEFAULT_RETRIEVE_TOP_K = 20
@@ -291,6 +292,13 @@ def _to_nonnegative_finite(name: str, text: str) -> float:
     return value
 
 
+def _to_shadow_every(name: str, text: str):
+    """``adaptive`` (any case, surrounding whitespace allowed) or a non-negative integer."""
+    if text.strip(_WHITESPACE).lower() == "adaptive":
+        return "adaptive"
+    return _to_int(name, text, 0)
+
+
 def _literal(choices: tuple[str, ...]) -> Callable[[str, str], str]:
     def convert(name: str, text: str) -> str:
         if text not in choices:
@@ -393,7 +401,8 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("integrity_background_max_scans", lambda name, text: _to_int(name, text, 1),
               _static(DEFAULT_INTEGRITY_BACKGROUND_MAX_SCANS)),
     FieldSpec("audit_incremental", lambda name, text: _to_bool(name, text), _static(True)),
-    FieldSpec("audit_shadow_every", lambda name, text: _to_int(name, text, 0), _static(DEFAULT_AUDIT_SHADOW_EVERY)),
+    FieldSpec("audit_shadow_every", _to_shadow_every, _static(DEFAULT_AUDIT_SHADOW_EVERY)),
+    FieldSpec("audit_shadow_idle_sec", _to_nonnegative_finite, _static(DEFAULT_AUDIT_SHADOW_IDLE_SEC)),
     FieldSpec("audit_incremental_min_events", lambda name, text: _to_int(name, text, 0),
               _static(DEFAULT_AUDIT_INCREMENTAL_MIN_EVENTS)),
     FieldSpec("rrf_k", lambda name, text: _to_int(name, text), _static(DEFAULT_RRF_K)),

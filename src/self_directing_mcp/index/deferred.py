@@ -43,10 +43,29 @@ class DerivedBuffer:
         # (receipts database path, session_id) -> the receipts digest the index was last built on (AGY "indexed" marker).
         # It lives in another database than the rows above, so ``agy_receipts.ReceiptStore`` writes it, not the store.
         self.markers: dict[tuple[str, str], str] = {}
+        # (provider, session_id) -> (epoch, state dict): the adaptive shadow-comparison schedule (audit/shadow.py). It names its
+        # own premise and epoch, so no lineage check is needed when it is written.
+        self.shadows: dict[tuple[str, str], tuple[int, dict]] = {}
 
     def __len__(self) -> int:
         # ``list(...)`` is one atomic step: another thread may be holding a row while this one only asks "anything?".
-        return sum(len(rows) for rows in list(self.states.values())) + len(self.stamps) + len(self.markers)
+        return (sum(len(rows) for rows in list(self.states.values())) + len(self.stamps) + len(self.markers)
+                + len(self.shadows))
+
+    # -- shadow-comparison schedules ----------------------------------------------------------------------------
+    def hold_shadow(self, provider, session_id, epoch, state) -> None:
+        self.shadows[(provider, session_id)] = (epoch, state)
+
+    def shadow_for(self, provider, session_id):
+        return self.shadows.get((provider, session_id))
+
+    def drop_shadow(self, provider, session_id) -> None:
+        self.shadows.pop((provider, session_id), None)
+
+    def drain_shadows(self) -> list[tuple[str, str, int, dict]]:
+        taken = [(provider, session, epoch, state) for (provider, session), (epoch, state) in self.shadows.items()]
+        self.shadows = {}
+        return taken
 
     def full(self) -> bool:
         return (len(self) >= MAX_ENTRIES

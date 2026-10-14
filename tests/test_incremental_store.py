@@ -15,6 +15,9 @@ from self_directing_mcp.schemas import AuditEvent, ContractRule
 from incremental_store import SID, Harness, chunk_of
 from incremental_support import Session, contracts, proposed_action
 
+# These tests judge the delta path alone (shadow_every=0): no warm-up comparisons after a rebuild.
+pytestmark = pytest.mark.usefixtures("no_forced_comparisons")
+
 PROVIDERS = ["codex", "claude", "agy", "omp"]
 
 

@@ -36,6 +36,7 @@ from bisect import bisect_left
 
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES
 from self_directing_mcp.audit import runner, shellstatus
+from self_directing_mcp.audit import shadow as shadow_module
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 from self_directing_mcp.audit import patterns as _patterns
 from self_directing_mcp.audit.applicability import PROPOSED_CALL_PREFIX, not_applicable_reason
@@ -863,6 +864,7 @@ def _shadow_affordable(events) -> bool:
 
 
 def _shadow_sample(session_id, offset, active, every) -> bool:
+    """The fixed legacy draw (``SELF_DIRECT_AUDIT_SHADOW_EVERY`` set to an integer): about one audit in ``every``."""
     if every <= 0:
         return False
     if every == 1:
@@ -911,7 +913,8 @@ class AuditPlan:
 
     def __init__(self, *, session_id, provider, mode, events, count, history_ids, monitors, offsets, facts,
                  facts_offset, facts_new, pools, routes, rebuilds, support, snapshot, shadow, digest,
-                 parser_version, report, reference):
+                 parser_version, report, reference, comparison=None, schedule=None, schedule_loaded=None,
+                 risky=frozenset(), prior=None):
         self.session_id, self.provider, self.mode = session_id, provider, mode
         self.events, self.count, self.reference = events, count, reference
         self.history_ids, self.monitors, self.offsets = history_ids, monitors, offsets
@@ -919,6 +922,12 @@ class AuditPlan:
         self.pools, self.routes, self.rebuilds = pools, routes, rebuilds
         self.support, self.snapshot, self.shadow = support, snapshot, shadow
         self.digest, self.parser_version, self.report = digest, parser_version, report
+        # ``comparison``: what this request is compared on (``audit.shadow.Comparison``); ``schedule``: the
+        # ``ShadowState`` it was planned from (``None`` when the setting compares every audit and keeps no state);
+        # ``schedule_loaded``: the state as stored, to tell whether it has to be written back.
+        self.comparison = comparison if comparison is not None else shadow_module.Comparison()
+        self.schedule, self.schedule_loaded = schedule, schedule_loaded
+        self.risky, self.prior = risky, prior or {}    # high-risk monitored contracts; their stored summaries
         self.fed = False
         self.overflowed, self.errors, self.timeouts = {}, {}, set()
 
@@ -926,8 +935,14 @@ class AuditPlan:
 
     @classmethod
     def prepare(cls, store, *, session_id, provider, active, planned, needs, link_calls, shadow_every,
-                force_full=frozenset(), report=None):
-        """Decide how to evaluate and read the events needed; ``None`` means evaluate everything the old way."""
+                force_full=frozenset(), report=None, premise_rules=None, force=None, idle=False):
+        """Decide how to evaluate and read the events needed; ``None`` means evaluate everything the old way.
+
+        ``shadow_every``: ``None`` for the adaptive schedule, else the fixed legacy rate (``audit.shadow``).
+        ``premise_rules``: the contracts the verification premise is taken over (default ``active``; the engine passes the
+        enabled contracts of the session before the proposed-action filter, so an audit and an action check share one
+        schedule). ``force``: comparisons a previous pass of this request found necessary (``shadow.Comparison``).
+        ``idle``: the idle comparison of a resident engine, which compares everything."""
         report = {} if report is None else report
         history = [r for r in active if r.regex and (r.type == "must" or planned is None)]
         history_ids = {r.id for r in history}
@@ -1021,8 +1036,42 @@ class AuditPlan:
         facts_rebuild = facts.needed and facts_why not in (None, "overflow")
         offsets = {rule_id: row["byte_offset"] for rule_id, row in deltas.items()}
         facts_offset = facts_row["byte_offset"] if facts_row is not None else 0
-        sampled = _shadow_sample(session_id, cursor["byte_offset"], active, shadow_every)
-        shadow = sampled or bool(rebuilds) or bool(facts_rebuild)
+        offset = cursor["byte_offset"]
+        # --- which comparison this request gets (audit/shadow.py) ---
+        comparison = shadow_module.Comparison()
+        schedule = schedule_loaded = None
+        if shadow_every != 1:           # comparing every audit needs no schedule
+            stored = store.load_shadow_state(session_id, provider)
+            schedule_loaded = stored.dump() if stored is not None else None
+            premise = shadow_module.make_premise(premise_rules if premise_rules is not None else active, parser_version,
+                                                 EVALUATOR_VERSION, generation if chain_ok else None)
+            schedule, reset = shadow_module.reconcile(stored, premise)
+            if reset is not None:
+                comparison.add("premise")
+                report["shadow_reset"] = reset
+            if rebuilds or facts_rebuild:
+                schedule = shadow_module.arm_warmup(schedule)
+            if schedule.warmup > 0:
+                comparison.add("warmup")
+        if rebuilds or facts_rebuild:
+            comparison.add("rebuild")
+        if idle:
+            comparison.add("idle")
+        if shadow_every is None:
+            drawn = shadow_module.sampled(schedule, session_id, provider, offset, None)
+        else:
+            drawn = _shadow_sample(session_id, offset, active, shadow_every)
+        if drawn:
+            comparison.add("sampled")
+        risky = frozenset(r.id for r in history if r.risk == "high" and r.id not in routes)
+        if planned is not None and risky and not comparison.full:
+            applies = {r.id for r in history if r.id in risky and runner.action_applies(r, planned)}
+            if applies:
+                comparison.add("high_risk", applies)
+        if force is not None:
+            for reason in force.reasons:
+                comparison.add(reason, force.scope)
+        shadow = comparison.active
         if shadow and not _shadow_affordable(store.session_metrics(session_id, provider)[0]):
             shadow = False
             report["shadow_skipped"] = "deadline"
@@ -1055,15 +1104,27 @@ class AuditPlan:
 
         full = bool(routes) or bool(rebuilds) or bool(facts_rebuild)
         reference = None
+        partial = False          # the reference holds text only for the compared contracts (a scoped comparison)
         if shadow or full:
-            snapshot_events = store.capture_audit_events(session_id, provider, needs, link_calls=link_calls)
+            if shadow and not comparison.full and not full:
+                scoped = [r for r in history if r.id in comparison.scope]
+                scoped_needs, scoped_links = runner.audit_needs(scoped, planned)
+                snapshot_events = store.capture_audit_events(session_id, provider, scoped_needs, link_calls=scoped_links)
+                partial = True
+            else:
+                snapshot_events = store.capture_audit_events(session_id, provider, needs, link_calls=link_calls)
             reference = list(snapshot_events.events)
             if not full:
                 bad = tail_mismatch(reference, "full")
                 if bad:
                     drop(bad)
                     full = True
-                    shadow = shadow or "shadow_skipped" not in report
+                    if "shadow_skipped" not in report:
+                        comparison.add("rebuild")
+                        shadow = True
+                    if partial:       # the monitors about to be rebuilt need the text of every rule
+                        snapshot_events = store.capture_audit_events(session_id, provider, needs, link_calls=link_calls)
+                        reference, partial = list(snapshot_events.events), False
         events, mode, count = [], "delta", latest["event_count"] if chain_ok else 0
         if not full:
             from_byte = min([*offsets.values(), *([facts_row["byte_offset"]] if facts_row is not None else [])])
@@ -1072,17 +1133,21 @@ class AuditPlan:
             if bad:
                 drop(bad)
                 full = True
-                shadow = shadow or "shadow_skipped" not in report
-                if reference is None:
+                if "shadow_skipped" not in report:
+                    comparison.add("rebuild")
+                    shadow = True
+                if reference is None or partial:
                     snapshot_events = store.capture_audit_events(session_id, provider, needs, link_calls=link_calls)
-                    reference = list(snapshot_events.events)
+                    reference, partial = list(snapshot_events.events), False
         if full:
             events, mode = reference, "full"
             count = latest["event_count"] if chain_ok else snapshot_events.count
             bad = tail_mismatch(events, "full")
             if bad:
                 drop(bad)
-                shadow = shadow or "shadow_skipped" not in report
+                if "shadow_skipped" not in report:
+                    comparison.add("rebuild")
+                    shadow = True
         monitors = {}
         for rule in history:
             if rule.id in routes:
@@ -1131,13 +1196,67 @@ class AuditPlan:
                     "count": count}
         report.update(mode=mode, shadow=shadow, events_read=len(events), monitors=len(monitors),
                       rebuilt=dict(rebuilds), fallback=dict(routes))
+        if shadow:
+            report["shadow_reasons"] = list(comparison.reasons)
+            if not comparison.full:
+                report["shadow_scope"] = sorted(comparison.scope)
+        if schedule is not None and shadow_every is None:
+            report["shadow_rate"] = shadow_module.rate_text(schedule, None)
+        if not shadow:
+            comparison = shadow_module.Comparison()
+        # The stored summaries of the high-risk monitors as text: a monitor shares its lists with the loaded state and
+        # appends to them while it folds, so only a copy taken now can tell afterwards whether the summary changed.
+        prior = {rule_id: json.dumps(deltas[rule_id]["state"], separators=(",", ":"))
+                 for rule_id in risky if rule_id in deltas and rule_id in monitors}
         if facts_rebuild:
             report["rebuilt"]["#facts"] = facts_why or "event_count"
         return cls(session_id=session_id, provider=provider, mode=mode, events=events, count=count,
                    history_ids=history_ids, monitors=monitors, offsets=offsets, facts=facts,
                    facts_offset=facts_offset, facts_new=facts_row is None, pools=pools, routes=routes,
                    rebuilds=rebuilds, support=support, snapshot=snapshot, shadow=shadow, digest=digest,
-                   parser_version=parser_version, report=report, reference=reference)
+                   parser_version=parser_version, report=report, reference=reference, comparison=comparison,
+                   schedule=schedule, schedule_loaded=schedule_loaded, risky=risky & set(monitors), prior=prior)
+
+    # --- comparisons that only the finished answer can call for ---
+
+    def state_key(self):
+        """Which stored events, as the cursor identifies them (what a memoized comparison was made on)."""
+        snapshot = self.snapshot
+        return (snapshot["generation"], snapshot["offset"], snapshot["prefix_hash"], snapshot["count"])
+
+    def summary_changed(self, rule_id) -> bool:
+        """Whether this request changed the stored summary of a monitored contract (a new, rebuilt or folded state)."""
+        monitor = self.monitors.get(rule_id)
+        if monitor is None:
+            return False
+        if monitor.new or monitor.overflow:
+            return True
+        if not monitor.dirty:
+            return False
+        before = self.prior.get(rule_id)
+        return before is None or json.dumps(monitor.dump(), separators=(",", ":")) != before
+
+    def late_reasons(self, result, key, applies=None) -> dict:
+        """``{reason: contract ids}`` the finished answer calls a comparison for, whatever the plan chose.
+
+        * ``violation``: a monitored contract the answer judges violation or suspicious (a wrong block);
+        * ``flip``: a monitored contract that the previous request of this kind judged so and the answer calls clean now
+          (a wrongly missed violation; events only append, so a real flip is rare);
+        * ``high_risk``: a monitored ``risk: high`` contract whose stored summary this request changed.
+        Contracts the plan already compares are left out by the caller; contracts the fast path does not decide (a proposed
+        action judged on its own, a rule routed to the full evaluator) never appear here. For an action check
+        ``applies(contract_id)`` tells whether the proposed action is in the contract's scope: only those findings can
+        block it, so only those are guarded."""
+        verdicts = {item.contract_id: item.verdict for item in result.findings}
+
+        def decided(contract_id):       # looked at only for contracts that could matter: a pattern search each
+            return contract_id in self.monitors and (applies is None or applies(contract_id))
+        out = {"violation": {c for c, v in verdicts.items() if v in shadow_module.FLAGGED and decided(c)}}
+        schedule = self.schedule
+        out["flip"] = ({c for c in shadow_module.flipped(schedule, key, verdicts) if decided(c)}
+                       if schedule is not None else set())
+        out["high_risk"] = {c for c in self.risky if c in self.monitors and self.summary_changed(c)}
+        return out
 
     # --- the audit stages (no database) ---
 
@@ -1243,9 +1362,16 @@ class AuditPlan:
         return rows
 
 
-def compare(result, reference):
-    """Contract ids whose finding differs between two audit results, or ``["#audit"]`` for any other difference."""
+def compare(result, reference, only=None):
+    """Contract ids whose finding differs between two audit results, or ``["#audit"]`` for any other difference.
+
+    ``only``: the ids of a scoped comparison; the reference then holds just those contracts and only their findings are
+    compared (the verdict, notes and coverage of a partial result are not comparable)."""
     left, right = result.model_dump(mode="json"), reference.model_dump(mode="json")
+    if only is not None:
+        mine = {item["contract_id"]: item for item in left["findings"] if item["contract_id"] in only}
+        theirs = {item["contract_id"]: item for item in right["findings"]}
+        return sorted(c for c in only if mine.get(c) != theirs.get(c))
     bad = [a["contract_id"] for a, b in zip(left["findings"], right["findings"]) if a != b]
     if len(left["findings"]) != len(right["findings"]):
         bad = ["#audit"]
