@@ -324,9 +324,12 @@ def command_test(args) -> int:
     tests = list(args.pytest_args)
     if args.profile == "tsan":
         tests += [f"--deselect={test}" for test in TSAN_DESELECT]
-    # Unbuffered output (below) keeps the progress written before a native exit, so a run that dies early still
-    # shows how far it got. pytest keeps its default fd capture: the MCP stdio tests hand sys.stderr to a child.
-    command = [*prefix, sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *tests]
+    # No output capture (-s), unbuffered (below). Under pytest's fd capture the GitHub ASan run of the phase-1 branch
+    # died about 10 s in with exit status 1 and no output at all (nothing in the sanitizer logs, the session-end leak
+    # check never ran); it did not reproduce locally on CPython 3.12.3 or 3.12.14, and the same CI run completed with
+    # sys-level capture. Without capture any native message reaches the job log, and the MCP stdio tests still get a
+    # real sys.stderr for their child (sys-level capture broke them).
+    command = [*prefix, sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", *tests]
     print("+", " ".join(command), flush=True)
     # UBSan writes to stderr even when ASan logs to files, so the run's output is kept and scanned too.
     env = {**env, "PYTHONUNBUFFERED": "1"}
