@@ -120,6 +120,14 @@ def test_argv_and_codex_style_arguments_are_read_like_a_command_line():
     assert shellstatus.unverifiable("[tool_call:shell] pytest -q || true", rx) == "or_masks_failure"
 
 
+def test_a_command_the_host_ran_in_the_background_reports_only_that_it_started():
+    rx = compile_contract("pytest")
+    started = "[tool_call:Bash] " + json.dumps({"command": "pytest -q", "run_in_background": True})
+    assert shellstatus.unverifiable(started, rx) == "background"
+    foreground = "[tool_call:Bash] " + json.dumps({"command": "pytest -q", "run_in_background": False})
+    assert shellstatus.unverifiable(foreground, rx) is None
+
+
 def test_an_unlexable_line_and_an_oversized_one_are_handled_conservatively():
     rx = compile_contract("pytest")
     assert shellstatus.unverifiable(text_of("pytest -q 'unterminated || true"), rx) is None   # not a runnable command

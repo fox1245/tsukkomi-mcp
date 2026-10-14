@@ -335,12 +335,19 @@ def _leaves(value, out: list[str]) -> None:
             _leaves(item, out)
 
 
-def shell_texts(text: str) -> list[str]:
-    """The strings of a tool call that a shell could run: the leaves of its JSON arguments, or the raw argument text."""
+def _arguments(text: str):
+    """``(parsed arguments or None, raw argument text)`` of a rendered tool call ``[tool_call:name] <arguments>``."""
     body = text.split("] ", 1)[1] if text.startswith("[") and "] " in text else text
     try:
-        value = json.loads(body)
+        return json.loads(body), body
     except ValueError:
+        return None, body
+
+
+def shell_texts(text: str) -> list[str]:
+    """The strings of a tool call that a shell could run: the leaves of its JSON arguments, or the raw argument text."""
+    value, body = _arguments(text)
+    if value is None:
         return [body]
     out: list[str] = []
     _leaves(value, out)
@@ -354,6 +361,9 @@ def unverifiable(text: str, regex) -> str | None:
     """
     if len(text) > MAX_CHARS:
         return "too_long_to_analyze"
+    value, _body = _arguments(text)
+    if isinstance(value, dict) and value.get("run_in_background") is True:
+        return "background"                # the host reports that the command started, not how it ended
     leaves = shell_texts(text)
     hit = [leaf for leaf in leaves if regex is None or regex.search(leaf)] or leaves
     for leaf in hit:
