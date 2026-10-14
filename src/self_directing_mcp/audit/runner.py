@@ -20,6 +20,13 @@ from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_cont
 
 REGEX_TIMEOUT = "regex_timeout: a contract pattern exceeded its time limit, so this contract could not be evaluated"
 SUCCESS_UNVERIFIABLE = "success_unverifiable"
+ANCHOR_NOT_USER = ("anchor_not_user: the contract's source_event_id is not a user message (a tool result, runtime or "
+                   "injected text cannot be the origin of a contract), so its findings for this session are unknown")
+
+
+def is_user_event(event) -> bool:
+    """A user message: what the parser marked ``role == "user"`` (never runtime, injected or tool text)."""
+    return (getattr(event, "meta", None) or {}).get("role") == "user"
 
 
 def success_unverifiable(why) -> str:
@@ -191,6 +198,8 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
     for anchor in (rule.source_event_id, rule.applies_from_event_id):
         if anchor and anchor not in ids:
             return finding("unknown", "contract source or activation event is not in this session")
+    if rule.source_event_id and not is_user_event(chunks[ids[rule.source_event_id]]):
+        return finding("unknown", ANCHOR_NOT_USER)
     if not rule.regex:
         return finding("unknown", "description-only contract needs a verifier; retrieval is not proof")
     try:

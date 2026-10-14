@@ -172,10 +172,35 @@ class ProposedAction(BaseModel):
     arguments: dict[str, Any] | str
 
 
+class PendingChange(BaseModel):
+    """A weakening of an active contract that no user message vouches for; the active revision stays in force.
+
+    An upsert that disables a contract or replaces it with a narrower one (see ``audit.contracts.loosening_reasons``)
+    needs a ``source_event_id`` that resolves to a user message. Without one the proposed revision is parked here and
+    the previous revision keeps being enforced. A later upsert (or revoke) of the same id that carries a user anchor
+    applies the change and clears this entry.
+    """
+    contract: ContractRule
+    reasons: list[str]
+    source_event_id: str | None = None
+    anchor_status: Literal["missing", "unresolved"] = "missing"
+    base_revision: int = 1
+
+
 class ContractsDocument(BaseModel):
     schema_version: str = SCHEMA_VERSION
     contracts: list[ContractRule] = Field(default_factory=list)
     history: dict[str, list[ContractRule]] = Field(default_factory=dict)
+    # Weakenings awaiting a user anchor, by contract id. Omitted while empty: files that never held one are unchanged
+    # and older processes (which ignore the key) keep reading the others.
+    pending: dict[str, PendingChange] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_pending(self, handler):
+        data = handler(self)
+        if not data.get("pending"):
+            data.pop("pending", None)
+        return data
 
 
 class Evidence(BaseModel):

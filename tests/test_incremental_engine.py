@@ -117,12 +117,21 @@ def test_random_codex_sessions_answer_identically_after_every_append(codex, seed
     twin, path = codex
     rng = random.Random(f"engine/{seed}")
     numbered = []
-    write(path, codex_records(rng, 12, numbered), "a")
+    write(path, [message("the user states a rule", "user")] + codex_records(rng, 12, numbered), "a")
     twin.upsert(RULES)
     twin.audit(SID)
-    ids = [c.chunk_id for c in twin.fast.store.list_chunks(SID, "codex")]
+    chunks = twin.fast.store.list_chunks(SID, "codex")
+    ids = [c.chunk_id for c in chunks]
+    users = [c.chunk_id for c in chunks if c.meta.get("role") == "user"]
     twin.upsert([{"id": "anchored", "type": "must_not", "scope": "tool_call", "regex": "push", "roles": ["assistant"],
-                  "applies_from_event_id": rng.choice(ids[:6]), "source_event_id": rng.choice(ids)}])
+                  "applies_from_event_id": rng.choice(ids[:6]), "source_event_id": rng.choice(users)}])
+    # An anchor that is not a user message cannot be upserted through the engine (it is rejected there); a stored
+    # contract can still have one (an older store, or an anchor that was unresolved at upsert), and it is unknown.
+    from self_directing_mcp.schemas import ContractRule
+    loose = rng.choice(ids)
+    for engine in (twin.fast, twin.full):
+        engine.contracts.upsert([ContractRule(id="any-anchor", type="must_not", scope="tool_call", regex="deploy",
+                                              roles=["assistant"], source_event_id=loose)])
     for _ in range(14):
         write(path, codex_records(rng, rng.choice([1, 2, 5, 11]), numbered), "a")
         twin.audit(SID)
@@ -139,19 +148,21 @@ def test_the_contract_set_changes_while_the_session_grows(codex):
     twin, path = codex
     rng = random.Random(4)
     numbered = []
-    write(path, codex_records(rng, 30, numbered), "a")
+    write(path, [message("the user asks to change the rules", "user")] + codex_records(rng, 30, numbered), "a")
     twin.upsert(RULES[:2])
     twin.audit(SID)
     write(path, codex_records(rng, 5, numbered), "a")
     twin.audit(SID)
+    # Replacing a regex or revoking a contract weakens it, so both carry the user's message as their anchor.
+    anchor = next(c.chunk_id for c in twin.fast.store.list_chunks(SID, "codex") if c.meta.get("role") == "user")
     # revision bump of one contract, a new contract, a revoked contract
-    twin.upsert([{**RULES[0], "regex": "deploy|push"}])
+    twin.upsert([{**RULES[0], "regex": "deploy|push", "source_event_id": anchor}])
     fast, _ = twin.audit(SID)
     assert set(fast["incremental"]["rebuilt"].values()) <= {"contract_revision", "no_state"}
     twin.upsert([RULES[3]])
     twin.audit(SID)
     for engine in (twin.fast, twin.full):
-        engine.revoke_contract("no-deploy")
+        engine.revoke_contract("no-deploy", source_event_id=anchor)
     write(path, codex_records(rng, 7, numbered), "a")
     fast, _ = twin.audit(SID)
     assert [f["contract_id"] for f in fast["findings"]] == ["tests-first", "no-secret-output"]

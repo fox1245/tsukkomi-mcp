@@ -22,6 +22,7 @@ from self_directing_mcp.audit.contracts import (
     GLOBAL_CONTRACT_MEANING,
     ContractStore,
     contract_scope,
+    loosening_reasons,
     scope_counts,
     visible_contracts,
 )
@@ -51,7 +52,7 @@ from self_directing_mcp.index.vector import build_vector_index
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.retrieve.checks import regex_search
 from self_directing_mcp.retrieve.hybrid import HybridRetriever, hits_to_schema
-from self_directing_mcp.schemas import ContractRule, ContractsDocument, ProposedAction
+from self_directing_mcp.schemas import ContractRule, ContractsDocument, PendingChange, ProposedAction
 from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.timeseries import analyze_activity
 from self_directing_mcp.graphrag import GraphStore, validate_proposal
@@ -153,6 +154,9 @@ def _fast_gate(payload, integrity):
 
 
 CHECKLIST_EVALUATION_ATTEMPTS = 3
+PENDING_NUDGE = ("NOT APPLIED: this change would weaken an active contract and no user message vouches for it "
+                 "(source_event_id missing or not found). The previous revision stays in force and the change is held "
+                 "as pending. Repeat it with source_event_id set to the user's own message that asked for it.")
 
 
 class ChecklistConflict(ValueError):
@@ -861,9 +865,10 @@ class SelfDirectEngine:
         assert self.contracts
         with self._publication_guard():
             raw, _token = self.contracts.capture()
-        stored = (ContractsDocument.model_validate_json(raw).contracts if raw is not None else [])
+        document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
+        stored = document.contracts
         selected = visible_contracts(stored, session_id)
-        return {
+        result = {
             "ok": True,
             "session_id": session_id,
             "scope": contract_scope(session_id),
@@ -871,20 +876,76 @@ class SelfDirectEngine:
             "contracts": [c.model_dump(mode="json") for c in selected],
             "counts": scope_counts(selected, len(stored)),
         }
+        shown = [change for change in document.pending.values()
+                 if change.contract.session_id is None or change.contract.session_id == session_id]
+        if shown:
+            result["pending"] = [change.model_dump(mode="json") for change in shown]
+            result["counts"]["pending"] = len(shown)
+        return result
+
+    def _anchor_status(self, event_ids) -> dict[str, tuple[str, str]]:
+        """``{event id: (status, detail)}``: ``user`` (a user message), ``other`` or ``unresolved`` (not indexed here).
+
+        An anchor is the event a contract was derived from, so it must be the user's own message: a tool result,
+        runtime text or injected context cannot grant or revoke authority, whatever role the host rendered it with.
+        The parsers mark a user turn with ``meta.role == "user"`` (Claude Code: ``origin.kind == "human"``; AGY:
+        ``USER_INPUT`` from ``USER_EXPLICIT``; OMP: a user-role message not attributed to an agent). Codex records the
+        typed prompt and the model-facing copy (which may also carry injected context) both as user-role turns and
+        cannot tell them apart.
+        """
+        wanted = tuple(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        found: dict[str, tuple[str, str]] = {}
+        if not wanted:
+            return found
+        with self._publication_guard(), self.store._read_boundary():
+            for event_id in wanted:
+                check_request()
+                chunk = self.store.get_chunk(event_id)
+                if chunk is None:
+                    found[event_id] = ("unresolved", "not in the index")
+                elif chunk.meta.get("role") == "user":
+                    found[event_id] = ("user", "user message")
+                else:
+                    found[event_id] = ("other", f"a {chunk.kind} event with role {chunk.meta.get('role')!r}")
+        return found
+
+    @staticmethod
+    def _reject_non_user_anchors(label, anchors, event_id) -> None:
+        status, detail = anchors.get(event_id, ("unresolved", ""))
+        if status == "other":
+            raise ValueError(f"{label}: source_event_id {event_id!r} is {detail}, not a user message. A contract anchor "
+                             "must be the user's own message; a tool result, runtime or injected text cannot be one.")
 
     @detached_operation
-    def revoke_contract(self, contract_id: str) -> dict[str, Any]:
-        """Disable a rule while keeping its history and source quote for audit."""
+    def revoke_contract(self, contract_id: str, source_event_id: str | None = None) -> dict[str, Any]:
+        """Disable a rule while keeping its history and source quote for audit.
+
+        Disabling weakens enforcement, so it needs ``source_event_id``: a user message that asked for it. Without a
+        user anchor the request is parked as a pending change and the contract stays in force.
+        """
         assert self.contracts
+        anchors = self._anchor_status([source_event_id])
+        self._reject_non_user_anchors(f"revoke {contract_id!r}", anchors, source_event_id)
+        status = anchors.get(source_event_id, ("missing", ""))[0] if source_event_id else "missing"
         with self._publication_guard():
             raw, token = self.contracts.capture()
             document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
-            disabled = self.contracts.prepare_revoke(document, contract_id)
-            if disabled is None:
+            current = next((rule for rule in document.contracts if rule.id == contract_id), None)
+            if current is None:
                 return {"ok": False, "error": "not_found", "contract_id": contract_id}
+            if current.enabled and status != "user":
+                document.pending[contract_id] = PendingChange(
+                    contract=current.model_copy(update={"enabled": False}, deep=True), reasons=["disabled"],
+                    source_event_id=source_event_id, anchor_status="unresolved" if source_event_id else "missing",
+                    base_revision=current.revision)
+                self.contracts.publish_document(document, document.model_dump_json(indent=2), token)
+                return {"ok": True, "status": "pending", "contract": current.model_dump(mode="json"),
+                        "reasons": ["disabled"], "nudge": PENDING_NUDGE}
+            disabled = self.contracts.prepare_revoke(document, contract_id)
+            document.pending.pop(contract_id, None)
             payload = document.model_dump_json(indent=2)
             self.contracts.publish_document(document, payload, token)
-        return {"ok": True, "contract": disabled.model_dump(mode="json"),
+        return {"ok": True, "status": "disabled", "contract": disabled.model_dump(mode="json"),
                 "nudge": "Contract disabled. History retained; re-enable via upsert_contracts with the same id."}
 
     @detached_operation
@@ -906,13 +967,34 @@ class SelfDirectEngine:
                 # (a denial when headless). A high-risk target must name the actions it covers.
                 raise ValueError(f"contract {rule.id!r}: a high-risk must_not needs a regex that names the actions it "
                                  "covers; without one it would ask on every tool call")
+        # An anchor that resolves to something other than a user message is rejected; one that cannot be resolved
+        # (the session is not indexed yet) is accepted and left to the audit (``anchor_not_user`` there).
+        anchors = self._anchor_status([rule.source_event_id for rule in rules])
+        for rule in rules:
+            self._reject_non_user_anchors(f"contract {rule.id!r}", anchors, rule.source_event_id)
         with self._publication_guard():
             raw, token = self.contracts.capture()
             document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
-            updated = self.contracts.prepare_upsert(document, rules)
+            active = {rule.id: rule for rule in document.contracts}
+            apply, held = [], []
+            for rule in rules:
+                previous = active.get(rule.id)
+                reasons = loosening_reasons(previous, rule) if previous is not None else []
+                if reasons and anchors.get(rule.source_event_id, ("", ""))[0] != "user":
+                    held.append((rule, reasons, previous))     # weakening needs a user anchor: not applied
+                    continue
+                apply.append(rule)
+                active[rule.id] = rule
+            updated = self.contracts.prepare_upsert(document, apply)
+            for rule in apply:
+                document.pending.pop(rule.id, None)
+            for rule, reasons, previous in held:
+                document.pending[rule.id] = PendingChange(
+                    contract=rule, reasons=reasons, source_event_id=rule.source_event_id,
+                    anchor_status="unresolved" if rule.source_event_id else "missing", base_revision=previous.revision)
             payload = document.model_dump_json(indent=2)
             self.contracts.publish_document(document, payload, token)
-        return {
+        result = {
             "ok": True,
             "returned": "upserted",
             "global_meaning": GLOBAL_CONTRACT_MEANING,
@@ -922,6 +1004,17 @@ class SelfDirectEngine:
                 "store": len(document.contracts),
             },
         }
+        checks = [{"contract_id": rule.id, "source_event_id": rule.source_event_id,
+                   "anchor": anchors[rule.source_event_id][0]} for rule in rules if rule.source_event_id]
+        if checks:
+            result["anchor_checks"] = checks
+        if held:
+            result["pending"] = [{"contract_id": rule.id, "reasons": reasons, "active_revision": previous.revision,
+                                  "anchor": "unresolved" if rule.source_event_id else "missing"}
+                                 for rule, reasons, previous in held]
+            result["counts"]["pending"] = len(held)
+            result["nudge"] = PENDING_NUDGE
+        return result
 
     def _verified_checklist_evidence(self, evidence_ids, chunks, complete) -> bool:
         """Evidence IDs are claims until current, linked runtime results resolve."""

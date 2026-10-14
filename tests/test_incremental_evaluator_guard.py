@@ -19,7 +19,7 @@ from self_directing_mcp import agy
 from self_directing_mcp.audit import applicability, patterns, runner, shellstatus
 from self_directing_mcp.retrieve import checks
 
-DIGEST = "d571508b7795990e"
+DIGEST = "305bfdcaa9fe5370"
 
 MIRRORED = [
     runner.audit_contract, runner._Presence, runner._eligible, runner._worse, runner.evidence, runner._key,
@@ -34,10 +34,12 @@ MIRRORED = [
     patterns.compile_contract, patterns.GuardedPattern.search,
     # a success that a masked exit status cannot vouch for is unknown (``success_unverifiable``): one function, both evaluators
     runner.success_unverifiable, shellstatus,
+    # a contract anchored to something other than a user message is unknown (``anchor_not_user``)
+    runner.is_user_event,
 ]
 CONSTANTS = [sorted(agy.RESULT_TYPES), sorted(agy.SUCCESS_TYPES), sorted(map(list, agy.JUDGED_FIELDS)),
              sorted(runner._FINAL_STATUS), sorted(runner._TRUNCATED_CODE.items()), applicability.PROPOSED_CALL_PREFIX,
-             runner.REGEX_TIMEOUT, runner.SUCCESS_UNVERIFIABLE]
+             runner.REGEX_TIMEOUT, runner.SUCCESS_UNVERIFIABLE, runner.ANCHOR_NOT_USER]
 
 
 def digest():

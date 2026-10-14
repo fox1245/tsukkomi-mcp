@@ -8,7 +8,8 @@ whenever they differ (see ``AuditPlan`` and the shadow comparison in ``engine``)
 What is summarized, per contract kind (all state is bounded and JSON-serializable):
 
 * anchors (``source_event_id``, ``applies_from_event_id``): whether each was seen and where the activation
-  event sits; events before an activation anchor are outside the rule's window;
+  event sits; events before an activation anchor are outside the rule's window; whether the source event is a user
+  message (``anchor_not_user`` otherwise);
 * ``when``: whether a call-evidence event inside the window matched;
 * ``must_not``: the match count, the first 20 matches as evidence and, with an ``exception_regex`` (which the
   reference matches against the join of every hit), the hit texts up to a cap;
@@ -44,7 +45,7 @@ from self_directing_mcp.security.mask import mask_secrets
 
 # Bump when the semantics of any evaluation changes (rules, evidence classes, evidence text); it invalidates every
 # stored state and re-enables contracts that a shadow mismatch disabled.
-EVALUATOR_VERSION = 3
+EVALUATOR_VERSION = 4
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
@@ -338,6 +339,7 @@ class RuleMonitor:
         self.track_trigger_proposals = self.agy and rule.type == "must" and self.trigger is not None
         # state
         self.src = False
+        self.src_user = False  # the source event was seen and is a user message
         self.started = self.from_id is None
         self.from_key = None
         self.when_met = False
@@ -360,7 +362,7 @@ class RuleMonitor:
 
     def dump(self):
         return {
-            "src": self.src, "started": self.started, "from_key": self.from_key, "when": self.when_met,
+            "src": self.src, "src_user": self.src_user, "started": self.started, "from_key": self.from_key, "when": self.when_met,
             "hits": self.hits, "hit_ev": self.hit_ev, "exc": self.exc, "exc_chars": self.exc_chars,
             "hit_n": self.hit_n, "last3": self.last3, "lh": self.lh,
             "trig_n": self.trig_n, "trig_worst": self.trig_worst, "trig_reasons": self.trig_reasons,
@@ -372,6 +374,7 @@ class RuleMonitor:
 
     def load(self, data):
         self.src, self.started, self.when_met = data["src"], data["started"], data["when"]
+        self.src_user = data["src_user"]
         self.from_key = _tuple(data["from_key"])
         self.hits, self.hit_ev, self.exc, self.exc_chars = data["hits"], data["hit_ev"], data["exc"], data["exc_chars"]
         self.hit_n, self.last3, self.lh = data["hit_n"], data["last3"], data["lh"]
@@ -413,6 +416,7 @@ class RuleMonitor:
     def feed(self, event, pools):
         if event.chunk_id == self.src_id:
             self.src = True
+            self.src_user = runner.is_user_event(event)
             if self.agy:
                 self.src_tu = _truncated_user(event.meta)
         if not self.started:
@@ -559,6 +563,8 @@ class RuleMonitor:
         rule = self.rule
         if (self.src_id and not self.src) or (self.from_id and not self.started):
             return self._make("unknown", "contract source or activation event is not in this session")
+        if self.src_id and not self.src_user:
+            return self._make("unknown", runner.ANCHOR_NOT_USER)
         if self.regex_invalid:
             return self._make("unknown", "invalid contract regex")
         if rule.when is not None:

@@ -199,3 +199,14 @@ def _reload(monitors, facts, provider, rules, needs):
 def one(rule, events, provider="claude", **kwargs):
     """The single finding of one rule, with both evaluators checked against each other."""
     return evaluate([rule], events, provider, **kwargs)[0]
+
+
+# ---------------------------------------------------------------- a user anchor in a Codex rollout
+
+def codex_user_anchor(engine, path, sid, text="please make that change to the rule", provider="codex"):
+    """Append a user message to a Codex rollout, index it and return its event id: a valid contract anchor."""
+    with Path(path).open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": text}}) + "\n")
+    engine.sync_session(session_id=sid, provider=provider, path=str(path), embed=False)
+    return next(c.chunk_id for c in reversed(engine.store.list_chunks(sid, provider)) if c.meta.get("role") == "user")

@@ -15,6 +15,7 @@ from self_directing_mcp.audit.contracts import ContractStore
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.schemas import ContractRule, ContractsDocument
+from semantic_support import codex_user_anchor
 
 ROOT = Path(__file__).resolve().parents[1]
 SID = "11111111-2222-3333-4444-555555555555"
@@ -95,7 +96,8 @@ def test_invalid_combinations_are_rejected(fields):
 
 
 def test_upsert_list_revoke_round_trip_preserves_the_new_fields(session):
-    engine, _path = session
+    engine, path = session
+    anchor = codex_user_anchor(engine, path, SID, "change the release condition and drop the gate")
     engine.upsert_contracts([
         {"id": "gate", "type": "must_not", "scope": "tool_call", "regex": "git push --force", "risk": "high"},
         {"id": "done", "type": "must", "scope": "message", "regex": "VERIFIED", "auto_continue": True,
@@ -108,14 +110,15 @@ def test_upsert_list_revoke_round_trip_preserves_the_new_fields(session):
     try:
         assert {c["id"]: c for c in reloaded.list_contracts()["contracts"]} == listed
         reloaded.upsert_contracts([{"id": "done", "type": "must", "scope": "message", "regex": "VERIFIED",
-                                    "auto_continue": True, "when": {"tool_call_regex": "release"}}])
+                                    "auto_continue": True, "when": {"tool_call_regex": "release"},
+                                    "source_event_id": anchor}])
         document = ContractsDocument.model_validate_json(engine.settings.resolve_contracts_path().read_bytes())
         current = {c.id: c for c in document.contracts}["done"]
         assert current.revision == 2 and current.when.tool_call_regex == "release"
         assert document.history["done"][0].when.tool_call_regex == "deploy"
     finally:
         reloaded.close()
-    engine.revoke_contract("gate")
+    engine.revoke_contract("gate", source_event_id=anchor)
     assert engine.list_contracts()["contracts"][0]["risk"] == "high"  # revoking keeps the declaration
 
 

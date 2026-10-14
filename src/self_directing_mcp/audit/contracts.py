@@ -32,6 +32,47 @@ def scope_counts(selected: list[ContractRule], store_count: int) -> dict[str, in
     }
 
 
+def loosening_reasons(previous: ContractRule, new: ContractRule) -> list[str]:
+    """Why replacing the active ``previous`` by ``new`` may enforce less; ``[]`` when it cannot.
+
+    Whether a regex got narrower is undecidable here, so any change of what a contract matches counts, as does every
+    field that restricts where or when it applies (moving ``applies_from_event_id`` is not judged: it is how a new
+    revision says "from now on"). Only strictly tightening edits (a new verifier for a description-only
+    contract, an added role, widening the scope to ``any``, adding an obligation flag, removing an exception, enabling)
+    pass without a user anchor. A contract that is not enabled enforces nothing, so editing it weakens nothing.
+    """
+    if not previous.enabled:
+        return []
+    reasons = []
+    if not new.enabled:
+        reasons.append("disabled")
+    if new.type != previous.type:
+        reasons.append("type changed")
+    if previous.regex and new.regex != previous.regex:
+        reasons.append("regex changed")
+    if new.before_regex != previous.before_regex:
+        reasons.append("before_regex changed")
+    if new.exception_regex and new.exception_regex != previous.exception_regex:
+        reasons.append("exception added or changed")
+    if new.scope != previous.scope and new.scope != "any":
+        reasons.append("scope narrowed")
+    if set(previous.roles) - set(new.roles):
+        reasons.append("roles narrowed")
+    if new.when is not None and new.when != previous.when:
+        reasons.append("applicability condition (when) added or changed")
+    if new.provider is not None and new.provider != previous.provider:
+        reasons.append("narrowed to one provider")
+    if new.session_id is not None and new.session_id != previous.session_id:
+        reasons.append("narrowed to one session")
+    if previous.requires_success and not new.requires_success:
+        reasons.append("success requirement removed")
+    if previous.risk == "high" and new.risk != "high":
+        reasons.append("risk lowered")
+    if previous.auto_continue and not new.auto_continue:
+        reasons.append("auto_continue removed")
+    return reasons
+
+
 class ContractStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)

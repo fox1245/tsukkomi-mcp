@@ -175,6 +175,14 @@ def pattern(rng, *, bad=0.04):
     return rng.choice(BAD_PATTERNS) if rng.random() < bad else rng.choice(PATTERNS)
 
 
+def source_anchor(rng, events):
+    """A random ``source_event_id``: mostly a user message (a valid origin), otherwise any event (then unknown)."""
+    users = [e.chunk_id for e in events if e.meta.get("role") == "user"]
+    if users and rng.random() < 0.7:
+        return rng.choice(users)
+    return rng.choice([e.chunk_id for e in events])
+
+
 def contracts(rng, provider, events, count, *, descriptions=0.0):
     """``count`` random rules covering every supported shape. ``descriptions`` is the share of description-only rules
     (no regex), which no monitor serves: the reference judges them in every mode."""
@@ -186,7 +194,7 @@ def contracts(rng, provider, events, count, *, descriptions=0.0):
             spec = {"id": f"r{number}", "type": kind, "description": "a rule that needs a verifier",
                     "roles": rng.sample(ROLES, rng.randint(1, 3))}
             if ids and rng.random() < 0.5:
-                spec["source_event_id"] = rng.choice(ids) if rng.random() < 0.8 else "missing-source"
+                spec["source_event_id"] = source_anchor(rng, events) if rng.random() < 0.8 else "missing-source"
             if ids and rng.random() < 0.3:
                 spec["applies_from_event_id"] = rng.choice(ids) if rng.random() < 0.8 else "missing-anchor"
             out.append(ContractRule(**spec))
@@ -196,7 +204,7 @@ def contracts(rng, provider, events, count, *, descriptions=0.0):
         spec["regex"] = pattern(rng)
         spec["scope"] = rng.choice(["any", "tool_call", "tool_result", "message"])
         if rng.random() < 0.1 and ids:
-            spec["source_event_id"] = rng.choice(ids) if rng.random() < 0.9 else "missing-source"
+            spec["source_event_id"] = source_anchor(rng, events) if rng.random() < 0.9 else "missing-source"
         if rng.random() < 0.18 and ids:
             spec["applies_from_event_id"] = rng.choice(ids[:max(1, len(ids) * 3 // 4)]) if rng.random() < 0.93 else "missing-anchor"
         if rng.random() < 0.08:
