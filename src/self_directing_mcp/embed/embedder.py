@@ -9,7 +9,7 @@ from typing import Sequence
 import httpx
 import numpy as np
 
-from self_directing_mcp.security.mask import mask_secrets
+from self_directing_mcp.security.mask import mask_secrets, register_secret
 from self_directing_mcp.request_control import check_request, current_request, request_operation
 
 
@@ -126,6 +126,7 @@ class OpenRouterEmbedder(Embedder):
         base_url: str = "https://openrouter.ai/api/v1",
     ) -> None:
         self.api_key = api_key
+        register_secret(api_key)
         self.model = model
         self.dim = dim
         self.base_url = base_url.rstrip("/")

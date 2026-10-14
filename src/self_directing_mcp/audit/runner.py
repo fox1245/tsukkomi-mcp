@@ -171,7 +171,7 @@ def audit_contract(rule, *, session_id, store, retriever=None, provider=None, pr
                            basis=f"{rule.id}.exception_regex matched the same event(s); user-authorized exception requires confirmation")
         reason = f"forbidden regex matched {len(hits)} event(s)"
         if rule.source_quote:
-            reason += f"; user said: {rule.source_quote[:120]}"
+            reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
         return finding("violation", reason,
                        basis=f"{rule.id}.regex '{rule.regex}' matched prohibited content", items=[evidence(c) for c in hits[:20]])
     if trigger:

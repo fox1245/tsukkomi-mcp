@@ -9,6 +9,8 @@ import json
 import sys
 from typing import Any, TYPE_CHECKING
 
+from self_directing_mcp.security.mask import mask_value
+
 if TYPE_CHECKING:
     from self_directing_mcp.engine import SelfDirectEngine
 
@@ -194,7 +196,7 @@ def main() -> None:
         reason = f"Tsukkomi verification unavailable ({type(exc).__name__})"
         print(reason, file=sys.stderr)
         response = failure_response(event, payload, reason=reason)
-    json.dump(response, sys.stdout)
+    json.dump(mask_value(response), sys.stdout)  # contract text, graph context and reasons may quote history
     sys.stdout.write("\n")
 
 

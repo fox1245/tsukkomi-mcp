@@ -27,6 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 from self_directing_mcp.neograph_runtime import ng
+from self_directing_mcp.security.mask import mask_secrets, mask_value, register_secret
 from self_directing_mcp.request_control import (
     IndexBusy, RequestStopped, check_request, current_request, request_scope,
 )
@@ -71,6 +72,7 @@ class _Transport:
 
     def __init__(self, api_key: str, model: str, timeout_s: float = 240) -> None:
         self.api_key = api_key
+        register_secret(api_key)
         self.model = model
         self.timeout_s = timeout_s
         self.schema = {
@@ -150,6 +152,8 @@ def run_update_pipeline(*, session_id: str, provider: str, events: list[dict[str
 def _run_update_pipeline(*, session_id, provider, events, api_key, model,
                          checkpoint_dir, on_proposal):
     check_request()
+    # Remote extraction and the durable checkpoint only ever see masked event text, whoever the caller is.
+    events = mask_value(events)
     control = current_request()
     callback_error = None
     transport = _Transport(api_key, model)
@@ -179,7 +183,7 @@ def _run_update_pipeline(*, session_id, provider, events, api_key, model,
             for event in events:
                 check_request()
                 lines.append(f"- {event['chunk_id']} [{event['kind']}] {event['text']}")
-            event_block = chr(10).join(lines)
+            event_block = mask_secrets(chr(10).join(lines))
             prompt = EXTRACT_PROMPT.replace("{events}", event_block)
             try:
                 if len(event_block) > 100000:
