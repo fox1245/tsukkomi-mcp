@@ -183,5 +183,7 @@ class SparseIndex:
                 (session_id,),
             ).fetchone()
         else:
-            row = self._conn.execute("SELECT COUNT(*) AS c FROM chunks_fts").fetchone()
+            # chunk_rows mirrors every FTS document in the same transaction; counting the FTS5 table
+            # itself scans the whole index while callers may hold the shared index lock.
+            row = self._conn.execute("SELECT COUNT(*) AS c FROM chunk_rows").fetchone()
         return int(row["c"]) if row else 0

@@ -36,3 +36,20 @@ def test_search_repair_does_not_load_other_sessions_ids(session, monkeypatch):
     monkeypatch.setattr(SparseIndex, "ids", forbidden)
     result = engine.search_history("needle", session_id=SID, mode="sparse")
     assert result["hits"]
+
+
+def test_status_counts_sparse_rows_without_scanning_fts(session):
+    # COUNT(*) over the FTS5 table scans the whole index (about 2 s at 365k chunks) while
+    # audit_status holds the cross-process lock; chunk_rows carries the same count.
+    engine, path = session
+    write(path, [message(f"row {i}") for i in range(5)], "a")
+    engine.sync_session(session_id=SID, embed=False)
+    statements = []
+    engine.sparse._conn.set_trace_callback(statements.append)
+    try:
+        status = engine.audit_status()
+    finally:
+        engine.sparse._conn.set_trace_callback(None)
+    fts_rows = engine.sparse._conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+    assert status["sparse_count"] == fts_rows > 0
+    assert not [s for s in statements if "count(" in s.lower() and "chunks_fts" in s.lower()], statements
