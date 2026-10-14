@@ -324,9 +324,13 @@ def command_test(args) -> int:
     tests = list(args.pytest_args)
     if args.profile == "tsan":
         tests += [f"--deselect={test}" for test in TSAN_DESELECT]
-    command = [*prefix, sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *tests]
+    # --capture=sys leaves file descriptors 1 and 2 alone, so a native abort (a sanitizer refusing to start, a C-level
+    # exit) still reaches the job output instead of dying inside pytest's fd capture; unbuffered output keeps the
+    # progress written before such an exit.
+    command = [*prefix, sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--capture=sys", *tests]
     print("+", " ".join(command), flush=True)
     # UBSan writes to stderr even when ASan logs to files, so the run's output is kept and scanned too.
+    env = {**env, "PYTHONUNBUFFERED": "1"}
     with subprocess.Popen(command, env=env, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, errors="replace") as process, open(logs / "pytest.out", "w") as copy:
         for line in process.stdout:
