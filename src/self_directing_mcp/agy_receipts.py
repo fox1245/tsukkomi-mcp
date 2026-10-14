@@ -12,7 +12,7 @@ from pathlib import Path
 import sqlite3
 from uuid import uuid4
 
-from self_directing_mcp.session_events import capture_source, iter_raw_lines, source_scope
+from self_directing_mcp.session_events import capture_source, iter_raw_lines, same_identity, source_scope
 from self_directing_mcp.request_control import check_request, publication
 
 
@@ -123,7 +123,7 @@ class ReceiptStore:
         except FileNotFoundError:
             return ("missing", None, None)
         identity = (after.st_dev, after.st_ino)
-        if identity != (before.st_dev, before.st_ino):
+        if not same_identity(identity, (before.st_dev, before.st_ino)):
             return ("changed", identity, None)
         return ("present", identity, self.rows_digest(rows))
 

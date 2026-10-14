@@ -176,3 +176,58 @@ def test_sync_does_full_rehash_only_outside_the_guard(session, monkeypatch):
     engine.audit_session(session_id=SID)
     assert seen and any(depth for _, depth in seen)
     assert [item for item in seen if item[1] and not item[0]] == []
+
+
+# ---- finding 4: st_ino == 0 on one side carries no identity ----
+
+from types import SimpleNamespace  # noqa: E402
+
+from self_directing_mcp.session_events import same_identity  # noqa: E402
+
+
+def _zero_fstat_ino(monkeypatch, dev=None):
+    real = os.fstat
+
+    def fake(fd):
+        stat = real(fd)
+        fields = {n: getattr(stat, n) for n in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")}
+        fields["st_ino"] = 0
+        if dev is not None:
+            fields["st_dev"] = dev
+        return SimpleNamespace(**fields)
+    monkeypatch.setattr(session_events.os, "fstat", fake)
+
+
+def test_same_identity_helper():
+    assert same_identity((1, 5), (1, 5))
+    assert not same_identity((1, 5), (1, 6))
+    assert not same_identity((1, 5), (2, 5))
+    assert same_identity((1, 0), (1, 6)) and same_identity((9, 5), (1, 0))
+
+
+@pytest.mark.parametrize("dev", [None, 12345])
+def test_zero_inode_on_handle_side_still_captures_and_rejects_rewrites(tmp_path, monkeypatch, dev):
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(b'{"a":1}\n' * 50)
+    _zero_fstat_ino(monkeypatch, dev)
+    observation = capture_source(path)
+    with path.open("ab") as stream:
+        stream.write(b'{"b":2}\n')
+    assert observation.validate_prefix() and observation.validate_prefix(locked=True)
+    assert [row[1] for row in session_events.iter_raw_lines(path)][:1] == [0]
+    path.write_bytes(b'{"a":2}\n' * 10)  # size-changing rewrite
+    assert not observation.validate_prefix() and not observation.validate_prefix(locked=True)
+
+
+def test_nonzero_identity_mismatch_is_still_rejected(tmp_path, monkeypatch):
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(b'{"a":1}\n')
+    real = os.fstat
+
+    def fake(fd):
+        stat = real(fd)
+        return SimpleNamespace(st_dev=stat.st_dev, st_ino=stat.st_ino + 1, st_size=stat.st_size,
+                               st_mtime_ns=stat.st_mtime_ns, st_ctime_ns=stat.st_ctime_ns)
+    monkeypatch.setattr(session_events.os, "fstat", fake)
+    with pytest.raises(ValueError, match="source changed"):
+        capture_source(path)

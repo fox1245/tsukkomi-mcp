@@ -61,7 +61,7 @@ class SourceObservation:
             raise ValueError("source truncated during read")
         digest, lines = hashlib.sha256(), 0
         with self.path.open("rb") as stream:
-            if _identity(os.fstat(stream.fileno())) != self.identity:
+            if not same_identity(_identity(os.fstat(stream.fileno())), self.identity):
                 raise ValueError("source replaced during read")
             remaining = offset
             while remaining:
@@ -111,7 +111,7 @@ class SourceObservation:
         try:
             with self.path.open("rb") as stream:
                 before = os.fstat(stream.fileno())
-                if _identity(before) != self.identity or before.st_size < self.length:
+                if not same_identity(_identity(before), self.identity) or before.st_size < self.length:
                     return self._fail()
                 if _stamp(before) == self._verified_stamp:
                     return True
@@ -126,7 +126,7 @@ class SourceObservation:
                 after = os.fstat(stream.fileno())
         except OSError:
             return False
-        if digest.hexdigest() != self._full_digest or _identity(after) != self.identity or after.st_size < self.length:
+        if digest.hexdigest() != self._full_digest or not same_identity(_identity(after), self.identity) or after.st_size < self.length:
             return self._fail()
         if _stamp(after) == _stamp(before):
             self._verified_stamp = _stamp(after)
@@ -142,7 +142,7 @@ class SourceObservation:
         try:
             with self.path.open("rb") as stream:
                 before = os.fstat(stream.fileno())
-                if _identity(before) != self.identity or before.st_size < self.length:
+                if not same_identity(_identity(before), self.identity) or before.st_size < self.length:
                     return self._fail()
                 if _stamp(before) == self._verified_stamp:
                     return True
@@ -160,6 +160,13 @@ class SourceObservation:
 
 def _identity(stat) -> tuple[int, int]:
     return stat.st_dev, stat.st_ino
+
+
+def same_identity(left, right) -> bool:
+    """(st_dev, st_ino) pairs from different stat APIs. Some Windows filesystems report st_ino == 0 on one side
+    (or on both); that side carries no identity, so the pair is skipped and size/mtime/hash decide. Two
+    non-zero inodes are always compared."""
+    return left[1] == 0 or right[1] == 0 or tuple(left) == tuple(right)
 
 
 def _hash_prefix(stream, length, checkpoints):
@@ -219,8 +226,8 @@ def capture_source(path: Path, *, checkpoints=()) -> SourceObservation:
     # Some runtimes (e.g. 9p/drvfs) give stat and fstat different ctime semantics. Compare full stamps
     # within each API, and only identity, size and mtime across them. validate() later compares stat to
     # stat, so the observation keeps the path stamp.
-    if (_identity(after) != _identity(before) or after.st_size < length
-            or path_stamp[:2] != _identity(after) or path_stamp[2] < after.st_size
+    if (not same_identity(_identity(after), _identity(before)) or after.st_size < length
+            or not same_identity(path_stamp[:2], _identity(after)) or path_stamp[2] < after.st_size
             or (path_stamp[2] == after.st_size and path_stamp[3] != after.st_mtime_ns)):
         raise ValueError("source changed during preparation")
     observation = SourceObservation(path, path_stamp, length, boundary, full_digest, states, tail_digest)
@@ -277,7 +284,7 @@ def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, in
     if observation is not None and start_byte > observation.complete_end:
         raise ValueError("cursor is not on a complete record boundary")
     with Path(path).open("rb") as stream:
-        if observation is not None and _identity(os.fstat(stream.fileno())) != observation.identity:
+        if observation is not None and not same_identity(_identity(os.fstat(stream.fileno())), observation.identity):
             raise ValueError("source replaced during read")
         check_digest = None
         if start_byte:
