@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from self_directing_mcp.compressed_source import CompressedSourceError, is_compressed, open_source
+from self_directing_mcp.tool_payload import tool_call_text
 from self_directing_mcp.session_events import (
     as_text, iter_raw_lines, make_chunk, parse_error, result_success,
 )
@@ -222,7 +223,7 @@ def _classify_and_text(obj):
             name = call.get("name") or call.get("tool_name") or item_type
             args = call.get("arguments", call.get("input", call.get("command", call.get("content"))))
             meta.update(role="assistant", tool_name=name)
-            return "tool_call", f"[tool_call:{name}] {as_text(args)}", meta
+            return "tool_call", tool_call_text("codex", name, args), meta
         content = item.get("content", item.get("text", item.get("output", item)))
         meta["role"] = item.get("role", "assistant")
         if item_type not in ("message", "input", "reasoning"):
