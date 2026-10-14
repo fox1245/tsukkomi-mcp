@@ -2,7 +2,7 @@
 
 ## Required operational defaults
 
-NeoGraph is required (`neograph-engine==0.14.0`), including in the actual Codex
+NeoGraph is required (`neograph-engine==0.14.1`), including in the actual Codex
 managed venv. Official Windows wheels are available. Never report native execution
 from package presence alone: inspect audit.execution and GraphRAG execution_trace.
 The native audit graph runs select_contracts -> load_evidence -> evaluate_contracts

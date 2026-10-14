@@ -9,7 +9,7 @@ description = "Tsukkomi MCP: Deterministic governance, invariant contracts, and 
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "neograph-engine==0.14.0",
+  "neograph-engine==0.14.1",
   "mcp>=1.0,<2",
   "pydantic>=2.0",
   "pydantic-settings>=2.0",
