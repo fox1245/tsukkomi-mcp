@@ -84,7 +84,7 @@ def audit_needs(active, proposed):
 
 
 class _Presence:
-    """Prerequisite lookups over ``active`` built once; each checkpoint costs O(log n), not a prefix rescan."""
+    """Index prerequisites once; each checkpoint is a binary search plus a bounded evidence slice."""
 
     def __init__(self, rule, regex, active):
         self.rule, self.active = rule, active
@@ -101,32 +101,27 @@ class _Presence:
         """Verdict for a checkpoint whose prefix is ``active[:position]``."""
         check_request()
         rule, active = self.rule, self.active
-        matches = self.hits[:bisect_left(self.hits, position)]
-        if not matches:
+        hit_end = bisect_left(self.hits, position)
+        if not hit_end:
             return "violation", "required evidence missing before checkpoint", []
+        index = self.hits[hit_end - 1]
+        chunk = active[index]
         if not rule.requires_success:
-            return "clean", "required regex evidenced", [evidence(active[matches[-1]])]
-        unresolved = False
-        # A newer failed/pending run invalidates older success at this checkpoint.
-        for index in matches[-1:]:
-            chunk = active[index]
-            call_id = chunk.meta.get("call_id")
-            if not call_id:
-                unresolved = True
-                continue
-            calls = self.calls.get(_key(call_id), ())
-            if bisect_left(calls, position) != 1:
-                unresolved = True
-                continue
+            return "clean", "required regex evidenced", [evidence(chunk)]
+        # Only the latest matching call decides; a newer failed/pending run invalidates older success.
+        # Positions are found by bisection, never by copying the prefix of hits or results.
+        unresolved = True
+        call_id = chunk.meta.get("call_id")
+        if call_id and bisect_left(self.calls.get(_key(call_id), ()), position) == 1:
             outputs = self.outputs.get(_key(call_id), ())
-            outputs = outputs[bisect_right(outputs, index):bisect_left(outputs, position)]
-            if len(outputs) != 1 or active[outputs[0]].meta.get("success") is None:
-                unresolved = True
-                continue
-            if active[outputs[0]].meta["success"] is True:
-                return "clean", "required call has linked successful result", [
-                    evidence(chunk), evidence(active[outputs[0]], "linked successful tool result")]
-        items = [evidence(active[i]) for i in matches[-3:]]
+            start, end = bisect_right(outputs, index), bisect_left(outputs, position)
+            if end - start == 1 and active[outputs[start]].meta.get("success") is not None:
+                output = active[outputs[start]]
+                if output.meta["success"] is True:
+                    return "clean", "required call has linked successful result", [
+                        evidence(chunk), evidence(output, "linked successful tool result")]
+                unresolved = False
+        items = [evidence(active[i]) for i in self.hits[max(0, hit_end - 3):hit_end]]
         if unresolved:
             return "unknown", "required call has no unambiguous completion status", items
         return "violation", "required calls completed without success", items
