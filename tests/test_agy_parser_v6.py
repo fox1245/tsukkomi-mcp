@@ -5,8 +5,9 @@ Synthetic data only; shapes mirror the host log: records are
  truncated_fields?}. The display log (transcript.jsonl) JSON-encodes every tool-call argument value;
 the full log (transcript_full.jsonl) keeps native values.
 """
+import base64
+import hashlib
 import json
-import time
 import tracemalloc
 from pathlib import Path
 
@@ -143,7 +144,7 @@ def test_truncated_fields_restore_from_sibling_full_transcript(tmp_path):
 
 def test_fallback_is_per_field_and_leaves_thinking_unrestored(tmp_path):
     display = make(tmp_path, [
-        planner(0, "cut", None, thinking="short", truncated_fields=["content", "thinking"]),
+        planner(0, "complete", None, thinking="short", truncated_fields=["content", "thinking"]),
     ], [
         planner(0, "complete answer", None, thinking="long long thinking", display=False),
     ])
@@ -164,6 +165,11 @@ FAILURES = [
     ("step_gap", 0, [generic(1), generic(2)], "full_missing_step", False),
     ("not_written_yet", 3, [generic(0), generic(1), generic(2)], "full_missing_step", True),
     ("not_longer", 0, [user(0, "Do not touch production, unl")], "full_not_longer", False),
+    ("other_text_same_step", 0, [user(0, "Something else entirely, much longer than what the display shows")],
+     "full_prefix_mismatch", False),
+    ("duplicate_step", 0, [user(0, "Do not touch production, unless approved by the owner"),
+                           user(0, "Do not touch production, unless approved by somebody else")],
+     "full_duplicate_step", False),
 ]
 
 
@@ -177,6 +183,15 @@ def test_failed_fallback_keeps_visible_text_and_marks_field_truncated(tmp_path, 
     assert chunk.meta["truncated_fields"] == ["content"] and chunk.meta["source"] == "display"
     assert chunk.meta["fallback"]["reason"] == reason and chunk.meta["fallback"]["retryable"] is retryable
     assert "restored_fields" not in chunk.meta
+
+
+def test_a_later_state_of_the_step_does_not_restore_a_running_record(tmp_path):
+    display = make(tmp_path, [generic(2, "partial", status="RUNNING", truncated_fields=["content"])],
+                   [generic(2, "partial output that finished\n" * 5, status="DONE")])
+    chunks, *_ = parse_session_chunks(display)
+    chunk = next(c for c in chunks if c.kind == "tool_result")
+    assert chunk.meta["fallback"]["reason"] == "full_step_mismatch" and chunk.meta["pending"] is True
+    assert chunk.meta["truncated_fields"] == ["content"]
 
 
 def test_full_file_changed_after_indexing_fails_the_fallback(tmp_path, monkeypatch):
@@ -202,7 +217,10 @@ def test_sibling_must_be_the_real_file_in_the_same_directory(tmp_path):
     write(outside, [user(0, "Keep the logs for thirty days")])
     display = make(tmp_path, [user(0, "Keep the logs", truncated_fields=["content"])])
     link = display.with_name("transcript_full.jsonl")
-    link.symlink_to(outside)
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
     chunks, *_ = parse_session_chunks(display)
     chunk = next(c for c in chunks if c.meta.get("event_type") == "USER_INPUT")
     assert chunk.meta["truncated_fields"] == ["content"] and "thirty" not in chunk.text
@@ -283,7 +301,7 @@ def test_full_index_memory_is_bounded_by_records_not_file_size(tmp_path):
         for step in range(records):
             stream.write(json.dumps(planner(step, f"{step}:" + filler, None, display=False)) + "\n")
     display = write(folder / "transcript.jsonl", [
-        planner(step, "cut", None, truncated_fields=["content"]) for step in (0, 1200, records - 1)])
+        planner(step, f"{step}:zzzz", None, truncated_fields=["content"]) for step in (0, 1200, records - 1)])
     total = (folder / "transcript_full.jsonl").stat().st_size
     assert total > 35 * 1024 * 1024
     tracemalloc.start()
@@ -542,13 +560,15 @@ def test_checkpoint_and_error_message_do_not_enter_default_judgement(env):
 def test_media_payload_is_never_indexed(env):
     engine, root = env
     blob = "QUJDREVG" * 4000
-    content = "Created At: x\nCompleted At: y\n\nThe command exited with code 0.\nOutput:\nsaved data:image/png;base64," + blob + " ok\n"
+    raw = base64.b64encode(hashlib.sha512(b"seed").digest() * 100).decode()  # a long run of real base64 text
+    content = ("Created At: x\nCompleted At: y\n\nThe command exited with code 0.\nOutput:\nsaved data:image/png;base64,"
+               + blob + " ok " + raw + "\n")
     path = make(root, [user(0, "go"), planner(1, "ok"),
                        rec(2, "GENERIC", "MODEL", content=content,
                            media=[{"mime_type": "image/png", "data": blob, "name": "shot.png"}])])
     sync(engine, path)
     rows = engine.store._conn.execute("SELECT data FROM session_events").fetchall()
-    assert rows and not any("QUJDREVG" in row[0] for row in rows)
+    assert rows and not any("QUJDREVG" in row[0] or raw[:200] in row[0] for row in rows)
     result = next(c for c in chunks_of(engine) if c.kind == "tool_result")
     assert "[media #0 type=image/png" in result.text and "blob omitted" in result.text
     assert result.meta["media_count"] == 1
@@ -644,3 +664,83 @@ def test_legacy_never_shrinks_the_evaluation_window_of_a_must(env):
     anchor = next(c.chunk_id for c in chunks_of(engine) if c.meta.get("step_index") == 2 and c.kind == "tool_result")
     must_tests_first(engine, applies_from_event_id=anchor)
     assert finding(deploy_check(engine, path), "tests-first")["verdict"] == "violation"
+
+
+def test_persisted_evidence_counts_match_a_scan_across_incremental_syncs(env):
+    engine, root = env
+    path = make(root, [user(0, "go"), planner(1, "", [("run_command", {"CommandLine": "ls"})], truncated_fields=["tool_calls"]),
+                       generic(2, "listing"), rec(3, "EPHEMERAL_MESSAGE", "SYSTEM_SDK", content="c", truncated_fields=["content"])])
+    sync(engine, path)
+    append(path, generic(4, "more", media=[{"mime_type": "image/png", "data": "QUJD" * 50}]),
+           user(5, "again", truncated_fields=["content"]))
+    info = sync(engine, path)
+    assert not info["reindexed"]
+    persisted = info["coverage"]["agy_evidence"]
+    engine.store._conn.execute("DELETE FROM session_agy_stats")  # force the scan fallback
+    assert engine.store.agy_evidence_stats(SID) == persisted
+    assert persisted["legacy_unlinked_results"] == 2 and persisted["media_placeholders"] == 1
+    assert persisted["truncation"]["unrestored"] == {"PLANNER_RESPONSE.tool_calls": 1, "USER_INPUT.content": 1}
+    assert persisted["truncation"]["ignored"] == {"EPHEMERAL_MESSAGE.content": 1}
+
+
+def test_invalid_result_with_host_receipts_keeps_the_call_and_never_succeeds(env):
+    engine, root = env
+    engine.upsert_contracts([{"id": "no-deploy", "provider": "agy", "type": "must_not", "scope": "tool_call",
+                              "regex": "deploy"}])
+    path = make(root, [user(0, "go"), planner(1, "", [("run_command", {"CommandLine": "deploy"})])])
+    engine.record_agy_hook(hook(path, 2, "deploy"), "PreToolUse")
+    append(path, rec(2, "GENERIC", "MODEL", "INVALID", error="bad arguments"))
+    engine.record_agy_hook(hook(path, 2, "deploy", error="bad arguments"), "PostToolUse")
+    info = sync(engine, path)
+    assert info["coverage"]["complete"] and info["coverage"]["unsupported_event_count"] == 0
+    kinds = [(c.kind, c.meta.get("success")) for c in chunks_of(engine) if c.meta.get("step_index") == 2]
+    assert kinds == [("tool_call", None), ("tool_result", False)]
+    assert finding(engine.audit_session(SID, provider="agy", path=str(path)), "no-deploy")["verdict"] == "violation"
+
+
+def test_legacy_session_where_the_required_call_was_never_proposed_is_a_real_absence(env):
+    engine, root = env
+    path = make(root, [user(0, "go"), planner(1, "", [("run_command", {"CommandLine": "ls"})]), generic(2, "listing")])
+    must_tests_first(engine)
+    item = finding(deploy_check(engine, path), "tests-first")
+    # The call side proves no `npm test` was ever attempted, whatever the unlinked results say.
+    assert item["verdict"] == "violation" and not item["reason"].startswith("unsupported_legacy")
+
+
+def test_unrelated_running_result_does_not_mask_a_missing_obligation(env):
+    engine, root = env
+    must_tests_first(engine)
+    path = make(root, [user(0, "go"), planner(1, "", [("run_command", {"CommandLine": "sleep 600"})])])
+    engine.record_agy_hook(hook(path, 2, "sleep 600"), "PreToolUse")
+    append(path, generic(2, "waiting", status="RUNNING"))
+    item = finding(deploy_check(engine, path), "tests-first")
+    assert item["verdict"] == "violation"
+
+
+def test_must_not_on_tool_results_sees_visible_matches_and_stays_unknown_when_output_is_cut(env):
+    engine, root = env
+    engine.upsert_contracts([{"id": "no-secret", "provider": "agy", "type": "must_not", "scope": "tool_result",
+                              "roles": ["tool"], "regex": "hunter2"}])
+    cut = make(root, [user(0, "go"), generic(1, "all fine", truncated_fields=["content"])])
+    item = finding(engine.audit_session(SID, provider="agy", path=str(cut)), "no-secret")
+    assert item["verdict"] == "unknown" and item["reason"].startswith("truncated_content")
+    leaked = make(root, [user(0, "go"), generic(1, "password is hunter2", truncated_fields=["content"])])
+    assert finding(engine.audit_session(SID, provider="agy", path=str(leaked)), "no-secret")["verdict"] == "violation"
+    whole = make(root, [user(0, "go"), generic(1, "all fine")])
+    assert finding(engine.audit_session(SID, provider="agy", path=str(whole)), "no-secret")["verdict"] == "clean"
+
+
+def test_unverifiable_contract_stays_unknown_and_is_not_overridden_by_attempts(env):
+    engine, root = env
+    engine.upsert_contracts([{"id": "no-deploy", "provider": "agy", "type": "must_not", "scope": "tool_call",
+                              "regex": "deploy", "source_event_id": "agy:missing:0:0:abcd"}])
+    path = make(root, [user(0, "go"), planner(1, "", [("run_command", {"CommandLine": "deploy"})])])
+    item = finding(engine.audit_session(SID, provider="agy", path=str(path)), "no-deploy")
+    assert item["verdict"] == "unknown"
+
+
+def test_unrecognized_tool_result_status_is_unsupported_not_guessed(env):
+    engine, root = env
+    path = make(root, [user(0, "go"), generic(1, "x", status="TELEPORTED")])
+    info = sync(engine, path)
+    assert info["coverage"]["unsupported_event_count"] == 1 and not info["coverage"]["complete"]

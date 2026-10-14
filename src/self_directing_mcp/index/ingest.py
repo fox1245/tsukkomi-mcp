@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import json
@@ -43,6 +44,9 @@ class AuditEventSnapshot:
 
 
 _SCOPE_KINDS = {"tool_call": "tool_call", "tool_result": "tool_result", "message": "turn"}
+# Meta keys the audit helper for AGY evidence classes needs on every slim event.
+_AGY_AUDIT_META = ("event_type", "step_index", "status", "pending", "linkage", "evidence_origin",
+                   "tool_name", "truncated_fields", "denied_action")
 
 
 @dataclass(frozen=True)
@@ -133,12 +137,40 @@ def prefix_digest(path: Path, length: int) -> str:
     return digest.hexdigest()
 
 
+def agy_tally(linkage, pending, media_count, event_type, still, restored, fallback=None):
+    """Counter increments for one AGY event's evidence classes; shared by commit and the scan fallback."""
+    from self_directing_mcp.agy import JUDGED_FIELDS
+    out = []
+    if linkage == "legacy_unlinked":
+        out.append(("legacy_unlinked_results", 1))
+    if pending:
+        out.append(("running_results", 1))
+    if media_count:
+        out.append(("media_placeholders", media_count))
+    for field in still or ():
+        out.append((("unrestored|" if (event_type, field) in JUDGED_FIELDS else "ignored|") + f"{event_type}.{field}", 1))
+    for field in restored or ():
+        out.append((f"restored|{event_type}.{field}", 1))
+    if isinstance(fallback, dict) and fallback.get("retryable"):
+        out.append((f"retry|{fallback.get('full_size')}", 1))  # the size of the full log that failed transiently
+    return out
+
+
+def _agy_stats_dict(counter):
+    def bucket(prefix):
+        return {key.split("|", 1)[1]: count for key, count in sorted(counter.items()) if key.startswith(prefix + "|")}
+    return {"legacy_unlinked_results": counter["legacy_unlinked_results"], "running_results": counter["running_results"],
+            "media_placeholders": counter["media_placeholders"],
+            "truncation": {"restored_from_full": bucket("restored"), "unrestored": bucket("unrestored"),
+                           "ignored": bucket("ignored")}}
+
+
 class RowSpool:
     """Prepared event rows spooled to disk (memory below 1 MiB); parsers append, publication replays in batches."""
 
     def __init__(self):
         self._file = tempfile.SpooledTemporaryFile(max_size=1 << 20, mode="w+", encoding="utf-8", newline="\n")
-        self.count, self.ids, self.flags = 0, set(), {}
+        self.count, self.ids, self.flags, self.tallies = 0, set(), {}, {}
 
     @classmethod
     def from_chunks(cls, chunks):
@@ -156,6 +188,12 @@ class RowSpool:
         self.ids.add(chunk.chunk_id)
         if chunk.meta.get("parse_error") or chunk.meta.get("unsupported_event"):
             self.flags[chunk.chunk_id] = (bool(chunk.meta.get("parse_error")), bool(chunk.meta.get("unsupported_event")))
+        if chunk.provider == "agy":
+            meta = chunk.meta
+            tally = agy_tally(meta.get("linkage"), meta.get("pending"), meta.get("media_count"), meta.get("event_type"),
+                              meta.get("truncated_fields"), meta.get("restored_fields"), meta.get("fallback"))
+            if tally:
+                self.tallies[chunk.chunk_id] = tally
 
     def __len__(self):
         return self.count
@@ -251,6 +289,9 @@ class SessionStore:
                 parser_version INTEGER NOT NULL, synced_at TEXT NOT NULL,
                 PRIMARY KEY(provider,session_id)
             );
+            CREATE TABLE IF NOT EXISTS session_agy_stats (
+                session_id TEXT PRIMARY KEY, stats TEXT NOT NULL, synced_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS session_receipt_versions (
                 provider TEXT NOT NULL, session_id TEXT NOT NULL,
                 digest TEXT, synced_at TEXT NOT NULL,
@@ -328,6 +369,8 @@ class SessionStore:
                 raise ValueError("stale session preparation")
             metrics = self.session_metrics(session_id, provider)
             known = self.chunk_ids(session_id, provider)
+            prior = self._agy_tally(session_id) if provider == "agy" and not replace else Counter()
+            tally = Counter()
             with publication():
                 if replace:
                     for cid in known - spool.ids:
@@ -348,6 +391,8 @@ class SessionStore:
                             flag = spool.flags.get(row[0], (False, False))
                             errors += flag[0]
                             unsupported += flag[1]
+                            for key, count in spool.tallies.get(row[0], ()):
+                                tally[key] += count
                 base = (0, 0, 0) if replace else metrics
                 metrics = (base[0] + added, base[1] + errors, base[2] + unsupported)
                 synced_at = datetime.now(timezone.utc).isoformat()
@@ -358,6 +403,8 @@ class SessionStore:
                 if provider == "agy":
                     self._conn.execute("INSERT OR REPLACE INTO session_receipt_versions VALUES (?,?,?,?)",
                                        (provider, session_id, receipt_digest, synced_at))
+                    self._conn.execute("INSERT OR REPLACE INTO session_agy_stats VALUES (?,?,?)",
+                                       (session_id, json.dumps(dict(prior + tally), sort_keys=True), synced_at))
                 self._conn.execute("INSERT OR REPLACE INTO session_metrics VALUES (?,?,?,?,?)",
                                    (provider, session_id, *metrics))
                 check_request()
@@ -470,6 +517,10 @@ class SessionStore:
         with self._read_boundary():
             terms, term_params = [], []
             for scope, roles in needs:
+                if scope == "attempt":
+                    # Host-logged model proposals (forbidden-attempt matching); never every runtime-role event.
+                    terms.append("json_extract(data,'$.meta.evidence_origin')='model_proposal'")
+                    continue
                 kind = _SCOPE_KINDS.get(scope)
                 parts = []
                 if kind is not None:
@@ -483,11 +534,14 @@ class SessionStore:
             wanted = " OR ".join(terms) if terms else "0"
             count = self.chunk_count(session_id, provider)
             check_request()
+            # AGY evidence classes (truncation, pending, legacy, denial) are read with one extra packed column.
+            extra = ("json_extract(data,'" + "','".join("$.meta." + key for key in _AGY_AUDIT_META) + "')"
+                     if provider == "agy" else "NULL")
             cursor = self._conn.execute(
                 "SELECT chunk_id, json_extract(data,'$.kind'), json_extract(data,'$.meta.role'),"
                 " json_extract(data,'$.meta.call_id'), json_type(data,'$.meta.success'),"
-                " json_extract(data,'$.meta.success'), CASE WHEN " + wanted + " THEN json_extract(data,'$.text') END"
-                " FROM session_events WHERE session_id=? AND provider=?"
+                " json_extract(data,'$.meta.success'), CASE WHEN " + wanted + " THEN json_extract(data,'$.text') END,"
+                " " + extra + " FROM session_events WHERE session_id=? AND provider=?"
                 " ORDER BY provider,session_id,byte_start,sub_index", term_params + [session_id, provider])
             events = []
             while True:
@@ -495,15 +549,52 @@ class SessionStore:
                 page = cursor.fetchmany(512)
                 if not page:
                     break
-                for cid, kind, role, call_id, success_type, success, text in page:
+                for cid, kind, role, call_id, success_type, success, text, packed in page:
                     if success_type == "true":
                         success = True
                     elif success_type == "false":
                         success = False
                     elif success_type in (None, "null"):
                         success = None
-                    events.append(AuditEvent(cid, kind, text or "", {"role": role, "call_id": call_id, "success": success}))
+                    meta = {"role": role, "call_id": call_id, "success": success}
+                    if packed is not None:
+                        meta.update((key, value) for key, value in zip(_AGY_AUDIT_META, json.loads(packed))
+                                    if value is not None)
+                    events.append(AuditEvent(cid, kind, text or "", meta))
             return AuditEventSnapshot(session_id, provider, tuple(events), count)
+
+    def agy_fallback_retries(self, session_id):
+        """Sizes (None: missing) of the sibling full log recorded with this session's transient failed fallbacks."""
+        with self._read_boundary():
+            return [None if size == "None" else int(size) for size in
+                    (key.split("|", 1)[1] for key in self._agy_tally(session_id) if key.startswith("retry|"))]
+
+    def _agy_tally(self, session_id):
+        """Evidence-class counts: the row published with the current cursor, else a scan of the stored events
+        (a still-running older process, or an index from before parser v6)."""
+        row = self._conn.execute(
+            "SELECT s.stats FROM session_agy_stats s JOIN session_cursors c ON c.provider='agy'"
+            " AND c.session_id=s.session_id AND c.synced_at=s.synced_at WHERE s.session_id=?", (session_id,)).fetchone()
+        if row is not None:
+            return Counter(json.loads(row[0]))
+        tally = Counter()
+        cursor = self._conn.execute(
+            "SELECT json_extract(data,'$.meta.linkage','$.meta.pending','$.meta.media_count','$.meta.event_type',"
+            "'$.meta.truncated_fields','$.meta.restored_fields','$.meta.fallback') FROM session_events"
+            " WHERE provider='agy' AND session_id=?", (session_id,))
+        while True:
+            check_request()
+            page = cursor.fetchmany(1024)
+            if not page:
+                return tally
+            for (packed,) in page:
+                for key, count in agy_tally(*json.loads(packed)):
+                    tally[key] += count
+
+    def agy_evidence_stats(self, session_id):
+        """Legacy/pending results, media placeholders and truncation counts of one AGY session."""
+        with self._read_boundary():
+            return _agy_stats_dict(self._agy_tally(session_id))
 
     def session_metrics(self, session_id, provider):
         row = self._conn.execute(
@@ -607,7 +698,13 @@ class SessionStore:
         with self._read_boundary():
             record = self.cursor_record(session_id, provider)
             metrics = self.session_metrics(session_id, provider)
-        return coverage_from_capture(session_id, provider, record, metrics)
+            stats = self.agy_evidence_stats(session_id) if provider == "agy" and record else None
+        coverage = coverage_from_capture(session_id, provider, record, metrics)
+        if stats is not None:
+            # No receipt capture here: the counts are exact, the first-receipt position is reported by sync/audit.
+            coverage.update(legacy_unlinked_count=stats["legacy_unlinked_results"],
+                            result_dependent_complete=not stats["legacy_unlinked_results"], agy_evidence=stats)
+        return coverage
 
 
 def coverage_from_capture(session_id, provider, record, metrics, observation=None, *, alias=False):
@@ -644,6 +741,25 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
         issues.append("unsupported_events")
     result.update(issues=issues, complete=not issues)
     return result
+
+
+def _full_size(path):
+    from self_directing_mcp.agy import full_transcript_size
+    return full_transcript_size(path)
+
+
+def agy_coverage(coverage, stats, receipts=None):
+    """AGY-only coverage facts. They do not make ``complete`` false: a legacy result is a classified, known
+    limitation (the unsupported_legacy verdict reason), not a current-session defect. They do make the
+    result-dependent half of the evidence honest: ``result_dependent_complete`` is false while any result
+    predates this conversation's receipts."""
+    first = min(receipts) if receipts else None
+    coverage["receipts_since"] = (None if first is None else
+                                  {"step_index": first, "byte_offset": receipts[first].get("prefix_length")})
+    coverage["legacy_unlinked_count"] = stats["legacy_unlinked_results"]
+    coverage["result_dependent_complete"] = not stats["legacy_unlinked_results"]
+    coverage["agy_evidence"] = stats
+    return coverage
 
 
 @request_operation
@@ -780,7 +896,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         claimed = peek_session_id(path)
         if claimed is not None and (claimed.lower() if provider in ("codex", "agy") else claimed) != sid:
             raise ValueError("session identity differs from observed source")
-        receipt_store = None
+        receipt_store, receipts, fallback_retries = None, {}, ()
         with guard(), store._read_boundary():
             cursor = store.cursor_record(sid, provider)
             expected_token = store.state_token(sid, provider)
@@ -788,6 +904,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                            if provider == "omp" and cursor and observation.complete_end > cursor["byte_offset"] else ())
             if provider == "agy":
                 from self_directing_mcp.agy_receipts import ReceiptStore
+                fallback_retries = store.agy_fallback_retries(sid) if cursor else ()
                 receipt_store = ReceiptStore(store.db_path.parent)
                 receipt_capture = receipt_store.read_capture(sid)
                 receipt_authority_before = receipt_store.authority_token(sid)
@@ -819,6 +936,10 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 start, reindexed, reindex_reason = 0, True, "source_changed"
             elif cursor["parser_version"] != parser_version:
                 start, reindexed, reindex_reason = 0, True, "parser_updated"
+            elif fallback_retries and any(size != _full_size(path) for size in fallback_retries):
+                # A fallback that failed because the full log was missing or not yet at that step: it is retried
+                # once per change of the full log, and only for those transient failures.
+                start, reindexed, reindex_reason = 0, True, "truncated_fallback_retry"
         receipt_digest = None
         if receipt_store is not None:
             receipt_rows, receipts, receipt_digest, indexed_digest = receipt_store.prepare_bindings(receipt_capture, path)
@@ -895,11 +1016,14 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 committed_cursor = store.cursor_record(sid, provider)
                 metrics = store.session_metrics(sid, provider)
                 receipt_authority = receipt_store.authority_token(sid) if receipt_store is not None else None
+                agy_stats = store.agy_evidence_stats(sid) if provider == "agy" else None
     finally:
         new_chunks = chunks.count
         chunks.close()
     alias = committed_cursor["path"] != str(path)  # an equal or shorter copy never moves the cursor
     coverage = coverage_from_capture(sid, provider, committed_cursor, metrics, observation, alias=alias)
+    if agy_stats is not None:
+        agy_coverage(coverage, agy_stats, receipts)
     info = {"session_id": sid, "provider": provider, "path": str(path), "byte_offset": offset,
             "new_chunks": new_chunks, "embedded": 0, "total_chunks": coverage["chunk_count"],
             "reindexed": reindexed, "parser_version": parser_version, "reindex_reason": reindex_reason,

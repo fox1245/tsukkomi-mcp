@@ -211,7 +211,15 @@ def test_denial_text_without_host_observation_remains_unknown(session):
         stream.write(json.dumps({"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "ERROR",
                                  "error": "tool call denied by pre-tool hook: missing prerequisite"}) + "\n")
     result = engine.sync_session(session_id=SID, provider="agy", path=str(path), embed=False)
-    assert not result["coverage"]["complete"]
+    chunks = engine.store.list_chunks(SID, "agy")
+    # Denial text is not proof of non-execution without the host's own Pre receipt; with no receipt at all the
+    # conversation predates receipts, so the result is preserved as legacy_unlinked and result-dependent
+    # obligations stay unknown (unsupported_legacy), never clean.
+    assert not [c for c in chunks if c.meta.get("evidence_origin") == "host_rejected_proposal"]
+    outcome = next(c for c in chunks if c.kind == "tool_result")
+    assert outcome.meta["linkage"] == "legacy_unlinked" and outcome.meta["success"] is False
+    assert result["coverage"]["result_dependent_complete"] is False
+    assert _deploy_check(engine, path)["verdict"] == "unknown"
 
 
 @pytest.mark.parametrize("post_before_persistence", [False, True])
