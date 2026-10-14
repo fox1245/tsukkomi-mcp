@@ -274,6 +274,89 @@ def test_malformed_queued_command_is_unsupported_never_a_user_turn(root, fields)
     assert chunk.meta["unsupported_event"] is True and chunk.meta["role"] == "runtime" and chunk.kind == "meta"
 
 
+QUEUED_BASE = {"delivery_id": "d1", "source_uuid": "s1", "timestamp": "2026-10-01T00:00:00.000Z"}
+PEER = {"kind": "peer", "body": "b", "from": "agent-x", "handback": False, "name": "reviewer", "senderTaskId": "t1"}
+
+
+def queued(**fields):
+    return attachment("queued_command", **fields)
+
+
+# Key sets observed in real transcripts: (record, user turn?, evidence_origin).
+QUEUED_VARIANTS = {
+    "task_notification": (queued(commandMode="task-notification", origin={"kind": "task-notification",
+                                                                        "producer": "bash"},
+                                 prompt="done", runId="r1", **QUEUED_BASE), False, "task_notification"),
+    "task_notification_with_usage_dict": (queued(commandMode="task-notification", origin={
+        "kind": "task-notification", "producer": "bash"}, prompt="done", runId="r1", usage={"tokens": "USAGE-SENTINEL"},
+        **QUEUED_BASE), False, "task_notification"),
+    "task_notification_with_usage_int": (queued(commandMode="task-notification", origin={
+        "kind": "task-notification", "producer": "bash"}, prompt="done", runId="r1", usage=12, **QUEUED_BASE),
+        False, "task_notification"),
+    "task_notification_with_usage_str": (queued(commandMode="task-notification", origin={
+        "kind": "task-notification", "producer": "bash"}, prompt="done", runId="r1", usage="USAGE-SENTINEL",
+        **QUEUED_BASE), False, "task_notification"),
+    "task_notification_without_run_id": (queued(commandMode="task-notification", origin={
+        "kind": "task-notification", "producer": "bash"}, prompt="done", **QUEUED_BASE), False, "task_notification"),
+    "human_turn_bool": (queued(commandMode="prompt", origin={"kind": "human"}, prompt=f"mid {PHRASE}", humanTurn=True,
+                               **QUEUED_BASE), True, None),
+    "human_turn_str": (queued(commandMode="prompt", origin={"kind": "human"}, prompt=f"mid {PHRASE}", humanTurn="3",
+                              **QUEUED_BASE), True, None),
+    "human_turn_int": (queued(commandMode="prompt", origin={"kind": "human"}, prompt=f"mid {PHRASE}", humanTurn=3,
+                              **QUEUED_BASE), True, None),
+    "coordinator_reminder": (queued(isMeta=True, origin={"kind": "coordinator"}, prompt=f"remind {PHRASE}",
+                                    reminderId="rem-1", source_uuid="s1"), False, "coordinator"),
+    "peer_prompt_mode_meta": (queued(commandMode="prompt", isMeta=True, origin=PEER, prompt=f"peer {PHRASE}",
+                                     reminderId="rem-2", **QUEUED_BASE), False, "peer_message"),
+    "peer_reminder": (queued(isMeta=True, origin=PEER, prompt=f"peer {PHRASE}", reminderId="rem-3",
+                             source_uuid="s1"), False, "peer_message"),
+    "peer_reminder_without_handback": (queued(isMeta=True, origin={k: v for k, v in PEER.items() if k != "handback"},
+                                              prompt=f"peer {PHRASE}", reminderId="rem-4", source_uuid="s1"),
+                                       False, "peer_message"),
+    "meta_without_origin": (queued(isMeta=True, prompt=f"meta {PHRASE}", reminderId="rem-5", source_uuid="s1"),
+                            False, "injected_meta"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(QUEUED_VARIANTS))
+def test_observed_queued_command_variants_are_supported_and_only_human_prompts_are_user(root, name):
+    record, is_user, origin = QUEUED_VARIANTS[name]
+    chunks = parse(write(main_file(root), record))
+    assert len(chunks) == 1
+    (chunk,) = chunks
+    assert not chunk.meta.get("unsupported_event") and not chunk.meta.get("parse_error")
+    if is_user:
+        assert (chunk.kind, chunk.meta["role"]) == ("turn", "user") and "evidence_origin" not in chunk.meta
+        assert chunk.text.startswith("[message:user] mid ")
+    else:
+        assert (chunk.kind, chunk.meta["role"], chunk.meta["evidence_origin"]) == ("meta", "runtime", origin)
+    assert "USAGE-SENTINEL" not in dump(chunks)
+
+
+def test_queued_command_extra_fields_become_meta_not_text(root):
+    chunks = parse(write(main_file(root), QUEUED_VARIANTS["human_turn_str"][0], QUEUED_VARIANTS["peer_reminder"][0]))
+    assert chunks[0].meta["human_turn"] == "3" and chunks[0].meta["delivery_id"] == "d1"
+    assert chunks[1].meta["reminder_id"] == "rem-3" and chunks[1].meta["is_meta"] is True
+    assert chunks[1].meta["peer_from"] == "agent-x" and chunks[1].meta["peer_name"] == "reviewer"
+
+
+@pytest.mark.parametrize("fields", [
+    {"commandMode": "prompt", "origin": {"kind": "human"}, "prompt": "x", "isMeta": True},   # meta is never the human
+    {"commandMode": "prompt", "origin": {"kind": "human"}, "prompt": "x", "isMeta": "no"},
+    {"commandMode": "prompt", "origin": {"kind": "human"}, "prompt": "x", "humanTurn": [1]},
+    {"commandMode": "prompt", "origin": {"kind": "human"}, "prompt": "x", "humanTurn": {"n": 1}},
+    {"commandMode": "prompt", "origin": {"kind": "human"}, "prompt": "x", "usage": [1]},
+    {"commandMode": "prompt", "origin": {"kind": "human"}, "prompt": "x", "usage": True},
+    {"origin": PEER, "prompt": "x", "isMeta": True, "reminderId": ["r"]},
+    {"origin": PEER, "prompt": "x", "isMeta": True, "reminderId": True},
+    {"origin": PEER, "prompt": "x", "isMeta": True, "mystery": 1},
+    {"origin": {"kind": "coordinator", "extra": 1}, "prompt": "x", "isMeta": True},
+])
+def test_malformed_queued_command_variants_stay_unsupported_and_never_user(root, fields):
+    (chunk,) = parse(write(main_file(root), queued(**fields)))
+    assert chunk.meta["unsupported_event"] is True and chunk.kind == "meta" and chunk.meta["role"] == "runtime"
+
+
 def test_attachments_rendered_as_user_role_are_never_user_authority(root):
     path = write(main_file(root),
                  attachment("session_context", context=f"project rules {PHRASE}", renderedRole="user"),
@@ -402,6 +485,108 @@ def test_tool_use_inside_an_api_error_message_is_not_a_call(root):
     assert chunks[0].meta["unsupported_event"] is True
 
 
+# ---------------------------------------------------------------- newer attachment types
+
+def test_file_attachments_index_paths_only(root):
+    path = write(main_file(root),
+                 attachment("file", filename="/synthetic/a.txt", displayPath="a.txt", content={
+                     "type": "text", "file": {"content": "FILE-BODY-SENTINEL"}}),
+                 attachment("compact_file_reference", filename="/synthetic/b.txt", displayPath="b.txt"))
+    chunks = parse(path)
+    assert [c.text for c in chunks] == [
+        "[attachment:file] display_path=a.txt filename=/synthetic/a.txt",
+        "[attachment:compact_file_reference] display_path=b.txt filename=/synthetic/b.txt"]
+    assert all(c.kind == "meta" and c.meta["role"] == "runtime" and not c.meta.get("unsupported_event") for c in chunks)
+    assert [c.meta["attachment_type"] for c in chunks] == ["file", "compact_file_reference"]
+    assert "FILE-BODY-SENTINEL" not in dump(chunks)
+
+
+def test_hook_injected_attachments_keep_only_event_and_name(root):
+    path = write(main_file(root),
+                 attachment("hook_additional_context", content=[f"tool output {PHRASE}"], hookName="UserPromptSubmit",
+                            toolUseID="toolu_h1", hookEvent="UserPromptSubmit"),
+                 attachment("hook_system_message", content=f"system says {PHRASE}", hookName="PostToolUse:Bash",
+                            toolUseID="toolu_h2", hookEvent="PostToolUse"))
+    chunks = parse(path)
+    assert [c.text for c in chunks] == [
+        "[attachment:hook_additional_context] event=UserPromptSubmit name=UserPromptSubmit",
+        "[attachment:hook_system_message] event=PostToolUse name=PostToolUse:Bash"]
+    assert all((c.kind, c.meta["role"]) == ("meta", "runtime") for c in chunks)
+    assert [c.meta["tool_use_id"] for c in chunks] == ["toolu_h1", "toolu_h2"]
+    assert PHRASE not in dump(chunks)
+
+
+def test_thinking_drop_and_remote_session_change_are_metadata_only(root):
+    path = write(main_file(root),
+                 attachment("thinking_drop", requestId="req_1", thinkingBlocksSent=3, thinkingTurnsSent=2,
+                            newlyDropped={"h": "DROP-SENTINEL"}, blockHashes=["DROP-SENTINEL"],
+                            firstReportForThreadInProcess=True, clientChange={"c": "DROP-SENTINEL"},
+                            model="claude-synthetic"),
+                 attachment("remote_session_change", url="https://remote.invalid/DROP-SENTINEL", commit="abc123",
+                            pr="DROP-SENTINEL", sendUserFileHint=True, managedCommit=False, managedPr=True))
+    chunks = parse(path)
+    assert [c.text for c in chunks] == ["[attachment:thinking_drop]", "[attachment:remote_session_change]"]
+    assert (chunks[0].meta["thinking_blocks_sent"], chunks[0].meta["thinking_turns_sent"]) == (3, 2)
+    assert chunks[1].meta["managed_pr"] is True and chunks[1].meta["managed_commit"] is False
+    assert "DROP-SENTINEL" not in dump(chunks) and "abc123" not in dump(chunks)
+    assert not any(c.meta.get("unsupported_event") for c in chunks)
+
+
+def test_read_truncation_notice_records_the_truncated_result_link(root):
+    path = write(main_file(root),
+                 assistant(use("toolu_read", "Read", file_path="/synthetic/big.txt")),
+                 tool_result("toolu_read", "first lines", block_extra={"is_error": False}),
+                 attachment("read_truncation_notice", banner="BANNER-SENTINEL", toolUseID="toolu_read"))
+    chunks = parse(path)
+    notice = chunks[-1]
+    assert notice.text == "[attachment:read_truncation_notice] truncated_result_for=toolu_read"
+    assert notice.meta["truncated_result_for"] == "toolu_read" and notice.meta["role"] == "runtime"
+    assert notice.kind == "meta" and not notice.meta.get("unsupported_event")
+    assert "BANNER-SENTINEL" not in dump(chunks)
+    # The result itself is untouched at parse time: the link lives on the notice for the audit layer.
+    assert chunks[1].meta["call_id"] == "toolu_read" and "truncated_result_for" not in chunks[1].meta
+
+
+NEW_ATTACHMENT_FIELDS = {
+    "file": dict(filename="/s/a.txt", displayPath="a.txt", content={"type": "text", "file": {}}),
+    "compact_file_reference": dict(filename="/s/a.txt", displayPath="a.txt"),
+    "hook_additional_context": dict(content=["x"], hookName="n", toolUseID="t", hookEvent="UserPromptSubmit"),
+    "hook_system_message": dict(content="x", hookName="n", toolUseID="t", hookEvent="PostToolUse"),
+    "thinking_drop": dict(requestId="r", thinkingBlocksSent=1, thinkingTurnsSent=1, newlyDropped={}, blockHashes=[],
+                          firstReportForThreadInProcess=False, clientChange={}, model="m"),
+    "remote_session_change": dict(url=None, commit="c", pr="p", sendUserFileHint=False, managedCommit=False,
+                                  managedPr=False),
+    "read_truncation_notice": dict(banner="b", toolUseID="t"),
+}
+NEW_ATTACHMENT_BREAKS = {
+    "file": [dict(filename=3), dict(displayPath=None), dict(content="text"), dict(content={"mystery": 1}),
+             dict(mystery=1), "filename"],
+    "compact_file_reference": [dict(displayPath=3), dict(mystery=1), "displayPath"],
+    "hook_additional_context": [dict(content="str-not-list"), dict(hookName=3), dict(toolUseID=3),
+                                dict(hookEvent=None), dict(mystery=1), "hookName"],
+    "hook_system_message": [dict(content=["list-not-str"]), dict(hookEvent=3), dict(mystery=1), "toolUseID"],
+    "thinking_drop": [dict(thinkingBlocksSent="1"), dict(thinkingTurnsSent=True), dict(newlyDropped=[]),
+                      dict(blockHashes={}), dict(firstReportForThreadInProcess=1), dict(clientChange=[]),
+                      dict(model=3), dict(querySource=3), dict(mystery=1), "requestId"],
+    "remote_session_change": [dict(url=3), dict(commit=None), dict(pr=3), dict(sendUserFileHint="no"),
+                              dict(managedCommit=1), dict(managedPr=None), dict(mystery=1), "commit"],
+    "read_truncation_notice": [dict(banner=3), dict(toolUseID=""), dict(toolUseID=3), dict(mystery=1), "toolUseID"],
+}
+
+
+@pytest.mark.parametrize("kind", sorted(NEW_ATTACHMENT_FIELDS))
+def test_new_attachment_types_validate_their_shape_strictly(root, kind):
+    valid = NEW_ATTACHMENT_FIELDS[kind]
+    (good,) = parse(write(main_file(root), attachment(kind, **valid)))
+    assert not good.meta.get("unsupported_event") and not good.meta.get("parse_error")
+    for change in NEW_ATTACHMENT_BREAKS[kind]:
+        fields = {key: value for key, value in valid.items() if key != change} if isinstance(change, str) \
+            else {**valid, **change}
+        (bad,) = parse(write(main_file(root), attachment(kind, **fields)))
+        assert bad.meta.get("unsupported_event") is True and bad.meta["role"] == "runtime", (kind, change)
+        assert bad.kind == "meta"
+
+
 # ---------------------------------------------------------------- opaque and runtime-only payloads
 
 SENTINELS = {
@@ -413,6 +598,10 @@ SENTINELS = {
     "context": "SESSION-CONTEXT-SENTINEL", "pr": "PR-LINK-SENTINEL", "away": "AWAY-SUMMARY-SENTINEL",
     "local": "LOCAL-COMMAND-SENTINEL", "silent": "SILENT-TURN-SENTINEL", "model": "MODEL-ATTACH-SENTINEL",
     "agent_name": "AGENT-NAME-SENTINEL", "cost": "COST-STATE-SENTINEL", "delta": "FILE-DELTA-SENTINEL",
+    "file_content": "FILE-CONTENT-SENTINEL", "hook_ctx": "HOOK-ADDITIONAL-CONTEXT-SENTINEL",
+    "hook_sys": "HOOK-SYSTEM-MESSAGE-SENTINEL", "banner": "READ-BANNER-SENTINEL", "block_hash": "BLOCK-HASH-SENTINEL",
+    "client_change": "CLIENT-CHANGE-SENTINEL", "remote_url": "REMOTE-URL-SENTINEL",
+    "remote_commit": "REMOTE-COMMIT-SENTINEL", "remote_pr": "REMOTE-PR-SENTINEL", "usage": "USAGE-PAYLOAD-SENTINEL",
 }
 
 
@@ -447,6 +636,31 @@ def corpus(sub=False):
         attachment("auto_mode", enabled=True, **base),
         attachment("skill_listing", skills=[s["mcp"]], **base),
         attachment("task_status", status="running", **base),
+        attachment("file", filename="/synthetic/read.txt", displayPath="read.txt", content={
+            "type": "text", "file": {"filePath": "/synthetic/read.txt", "content": s["file_content"]}}, **base),
+        attachment("compact_file_reference", filename="/synthetic/ref.txt", displayPath="ref.txt", **base),
+        attachment("hook_additional_context", content=[s["hook_ctx"]], hookName="UserPromptSubmit",
+                   toolUseID="toolu_c1", hookEvent="UserPromptSubmit", **base),
+        attachment("hook_system_message", content=s["hook_sys"], hookName="PostToolUse:Bash", toolUseID="toolu_c1",
+                   hookEvent="PostToolUse", **base),
+        attachment("thinking_drop", requestId="req_1", thinkingBlocksSent=3, thinkingTurnsSent=2,
+                   newlyDropped={"a": s["block_hash"]}, blockHashes=[s["block_hash"]],
+                   firstReportForThreadInProcess=True, clientChange={"a": s["client_change"]},
+                   model="claude-synthetic", querySource="repl", **base),
+        attachment("thinking_drop", requestId="req_2", thinkingBlocksSent=0, thinkingTurnsSent=0, newlyDropped={},
+                   blockHashes=[], firstReportForThreadInProcess=False, clientChange={}, model="claude-synthetic",
+                   **base),
+        attachment("remote_session_change", url=s["remote_url"], commit=s["remote_commit"], pr=s["remote_pr"],
+                   sendUserFileHint=False, managedCommit=True, managedPr=False, **base),
+        attachment("remote_session_change", url=None, commit="", pr="", sendUserFileHint=True, managedCommit=False,
+                   managedPr=False, **base),
+        attachment("read_truncation_notice", banner=s["banner"], toolUseID="toolu_c1", **base),
+        attachment("queued_command", commandMode="task-notification", origin={"kind": "task-notification",
+                                                                             "producer": "bash"},
+                   prompt="done", runId="r1", usage={"n": s["usage"]}, delivery_id="d", source_uuid="s",
+                   timestamp="2026-10-01T00:00:00.000Z", **base),
+        attachment("queued_command", isMeta=True, origin={"kind": "coordinator"}, prompt="remind", reminderId="r1",
+                   source_uuid="s", **base),
         env("system", subtype="turn_duration", durationMs=1234, level="info", isMeta=False, content=s["system"],
             sub=sub),
         env("system", subtype="stop_hook_summary", level="info", isMeta=False, content=s["system"], sub=sub),
@@ -613,9 +827,7 @@ def test_records_that_claim_another_session_are_errors_not_evidence(root):
     assert [c.text for c in chunks][0] == "[message:user] mine"
     assert [bool(c.meta.get("parse_error")) for c in chunks] == [False, True, True, False]
     assert "inherited" not in dump(chunks)
-    # Subagent records must carry the parent's session id, never the child's own id.
-    sub = write(sub_file(root), user("task", sub=True, sid=CHILD))
-    assert parse(sub)[0].meta.get("parse_error") is True
+    assert all("inherited" not in c.meta and "record_session_id" not in c.meta for c in chunks)
 
 
 def test_sidechain_flag_must_agree_with_the_file_layout(root):
@@ -624,6 +836,70 @@ def test_sidechain_flag_must_agree_with_the_file_layout(root):
     in_main = parse(write(main_file(root), human("embedded child", isSidechain=True)))
     assert in_main[0].meta["unsupported_event"] is True and in_main[0].meta["role"] == "runtime"
     assert "embedded child" not in dump(in_main)
+
+
+def test_subagent_file_with_inherited_session_ids_is_accepted_when_the_agent_is_constant(engine, root):
+    path = write(
+        sub_file(root),
+        user("parent task", sub=True),
+        user("older task", sub=True, sid=OTHER),
+        user("older coordinator", sub=True, sid=OTHER, origin={"kind": "coordinator"}),
+        assistant(text("older answer"), use("toolu_old", "Bash", command="ls"), sub=True, sid=OTHER),
+        tool_result("toolu_old", "ok", sub=True, sid=OTHER, block_extra={"is_error": False}),
+        attachment("hook_success", sub=True, sid=OTHER, hookEvent="Stop", hookName="Stop", exitCode=0),
+        env("mode", mode="plan", sub=True, sid=OTHER),
+        assistant(text("current answer"), sub=True),
+    )
+    chunks = parse(path)
+    assert not any(c.meta.get("parse_error") or c.meta.get("unsupported_event") for c in chunks)
+    assert {c.session_id for c in chunks} == {CHILD}
+    inherited = [c for c in chunks if c.meta.get("inherited")]
+    assert len(inherited) == 7 and {c.meta["record_session_id"] for c in inherited} == {OTHER}
+    own = [c for c in chunks if not c.meta.get("inherited")]
+    assert len(own) == 2 and {c.meta["record_session_id"] for c in own} == {SID}
+    assert all(c.meta["inherited"] is True for c in inherited) and all("inherited" not in c.meta for c in own)
+    assert all(c.meta["parent_session_id"] == SID and c.meta["agent_id"] == AGENT_ID for c in chunks)
+    # Authority is exactly what origin and flags say: an inherited prompt is no more a user turn than its own.
+    assert [(c.kind, c.meta["role"], c.meta.get("evidence_origin")) for c in chunks[:3]] == [
+        ("meta", "runtime", "parent_task"), ("meta", "runtime", "parent_task"), ("meta", "runtime", "coordinator")]
+    assert [c.kind for c in chunks[3:6]] == ["turn", "tool_call", "tool_result"]
+    result = sync(engine, path, CHILD)
+    assert result["ok"] and result["coverage"]["complete"] is True, result["coverage"]
+
+
+def test_inherited_history_never_upgrades_authority(engine, root):
+    path = write(sub_file(root),
+                 human(f"older human {PHRASE}", sub=True, sid=OTHER),
+                 user(f"older parent task {PHRASE}", sub=True, sid=OTHER),
+                 user(f"older meta {PHRASE}", sub=True, sid=OTHER, isMeta=True),
+                 user(f"older compact {PHRASE}", sub=True, sid=OTHER, isCompactSummary=True))
+    chunks = parse(path)
+    assert [(c.kind, c.meta["role"]) for c in chunks] == [("turn", "user")] + [("meta", "runtime")] * 3
+    assert [c.meta.get("evidence_origin") for c in chunks[1:]] == ["parent_task", "injected_meta", "compaction"]
+    assert all(c.meta["inherited"] and c.meta["record_session_id"] == OTHER for c in chunks)
+
+
+def test_inherited_session_ids_need_a_constant_agent_id(root):
+    other_agent = user("older task", sub=True, sid=OTHER)
+    other_agent["agentId"] = "ffffffffffffffff"
+    unattributed = user("older task", sub=True, sid=OTHER)
+    del unattributed["agentId"]
+    first_inherited = user("older task", sub=True, sid=OTHER)
+    first_inherited["agentId"] = "ffffffffffffffff"
+    cases = {
+        "agent_changes_on_inherited_record": [user("task", sub=True), other_agent],
+        "inherited_record_without_agent_id": [user("task", sub=True), unattributed],
+        "agent_changes_after_inherited_record": [first_inherited, user("task", sub=True)],
+    }
+    for name, records in cases.items():
+        chunks = parse(write(sub_file(root), *records))
+        assert [bool(c.meta.get("parse_error")) for c in chunks] == [False, True], name
+        assert "inherited" not in chunks[1].meta and chunks[1].kind == "meta"
+
+
+def test_main_files_keep_the_strict_session_check_even_with_an_agent_id(root):
+    chunks = parse(write(main_file(root), human("mine"), human("foreign", sid=OTHER, agentId=AGENT_ID)))
+    assert [bool(c.meta.get("parse_error")) for c in chunks] == [False, True]
 
 
 def test_agent_id_must_not_change_inside_one_file(root):
