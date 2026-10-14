@@ -82,6 +82,9 @@ jobs:
           tests/test_tool_timeout_arg.py
           tests/test_quiet_hooks.py
           tests/test_agy_hooks.py
+          tests/test_agy_policy.py
+          tests/test_contract_risk_when.py
+          tests/test_common_judgement_fixture.py
           tests/test_reliability.py
           tests/test_hook_gating.py
           --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file

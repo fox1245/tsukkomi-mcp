@@ -591,7 +591,7 @@ class SelfDirectEngine:
                             and (rule.requires_success or not payload["coverage"].get("judged_prefix"))}
                 for item in payload["findings"]:
                     if item["contract_id"] in gate_ids and item["verdict"] == "clean":
-                        item.update(verdict="unknown",
+                        item.update(verdict="unknown", applicability="applicable",
                                     reason="incomplete current history cannot establish the proposed action's prerequisite",
                                     basis=(item.get("basis") or "") + "; captured prerequisite evidence does not establish current compliance")
                 if gate_ids:

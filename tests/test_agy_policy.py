@@ -631,3 +631,14 @@ def test_warning_queue_is_per_conversation_bounded_and_deduplicated(env):
     drained = health.drain_warnings(SID)
     assert drained.count("same") <= 1 and len(drained) <= 5
     assert health.drain_warnings(SID) == [] and health.drain_warnings(OTHER) == ["other"]
+
+
+def test_concurrent_claims_spend_the_budget_exactly_once(env):
+    from concurrent.futures import ThreadPoolExecutor
+    engine, _path = env
+    health = state.HookState(engine.settings.index_dir)
+    health.claim_continue(OTHER, "warm-up")           # create the schema once, as an earlier hook would have
+    with ThreadPoolExecutor(8) as pool:
+        results = list(pool.map(lambda _: state.HookState(engine.settings.index_dir).claim_continue(SID, "same"), range(8)))
+    assert results.count(True) == 1
+    assert health.continue_claims(SID) == 1

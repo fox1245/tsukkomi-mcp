@@ -166,6 +166,9 @@ class HookState:
             return True
         try:
             with closing(self._connect()) as conn:
+                if conn.execute("SELECT 1 FROM hook_health WHERE consecutive>0 AND (event=? OR kind=?) LIMIT 1",
+                                (event, AUDIT_UNAVAILABLE)).fetchone() is None:
+                    return True  # healthy hot path: no write lock
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute("UPDATE hook_health SET consecutive=0, last_success_at=?"
                              " WHERE consecutive>0 AND (event=? OR kind=?)", (time.time(), event, AUDIT_UNAVAILABLE))

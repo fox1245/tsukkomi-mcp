@@ -351,3 +351,30 @@ def test_seed_missing_is_idempotent_and_leaves_existing_contracts_alone(tmp_path
     assert store.seed_missing(PRESETS) == len(_presets())
     assert store.seed_missing(PRESETS) == 0
     assert "mine" in {r.id for r in store.list()}
+
+
+def test_when_also_scopes_a_gating_prerequisite_checked_against_a_proposed_action(session):
+    engine, path = session
+    _write(path, [_call("echo hello")], "a")
+    engine.upsert_contracts([{"id": "tests-first", "type": "must", "scope": "tool_call", "regex": "pytest",
+                              "before_regex": "release", "requires_success": True,
+                              "when": {"tool_call_regex": "docker build"}}])
+    action = {"tool_name": "shell", "arguments": {"command": "release now"}}
+    unmet = engine.check_action(SID, action)
+    assert (unmet["findings"][0]["verdict"], unmet["findings"][0]["applicability"]) == ("clean", "not_applicable")
+    _write(path, [_call("docker build .", "c1")], "a")
+    met = engine.check_action(SID, action)
+    assert (met["verdict"], met["findings"][0]["applicability"]) == ("violation", "applicable")
+
+
+def test_unmet_when_on_a_gate_is_unknown_for_a_proposed_action_when_coverage_is_incomplete(session):
+    engine, path = session
+    _write(path, [_call("echo hello")], "a")
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("not json\n")
+    engine.upsert_contracts([{"id": "tests-first", "type": "must", "scope": "tool_call", "regex": "pytest",
+                              "before_regex": "release", "when": {"tool_call_regex": "docker build"}}])
+    result = engine.check_action(SID, {"tool_name": "shell", "arguments": {"command": "release now"}})
+    assert result["coverage"]["complete"] is False
+    assert (result["verdict"], result["findings"][0]["verdict"], result["findings"][0]["applicability"]) == (
+        "unknown", "unknown", "applicable")
