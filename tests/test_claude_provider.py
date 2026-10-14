@@ -643,6 +643,7 @@ SENTINELS = {
     "client_change": "CLIENT-CHANGE-SENTINEL", "remote_url": "REMOTE-URL-SENTINEL",
     "remote_commit": "REMOTE-COMMIT-SENTINEL", "remote_pr": "REMOTE-PR-SENTINEL", "usage": "USAGE-PAYLOAD-SENTINEL",
     "informational": "INFORMATIONAL-HOST-TEXT-SENTINEL", "plan_text": "PLAN-FILE-CONTENT-SENTINEL",
+    "scheduled_prompt": "SCHEDULED-PROMPT-SENTINEL", "scheduled_content": "SCHEDULED-CONTENT-SENTINEL",
 }
 
 
@@ -680,6 +681,9 @@ def corpus(sub=False):
         attachment("plan_mode", isSubAgent=sub, planExists=True, planFilePath="/synthetic/plan.md",
                    reminderType="full", **base),
         env("system", subtype="informational", level="notice", content=s["informational"], isMeta=False, sub=sub),
+        env("system", subtype="scheduled_task_fire", content=s["scheduled_content"], prompt=s["scheduled_prompt"],
+            cron="*/5 * * * *", cronKind="recurring", taskId="task-0001", taskKind="cron", isMeta=False,
+            entrypoint="cli", gitBranch="main", slug="a-b-c", sub=sub),
         env("continued-in", continuedInSessionId=OTHER, sub=sub),
         attachment("file", filename="/synthetic/read.txt", displayPath="read.txt", content={
             "type": "text", "file": {"filePath": "/synthetic/read.txt", "content": s["file_content"]}}, **base),
@@ -756,6 +760,7 @@ def test_payload_sentinels_are_never_indexed_and_every_valid_shape_is_supported(
     assert "[attachment:edited_text_file] /synthetic/edited.txt" in texts
     assert "[attachment:mcp_instructions_delta] added=srv-a removed=srv-b" in texts
     assert "[system:turn_duration]" in texts and "[queue_operation:enqueue]" in texts
+    assert any(t.startswith("[system:scheduled_task_fire] task_id=task-0001") for t in texts)
     assert "[claude_metadata:last-prompt]" in texts and "[claude_metadata:file-history-snapshot]" in texts
     modes = {c.meta.get("permission_mode") for c in chunks if c.meta.get("event_type") == "permission-mode"}
     assert modes == {"acceptEdits"}
