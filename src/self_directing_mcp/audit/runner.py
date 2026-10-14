@@ -207,8 +207,22 @@ def audit_contract(rule, *, session_id, store, retriever=None, provider=None, pr
     return finding(verdict, reason, supporting)
 
 
+def full_findings(active, chunks, *, session_id, store, provider, proposed, coverage):
+    """The reference evaluation: every rule over the whole event list, then the provider's evidence classes."""
+    findings = [audit_contract(r, session_id=session_id, store=store, provider=provider,
+                               proposed=proposed, chunks=chunks) for r in _checked(active)]
+    # Provider-specific partial-observation passes post-process the findings; other providers have none.
+    evidence_rules = _EVIDENCE_RULES.get(provider)
+    if evidence_rules is not None:
+        evidence_rules(active, findings, chunks, proposed=proposed, coverage=coverage)
+    return findings
+
+
 @request_operation
-def run_audit(*, session_id, contracts, store, retriever=None, provider=None, proposed=None, coverage=None):
+def run_audit(*, session_id, contracts, store, retriever=None, provider=None, proposed=None, coverage=None,
+              plan=None):
+    """``plan`` (see ``audit.incremental``) replaces how events are loaded and rules evaluated; the stage graph, the
+    selection and the aggregation are the same. Without a plan every rule runs over the whole event list."""
     snapshot = hashlib.sha256(json.dumps([c.model_dump(mode="json") for c in _checked(contracts)],
                                         sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     notes = [
@@ -224,6 +238,9 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
                   and (r.session_id is None or r.session_id == session_id)]
     def load_evidence():
         nonlocal chunks
+        if plan is not None:
+            plan.load(active)
+            return
         needs_history = any(r.regex and (r.type == "must" or proposed is None) for r in active)
         if needs_history:
             chunks = store.list_chunks(session_id, provider)
@@ -233,12 +250,11 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
                       and c.session_id == session_id and (provider is None or c.provider == provider)]
     def evaluate_contracts():
         nonlocal findings
-        findings = [audit_contract(r, session_id=session_id, store=store, provider=provider,
-                                   proposed=proposed, chunks=chunks) for r in _checked(active)]
-        # Provider-specific partial-observation passes post-process the findings; other providers have none.
-        evidence_rules = _EVIDENCE_RULES.get(provider)
-        if evidence_rules is not None:
-            evidence_rules(active, findings, chunks, proposed=proposed, coverage=coverage)
+        if plan is not None:
+            findings = plan.evaluate(active, proposed=proposed, coverage=coverage)
+            return
+        findings = full_findings(active, chunks, session_id=session_id, store=store, provider=provider,
+                                 proposed=proposed, coverage=coverage)
     def aggregate_findings():
         nonlocal overall
         if coverage and not coverage.get("complete"):

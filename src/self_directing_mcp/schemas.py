@@ -38,10 +38,12 @@ class AuditEvent:
 
     ``text`` is empty for events no contract can inspect; nothing else of the stored chunk is kept.
     """
-    __slots__ = ("chunk_id", "kind", "text", "meta")
+    __slots__ = ("chunk_id", "kind", "text", "meta", "key")
 
-    def __init__(self, chunk_id, kind, text, meta):
-        self.chunk_id, self.kind, self.text, self.meta = chunk_id, kind, text, meta
+    def __init__(self, chunk_id, kind, text, meta, key=None):
+        # ``key`` is the event's place in the session order, ``(byte_start, sub_index)``; incremental monitors
+        # compare keys, never row numbers. Events built without a store carry ``None``.
+        self.chunk_id, self.kind, self.text, self.meta, self.key = chunk_id, kind, text, meta, key
 
 
 class ContractWhen(BaseModel):

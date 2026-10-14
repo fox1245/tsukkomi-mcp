@@ -180,6 +180,19 @@ class Settings(BaseSettings):
                     "(rollout-*.jsonl.zst). A larger file is reported as zstd_too_large and not decoded. "
                     "SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES.",
     )
+    audit_incremental: bool = Field(
+        default=True,
+        description="Evaluate contracts incrementally from stored per-contract monitor state (see README, 'Incremental "
+                    "audits'). false evaluates every audit over the whole session. SELF_DIRECT_AUDIT_INCREMENTAL.",
+    )
+    audit_shadow_every: int = Field(
+        default=16,
+        ge=0,
+        description="Also run the full evaluator beside the incremental one on about every Nth audit and compare. A "
+                    "mismatch returns the full result and disables incremental evaluation of that contract in that "
+                    "session until the evaluator version changes. 1 compares every audit; 0 compares only when state "
+                    "was just rebuilt. SELF_DIRECT_AUDIT_SHADOW_EVERY.",
+    )
     rrf_k: int = 60
     retrieve_top_k: int = 20
     search_top_k: int = 10
