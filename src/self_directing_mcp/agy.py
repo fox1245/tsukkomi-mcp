@@ -16,12 +16,21 @@ from self_directing_mcp.session_events import (
 PARSER_VERSION = 7
 DISPLAY_NAME, FULL_NAME = "transcript.jsonl", "transcript_full.jsonl"
 KNOWN_STATUS = frozenset({"DONE", "RUNNING", "ERROR", "INVALID", "CANCELED"})
+# The result of a tool call. The CLI writes every result as GENERIC; the IDE writes one step type per tool. Both
+# are linked to their call only through a host receipt (no call ids exist) and follow the same evidence rules.
+IDE_RESULT_TYPES = frozenset({"RUN_COMMAND", "VIEW_FILE", "CODE_ACTION", "MCP_TOOL", "LIST_DIRECTORY"})
+RESULT_TYPES = frozenset({"GENERIC"}) | IDE_RESULT_TYPES
+# Result steps that can carry a success verdict: the CLI's exit-code header, the IDE's host ``exit_code``.
+SUCCESS_TYPES = frozenset({"GENERIC", "RUN_COMMAND"})
+# Content-free context-loading steps of the IDE: runtime metadata, like CHECKPOINT; the value is the label.
+CONTEXT_TYPES = {"CONVERSATION_HISTORY": "conversation_history", "KNOWLEDGE_ARTIFACTS": "knowledge_artifacts"}
 # Fields a fallback to transcript_full.jsonl is attempted for. thinking, CHECKPOINT, SYSTEM_MESSAGE and
 # EPHEMERAL_MESSAGE are context, not evidence: they are kept visible and only counted when truncated.
-FALLBACK_FIELDS = {"USER_INPUT": ("content",), "PLANNER_RESPONSE": ("content", "tool_calls"), "GENERIC": ("content",)}
+FALLBACK_FIELDS = {"USER_INPUT": ("content",), "PLANNER_RESPONSE": ("content", "tool_calls"), "GENERIC": ("content",),
+                   **{kind: ("content",) for kind in IDE_RESULT_TYPES}}
 # (step type, field) pairs a verdict can depend on; the runner keys its partial-observation rules on these.
 JUDGED_FIELDS = frozenset({("USER_INPUT", "content"), ("PLANNER_RESPONSE", "content"),
-                           ("PLANNER_RESPONSE", "tool_calls"), ("GENERIC", "content")})
+                           ("PLANNER_RESPONSE", "tool_calls")} | {(kind, "content") for kind in RESULT_TYPES})
 _ID = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\Z")
 
 
@@ -446,7 +455,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 raise ValueError("invalid transcript content")
             marks = _marks(record)
             # Only a tool result's status carries semantics (success, pending); an unrecognized one is unsupported.
-            known = kind != "GENERIC" or status is None or status in KNOWN_STATUS
+            known = kind not in RESULT_TYPES or status is None or status in KNOWN_STATUS
 
             def truncation(visible=None):
                 return _Truncation(record, kind, source, step, marks, get_full, visible or {"content": content})
@@ -479,6 +488,13 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 chunks.append(make_chunk("agy", sid, "meta", text,
                                          {**base, "role": "runtime", "evidence_origin": "host_error_message",
                                           **truncation().meta()}, line, start, end, timestamp=timestamp))
+            elif known and kind in CONTEXT_TYPES and source == "SYSTEM":
+                # IDE context loading (history, knowledge): a context projection, never a user instruction and
+                # never observed execution. The observed records carry no content at all.
+                label = CONTEXT_TYPES[kind]
+                chunks.append(make_chunk("agy", sid, "meta", f"[{label}]" + (" " + _scrub(content) if content else ""),
+                                         {**base, "role": "runtime", "evidence_origin": label, **truncation().meta()},
+                                         line, start, end, timestamp=timestamp))
             elif known and kind == "PLANNER_RESPONSE" and source == "MODEL":
                 lenient = "tool_calls" in marks
                 visible_calls = _decode_calls(record.get("tool_calls", []), encoded=not is_full, lenient=lenient)
@@ -507,13 +523,16 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                                              {**base, "role": "runtime", "evidence_origin": "model_proposal_truncated",
                                               **cut.meta(("tool_calls",))},
                                              line, start, end, sub=len(calls) + 1, timestamp=timestamp))
-            elif known and kind == "GENERIC" and source == "MODEL":
+            elif known and kind in RESULT_TYPES and source == "MODEL":
                 from self_directing_mcp.agy_receipts import linked_receipt
                 cut = truncation()
                 content = cut.values.get("content", content)
                 error = record.get("error")
                 if error is not None and not isinstance(error, str):
                     raise ValueError("invalid error")
+                exit_code = record.get("exit_code") if kind == "RUN_COMMAND" else None
+                if exit_code is not None and type(exit_code) is not int:
+                    raise ValueError("invalid exit_code")
                 observation = linked_receipt(receipts, step, path, start,
                                              result_record=record, require_paired=False)
                 if (observation and not observation.get("paired") and status == "ERROR"
@@ -527,9 +546,23 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                                               "denied_action": {"name": denied.get("name"), "args": denied.get("args")}},
                                              line, start, end, timestamp=timestamp))
                     continue
-                # Match only the host prefix, never exit-code prose in output.
-                exit_match = _EXIT_HEADER.match(content)
-                success = int(exit_match.group(1)) == 0 if exit_match and status == "DONE" else None
+                if kind == "RUN_COMMAND":
+                    # The IDE records the exit status as a host field. A command that is still running has none
+                    # yet, so the field is not read then; output prose is never read at all.
+                    shaped = exit_code is not None
+                    if status == "RUNNING":
+                        exit_code = None
+                    if exit_code is None:
+                        success = None
+                    elif exit_code != 0:
+                        success = False  # a host-recorded failure, linked or not; it can only make a verdict worse
+                    else:
+                        success = True if status == "DONE" else None
+                else:
+                    # Match only the host prefix, never exit-code prose in output.
+                    exit_match = _EXIT_HEADER.match(content)
+                    shaped = kind != "GENERIC" or exit_match is not None  # typed IDE results carry no header
+                    success = int(exit_match.group(1)) == 0 if exit_match and status == "DONE" else None
                 if status in ("ERROR", "CANCELED", "INVALID"):
                     success = False  # never success evidence; the call attempt itself is preserved elsewhere
                 receipt = observation if observation and observation.get("paired") else None
@@ -549,11 +582,15 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                                              line, start, end, timestamp=timestamp))
                     if receipt.get("post_error"):
                         success = False
-                    elif name != "run_command":
+                    elif kind == "GENERIC" and name != "run_command":
                         # An empty hook error is tool transport success, not a
                         # proof that an arbitrary tool fulfilled its objective.
                         success = None
+                    elif kind != "GENERIC" and (kind != "RUN_COMMAND" or name != "run_command"):
+                        success = False if success is False else None  # a typed result stays a failure, never a success
                 extra = {}
+                if kind == "RUN_COMMAND" and success is True and not receipt:
+                    success, extra["success_withheld"] = None, "unlinked"  # a host exit code is no proof of which call ran
                 if success is True and "content" in cut.still:
                     success, extra["success_withheld"] = None, "truncated_content"  # a cut output proves nothing
                 pending = status == "RUNNING"
@@ -565,7 +602,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                     linkage = "legacy_unlinked"  # predates this conversation's receipts; never a fabricated link
                 else:
                     linkage = "native_log_omits_call_id"
-                unsupported = (not exit_match and status in (None, "DONE")) if receipt else linkage == "native_log_omits_call_id"
+                unsupported = (not shaped and status in (None, "DONE")) if receipt else linkage == "native_log_omits_call_id"
                 if pending:
                     extra["pending"] = True
                 placeholders = _media(record.get("media"))
@@ -576,6 +613,10 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                     text += "\n[error] " + _scrub(error)
                 for placeholder in placeholders:
                     text += "\n" + placeholder
+                if kind != "GENERIC":
+                    extra["result_type"] = kind  # the IDE's step type; a GENERIC result's event_type already says so
+                    if exit_code is not None:
+                        extra["exit_code"] = exit_code
                 chunks.append(make_chunk("agy", sid, "tool_result", text,
                                          {**base, **provenance, "role": "tool", "call_id": call_id,
                                           "tool_name": name, "success": success, "linkage": linkage,

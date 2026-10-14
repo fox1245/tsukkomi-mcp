@@ -5,7 +5,7 @@ import json
 import re
 from bisect import bisect_left, bisect_right
 
-from self_directing_mcp.agy import JUDGED_FIELDS
+from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES, SUCCESS_TYPES
 from self_directing_mcp.audit.applicability import (
     INVALID, UNMET, downgrade_unproven_inapplicability, not_applicable_reason, when_needs, when_state,
 )
@@ -314,9 +314,9 @@ def _dependencies(rule) -> set:
     if scope in ("tool_call", "any") and roles & {"assistant", "runtime"}:
         deps.add(("PLANNER_RESPONSE", "tool_calls"))
     if _reads_results(rule):
-        deps.add(("GENERIC", "content"))
+        deps.update((kind, "content") for kind in RESULT_TYPES)  # the CLI's GENERIC and every typed IDE result
     if rule.requires_success:
-        deps.add(("GENERIC", "content"))
+        deps.update((kind, "content") for kind in SUCCESS_TYPES)  # only results that can carry a success verdict
     return deps
 
 
@@ -403,7 +403,7 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
     last_final = {}
     for index, event in enumerate(events):
         meta = _meta(event)
-        if meta.get("event_type") == "GENERIC" and meta.get("status") in _FINAL_STATUS:
+        if meta.get("event_type") in RESULT_TYPES and meta.get("status") in _FINAL_STATUS:
             last_final[meta.get("step_index")] = index
     history = proposed is None
     blocked = _blocked_proposals(events) if history and any(_wants_attempts(r) for r in rules) else set()
