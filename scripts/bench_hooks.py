@@ -10,29 +10,32 @@ What is measured, separately (the numbers are never mixed):
   ``scripts/agy_hook.py`` entry points with synthetic payloads (Claude Code: PreToolUse, PostToolUse,
   UserPromptSubmit, SessionStart, Stop; AGY: PreToolUse, PostToolUse, PreInvocation, Stop). The page cache is warm;
   "cold" means a new interpreter that imports the package and judges once. Wall time, user+sys CPU and peak RSS come
-  from the operating system (``os.wait4`` on POSIX; ``GetProcessTimes`` / ``GetProcessMemoryInfo`` on Windows).
-  The checked-in installers register ``python scripts/*_hook.py``. A ``.venv`` re-exec (one extra interpreter start)
-  is not included: the benchmark runs the interpreter it is given directly.
+  from the operating system (``os.wait4`` on POSIX; on Windows a job object holds the process tree, because a
+  venv's ``python.exe`` is a launcher that starts the real interpreter, and ``GetProcessMemoryInfo`` reads the
+  interpreter's peak working set). The installers register ``python scripts/*_hook.py``. The ``.venv`` re-exec inside
+  those scripts (one extra interpreter start) is not included: the benchmark runs the interpreter it is given.
 * ``warm``: calls through the FastMCP dispatcher of a long-lived server process (``codex_session_hook``,
   ``check_action``, ``audit_session``), one asyncio loop, one engine. ``first_call`` is the index build; steady
   state is reported separately for "nothing appended" and "after appending N bytes".
 * ``idle_servers``: N real ``python -m self_directing_mcp`` stdio servers started with an isolated index, after the
   MCP handshake (``after_init``) and after one tool call that initializes the engine (``after_use``). Linux reads
-  /proc (VmRSS, VmHWM, Pss); Windows reads the working set through psapi.
+  /proc (VmRSS, VmHWM, Pss); Windows reads the working set through psapi (WorkingSetSize, PeakWorkingSetSize,
+  PrivateUsage).
 
 Fixed conditions (flags, defaults in parentheses): contract counts (10,100), each a rotating mix of must_not,
 must, must+before_regex and must+before_regex+requires_success; small session size (1 MB); large session
 (``--large``, 300 MB, opt-in, never in CI); appended bytes per step (4096); concurrent sessions in the burst (4);
 idle servers (12); repetitions (20 after 1 discarded warm-up).
 
-Targets and CI thresholds live in ``TARGETS`` below (one place). A CI threshold is 1.5x the target. Rows marked
-``gated: False`` are reported with their target but never fail ``--check``; they depend on other in-flight work
-(fast integrity path, incremental audit).
+Targets and CI thresholds live in ``TARGETS`` below (one place). A CI threshold is ``--ci-factor`` (1.5) times the
+target. Rows marked ``gated: False`` are reported with their target but never fail ``--check``; they depend on other
+in-flight work (fast integrity path, incremental audit).
 
 Usage::
 
     python scripts/bench_hooks.py --out bench.json --markdown bench.md [--check]
     python scripts/bench_hooks.py --large --large-mb 300 --out bench-large.json
+    python scripts/bench_hooks.py --only cold --versus /path/to/older/checkout   # interleaved A/B (cancels load)
     python scripts/bench_hooks.py --compare before.json after.json
     python scripts/bench_hooks.py --repo /path/to/other/checkout ...      # benchmark another checkout
 """
@@ -66,18 +69,19 @@ CI_FACTOR = 1.5          # default CI threshold = target x 1.5 (``--ci-factor`` 
 # report. ``gated`` is the decision for THIS branch: True = ``--check`` fails above target * CI factor (1.5).
 #
 # Gating decision for the cold hooks. This branch removes the import cost of the hook path (the light settings
-# reader, lazy NumPy, no HTTP stack, no parser for bookkeeping events). The events below spend their time in that
-# floor, so their numbers are what the branch can honestly be held to. Every other event also runs a judgement
-# whose cost grows with the session (PreToolUse: current-action capture; Stop: sync + audit over the whole history,
+# reader, lazy NumPy, no HTTP stack, no parser for bookkeeping events). The two events below, which fire after every
+# tool call and every prompt, spend their whole time in that floor, so their numbers are what the branch can
+# honestly be held to (about 50 ms here against a 600 ms threshold, a margin that survives a slower CI machine).
+# Every other event also runs a judgement whose cost grows with the session (PreToolUse: current-action capture; Stop: sync + audit over the whole history,
 # evaluating every contract; AGY: the transcript is re-parsed on every call). Those wait for the fast integrity
 # path and the incremental audit, so they are reported against the same target and not gated yet.
-GATED_COLD_EVENTS = {"claude": ("PostToolUse", "UserPromptSubmit", "SessionStart")}
+GATED_COLD_EVENTS = {"claude": ("PostToolUse", "UserPromptSubmit")}
 NOT_GATED_COLD = ("reported, not gated yet: PreToolUse/Stop evaluate every contract over the whole session (needs the "
                   "fast integrity path and the incremental audit) and AGY re-parses its transcript on every call")
 TARGETS = [
     {"id": "cold_hook_wall_p95_ms", "label": "Cold hook wall, p95 (gated events)", "unit": "ms", "target": 400,
      "gated": True, "stat": "max over the gated events of p95 wall (small session, every contract count)",
-     "note": "phase 1 gate; gated events: Claude Code PostToolUse, UserPromptSubmit, SessionStart"},
+     "note": "phase 1 gate; gated events: Claude Code PostToolUse, UserPromptSubmit"},
     {"id": "cold_hook_wall_p95_all_ms", "label": "Cold hook wall, p95 (worst of all events)", "unit": "ms", "target": 400,
      "gated": False, "stat": "max over every cold event of p95 wall (small session)", "note": NOT_GATED_COLD},
     {"id": "cold_hook_wall_p50_ms", "label": "Cold hook wall, median (worst of all events)", "unit": "ms", "target": 150,

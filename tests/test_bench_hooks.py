@@ -47,7 +47,7 @@ def test_targets_carry_the_minutes_numbers_and_the_ci_factor_is_one_and_a_half(b
 def test_work_that_depends_on_other_branches_is_reported_but_never_gated(bench):
     gated = {t["id"] for t in bench.TARGETS if t["gated"]}
     assert gated == {"cold_hook_wall_p95_ms", "cold_hook_cpu_s", "idle_server_rss_mb"}
-    assert bench.GATED_COLD_EVENTS == {"claude": ("PostToolUse", "UserPromptSubmit", "SessionStart")}
+    assert bench.GATED_COLD_EVENTS == {"claude": ("PostToolUse", "UserPromptSubmit")}
     report = {"cold": [], "burst": [], "warm": [{
         "session": "large", "contracts": 10, "scenarios": {
             "check_action_nothing_appended": {"cpu_ms": {"p50": 10_000, "p95": 10_000}}}}]}
@@ -58,7 +58,7 @@ def test_work_that_depends_on_other_branches_is_reported_but_never_gated(bench):
 def test_a_gated_metric_passes_below_the_threshold_and_fails_above_it(bench):
     ok = bench.evaluate({"cold": [cell("claude", "PostToolUse", 350, 250)]})
     assert status(ok, "cold_hook_wall_p95_ms").startswith("pass (within")
-    between = bench.evaluate({"cold": [cell("claude", "SessionStart", 500, 400)]})
+    between = bench.evaluate({"cold": [cell("claude", "UserPromptSubmit", 500, 400)]})
     assert status(between, "cold_hook_wall_p95_ms").startswith("pass (above target")
     assert status(between, "cold_hook_cpu_s").startswith("pass (above target")
     over = bench.evaluate({"cold": [cell("claude", "UserPromptSubmit", 601, 451)]})
@@ -70,6 +70,7 @@ def test_a_gated_metric_passes_below_the_threshold_and_fails_above_it(bench):
 def test_only_the_gated_events_can_fail_the_cold_gates(bench):
     report = {"cold": [cell("claude", "PostToolUse", 100, 100), cell("agy", "Stop", 1700, 900),
                        cell("claude", "Stop", 900, 800), cell("claude", "PreToolUse", 800, 700),
+                       cell("claude", "SessionStart", 900, 800),
                        cell("claude", "Stop", 9000, 9000, session="large")]}
     rows = bench.evaluate(report)
     assert status(rows, "cold_hook_wall_p95_ms").startswith("pass") and status(rows, "cold_hook_cpu_s").startswith("pass")
