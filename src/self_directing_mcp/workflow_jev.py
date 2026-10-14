@@ -15,10 +15,20 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import httpx
-from dotenv import dotenv_values
-
 from .security.mask import mask_secrets, register_secret
+
+
+def __getattr__(name: str):
+    """PEP 562: ``httpx`` and ``dotenv_values`` load on first use, so importing the workflow module (which hooks do
+    for its guard) stays cheap. Callers and tests may still reach ``workflow_jev.httpx``."""
+    if name == "httpx":
+        import httpx
+        return httpx
+    if name == "dotenv_values":
+        from dotenv import dotenv_values
+        return dotenv_values
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 MAPPING_VERSION = "1"
 MODEL = "typesafe/jev-1.13"
@@ -156,6 +166,8 @@ def classify(context: dict, *, api_key: str | None = None,
     interpolation. Otherwise use the explicit key or OPENROUTER_API_KEY environment
     variable. No provider substitution, retries, redirects, or model aliases.
     """
+    import httpx
+    from dotenv import dotenv_values
     if (model != MODEL or not _number(threshold) or type(timeout_sec) not in (int, float)
             or not 0 < timeout_sec <= 1.7976931348623157e308):
         return _failure("invalid_configuration", "Pinned model, valid threshold, and positive timeout required.",

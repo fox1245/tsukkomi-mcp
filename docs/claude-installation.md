@@ -95,7 +95,7 @@ The tool matchers stay `*`. Reads can be restricted by a contract, and a tool na
 
 ### Where the hooks read their settings
 
-Hosts run lifecycle hooks inside the project being edited. A `.env` in that directory is content the audited agent can write, so the hooks never read it: they build their settings from the process environment and the user TOML file only (`config.hook_settings()`), the same sources the standard-library fallback uses. Otherwise a project `.env` could point a hook at an empty index or at `advisory` mode and turn a confirmed violation into an allow. The MCP server is different: it still reads a `.env` in its own working directory, at the lowest precedence.
+Hosts run lifecycle hooks inside the project being edited. A `.env` in that directory is content the audited agent can write, so the hooks never read it: they build their settings from the process environment and the user TOML file only (`config.hook_settings()`), the same sources the standard-library fallback uses. The hook process reads them with `settings_core.load_hook_settings()`, a standard-library twin of `config.hook_settings()` that does not import pydantic-settings (about 30 ms per tool call); `tests/test_hook_settings_parity.py` keeps the two identical, including which inputs they reject. Otherwise a project `.env` could point a hook at an empty index or at `advisory` mode and turn a confirmed violation into an allow. The MCP server is different: it still reads a `.env` in its own working directory, at the lowest precedence.
 
 So the index directory, the contracts path and the enforcement mode of the hooks must come from one of these:
 

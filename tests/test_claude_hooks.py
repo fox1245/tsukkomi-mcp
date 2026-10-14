@@ -793,6 +793,7 @@ def test_internal_errors_fail_open_with_a_warning_in_every_mode(env, monkeypatch
     elif failure == "engine":
         monkeypatch.setattr("self_directing_mcp.engine.SelfDirectEngine", _raising)
         monkeypatch.setattr("self_directing_mcp.config.Settings", _raising)
+        monkeypatch.setattr("self_directing_mcp.settings_core.load_hook_settings", _raising)    # what hooks run on
         response = run_hook(event, message)
     else:
         message["session_id"] = "not-a-session-id"

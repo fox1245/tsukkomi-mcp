@@ -715,20 +715,119 @@ The suite covers parsers, host receipt linkage, restricted reads, temporal oblig
 python -m pytest -q
 python -m build
 python scripts/benchmark.py
+python scripts/bench_hooks.py --out bench-hooks.json --markdown bench-hooks.md   # hook cost, see below
 ```
 
 ### CI
 
 GitHub Actions runs two workflows. Superseded runs for the same ref are cancelled, and no API keys or paid model calls are used.
 
-The `CI` workflow runs two jobs on every push and pull request:
+The `CI` workflow runs three jobs on every push and pull request:
 
 - **`test`** (Ubuntu and Windows, Python 3.12, 10 minutes): the explicit MCP transport, Jev boundary and Windows session-path smoke tests and the compressed Codex session tests (without their two 50 MB allocation probes), then builds the source distribution and wheel.
-- **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, checklist conflicts, quiet hooks, AGY and Claude Code hooks, the Claude Code installer and provider, and hook gating. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
+- **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, checklist conflicts, quiet hooks, AGY and Claude Code hooks, the Claude Code installer and provider, and hook gating. It also runs the hook import budget and settings parity tests ([Hook import budget](#hook-import-budget)) and the BLAS thread test. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
+- **`bench`** (Ubuntu, Python 3.12, 10 minutes): `scripts/bench_hooks.py --check` on small synthetic sessions. It fails when a gated metric exceeds 1.5 times its target and uploads the JSON report and the markdown table as an artifact ([Hook cost benchmark](#hook-cost-benchmark)). The 300 MB session is never run in CI.
 
 The `Memory` workflow (pull requests to `main`, `main`, nightly and on demand) is described in [Memory verification](#memory-verification).
 
 Real Lean proof checks and the performance, large-session and concurrency benchmarks are local deep checks, not CI gates. A green CI run does not establish full workflow or native-proof coverage or performance guarantees. Live model validation needs a separate model and budget approval.
+
+### Hook import budget
+
+A Claude Code or AGY hook is a fresh Python process for every tool call, so every module it imports is paid for on every call. The hook path is kept deliberately small and a test enforces it.
+
+`tests/test_hook_import_budget.py` runs **representative judgements**, not bare imports, in subprocesses: a `PreToolUse` that denies (a confirmed violation) and one that passes (a prerequisite satisfied from the transcript), `Stop` with its sync and audit, `SessionStart`, `PreInvocation` and the bookkeeping events, for Claude Code and AGY. Afterwards `sys.modules` must not contain a forbidden module, and the only third-party packages loaded must be the documented exceptions below. A new import that breaks this fails the test with the module's name.
+
+Never loaded on the local-only hook path. The cost is the cumulative import time that the module added to a hook (`python -X importtime`, median of 13 fresh processes, AMD Ryzen 7 5800X under WSL2, Python 3.12; the tracing itself adds roughly 15 percent):
+
+| Module | Why hooks do not need it | Cost when loaded |
+|---|---|---|
+| `numpy` | Dense vectors only, and local-only hooks never embed. `self_directing_mcp._runtime.np` is the single loading point and a lazy proxy: NumPy loads, with one BLAS thread and the environment restored, at the first attribute access. | 37 ms and about 15 MB (with the default BLAS threads about 1 CPU second more) |
+| `pydantic_settings` (and `dotenv`) | The hooks read their settings with `settings_core.load_hook_settings()`: the same sources, precedence and rejections as `config.hook_settings()` (environment, `CODEX_SESSIONS_DIR`, the user TOML `[paths]`, defaults; never a working-directory `.env`), standard library only. The defaults, the TOML source and the accessors live in `settings_core` and are shared with `config.Settings`, so they cannot drift; `tests/test_hook_settings_parity.py` compares the two readers on about 850 environment and TOML combinations, including the ones both must reject. | 28 ms |
+| `httpx` (with `idna` and `zstandard`) | The OpenRouter client. `embed.embedder`, `workflow_jev` and the graph runner import it, `dotenv` and `urllib.request` only where a request is made. | 28 ms (`urllib.request`: 4 ms) |
+| `mcp` (with `anyio`, `starlette`) | The server transport; hooks are plain processes. | not loaded before this change either; guarded against regressions |
+| `self_directing_mcp.config`, `.server` | Server-side settings and tool registration. | included above |
+
+Claude Code's bookkeeping events (`UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`) load none of pydantic, the engine or the transcript parser: they validate the session id with `claude_ids` and deliver queued warnings.
+
+Documented exceptions, loaded by every hook that judges contracts:
+
+| Module | Reason | Measured cost |
+|---|---|---|
+| `pydantic` (with `pydantic_core`, `annotated_types`, `typing_extensions`) | `schemas.py` defines the contract, chunk and audit models, and the contracts file and every parsed chunk are validated through them. Replacing them is a rewrite, not an import fix. | about 75 ms cumulative: pydantic 16 ms, `importlib.metadata` 15 ms (pydantic's plugin loader) and the models themselves |
+| `regex` | Contract patterns come from users and agents. They run on this engine because a search can be given a time limit (`audit/patterns.py`: 0.25 s per search, 2 s per contract, `regex_timeout` unknown beyond that), which the standard `re` module cannot interrupt. | about 10 ms |
+| `neograph_engine` (with `certifi`) | Project rule ([AGENTS.md](AGENTS.md)): audit judgements run through the NeoGraph native graph, with no direct executor fallback. Kept as a documented exception; the roundtable proposed forbidding it and left the rule to the owner. | about 40 ms: the native extension 21 ms and `asyncio` 15 ms |
+
+To re-measure, run a hook with `-X importtime` (`python -X importtime scripts/claude_hook.py --event=PreToolUse --local-only < payload.json 2> importtime.txt`; the columns are self and cumulative microseconds). Change the budget only by editing `FORBIDDEN` or `ALLOWED_THIRD_PARTY` in the test together with this section, with the module, the reason and the measured cost.
+
+### Hook cost benchmark
+
+`scripts/bench_hooks.py` measures what the hooks cost. It uses synthetic sessions, contracts and payloads under an isolated `HOME`, index directory and config file, and never reads a user's sessions, indexes or credentials. Cold, warm and server numbers are reported separately and never mixed.
+
+```bash
+python scripts/bench_hooks.py --out bench-hooks.json --markdown bench-hooks.md      # small sessions, about 8 minutes
+python scripts/bench_hooks.py --check                                                # exit 1 above a gated CI threshold
+python scripts/bench_hooks.py --large --large-mb 300 --out bench-large.json         # opt-in 300 MB session, never in CI
+python scripts/bench_hooks.py --only cold --versus /path/to/older/checkout          # interleaved A/B of two checkouts
+python scripts/bench_hooks.py --compare before.json after.json                      # before/after tables from two reports
+python scripts/bench_hooks.py --python /path/to/venv/bin/python --hook-mode default # other interpreter / engine mode
+```
+
+What is measured:
+
+- **Cold command hooks** (`cold`): a fresh Python process per event through the real `scripts/claude_hook.py` (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `SessionStart`, `Stop`) and `scripts/agy_hook.py` (`PreToolUse`, `PostToolUse`, `PreInvocation`, `Stop`) with synthetic payloads, plus a burst of N concurrent sessions (`burst`). The page cache is warm; "cold" means a new interpreter that imports the package and judges once. The transcript grows by whole records between runs, so each hook syncs a small increment. The first run of each event, which builds the index, is recorded separately (`first_run`). A `.venv` re-exec (one more interpreter start) is not included. `--hook-mode local-only` (default) runs the engine without an embedder or dense index, as `--local-only` does for Claude Code; `default` uses the offline fake embedder and the NumPy backend, so each hook also initializes the dense side.
+- **Warm resident-server calls** (`warm`): one long-lived process and one asyncio loop through FastMCP's dispatcher: `codex_session_hook` (`PreToolUse`, `UserPromptSubmit`, `Stop`), `check_action` and `audit_session`, each with nothing appended and after appending bytes. The index build of the first call is reported on its own.
+- **Idle servers** (`idle_servers`): N real `python -m self_directing_mcp` stdio servers with an isolated index, after the MCP handshake (`after_init`) and after one tool call that initializes the engine (`after_use`). Linux reads `/proc` (`VmRSS`, `VmHWM`, `Pss`); Windows reads the working set, peak working set and private bytes through `GetProcessMemoryInfo`. A sum of RSS counts shared libraries once per process; `pss_mb_total` divides them fairly.
+
+Every row gives p50, p95 and maximum wall time, CPU time (user plus system, from the operating system: `os.wait4` for hook processes, `getrusage` or `GetProcessTimes` in a server) and peak RSS per process, together with the machine, OS, Python and package versions and the load average. A hook that fails open or exits non-zero invalidates the run (`hooks_failed_open`). On a shared machine use `--versus`: the two checkouts see the same transcript and payloads in alternating order, so load from other processes hits both alike.
+
+Fixed conditions (flags, defaults in parentheses): contract counts (`--contracts 10,100`, each a rotating mix of `must_not`, `must`, `must` with `before_regex` and `must` with `before_regex` and `requires_success`), small session size (`--session-mb 1`), large session (`--large`, `--large-mb 300`, opt-in), bytes appended per step (`--append-bytes 4096`), concurrent sessions in the burst (`--sessions 4`), idle servers (`--servers 12`, `--server-profile local-only|fake-numpy`), repetitions (`--runs 20` after one discarded warm-up, `--warm-repeat 15`, `--large-repeat 5`).
+
+Targets and CI thresholds live in one table, `TARGETS` in the script (also written into every report). A CI threshold is `--ci-factor` (default 1.5) times the target. Rows that depend on other work are reported against their target and marked "reported, not gated yet":
+
+| Metric | Target | CI threshold | Gated here |
+|---|---:|---:|---|
+| Cold hook wall, p95 | 400 ms | 600 ms | yes, for Claude Code `PostToolUse` and `UserPromptSubmit`, which fire after every tool call and every prompt |
+| Cold hook CPU (user+sys), p95 | 0.3 s | 0.45 s | yes, for the same events |
+| Cold hook wall, p95 and CPU, every event | 400 ms, 0.3 s | 600 ms, 0.45 s | no: `PreToolUse` and `Stop` evaluate every contract over the whole session and AGY re-parses its transcript on every call; they wait for the fast integrity path and the incremental audit |
+| Cold hook wall, median (goal) | 150 ms | 225 ms | no |
+| `check_action`, large session, nothing appended, CPU | 100 ms | 150 ms | no: needs the fast integrity path |
+| `audit_session` after at most 100 appended events, CPU | 20 ms | 30 ms | no: needs the incremental audit |
+| Idle server RSS | 90 MB (70 MB desired) | 135 MB | yes |
+
+Phase 2 (a resident daemon) becomes due if the summed RSS across hosts exceeds 500 MB, a turn's accumulated hook latency exceeds 2 s, or the phase 1 gates are missed; the report states when the idle-server total passes 500 MB. The thresholds are absolute: on a slower machine (a hosted CI runner, Windows) widen `--ci-factor` rather than the targets, and report Linux and Windows separately.
+
+Measured on 2026-10-15, Linux (WSL2) on an AMD Ryzen 7 5800X with 16 logical CPUs, Python 3.12.14, 1 MB synthetic sessions, 10 contracts, 4 KB appended per step, 20 interleaved runs per event (`--versus`), the machine shared with other work (load average about 6). Wall and CPU in milliseconds, before (commit `00cb90e`) → after this change:
+
+| host | event | wall p50 | wall p95 | CPU p50 | CPU p95 | peak RSS |
+|---|---|---|---|---|---|---|
+| claude | PreToolUse | 407 → 281 | 445 → 309 | 385 → 263 | 424 → 294 | 83 → 67 MB |
+| claude | PostToolUse (gated) | 189 → 52 | 254 → 60 | 188 → 52 | 252 → 59 | 35 → 25 MB |
+| claude | UserPromptSubmit (gated) | 185 → 50 | 205 → 62 | 185 → 50 | 205 → 62 | 35 → 25 MB |
+| claude | SessionStart | 316 → 208 | 344 → 247 | 315 → 208 | 344 → 246 | 73 → 56 MB |
+| claude | Stop | 598 → 410 | 766 → 474 | 551 → 365 | 718 → 406 | 90 → 74 MB |
+| agy | PreToolUse | 742 → 646 | 854 → 754 | 654 → 551 | 765 → 623 | 86 → 70 MB |
+| agy | PostToolUse | 780 → 664 | 898 → 748 | 646 → 538 | 743 → 606 | 82 → 65 MB |
+| agy | PreInvocation | 420 → 321 | 531 → 349 | 372 → 268 | 476 → 295 | 78 → 62 MB |
+| agy | Stop | 647 → 539 | 740 → 589 | 570 → 452 | 655 → 496 | 94 → 77 MB |
+
+With 100 contracts the same events move by about the same amount (`PostToolUse` 190 → 53, `UserPromptSubmit` 193 → 54, `SessionStart` 328 → 212, `PreToolUse` 443 → 345, `Stop` 669 → 558 ms at p50); AGY `Stop` is still 931 ms and AGY `PreToolUse` 854 ms, because both evaluate the contracts over the whole transcript (`audit_session` after appending: about 550 ms CPU for 100 contracts against the 20 ms target). Warm calls and the first-call index build did not change (the work is the same): `check_action` with nothing appended 40 ms, `audit_session` 80 ms, `codex_session_hook` `Stop` about 150 ms at 10 contracts. Twelve idle local-only servers: 1073 → 949 MB total RSS (89.4 → 79.1 MB each, 637 → 570 MB PSS), because a local-only server no longer loads NumPy. The roundtable's own measurement of an idle OMP server was 86 MB and of a Codex server 79 MB; a server with an embedder still loads NumPy at startup.
+
+Large session (`--large --skip-small`, opt-in), same machine: a 300 MB synthetic Codex rollout of about 200,000 events of 1.5 KB (the roundtable measured 314 MB and 225,000 events), one warm server process with a local-only engine. With one contract the numbers match the roundtable's measurement:
+
+| call (CPU, p50 of 5) | 1 `must_not` contract | 10-contract mix, before | 10-contract mix, after |
+|---|---:|---:|---:|
+| first call (builds the index, once) | 26.20 s | 29.39 s | 29.37 s |
+| `check_action`, nothing appended | 1.02 s | 4.71 s | 5.01 s |
+| `check_action`, 4 KB appended | 1.32 s | 4.82 s | 5.11 s |
+| `audit_session`, nothing appended | 2.69 s | 7.40 s | 7.27 s |
+| `audit_session`, 4 KB appended | 3.05 s | 7.64 s | 7.65 s |
+| `codex_session_hook` `PreToolUse` | 1.06 s | 4.61 s | 4.63 s |
+| `codex_session_hook` `Stop` | 10.73 s | 15.18 s | 17.23 s |
+
+Against the targets (`check_action` with nothing appended 100 ms, `audit_session` for a few appended events 20 ms) these are the work of the fast integrity path and the incremental audit, not of this change: before and after agree, which is why they are reported and not gated. With the 10-contract mix `check_action` costs 5 s because the `before_regex` obligations are evaluated over the whole history on every call. `codex_session_hook` `Stop` costs 10.7 s on this session: its evidence stamp reads and parses every line of the transcript before the audit runs.
+
+Windows, reported separately (Windows 11, Python 3.13, the same machine, 12 interleaved runs per event, 10 contracts; before → after, median wall in ms): Claude Code `PostToolUse` 361 → 141, `UserPromptSubmit` 358 → 144, `SessionStart` 543 → 359, `PreToolUse` 625 → 473, `Stop` 716 → 552; AGY events 11 to 28 percent faster. Windows is slower in absolute terms (a hook's process start and imports cost about 1.3 to 2.7 times as much), so the events that are not gated can exceed their 1.5 times threshold there (`SessionStart` reaches 0.56 s CPU at p95); the gated `PostToolUse` and `UserPromptSubmit` stay at about 0.2 s p95 and pass with the default factor. Twelve idle local-only servers: 966 → 877 MB working set (80.6 → 73.3 MB each). A venv's `python.exe` is a launcher that starts the real interpreter, so the benchmark runs the process tree in a job object and reads the interpreter's own peak working set; Windows CPU times have the 15.6 ms resolution of the operating system clock. The roundtable measured the 314 MB session on Windows at commit `00cb90e` (local-only engine): server import 1.12 s, first `check_action` 44.8 s, `check_action` with nothing appended 1.50 to 1.58 s CPU, `audit_session` 4.22 s.
 
 ### Memory verification
 

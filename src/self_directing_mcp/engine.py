@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TYPE_CHECKING
 from functools import wraps
 from threading import Condition, RLock
 from collections import OrderedDict
@@ -39,7 +39,6 @@ from self_directing_mcp.checklist import (
 from self_directing_mcp.codex import discover as codex_discover
 from self_directing_mcp.grokbot import discover as grokbot_discover
 from self_directing_mcp import omp, agy, claude
-from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
 from self_directing_mcp.index.ingest import (
     AmbiguousSessionSource, AuditEventSnapshot, IntegrityPolicy, SessionStore, capture_for_cursor, coverage_from_capture,
@@ -59,6 +58,9 @@ from self_directing_mcp.neograph_runtime import ng, graph_operation
 from self_directing_mcp.request_control import (
     IndexBusy, RequestStopped, check_request, current_request, publication, request_operation, request_scope,
 )
+
+if TYPE_CHECKING:       # the pydantic Settings model is imported lazily: command hooks pass a light settings object
+    from self_directing_mcp.config import Settings
 
 
 def serialized(method):
@@ -170,7 +172,10 @@ class SelfDirectEngine:
         self._last_activity = time.monotonic()
         self._integrity_worker = None  # set only by a resident server (see integrity_worker)
         self.integrity_policy: IntegrityPolicy | None = None  # tests may inject a clock / randomness
-        self.settings = settings or get_settings()
+        if settings is None:
+            from self_directing_mcp.config import get_settings    # the server's pydantic settings; hooks pass their own
+            settings = get_settings()
+        self.settings = settings
         self.store: SessionStore | None = None
         self.sparse: SparseIndex | None = None
         self.dense = None

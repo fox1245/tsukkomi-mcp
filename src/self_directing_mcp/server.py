@@ -669,6 +669,12 @@ def main(argv: list[str] | None = None) -> None:
         # Bind the shared source to the singleton used by every MCP handler.
         # Indexes, native loading, and remote clients remain lazy.
         _engine.settings = settings
+    if not _engine.settings.local_only:
+        # Dense retrieval and embeddings need NumPy. Load it now, while the process is single-threaded, so the
+        # one-BLAS-thread setup of _runtime never races a worker thread that spawns a child. A local-only server
+        # never touches a dense vector, so it never loads NumPy at all (about 25 MB of resident memory).
+        from self_directing_mcp._runtime import load_numpy
+        load_numpy()
     _mask_logging()
     # A resident server closes the gap that fast hook-time checks leave: it verifies watched sources in full while
     # idle. Hook processes (one event each) never do this.
