@@ -53,19 +53,24 @@ def _quote(argument: str) -> str:
     return shlex.quote(argument)
 
 
-def hook_command(python: str, script: str, event: str, *, local_only: bool = False) -> str:
+def hook_command(python: str, script: str, event: str, *, local_only: bool = False,
+                 index_dir: str | None = None) -> str:
     parts = [_quote(python), _quote(script), f"--event={event}"]
     if local_only:
         parts.append("--local-only")
+    if index_dir:
+        # Hooks never read a project .env, so the index is named on the command line (or in the user TOML).
+        parts.append(_quote(f"--index-dir={index_dir}"))
     return " ".join(parts)
 
 
-def desired_hooks(python: str, script: str, events=tuple(EVENT_SPECS), *, local_only: bool = False) -> dict:
+def desired_hooks(python: str, script: str, events=tuple(EVENT_SPECS), *, local_only: bool = False,
+                  index_dir: str | None = None) -> dict:
     block: dict[str, list] = {}
     for event in events:
         matcher, timeout = EVENT_SPECS[event]
-        handler = {"type": "command", "command": hook_command(python, script, event, local_only=local_only),
-                   "timeout": timeout}
+        handler = {"type": "command", "timeout": timeout,
+                   "command": hook_command(python, script, event, local_only=local_only, index_dir=index_dir)}
         block[event] = [{"matcher": matcher, "hooks": [handler]} if matcher is not None else {"hooks": [handler]}]
     return block
 
@@ -277,6 +282,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="comma-separated events to install (default: all)")
     parser.add_argument("--local-only", action="store_true",
                         help="run the hook engine local-only (no embedder or credentials); affects hooks only")
+    parser.add_argument("--index-dir", type=Path,
+                        help="absolute index directory the hooks use (shared with the MCP server whose contracts "
+                             "apply); default: SELF_DIRECT_INDEX_DIR, the user TOML, then ~/.self_direct_index")
     return parser
 
 
@@ -285,8 +293,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if (args.apply or args.uninstall) and args.settings is None:
         parser.error("--settings is required with --apply and --uninstall")
+    if args.index_dir is not None and not args.index_dir.is_absolute():
+        parser.error("--index-dir must be an absolute path")
     script = str(args.script.resolve())
-    desired = desired_hooks(args.python, script, args.events, local_only=args.local_only)
+    index_dir = str(args.index_dir) if args.index_dir is not None else None
+    desired = desired_hooks(args.python, script, args.events, local_only=args.local_only, index_dir=index_dir)
     env = {ENV_KEY: args.mode}
     try:
         if not (args.apply or args.uninstall):

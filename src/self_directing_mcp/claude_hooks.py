@@ -377,10 +377,14 @@ def _event_from_payload(payload: Any) -> str | None:
 
 def main() -> None:
     argv = sys.argv[1:]
+    import os
     if "--local-only" in argv:
-        import os
         # Hooks never embed. This keeps the credential-free engine local without touching the MCP server's own env.
         os.environ["SELF_DIRECT_LOCAL_ONLY"] = "true"
+    for arg in argv:
+        # Named at registration because hooks never read a project .env (see config.hook_settings).
+        if arg.startswith("--index-dir=") and os.path.isabs(arg.split("=", 1)[1]):
+            os.environ["SELF_DIRECT_INDEX_DIR"] = arg.split("=", 1)[1]
     event = _event_from_argv(argv)
     try:
         payload = json.load(sys.stdin)

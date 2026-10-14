@@ -139,6 +139,23 @@ def test_printed_commands_run_the_real_hook_and_fail_open_on_bad_input(tmp_path)
         assert "not a compliance verdict" in json.loads(result.stdout)["systemMessage"]
 
 
+
+def test_index_dir_is_baked_into_every_command_and_must_be_absolute(tmp_path):
+    index = tmp_path / "shared index"
+    document = json.loads(run_cli("--python", sys.executable, "--index-dir", str(index)).stdout)
+    for event, groups in document["hooks"].items():
+        command = groups[0]["hooks"][0]["command"]
+        assert f"--index-dir={index}" in command and installer.is_owned(groups[0]["hooks"][0])
+    assert document["env"] == {"SELF_DIRECT_CLAUDE_ENFORCEMENT": "confirmed_only"}     # nothing else leaks to MCP
+    assert run_cli("--index-dir", "relative/index").returncode == 2
+    command = document["hooks"]["Stop"][0]["hooks"][0]["command"]
+    environment = {key: value for key, value in os.environ.items() if key != "SELF_DIRECT_INDEX_DIR"}
+    environment["SELF_DIRECT_CONFIG_FILE"] = str(tmp_path / "none.toml")
+    result = subprocess.run(command, shell=True, input="not json", capture_output=True, text=True, timeout=30,
+                            cwd=tmp_path, env=environment)
+    assert result.returncode == 0 and "not a compliance verdict" in json.loads(result.stdout)["systemMessage"]
+    assert (index / "claude-hook-state.sqlite").is_file()        # health was recorded in the named index
+
 # --- --apply ----------------------------------------------------------------------------------------------
 
 def test_apply_creates_a_missing_settings_file_without_a_backup_and_is_idempotent(settings_path):

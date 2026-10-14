@@ -52,7 +52,15 @@ def _event(argv, payload):
     return event
 
 
+def _apply_index_dir(argv):
+    """``--index-dir=PATH`` from the registered command wins; the fallback below records health there too."""
+    for arg in argv:
+        if arg.startswith("--index-dir=") and os.path.isabs(arg.split("=", 1)[1]):
+            os.environ["SELF_DIRECT_INDEX_DIR"] = arg.split("=", 1)[1]
+
+
 def main():
+    _apply_index_dir(sys.argv[1:])
     root = Path(__file__).resolve().parent.parent
     venv = root / ".venv"
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
