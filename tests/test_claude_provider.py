@@ -501,6 +501,43 @@ def test_file_attachments_index_paths_only(root):
     assert "FILE-BODY-SENTINEL" not in dump(chunks)
 
 
+def test_plan_mode_indexes_the_reminder_type_and_flags_only(root):
+    path = write(main_file(root),
+                 attachment("plan_mode", isSubAgent=False, planExists=True, planFilePath="/synthetic/PLAN-PATH.md",
+                            reminderType="full"),
+                 attachment("plan_mode", isSubAgent=True, planExists=False, planFilePath="/synthetic/none.md",
+                            reminderType="sparse"))
+    chunks = parse(path)
+    assert [c.text for c in chunks] == [
+        "[attachment:plan_mode] reminder_type=full plan_exists=true",
+        "[attachment:plan_mode] reminder_type=sparse plan_exists=false"]
+    assert all((c.kind, c.meta["role"]) == ("meta", "runtime") and not c.meta.get("unsupported_event") for c in chunks)
+    assert chunks[0].meta["plan_file_path"] == "/synthetic/PLAN-PATH.md" and chunks[0].meta["is_sub_agent"] is False
+    assert chunks[1].meta["plan_exists"] is False and chunks[1].meta["is_sub_agent"] is True
+    assert "PLAN-PATH" not in " ".join(c.text for c in chunks)
+
+
+def test_informational_system_record_is_a_placeholder(root):
+    path = write(main_file(root), env("system", subtype="informational", level="notice",
+                                      content=f"host says {PHRASE}", isMeta=False, entrypoint="cli",
+                                      gitBranch="main", slug="a-b-c"))
+    (chunk,) = parse(path)
+    assert chunk.text == "[system:informational]" and (chunk.kind, chunk.meta["role"]) == ("meta", "runtime")
+    assert chunk.meta["system_subtype"] == "informational" and chunk.meta["level"] == "notice"
+    assert not chunk.meta.get("unsupported_event") and PHRASE not in dump([chunk])
+
+
+def test_continued_in_links_session_continuations_as_metadata(root):
+    path = write(main_file(root), env("continued-in", continuedInSessionId=OTHER))
+    (chunk,) = parse(path)
+    assert chunk.text == "[claude_metadata:continued-in]" and (chunk.kind, chunk.meta["role"]) == ("meta", "runtime")
+    assert chunk.meta["continued_in_session_id"] == OTHER and not chunk.meta.get("unsupported_event")
+    for bad in ({}, {"continuedInSessionId": 5}, {"continuedInSessionId": ""}, {"continuedInSessionId": "a b"},
+                {"continuedInSessionId": ["x"]}):
+        (flagged,) = parse(write(main_file(root), env("continued-in", **bad)))
+        assert flagged.meta.get("unsupported_event") is True and "continued_in_session_id" not in flagged.meta
+
+
 def test_hook_injected_attachments_keep_only_event_and_name(root):
     path = write(main_file(root),
                  attachment("hook_additional_context", content=[f"tool output {PHRASE}"], hookName="UserPromptSubmit",
@@ -557,6 +594,7 @@ NEW_ATTACHMENT_FIELDS = {
     "remote_session_change": dict(url=None, commit="c", pr="p", sendUserFileHint=False, managedCommit=False,
                                   managedPr=False),
     "read_truncation_notice": dict(banner="b", toolUseID="t"),
+    "plan_mode": dict(isSubAgent=False, planExists=True, planFilePath="/s/plan.md", reminderType="full"),
 }
 NEW_ATTACHMENT_BREAKS = {
     "file": [dict(filename=3), dict(displayPath=None), dict(content="text"), dict(content={"mystery": 1}),
@@ -571,6 +609,8 @@ NEW_ATTACHMENT_BREAKS = {
     "remote_session_change": [dict(url=3), dict(commit=None), dict(pr=3), dict(sendUserFileHint="no"),
                               dict(managedCommit=1), dict(managedPr=None), dict(mystery=1), "commit"],
     "read_truncation_notice": [dict(banner=3), dict(toolUseID=""), dict(toolUseID=3), dict(mystery=1), "toolUseID"],
+    "plan_mode": [dict(isSubAgent="no"), dict(planExists=1), dict(planFilePath=None), dict(reminderType=3),
+                  dict(mystery=1), "reminderType", "planFilePath", "planExists", "isSubAgent"],
 }
 
 
@@ -602,6 +642,7 @@ SENTINELS = {
     "hook_sys": "HOOK-SYSTEM-MESSAGE-SENTINEL", "banner": "READ-BANNER-SENTINEL", "block_hash": "BLOCK-HASH-SENTINEL",
     "client_change": "CLIENT-CHANGE-SENTINEL", "remote_url": "REMOTE-URL-SENTINEL",
     "remote_commit": "REMOTE-COMMIT-SENTINEL", "remote_pr": "REMOTE-PR-SENTINEL", "usage": "USAGE-PAYLOAD-SENTINEL",
+    "informational": "INFORMATIONAL-HOST-TEXT-SENTINEL", "plan_text": "PLAN-FILE-CONTENT-SENTINEL",
 }
 
 
@@ -636,6 +677,10 @@ def corpus(sub=False):
         attachment("auto_mode", enabled=True, **base),
         attachment("skill_listing", skills=[s["mcp"]], **base),
         attachment("task_status", status="running", **base),
+        attachment("plan_mode", isSubAgent=sub, planExists=True, planFilePath="/synthetic/plan.md",
+                   reminderType="full", **base),
+        env("system", subtype="informational", level="notice", content=s["informational"], isMeta=False, sub=sub),
+        env("continued-in", continuedInSessionId=OTHER, sub=sub),
         attachment("file", filename="/synthetic/read.txt", displayPath="read.txt", content={
             "type": "text", "file": {"filePath": "/synthetic/read.txt", "content": s["file_content"]}}, **base),
         attachment("compact_file_reference", filename="/synthetic/ref.txt", displayPath="ref.txt", **base),
