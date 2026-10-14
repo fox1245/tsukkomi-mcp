@@ -299,7 +299,7 @@ async def sync_session(
 
     Audit/check_action refresh automatically; do not sync separately before them.
     Provide session_id or path under the configured root.
-    provider: "codex" (default), "grokbot", "omp" (OMP JSONL), or "agy".
+    provider: "codex" (default), "grokbot", "omp" (OMP JSONL), "agy" or "claude" (Claude Code transcripts).
     When omitted, uses SELF_DIRECT_SESSION_PROVIDER or auto-detects from path layout.
     Every event occurrence is retained; only new sanitized text hashes are embedded.
     Set embed=False for local indexing. SELF_DIRECT_LOCAL_ONLY=true disables
@@ -326,7 +326,7 @@ async def search_history(
     Use when relevant evidence is missing. Do NOT treat retrieval
     alone as compliance proof — call audit_session; contracts/regex are authoritative.
     top_k defaults from settings (search_top_k). Never treat top-1 alone as a violation.
-    provider filters the index (codex|grokbot|omp|agy). Local-only supports regex/sparse, not dense/hybrid.
+    provider filters the index (codex|grokbot|omp|agy|claude). Local-only supports regex/sparse, not dense/hybrid.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.search_history,
@@ -346,7 +346,7 @@ async def audit_session(session_id: str, provider: str | None = None, path: str 
     Rules/regex are primary; hybrid is auxiliary only.
     Refreshes local JSONL first and returns coverage and a contracts snapshot.
     Unknown means evidence/verification is missing; it must not be called compliance.
-    provider filters the audit (codex|grokbot|omp|agy).
+    provider filters the audit (codex|grokbot|omp|agy|claude).
     timeout_ms: optional per-call budget in milliseconds for large sessions.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=True)

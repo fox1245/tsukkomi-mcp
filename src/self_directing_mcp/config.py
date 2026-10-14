@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 
 
 _PATH_FIELDS = frozenset({
-    "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir",
+    "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
     "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file",
 })
 
@@ -87,6 +87,10 @@ def _default_omp_sessions_dir() -> Path:
     return Path(os.environ.get("SELF_DIRECT_OMP_SESSIONS_DIR") or Path.home() / ".omp" / "sessions")
 
 
+def _default_claude_projects_dir() -> Path:
+    return Path(os.environ.get("SELF_DIRECT_CLAUDE_PROJECTS_DIR") or Path.home() / ".claude" / "projects")
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -120,12 +124,13 @@ class Settings(BaseSettings):
     codex_sessions_dir: Path = Field(default_factory=_default_codex_sessions_dir)
     grokbot_transcripts_dir: str | list[Path] = Field(default_factory=_default_grokbot_transcripts_dir)
     omp_sessions_dir: Path = Field(default_factory=_default_omp_sessions_dir)
+    claude_projects_dir: Path = Field(default_factory=_default_claude_projects_dir)
     agy_app_data_dirs: list[Path] = Field(default_factory=lambda: [
         Path.home() / ".gemini" / name
         for name in ("antigravity", "antigravity-cli", "antigravity-ide")
     ])
     agy_enforcement: Literal["confirmed_only", "advisory", "enforced"] = "confirmed_only"
-    session_provider: Literal["codex", "grokbot", "omp", "agy"] = "codex"
+    session_provider: Literal["codex", "grokbot", "omp", "agy", "claude"] = "codex"
     index_dir: Path = Field(default_factory=_default_index_dir)
     contracts_path: Path | None = Field(
         default=None,
@@ -194,6 +199,9 @@ class Settings(BaseSettings):
     def resolve_omp_sessions_dir(self) -> Path:
         return Path(self.omp_sessions_dir)
 
+    def resolve_claude_projects_dir(self) -> Path:
+        return Path(self.claude_projects_dir)
+
     def resolve_agy_app_data_dirs(self) -> list[Path]:
         return [Path(root).expanduser().resolve() for root in self.agy_app_data_dirs]
 
@@ -202,7 +210,7 @@ class Settings(BaseSettings):
 
         return parse_transcripts_dirs(self.grokbot_transcripts_dir)
 
-    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp", "agy"]:
+    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp", "agy", "claude"]:
         return self.session_provider
 
     def resolve_contracts_path(self) -> Path:

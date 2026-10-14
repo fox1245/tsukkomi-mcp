@@ -87,4 +87,5 @@ jobs:
           tests/test_common_judgement_fixture.py
           tests/test_reliability.py
           tests/test_hook_gating.py
+          tests/test_claude_provider.py
           --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file

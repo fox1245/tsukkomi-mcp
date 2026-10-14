@@ -23,7 +23,7 @@ def main() -> None:
             continue
         sub.add_argument("--state", type=Path, default=os.environ.get("TSUKKOMI_WORKFLOW_STATE"))
         sub.add_argument("--session", required=True)
-        sub.add_argument("--provider", choices=("agy", "codex", "omp", "grokbot"), default="agy")
+        sub.add_argument("--provider", choices=("agy", "codex", "omp", "grokbot", "claude"), default="agy")
         sub.add_argument("--lean", default=os.environ.get("TSUKKOMI_LEAN"))
         if name == "run-checks":
             sub.add_argument("--kind", choices=("all", "proof", "test"), default="all")

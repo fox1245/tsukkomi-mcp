@@ -32,7 +32,7 @@ from self_directing_mcp.checklist import (
 )
 from self_directing_mcp.codex import discover as codex_discover
 from self_directing_mcp.grokbot import discover as grokbot_discover
-from self_directing_mcp import omp, agy
+from self_directing_mcp import omp, agy, claude
 from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
 from self_directing_mcp.index.ingest import AmbiguousSessionSource, SessionStore, ingest_session, coverage_from_capture
@@ -260,13 +260,13 @@ class SelfDirectEngine:
         provider: str | None,
         *,
         path: str | None = None,
-    ) -> Literal["codex", "grokbot", "omp", "agy"]:
+    ) -> Literal["codex", "grokbot", "omp", "agy", "claude"]:
         """Explicit arg > settings/env > light auto-detect from path layout."""
         if provider:
             p = provider.strip().lower()
-            if p in ("codex", "grokbot", "omp", "agy"):
+            if p in ("codex", "grokbot", "omp", "agy", "claude"):
                 return p  # type: ignore[return-value]
-            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot|omp|agy)")
+            raise ValueError(f"unknown provider: {provider!r} (use codex|grokbot|omp|agy|claude)")
         # Auto-detect: path under a configured grokbot root, or <id>/<id>.jsonl layout
         if path:
             try:
@@ -277,6 +277,9 @@ class SelfDirectEngine:
                 path_r.is_relative_to(root) for root in self.settings.resolve_agy_app_data_dirs()
             ):
                 return "agy"
+            if claude.peek_session_id(path_r) and path_r.is_relative_to(
+                    self.settings.resolve_claude_projects_dir().expanduser().resolve()):
+                return "claude"
             for root in self.settings.resolve_grokbot_transcripts_dirs():
                 try:
                     path_r.relative_to(Path(root).resolve())
@@ -314,6 +317,10 @@ class SelfDirectEngine:
                 resolved = agy.resolve_session_path(
                     self.settings.resolve_agy_app_data_dirs(), session_id=session_id, path=path
                 )
+            elif resolved_provider == "claude":
+                resolved = claude.resolve_session_path(
+                    self.settings.resolve_claude_projects_dir(), session_id=session_id, path=path
+                )
             elif resolved_provider == "omp":
                 resolved = omp.resolve_session_path(
                     self.settings.resolve_omp_sessions_dir(), session_id=session_id, path=path
@@ -328,7 +335,8 @@ class SelfDirectEngine:
                 resolved = codex_discover.resolve_session_path(
                     sessions_root, session_id=session_id, path=path
                 )
-        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError, omp.PathTraversalError, agy.PathTraversalError) as e:
+        except (codex_discover.PathTraversalError, grokbot_discover.PathTraversalError, omp.PathTraversalError,
+                agy.PathTraversalError, claude.PathTraversalError) as e:
             return {"ok": False, "error": "path_traversal", "message": str(e)}
         except FileNotFoundError as e:
             return {"ok": False, "error": "not_found", "message": str(e)}
@@ -1139,6 +1147,7 @@ class SelfDirectEngine:
             "sessions_dir": str(s.resolve_sessions_dir()),
             "grokbot_transcripts_dirs": [str(p) for p in s.resolve_grokbot_transcripts_dirs()],
             "omp_sessions_dir": str(s.resolve_omp_sessions_dir()),
+            "claude_projects_dir": str(s.resolve_claude_projects_dir()),
             "session_provider": s.resolve_session_provider(),
             "index_dir": str(Path(s.index_dir).resolve()),
             "dense_backend": self.dense_backend,
