@@ -578,3 +578,146 @@ def test_v7_notice_text_and_images_never_satisfy_or_trigger_user_contracts(local
     # must (user role) is not satisfied by them either.
     assert found["no-zz"]["verdict"] == found["no-zz-any"]["verdict"] == "clean"
     assert found["need-img"]["verdict"] == "violation" and not found["need-img"]["evidence"]
+
+
+# --- Parser v7 (extended): steering, subagent/usage/branch records, redacted thinking -------------
+def _steer(content="zzforbidden steer", attribution="agent", **over):
+    msg = {"role": "user", "content": content, "timestamp": 1, "attribution": attribution,
+           "steering": True, "liveSteered": True}
+    msg.update(over)
+    return {"type": "message", "id": "s1", "parentId": None, "timestamp": _TS,
+            "message": {k: v for k, v in msg.items() if v is not ...}}
+
+
+def _rec(record_type, **fields):
+    rec = {"type": record_type, "id": "r1", "parentId": None, "timestamp": _TS, **fields}
+    return {k: v for k, v in rec.items() if v is not ...}
+
+
+_INIT = dict(agent="task", task="SUBTASKSECRET do work", systemPrompt="SYSPROMPTSECRET", tools=["read", "TOOLSECRET"],
+             spawns="*", resolvedModel="m", readOnly=True)
+_USAGE = dict(api="a", model="m", provider="p", purpose="cache-warm", stopReason="stop", usage={"USAGESECRET": 1})
+_BRANCH = dict(summary="BRANCHSECRET", fromId="f1", details={"discardedEntryId": "d1", "kind": "k"})
+_ASSIST = lambda *blocks: {"type": "message", "message": {"role": "assistant", "content": list(blocks)}}  # noqa: E731
+_IMG_META = _image(_meta={"codex/imageDetail": "high"})
+_V7B_VALID = [
+    _steer(attribution="agent"), _steer(attribution="user"),
+    _steer(content=[{"type": "text", "text": "t"}], attribution="agent"),
+    _steer(content=[{"type": "text", "text": "t"}], attribution="user"),
+    _steer(liveSteered=...), _steer(liveSteered="2026-01-01"),
+    _rec("session_init", **_INIT),
+    _rec("session_init", **_INIT, modelRole="r", outputSchema={"a": 1}, outputSchemaMode="permissive", readSummarize=False),
+    _rec("session_init", **{**_INIT, "systemPrompt": ["a", {"b": 1}]}),
+    _rec("model_usage", **_USAGE),
+    _rec("model_usage", **_USAGE, role="judge", errorMessage="ERRSECRET"),
+    _rec("branch_summary", **_BRANCH),
+    _ASSIST({"type": "redactedThinking", "data": "REDACTEDSECRET"}),
+    _tool_result(_IMG_META),
+    _tool_result({"type": "text", "text": "ok"}, details={"DETAILSECRET": 1}),
+    _cm("thinking-loop-redirect", details=...),
+]
+
+
+@pytest.mark.parametrize("record", _V7B_VALID)
+def test_v7b_shapes_supported_and_secrets_not_indexed(local_engine, record):
+    engine, file = local_engine
+    _append(file, record)
+    result = _check_read(engine, file)
+    assert result["coverage"]["complete"] is True and result["verdict"] == "clean"
+    assert result["coverage"]["parse_error_count"] == 0
+    chunks = _new_chunks(engine)
+    assert chunks
+    blob = " ".join(c.text + str(c.meta) for c in chunks)
+    for secret in ("SYSPROMPTSECRET", "TOOLSECRET", "USAGESECRET", "ERRSECRET", "BRANCHSECRET",
+                   "REDACTEDSECRET", "DETAILSECRET", _B64, "codex/imageDetail"):
+        assert secret not in blob
+
+
+def _new_chunks(engine):
+    # The fixture seeds four lines (title, header, user, assistant); the rest came from the test.
+    return [c for c in engine.store.list_chunks("session-1", "omp") if c.line_start > 4]
+
+
+def test_v7b_subagent_init_is_runtime_meta_with_task_text(local_engine):
+    engine, file = local_engine
+    _append(file, _rec("session_init", **_INIT))
+    _check_read(engine, file)
+    (chunk,) = _new_chunks(engine)
+    assert chunk.kind == "meta" and chunk.meta["role"] == "runtime"
+    assert chunk.meta["evidence_origin"] == "subagent_init" and chunk.meta["unsupported_event"] is False
+    assert "[subagent_task] SUBTASKSECRET do work" in chunk.text
+
+
+def test_v7b_runtime_origins(local_engine):
+    engine, file = local_engine
+    _append(file, _rec("model_usage", **_USAGE), _rec("branch_summary", **_BRANCH),
+            _ASSIST({"type": "redactedThinking", "data": "x"}))
+    _check_read(engine, file)
+    usage, branch, red = _new_chunks(engine)
+    assert all(c.kind == "meta" and c.meta["role"] == "runtime" and not c.meta["unsupported_event"]
+               for c in (usage, branch, red))
+    assert usage.meta["evidence_origin"] == "model_usage" and branch.meta["evidence_origin"] == "branch_summary"
+    assert red.meta["evidence_origin"] == "thinking" and red.text == "[redacted_thinking]"
+
+
+@pytest.mark.parametrize("record", [
+    _steer(attribution="system"), _steer(attribution=...), _steer(attribution=None),
+    _steer(steering=False), _steer(steering="yes"), _steer(steering=...),
+    _steer(liveSteered=False), _steer(liveSteered=5), _steer(extra=1), _steer(content=5),
+    _steer(content=[{"type": "text", "text": 5}]), _steer(content=[{"type": "audio"}]),
+    _rec("session_init", **{**_INIT, "agent": 5}), _rec("session_init", **{**_INIT, "task": ["x"]}),
+    _rec("session_init", **{**_INIT, "systemPrompt": 5}), _rec("session_init", **{**_INIT, "tools": "all"}),
+    _rec("session_init", **{**_INIT, "spawns": True}), _rec("session_init", **{**_INIT, "readOnly": "yes"}),
+    _rec("session_init", **{**_INIT, "resolvedModel": None}), _rec("session_init", **_INIT, extra=1),
+    _rec("session_init", **_INIT, readSummarize="y"), _rec("session_init", **_INIT, outputSchema="s"),
+    _rec("session_init", **_INIT, outputSchemaMode=1), _rec("session_init", **_INIT, modelRole=1),
+    _rec("session_init", **{k: v for k, v in _INIT.items() if k != "task"}),
+    _rec("model_usage", **{**_USAGE, "usage": "u"}), _rec("model_usage", **{**_USAGE, "stopReason": 1}),
+    _rec("model_usage", **_USAGE, extra=1), _rec("model_usage", **_USAGE, role=1),
+    _rec("model_usage", **_USAGE, errorMessage={}), _rec("model_usage", **{k: v for k, v in _USAGE.items() if k != "api"}),
+    _rec("branch_summary", **{**_BRANCH, "summary": 5}), _rec("branch_summary", **{**_BRANCH, "fromId": 5}),
+    _rec("branch_summary", **{**_BRANCH, "details": {"discardedEntryId": "d"}}),
+    _rec("branch_summary", **{**_BRANCH, "details": {**_BRANCH["details"], "x": 1}}),
+    _rec("branch_summary", **{**_BRANCH, "details": "d"}), _rec("branch_summary", **_BRANCH, extra=1),
+    _rec("branch_summary", summary="s", fromId="f"),
+    _ASSIST({"type": "redactedThinking"}), _ASSIST({"type": "redactedThinking", "data": 5}),
+    _ASSIST({"type": "redactedThinking", "data": "x", "extra": 1}),
+    _message("user", {"type": "redactedThinking", "data": "x"}),
+    _tool_result(_image(_meta={})), _tool_result(_image(_meta={"codex/imageDetail": "h", "x": 1})),
+    _tool_result(_image(_meta={"other": "h"})), _tool_result(_image(_meta="x")),
+    _tool_result(_image(_meta={"codex/imageDetail": 5})),
+    _tool_result({"type": "text", "text": "ok"}, details="d"),
+    _tool_result({"type": "text", "text": "ok"}, details=[1]),
+])
+def test_v7b_malformed_shapes_stay_unsupported(local_engine, record):
+    engine, file = local_engine
+    _append(file, record)
+    result = _check_read(engine, file)
+    assert result["verdict"] == "unknown" and result["coverage"]["complete"] is False
+
+
+def test_v7b_steering_attribution_semantics(local_engine):
+    engine, file = local_engine
+    engine.upsert_contracts([
+        {"id": "no-zz", "type": "must_not", "scope": "message", "regex": "zzforbidden",
+         "provider": "omp", "roles": ["user"]},
+        {"id": "need-ok", "type": "must", "scope": "message", "regex": "zzsatisfy",
+         "provider": "omp", "roles": ["user"]},
+    ])
+    _append(file, _steer("zzforbidden zzsatisfy agent text", "agent"),
+            _steer([{"type": "text", "text": "zzforbidden zzsatisfy list"}], "agent"))
+    audit = engine.audit_session("session-1", provider="omp", path=str(file))
+    found = {f["contract_id"]: f for f in audit["findings"]}
+    assert audit["coverage"]["complete"] is True
+    assert found["no-zz"]["verdict"] == "clean" and found["need-ok"]["verdict"] == "violation"
+    steered = _new_chunks(engine)
+    assert len(steered) == 2 and all(c.kind == "meta" and c.meta["role"] == "runtime"
+                                     and c.meta["evidence_origin"] == "agent_steering" for c in steered)
+    assert all("zzforbidden" in c.text for c in steered)
+    # A user-attributed steering message is a genuine user turn.
+    _append(file, _steer("zzforbidden zzsatisfy typed", "user"))
+    audit = engine.audit_session("session-1", provider="omp", path=str(file))
+    found = {f["contract_id"]: f for f in audit["findings"]}
+    assert found["no-zz"]["verdict"] == "violation" and found["need-ok"]["verdict"] != "violation"
+    turn = _new_chunks(engine)[-1]
+    assert turn.kind == "turn" and turn.meta["role"] == "user" and turn.text == "[message:user] zzforbidden zzsatisfy typed"

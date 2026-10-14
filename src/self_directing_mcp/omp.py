@@ -9,7 +9,8 @@ from self_directing_mcp.session_events import as_text, iter_raw_lines, make_chun
 
 # Bumping this triggers a lazy per-session reparse on the next sync/audit of each already-indexed
 # session (index.ingest compares the recorded version); unchanged event ids, anchors and vectors survive.
-# v7: host runtime notices (custom/custom_message/mode_change shapes) and strict image blocks.
+# v7: host runtime notices (custom/custom_message/mode_change shapes), strict image blocks, steering
+# user messages, session_init/model_usage/branch_summary records and redactedThinking blocks.
 PARSER_VERSION = 7
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _EVENT_FIELDS = {"id", "parentId", "timestamp", "type"}
@@ -31,7 +32,7 @@ _TODO_HUD_FIELDS = _EVENT_FIELDS | {"customType", "data"}
 # Host notices: runtime metadata only, never user instructions or execution evidence. New notice
 # kinds are deliberately absent so they surface as unsupported until reviewed.
 _HOST_NOTICE_TYPES = {"launch-completion", "todo-error-reminder", "image-attachment", "tool-roster-notice",
-                      "resolve-reminder", "xdev-mount-notice", "goal-continuation"}
+                      "resolve-reminder", "xdev-mount-notice", "goal-continuation", "thinking-loop-redirect"}
 _GOAL_COMPLETED_TYPES = {"objective": (str,), "timeUsedSeconds": (int, float), "tokensUsed": (int, float)}
 
 
@@ -45,9 +46,47 @@ def _custom_data_ok(custom_type, data):
                     for key, kinds in _GOAL_COMPLETED_TYPES.items()))
 
 
+_SESSION_INIT_FIELDS = _EVENT_FIELDS | {"agent", "task", "systemPrompt", "tools", "spawns", "resolvedModel", "readOnly",
+                                        "modelRole", "outputSchema", "outputSchemaMode", "readSummarize"}
+_SESSION_INIT_TYPES = {"agent": str, "task": str, "tools": list, "spawns": str, "resolvedModel": str,
+                       "readOnly": bool, "modelRole": str, "outputSchema": dict, "outputSchemaMode": str,
+                       "readSummarize": bool}
+_MODEL_USAGE_TYPES = {"api": str, "model": str, "provider": str, "purpose": str, "stopReason": str, "usage": dict,
+                      "role": str, "errorMessage": str}
+_STEERING_FIELDS = {"role", "content", "timestamp", "attribution", "steering", "liveSteered"}
+
+
+def _typed_fields_ok(obj, allowed, required, types):
+    return (set(obj) <= allowed and required <= set(obj)
+            and all(type(obj[key]) is kind for key, kind in types.items() if key in obj))
+
+
+def _session_init_ok(obj):
+    return (_typed_fields_ok(obj, _SESSION_INIT_FIELDS, _SESSION_INIT_FIELDS - _EVENT_FIELDS
+                             - {"modelRole", "outputSchema", "outputSchemaMode", "readSummarize"}, _SESSION_INIT_TYPES)
+            and isinstance(obj["systemPrompt"], (str, list)))
+
+
+def _model_usage_ok(obj):
+    return _typed_fields_ok(obj, _EVENT_FIELDS | set(_MODEL_USAGE_TYPES),
+                            set(_MODEL_USAGE_TYPES) - {"role", "errorMessage"}, _MODEL_USAGE_TYPES)
+
+
+def _branch_summary_ok(obj):
+    details = obj.get("details")
+    return (set(obj) <= _EVENT_FIELDS | {"summary", "fromId", "details"}
+            and isinstance(obj.get("summary"), str) and isinstance(obj.get("fromId"), str)
+            and isinstance(details, dict) and set(details) == {"discardedEntryId", "kind"}
+            and all(isinstance(value, str) for value in details.values()))
+
+
 def _image_ok(block):
     """Strict image block; base64 data is validated but never indexed."""
-    return (isinstance(block, dict) and set(block) == {"type", "data", "mimeType"} and block["type"] == "image"
+    meta = block.get("_meta", {"codex/imageDetail": ""}) if isinstance(block, dict) else None
+    return (isinstance(block, dict) and {"type", "data", "mimeType"} <= set(block) <= {"type", "data", "mimeType", "_meta"}
+            and block["type"] == "image"
+            and isinstance(meta, dict) and set(meta) == {"codex/imageDetail"}
+            and isinstance(meta["codex/imageDetail"], (str, dict))
             and isinstance(block["data"], str) and isinstance(block["mimeType"], str)
             and block["mimeType"].startswith("image/") and len(block["mimeType"]) > 6)
 
@@ -176,6 +215,9 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                     record_type == "custom" and custom_type == "todo_hud_state"
                     and set(obj) <= _TODO_HUD_FIELDS and isinstance(obj.get("data"), dict)
                     and set(obj["data"]) <= {"sourceEntryId", "fingerprint", "visibility"}
+                ) or (record_type == "session_init" and _session_init_ok(obj)
+                ) or (record_type == "model_usage" and _model_usage_ok(obj)
+                ) or (record_type == "branch_summary" and _branch_summary_ok(obj)
                 ) or (record_type == "custom" and set(obj) == _TODO_HUD_FIELDS
                       and _custom_data_ok(custom_type, obj.get("data"))) or agent_message
                 if record_type == "ttsr_injection":
@@ -191,8 +233,13 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                             and prior_call(*call, start))
                 text = (f"[omp_event:{record_type}:{custom_type}] {obj['content']}"
                         if agent_message else f"[omp_event:{record_type}]")
+                if record_type == "session_init" and metadata_only:
+                    # Only the parent's instruction is searchable; prompt, tools and schema are never indexed.
+                    text = f"[omp_event:session_init] [subagent_task] {obj['task']}"
                 meta = {"unsupported_event": not metadata_only, "event_type": record_type, "role": "runtime"}
-                if metadata_only and (custom_type in _HOST_NOTICE_TYPES or record_type == "mode_change"
+                if metadata_only and record_type in ("session_init", "model_usage", "branch_summary"):
+                    meta["evidence_origin"] = {"session_init": "subagent_init"}.get(record_type, record_type)
+                elif metadata_only and (custom_type in _HOST_NOTICE_TYPES or record_type == "mode_change"
                                       or (record_type == "custom" and custom_type in (
                                           "user_todo_edit", "system-prompt-digest", "goal-completed"))):
                     meta["evidence_origin"] = f"host_notice:{custom_type or record_type}"
@@ -203,6 +250,16 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
             content = msg.get("content")
             timestamp = obj.get("timestamp") or msg.get("timestamp")
             timestamp = str(timestamp) if timestamp is not None else None
+            steering = role == "user" and "steering" in msg
+            if steering:
+                # Mid-run steering: only a user-attributed message is a user turn; agent-attributed is host text.
+                if (not set(msg) <= _STEERING_FIELDS or msg["steering"] is not True
+                        or msg.get("attribution") not in ("agent", "user")
+                        or ("liveSteered" in msg and msg["liveSteered"] is not True
+                            and not isinstance(msg["liveSteered"], str))):
+                    raise ValueError("unsupported OMP steering message shape")
+                if isinstance(content, str):
+                    content = [{"type": "text", "text": content}]
             if role not in ("user", "assistant", "toolResult", "developer") or not isinstance(content, list):
                 raise ValueError("unsupported OMP message shape")
             base = {"event_type": "message", "role": "tool" if role == "toolResult" else role}
@@ -216,6 +273,9 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                                for block in content)):
                     raise ValueError("unsupported OMP developer message shape")
                 base.update(role="runtime", evidence_origin="developer", attribution=msg.get("attribution"))
+            agent_steering = steering and msg["attribution"] == "agent"
+            if agent_steering:
+                base.update(role="runtime", evidence_origin="agent_steering")
             if role == "toolResult":
                 call_id = msg.get("toolCallId")
                 if not isinstance(call_id, str) or not call_id:
@@ -228,7 +288,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 # Image placeholders only; success is judged from the text blocks alone, as before images.
                 text = " ".join([as_text(block.get("text")) for block in text_blocks]
                                 + [f"[image:{block['mimeType']}]" for block in images])
-                unsupported = any(not _image_ok(block) and (not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str)) for block in content)
+                unsupported = ("details" in msg and not isinstance(msg["details"], dict)) or any(not _image_ok(block) and (not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str)) for block in content)
                 success = not msg["isError"] if type(msg.get("isError")) is bool else result_success(text_blocks)
                 chunks.append(make_chunk("omp", sid, "tool_result", f"[tool_result:{name or ''}] {text}",
                                          {**base, "call_id": call_id, "tool_name": name, "success": success,
@@ -243,10 +303,11 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 kind = block.get("type")
                 meta = dict(base)
                 if kind == "text" and isinstance(block.get("text"), str):
-                    event_kind, text = ("meta" if role == "developer" else "turn"), f"[message:{role}] {block['text']}"
+                    event_kind = "meta" if role == "developer" or agent_steering else "turn"
+                    text = f"[steering:agent] {block['text']}" if agent_steering else f"[message:{role}] {block['text']}"
                 elif kind == "image" and role == "user" and _image_ok(block):
                     # Attachments are not instructions: keep as runtime meta, never base64.
-                    meta.update(role="runtime", evidence_origin="image")
+                    meta.update(role="runtime", evidence_origin=base.get("evidence_origin", "image"))
                     event_kind, text = "meta", f"[image:{block['mimeType']}]"
                 elif kind == "toolCall" and role == "assistant" and isinstance(block.get("id"), str) and block["id"] and isinstance(block.get("name"), str) and block["name"]:
                     name = block["name"]
@@ -257,6 +318,10 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                     # Retain ordering but do not treat private reasoning as an assistant action.
                     meta.update(role="runtime", evidence_origin="thinking")
                     event_kind, text = "meta", "[thinking]"
+                elif (kind == "redactedThinking" and role == "assistant" and set(block) == {"type", "data"}
+                      and isinstance(block["data"], str)):
+                    meta.update(role="runtime", evidence_origin="thinking")
+                    event_kind, text = "meta", "[redacted_thinking]"
                 else:
                     meta["unsupported_event"] = True
                     event_kind, text = "meta", f"[unsupported_content:{kind}] {as_text(block)}"
