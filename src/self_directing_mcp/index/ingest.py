@@ -107,6 +107,18 @@ class AuditEvidenceSnapshot:
 _BATCH = 500
 
 
+def _load_deps(text):
+    """The stored receipt dependencies (see agy_receipts.dependencies), or None when absent or unreadable."""
+    try:
+        deps = json.loads(text) if text else None
+        if isinstance(deps, dict) and isinstance(deps.get("steps"), dict):
+            deps["steps"] = {int(step): digest for step, digest in deps["steps"].items()}
+            return deps
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def _batches(items, size=_BATCH):
     for start in range(0, len(items), size):
         check_request()
@@ -312,6 +324,14 @@ class SessionStore:
                 digest TEXT, synced_at TEXT NOT NULL,
                 PRIMARY KEY(provider,session_id)
             );
+            -- What the AGY events of a session were derived from besides its bytes: the receipt of each result step
+            -- and the first receipt (agy_receipts.dependencies). Bound to a cursor by synced_at like the receipt
+            -- digest above; a cursor written by an older process leaves it stale, which means "reparse", never "reuse".
+            CREATE TABLE IF NOT EXISTS session_receipt_deps (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL,
+                deps TEXT, synced_at TEXT NOT NULL,
+                PRIMARY KEY(provider,session_id)
+            );
             CREATE TABLE IF NOT EXISTS pending_index_deletions (
                 provider TEXT NOT NULL, session_id TEXT NOT NULL, chunk_id TEXT NOT NULL,
                 PRIMARY KEY(provider,session_id,chunk_id)
@@ -397,6 +417,14 @@ class SessionStore:
             record["receipt_digest"] = receipt[0] if receipt and receipt[1] == record["synced_at"] else None
         return record
 
+    def receipt_deps(self, session_id, provider, synced_at):
+        """What the indexed events of an AGY session were derived from (``agy_receipts.dependencies``), or None:
+        absent, unreadable, or written for another publication than the cursor stamped ``synced_at``."""
+        with self._read_boundary():
+            row = self._conn.execute("SELECT deps,synced_at FROM session_receipt_deps WHERE provider=? AND session_id=?",
+                                     (provider, session_id)).fetchone()
+        return _load_deps(row[0]) if row and row[1] == synced_at else None
+
     def get_cursor(self, session_id, provider="codex"):
         record = self.cursor_record(session_id, provider)
         return (record["byte_offset"], record["path"]) if record else (0, None)
@@ -432,31 +460,35 @@ class SessionStore:
         return changed == 1
 
     def commit_events(self, chunks, *, session_id, provider, path, offset, digest, replace=False,
-                      parser_version=None, expected_token=None, prepared_rows=None, receipt_digest=None, blocks=None):
+                      parser_version=None, expected_token=None, prepared_rows=None, receipt_digest=None, blocks=None,
+                      receipt_deps=None):
         """``blocks``: the ``BlockDraft`` published with the cursor in the same transaction. A publication without
-        one (a source whose cursor is a plain digest) removes the session's block row."""
+        one (a source whose cursor is a plain digest) removes the session's block row.
+
+        ``receipt_deps`` (AGY): the JSON of ``agy_receipts.dependencies`` for the events as they stand after this
+        commit, written with the cursor. A commit without it leaves none, which makes the next receipt change reparse."""
         spool = prepared_rows if isinstance(prepared_rows, RowSpool) else RowSpool.from_chunks(chunks)
         try:
             self._commit_spool(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
                                replace=replace, parser_version=parser_version, expected_token=expected_token,
-                               receipt_digest=receipt_digest, blocks=blocks)
+                               receipt_digest=receipt_digest, blocks=blocks, receipt_deps=receipt_deps)
         finally:
             if spool is not prepared_rows:
                 spool.close()
 
     def _commit_spool(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
-                      expected_token, receipt_digest, blocks=None):
+                      expected_token, receipt_digest, blocks=None, receipt_deps=None):
         check_request()
         self._counts.clear()
         try:
             self._commit_rows(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
                               replace=replace, parser_version=parser_version, expected_token=expected_token,
-                              receipt_digest=receipt_digest, blocks=blocks)
+                              receipt_digest=receipt_digest, blocks=blocks, receipt_deps=receipt_deps)
         finally:
             self._counts.clear()  # a rolled-back write leaves no trace in total_changes
 
     def _commit_rows(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
-                     expected_token, receipt_digest, blocks=None):
+                     expected_token, receipt_digest, blocks=None, receipt_deps=None):
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             if expected_token is not None and self.state_token(session_id, provider) != expected_token:
@@ -514,6 +546,8 @@ class SessionStore:
                 if provider == "agy":
                     self._conn.execute("INSERT OR REPLACE INTO session_receipt_versions VALUES (?,?,?,?)",
                                        (provider, session_id, receipt_digest, synced_at))
+                    self._conn.execute("INSERT OR REPLACE INTO session_receipt_deps VALUES (?,?,?,?)",
+                                       (provider, session_id, receipt_deps, synced_at))
                     self._conn.execute("INSERT OR REPLACE INTO session_agy_stats VALUES (?,?,?)",
                                        (session_id, json.dumps(dict(prior + tally), sort_keys=True), synced_at))
                 self._conn.execute("INSERT OR REPLACE INTO session_metrics VALUES (?,?,?,?,?)",
@@ -1435,6 +1469,11 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                     known = store.cursor_record(sid_hint.lower() if provider in ("codex", "agy") else sid_hint, provider)
                     record = store.source_block_record(known["session_id"], provider) if known else None
                 hint = (known["byte_offset"],) if known and type(known["byte_offset"]) is int else ()
+                if provider == "agy":
+                    # Every receipt anchors to a prefix digest and the ledger to a verified length: hash the capture
+                    # at those offsets and none of them costs a second read of the file.
+                    from self_directing_mcp.agy_receipts import ReceiptStore
+                    hint += ReceiptStore(store.db_path.parent).checkpoints(sid_hint.lower(), path)
             except (OSError, sqlite3.Error):
                 hint, known, record = (), None, None
         observation = _capture_observation(path, provider, known, record, hint, verify, policy,
@@ -1453,7 +1492,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         claimed = peek_session_id(path)
         if claimed is not None and (claimed.lower() if provider in ("codex", "agy") else claimed) != sid:
             raise ValueError("session identity differs from observed source")
-        receipt_store, receipts, fallback_retries = None, {}, ()
+        receipt_store, receipts, fallback_retries, cursor_deps = None, {}, (), None
         with guard(), store._read_boundary():
             cursor = store.cursor_record(sid, provider)
             record = store.source_block_record(sid, provider) if cursor else None
@@ -1463,6 +1502,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             if provider == "agy":
                 from self_directing_mcp.agy_receipts import ReceiptStore
                 fallback_retries = store.agy_fallback_retries(sid) if cursor else ()
+                cursor_deps = store.receipt_deps(sid, provider, cursor["synced_at"]) if cursor else None
                 receipt_store = ReceiptStore(store.db_path.parent)
                 receipt_capture = receipt_store.read_capture(sid)
                 receipt_authority_before = receipt_store.authority_token(sid)
@@ -1501,18 +1541,27 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 # A fallback that failed because the full log was missing or not yet at that step: it is retried
                 # once per change of the full log, and only for those transient failures.
                 start, reindexed, reindex_reason = 0, True, "truncated_fallback_retry"
-        receipt_digest = None
+        receipt_digest = receipt_ledger = None
+        receipts_dirty = False
         if receipt_store is not None:
-            receipt_rows, receipts, receipt_digest, indexed_digest = receipt_store.prepare_bindings(receipt_capture, path)
-            if cursor and (receipt_digest != indexed_digest or cursor.get("receipt_digest") != receipt_digest):
+            receipt_rows, receipts, receipt_digest, indexed_digest, receipt_ledger = receipt_store.prepare_bindings(
+                receipt_capture, path, session_id=sid, observation=observation)
+            from self_directing_mcp.agy_receipts import affects_index
+            receipts_dirty = bool(cursor) and (receipt_digest != indexed_digest
+                                               or cursor.get("receipt_digest") != receipt_digest)
+            # The receipts moved since the indexed events were built. Those events are still what a fresh parse
+            # would produce unless a receipt they were derived from changed (agy_receipts.dependencies): the usual
+            # case is a receipt for a step that has no result yet. Anything unproven reparses from byte 0.
+            if receipts_dirty and (reindexed or affects_index(cursor_deps, receipt_rows)):
                 start, reindexed, reindex_reason = 0, True, "hook_receipts_changed"
         chunks = RowSpool()
+        uses = set()
         try:
             if cursor and not reindexed and provider != "agy" and start >= observation.complete_end:
                 offset, parsed_sid = start, sid
             elif provider == "agy":
                 _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, receipts=receipts,
-                                                             sink=chunks)
+                                                             sink=chunks, uses=uses)
             elif provider == "omp" and start:
                 # This lookup is request-owned and bound to the captured cursor generation.
                 earliest = {}
@@ -1529,6 +1578,14 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             blockable = _blockable(provider, path)
             digest = observation.cursor_hash(offset, "blocks" if blockable else "sha")
             draft = _draft(observation, offset, record) if blockable else None
+            receipt_deps = None
+            if receipt_store is not None:
+                from self_directing_mcp.agy_receipts import dependencies
+                # An append extends what the stored events depend on; without stored dependencies (an index from
+                # before they were kept) there is nothing to extend and the next receipt change reparses.
+                prior = None if reindexed or not cursor else cursor_deps
+                if reindexed or not cursor or prior is not None:
+                    receipt_deps = json.dumps(dependencies(receipt_rows, uses, prior), sort_keys=True)
         except BaseException:
             chunks.close()
             raise
@@ -1562,18 +1619,19 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 if receipt_store is not None:
                     if receipt_store.authority_token(sid) != receipt_authority_before:
                         raise ValueError("receipt authority changed during preparation")
-                    receipt_store.publish_bindings(sid, receipt_capture, receipt_rows)
+                    receipt_store.publish_bindings(sid, receipt_capture, receipt_rows, receipt_ledger)
                 # A cursor without a block table (written before this version, by an older process, or after a
                 # change of source form) is republished with one, even when nothing else changed.
                 own = draft is not None and cursor is not None and cursor["path"] == str(path) and relation is None
                 bound = own and record is not None and record.bound_to(cursor)
                 needs_table = own and not bound
                 if (chunks.count or reindexed or cursor is None or offset != cursor["byte_offset"]
-                        or relation == "moved" or needs_table):
+                        or relation == "moved" or needs_table or receipts_dirty):
+                    # receipts_dirty: the events stand, but they now belong to these receipts (and their dependencies).
                     store.commit_events((), session_id=sid, provider=provider, path=path, offset=offset,
                                         digest=digest, replace=reindexed, parser_version=parser_version,
                                         expected_token=expected_token, prepared_rows=chunks, receipt_digest=receipt_digest,
-                                        blocks=draft)
+                                        blocks=draft, receipt_deps=receipt_deps)
                 elif bound and observation.mode == "full":
                     # Nothing to publish, but every block was just compared: stamp the stored table.
                     stamp = observation.stamp

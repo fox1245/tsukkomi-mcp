@@ -130,8 +130,10 @@ native result with the exact `step_index`; no adjacency inference is used.
 Success requires both a matching Post receipt without an error and an explicit
 successful native command exit (`Output:` and observed `Stdout:` layouts).
 Missing, mismatched, stale, duplicate, or unlinked receipts cannot establish
-success. Receipt revisions trigger local reparsing even if transcript bytes have
-not changed. Installing hooks does not retroactively manufacture receipts.
+success. A receipt revision that can change an event that is already indexed triggers
+local reparsing even if transcript bytes have not changed (see
+[Hook cost](#hook-cost-what-a-hook-reads)); any other receipt is indexed with the
+records that follow it. Installing hooks does not retroactively manufacture receipts.
 
 A prefix-bound Pre receipt plus the native structured hook-denial error is retained
 as nonexecution metadata. It is not a successful tool result, and does not poison
@@ -149,6 +151,54 @@ Receipts are not accepted through an MCP/model-facing API.
 CLI 1.2.9 emits `NO_TOOL_CALL` for normal Stop; the documented `model_stop` is
 also accepted. All other termination reasons pause/stop without restarting.
 Other native record formats remain unsupported until observed and validated.
+
+### Hook cost: what a hook reads
+
+A hook costs what was appended since the last one, not the size of the transcript. Three mechanisms
+make that so, and each one falls back to the whole-file parse the hooks always did whenever it cannot prove itself.
+
+1. **One pass, from a verified prefix.** A receipt hashes the file once and parses only the records after a prefix it
+   already knows. For each conversation and file, `agy-receipts.sqlite` keeps the length of the last scanned prefix and
+   the SHA-256 of exactly those bytes, the file identity, the highest step number, whether any record lacked an integer
+   `step_index`, and the digest of every completed result (`scan_state`, `scan_results`). This ledger is a cache of a
+   parse, never evidence. It is used only after the SHA-256 of that prefix was recomputed from the file in the pass that
+   hashes it for the current hook (a hash state is kept at the stored length, so the check costs nothing extra), and only
+   for the same path and file identity. A step the transcript has already reached (a repeated or late hook: the position
+   matters), a result numbered at or below the stored maximum, an unreadable line, a different file or any mismatch parses
+   the whole file. A failed parse stores nothing, and writes are compare-and-set on the stored length and digest in the
+   transaction of the receipt that needed them. What a receipt records is unchanged: the same fields and the same plain
+   SHA-256 `prefix_hash`.
+2. **Anchors in the capture pass.** A sync hashes the file once with a state at the `prefix_length` of every receipt, so
+   checking the anchor of each linked result needs no further read; it used to re-read the whole prefix once per linked
+   result. The anchor is always the plain SHA-256 of the file's bytes as they are now. AGY sources are verified in
+   full, never with block digests or samples (`integrity.full_reason: "legacy_source"`), and no cache or cheap
+   observation can turn a mismatch into a link.
+3. **A receipt reindexes a conversation only when it can change an indexed event.** The parser reads receipts in two
+   ways only: the receipt of the step of each result record it turned into events, and the conversation's first
+   receipt, which decides `legacy_unlinked`. The index stores, with the cursor and in the same transaction
+   (`session_receipt_deps`), the digest of the receipt of every result step it parsed and the first receipt. A sync
+   reparses from byte 0, with the existing `reindex_reason: "hook_receipts_changed"`, when the receipt of an indexed
+   result step changed (added, removed or modified), or when the first receipt moved past an indexed result. A receipt for
+   a step that has no result yet (the usual `PreToolUse`), and a `PostToolUse` that arrives before its result is
+   indexed, are plain appends; the cursor is still republished so the stored receipt digest follows the receipts. A
+   `PostToolUse` that pairs a result a sync already indexed as unlinked reparses, as does an index without stored
+   dependencies (written before this version, or by an older process): once, on its next receipt change.
+
+Measured with `scripts/bench_agy_hooks.py` (WSL2, ext4, Python 3.12; synthetic transcripts with a linked receipt per result; a few KB appended
+before each hook; each hook a fresh process, interpreter start and imports included; median of five cycles; wall / CPU
+seconds, and a process that only starts the engine costs about 0.3 / 0.3):
+
+| Transcript | `PreToolUse` before | after | `PostToolUse` before | after |
+|---|---|---|---|---|
+| 0.1 MB | 0.44 / 0.35 | 0.38 / 0.33 | 0.42 / 0.34 | 0.36 / 0.31 |
+| 1 MB | 0.89 / 0.77 | 0.45 / 0.36 | 0.84 / 0.75 | 0.41 / 0.33 |
+| 3 MB | 2.83 / 2.68 | 0.45 / 0.40 | 2.74 / 2.60 | 0.44 / 0.39 |
+| 10 MB | 20.5 / 20.1 | 0.51 / 0.45 | 20.4 / 20.0 | 0.58 / 0.52 |
+
+What still grows with the file: two SHA-256 passes per hook (one for the receipt, one for the sync's capture;
+about 14 ms per 10 MB each), and per-receipt work done in C (reading the receipts to check them, comparing the stored
+dependencies): about 0.1 s for 3,400 receipts. The first hook after an upgrade, or after the transcript was
+replaced, parses the whole file once.
 
 ### Parser version 6: truncated fields, result statuses and legacy results
 

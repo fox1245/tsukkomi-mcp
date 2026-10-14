@@ -1,6 +1,7 @@
 """Shared lossless JSONL and event helpers. Raw evidence stays local."""
 from __future__ import annotations
 
+import bisect
 import hashlib
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -372,7 +373,7 @@ def _hash_prefix(stream, length, checkpoints, *, sha=True, scan=None, start=0, m
             raise SourceChanged("source truncated during read")
         end = position + len(data)
         newline = data.rfind(b"\n")
-        splits = {o - position for o in wanted if position < o <= end}
+        splits = {o - position for o in wanted[bisect.bisect_right(wanted, position):bisect.bisect_right(wanted, end)]}
         if newline >= 0 and position + newline + 1 > min_boundary:
             splits.add(newline + 1)
         if scan is not None:
@@ -616,7 +617,11 @@ _source_observation: ContextVar[SourceObservation | None] = ContextVar("source_o
 
 def observed_source(path: Path) -> SourceObservation | None:
     observation = _source_observation.get()
-    return observation if observation is not None and Path(path).resolve() == observation.path else None
+    if observation is None:
+        return None
+    candidate = Path(path)
+    # ``observation.path`` is resolved: an equal path needs no filesystem lookup (one per result record otherwise).
+    return observation if candidate == observation.path or candidate.resolve() == observation.path else None
 
 
 @contextmanager

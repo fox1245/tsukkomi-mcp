@@ -32,6 +32,13 @@ FALLBACK_FIELDS = {"USER_INPUT": ("content",), "PLANNER_RESPONSE": ("content", "
 JUDGED_FIELDS = frozenset({("USER_INPUT", "content"), ("PLANNER_RESPONSE", "content"),
                            ("PLANNER_RESPONSE", "tool_calls")} | {(kind, "content") for kind in RESULT_TYPES})
 _ID = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\Z")
+# ``iter_raw_lines`` decodes with surrogateescape: a byte that is not UTF-8 becomes one of these code points.
+_UNDECODABLE = re.compile("[\udc80-\udcff]")
+
+
+def has_undecodable(raw: str) -> bool:
+    """Does the line hold a byte that was not valid UTF-8? Pure ASCII (almost every record) needs no search."""
+    return not raw.isascii() and _UNDECODABLE.search(raw) is not None
 
 
 class PathTraversalError(ValueError):
@@ -398,7 +405,8 @@ _EXIT_HEADER = re.compile(r"\ACreated At: [^\n]+\nCompleted At: [^\n]+\n\n"
                           r"The command exited with code (-?\d+)\.\n(?:Output|Stdout):\n")
 
 
-def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, receipts=None, sink=None):
+def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, receipts=None, sink=None,
+                         uses=None):
     """Read the host's display JSONL, not lifecycle hook payloads.
 
     CLI 1.2.9 emits JSON-encoded values in tool_calls[].args and omits call IDs.
@@ -408,6 +416,10 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
     cut keeps its visible text and is marked in the chunk meta. GENERIC results with no host receipt are
     ``legacy_unlinked`` only when they precede this conversation's first receipt (or it has none); a result after
     its first receipt that lacks one stays an unsupported, current-session defect.
+
+    ``uses`` (a set) receives the step of every result record whose output was derived from ``receipts``: exactly the
+    records an index would have to rewrite if the receipt of that step changed. Together with ``first_receipt``
+    (which decides ``legacy_unlinked``) that is everything the parse reads from ``receipts``.
     """
     sid = peek_session_id(path)
     if sid is None or (session_id is not None and sid != session_id.lower()):
@@ -416,6 +428,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
     is_full = path.name == FULL_NAME
     receipts = receipts or {}
     first_receipt = min(receipts) if receipts else None
+    resolved = str(path.resolve())  # compared with every receipt's path; one lookup, not one per result
     siblings: list[_FullTranscript] = []
 
     def get_full():
@@ -431,7 +444,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
         if not raw.strip():
             continue
         try:
-            if any(0xDC80 <= ord(c) <= 0xDCFF for c in raw):
+            if has_undecodable(raw):
                 raise ValueError("invalid UTF-8")
             record, padding = load_line(raw)
             if not isinstance(record, dict):
@@ -533,8 +546,10 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 exit_code = record.get("exit_code") if kind == "RUN_COMMAND" else None
                 if exit_code is not None and type(exit_code) is not int:
                     raise ValueError("invalid exit_code")
-                observation = linked_receipt(receipts, step, path, start,
-                                             result_record=record, require_paired=False)
+                if uses is not None:
+                    uses.add(step)
+                observation = linked_receipt(receipts, step, path, start, result_record=record,
+                                             require_paired=False, resolved=resolved)
                 if (observation and not observation.get("paired") and status == "ERROR"
                         and isinstance(error, str) and error.startswith("tool call denied by pre-tool hook: ")):
                     # Native host rejection plus the anchored Pre receipt proves
