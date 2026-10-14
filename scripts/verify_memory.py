@@ -111,7 +111,8 @@ def manifest(profile: str) -> dict:
     compiler = run(["gcc", "-dumpfullversion"], capture_output=True, text=True).stdout.strip()
     return {"profile": profile, "flags": PROFILES[profile]["flags"], "gcc": compiler,
             "python": "%d.%d" % sys.version_info[:2], "neograph_version": version,
-            "neograph_sdist_sha256": NEOGRAPH_SDISTS[version], "sqlite_vector": list(SQLITE_VECTOR)}
+            "neograph_sdist_sha256": NEOGRAPH_SDISTS[version], "sqlite_vector": list(SQLITE_VECTOR),
+            "sqlite_vector_extra_flags": VECTOR_EXTRA_FLAGS.get(profile, "")}
 
 
 # --- native builds ------------------------------------------------------------------------------------------
@@ -146,6 +147,14 @@ def build_neograph(profile: str, out: Path, ccache: bool) -> None:
              *[f"-C{key}={value}" for key, value in settings.items()]])
 
 
+# Known upstream undefined behaviour in sqlite-vector 1.1.0, exempted for that library only: cpu_supports_avx512()
+# (src/distance-cpu.c:823) computes ``1 << 31`` on an int while probing CPUID, which UBSan reports as shift-base on
+# CPUs that reach that probe (GitHub's AVX-512 runners; not an AMD Zen 3 workstation). The build uses
+# -fno-sanitize-recover, so a suppression file cannot help; only this one check is left out of this one library, and
+# NeoGraph, CPython and the canaries keep the full -fsanitize=undefined set.
+VECTOR_EXTRA_FLAGS = {"asan": " -fno-sanitize=shift-base"}
+
+
 def build_sqlite_vector(profile: str, out: Path) -> None:
     spec, (tag, commit) = PROFILES[profile], SQLITE_VECTOR
     source = out / "sqlite-vector"
@@ -155,7 +164,8 @@ def build_sqlite_vector(profile: str, out: Path) -> None:
     if head != commit:
         raise SystemExit(f"sqlite-vector {tag} resolved to {head}, expected {commit}")
     run(["make", "-C", source, "extension", "STRIP=true",
-         f"CFLAGS=-Wall -Wno-unused-parameter -Isrc -Ilibs {spec['flags']}", f"LDFLAGS=-shared {spec['link']}"],
+         f"CFLAGS=-Wall -Wno-unused-parameter -Isrc -Ilibs {spec['flags']}{VECTOR_EXTRA_FLAGS.get(profile, '')}",
+         f"LDFLAGS=-shared {spec['link']}"],
         stdout=subprocess.DEVNULL)
     shutil.copy2(source / "dist" / "vector.so", out / "vector.so")
 
@@ -324,9 +334,12 @@ def command_test(args) -> int:
     tests = list(args.pytest_args)
     if args.profile == "tsan":
         tests += [f"--deselect={test}" for test in TSAN_DESELECT]
-    # Unbuffered output (below) keeps the progress written before a native exit, so a run that dies early still
-    # shows how far it got. pytest keeps its default fd capture: the MCP stdio tests hand sys.stderr to a child.
-    command = [*prefix, sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *tests]
+    # No output capture (-s), unbuffered (below). Under pytest's fd capture the GitHub ASan run of the phase-1 branch
+    # died about 10 s in with exit status 1 and no output at all (nothing in the sanitizer logs, the session-end leak
+    # check never ran); it did not reproduce locally on CPython 3.12.3 or 3.12.14, and the same CI run completed with
+    # sys-level capture. Without capture any native message reaches the job log, and the MCP stdio tests still get a
+    # real sys.stderr for their child (sys-level capture broke them).
+    command = [*prefix, sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", *tests]
     print("+", " ".join(command), flush=True)
     # UBSan writes to stderr even when ASan logs to files, so the run's output is kept and scanned too.
     env = {**env, "PYTHONUNBUFFERED": "1"}
