@@ -909,6 +909,13 @@ class SelfDirectEngine:
             updated = self.contracts.prepare_upsert(document, rules)
             payload = document.model_dump_json(indent=2)
             self.contracts.publish_document(document, payload, token)
+        try:
+            # Informational report of equivalent spellings the regexes miss. Imported here and nowhere else, so
+            # hook paths never load the variant library; it runs after the save and can only add this section.
+            from self_directing_mcp.audit.variants import fragility_report
+            fragility = fragility_report(updated)
+        except Exception as exc:
+            fragility = {"informational": True, "status": "unavailable", "error": type(exc).__name__}
         return {
             "ok": True,
             "returned": "upserted",
@@ -918,6 +925,7 @@ class SelfDirectEngine:
                 "upserted": len(updated),
                 "store": len(document.contracts),
             },
+            "fragility": fragility,
         }
 
     def _verified_checklist_evidence(self, evidence_ids, chunks, complete) -> bool:

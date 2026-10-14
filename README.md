@@ -80,6 +80,31 @@ Contract regexes (`regex`, `before_regex`, `exception_regex`, `when.tool_call_re
 
 Set these only when the user asked for them. The high-risk presets in [`src/self_directing_mcp/resources/high_risk_presets.json`](src/self_directing_mcp/resources/high_risk_presets.json) are four example `must_not` contracts with `risk: "high"`: `preset-no-recursive-delete`, `preset-no-write-outside-workspace` (a path-pattern approximation to replace with your own boundary), `preset-no-force-push` and `preset-no-branch-delete`. They ship with `enabled: false` and exist in the contract store only when `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS=true`, where they are added if their id is missing and are never altered or re-enabled. The owner enables the ones they want.
 
+#### Contract fragility report (informational)
+
+A regex over command text is easy to bypass with an equivalent spelling (`rm -r -f` for `rm -rf`), channel (`python3 -c "shutil.rmtree(...)"`) or lexical trick (a backslash-newline, `busybox rm`, a GNU option abbreviation). The `upsert_contracts` response therefore ends with a `fragility` section that says which of those spellings the regex you just saved does **not** match.
+
+- **How it is chosen.** The server holds a versioned library of equivalent spellings ([`resources/contract_variants.json`](src/self_directing_mcp/resources/contract_variants.json)) in ten families: `recursive_delete`, `force_push`, `discard_worktree`, `world_writable`, `remote_script_exec`, `read_secret_file`, `stage_all`, `db_cli_access`, `skip_tests` and `tls_verify_off`. A family is reported only when the regex matches one of its canonical (standard) spellings; the section then lists that family's other spellings the regex misses, with their platform, technique and preconditions. Families the regex is not about are not mentioned. For a `must_not` contract the `regex` is analyzed; for a `must` it is the gated action (`before_regex`).
+- **Informational only.** It never blocks a registration, never edits or broadens a regex and never changes a verdict: findings still come from the saved regex alone. Use it as a prompt to widen the regex deliberately, if you want to. `exception_regex` and `when` are not analyzed.
+- **Unverified candidates.** Every library entry has `verified: false`: equivalence was not verified by execution, and the response says so (`"verified": false` and a note). A listed spelling may behave differently on your platform or tool version; read its preconditions.
+- **Deterministic and offline.** No model is involved. The report names the `library_version` that produced it. Each spelling is matched as plain command text with the contract regex engine (case-insensitive, multiline, the same time limits). A regex that exceeds them produces an explicit `"status": "regex_timeout"` entry for that contract, never a failure of the save.
+- **Bounded.** At most 8 spellings per family (`missed_total` counts all misses, `omitted` the unlisted ones; a capped list takes one spelling per technique in turn), 4 families per contract (`families_omitted`), 20 contracts per call (`contracts_not_analyzed`) and about 3 s per call (`skipped_time_budget`). A contract without such a pattern, or whose regex matches every listed spelling, is omitted.
+- **Hook paths never load it.** Only `upsert_contracts` imports the library, after the contracts are saved. If the library cannot be read, the response carries `"fragility": {"status": "unavailable", ...}` and the contracts are still saved.
+
+Abridged example for `{"id": "no-rm", "type": "must_not", "scope": "tool_call", "regex": "rm\\s+-rf"}`:
+
+```json
+"fragility": {
+  "library_version": "1.0.0", "informational": true, "verified": false, "analyzed": 1,
+  "contracts": [{"contract_id": "no-rm", "field": "regex", "status": "ok", "families_omitted": 0, "families": [{
+    "family": "recursive_delete", "matched_canonical": ["rm -rf build"], "missed_total": 19, "omitted": 11,
+    "missed_variants": [
+      {"id": "recursive_delete.split_flags", "text": "rm -r -f build", "platform": "posix",
+       "technique": "option_split", "verified": false},
+      {"id": "recursive_delete.python_rmtree", "text": "python3 -c \"import shutil; shutil.rmtree('build')\"",
+       "platform": "python", "technique": "interpreter", "verified": false, "preconditions": ["python3 on PATH"]}]}]}]}
+```
+
 ### 2. Checklist with evidence gating (`update_checklist`)
 - Track user requirements with provenance and completion criteria.
 - A completion claim without evidence is downgraded to `pending_verification`. An item becomes `done` (`verified=true`) only when its `evidence_chunk_ids` resolve to successful tool results linked to their calls **and** session coverage is complete. While appended bytes are unread, coverage is incomplete, so the item stays `pending_verification` until a later call sees the caught-up history.
@@ -155,7 +180,7 @@ Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout
 
 | Category | Tool | Description |
 |---|---|---|
-| **Governance & Contracts** | `upsert_contracts` | Create or update explicit invariant rules (`must` / `must_not`). |
+| **Governance & Contracts** | `upsert_contracts` | Create or update explicit invariant rules (`must` / `must_not`). The response adds an informational [fragility report](#contract-fragility-report-informational): equivalent spellings the saved regexes miss. |
 | | `list_contracts` | Inspect active contracts for the current session and global scope. |
 | | `revoke_contract` | Disable a contract while preserving history. |
 | | `check_action` | Pre-flight test of a proposed action against current contracts. `verify="fast"` selects the hook-time source verification; the result's `integrity` says what was compared. |
