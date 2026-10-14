@@ -432,6 +432,53 @@ class ReceiptStore:
                 conn.commit()
 
 
+# What an index of this transcript rests on, besides the transcript itself (see ``dependencies``).
+DEPENDENCIES_VERSION = 1
+
+
+def _row_digest(payload: str | None) -> str:
+    return "" if payload is None else hashlib.blake2b(payload.encode(), digest_size=8).hexdigest()
+
+
+def dependencies(rows, uses, prior: dict | None = None) -> dict:
+    """What the indexed events were derived from, to be stored with the cursor they belong to.
+
+    The parse reads receipts in two ways only (see ``parse_session_chunks``): the receipt of the step of each result
+    record it turned into events (``uses``), and the first receipt of the conversation, which decides whether an
+    unlinked result predates the receipts. So an index stays exactly what a fresh parse would build for as long
+    as neither changes. ``rows`` are the receipts the parse saw as ``(step, json)``; ``prior`` the dependencies
+    of the events already indexed (an append adds to them; a full parse starts from none).
+    """
+    by_step = dict(rows)
+    steps = dict(prior["steps"]) if prior else {}
+    for step in uses:
+        steps[step] = _row_digest(by_step.get(step))
+    return {"v": DEPENDENCIES_VERSION, "first": min(by_step) if by_step else None, "steps": steps}
+
+
+def affects_index(deps: dict | None, rows) -> bool:
+    """May a fresh parse with ``rows`` differ from the indexed events ``deps`` describes? True when unsure.
+
+    Differs only if the receipt of an indexed result step changed (added, removed or modified), or the first
+    receipt moved past an indexed result: such a result is ``legacy_unlinked`` exactly when its step is below the
+    first receipt, so only steps between the old and the new first receipt can flip. Missing or foreign
+    dependencies (an index from before they were kept) answer True: the caller reparses, as it always did.
+    """
+    if not isinstance(deps, dict) or deps.get("v") != DEPENDENCIES_VERSION or not isinstance(deps.get("steps"), dict):
+        return True
+    by_step = dict(rows)
+    steps = deps["steps"]
+    for step, digest in steps.items():
+        if _row_digest(by_step.get(step)) != digest:
+            return True
+    then, now = deps.get("first"), (min(by_step) if by_step else None)
+    if then != now:
+        moved = [first for first in (then, now) if first is not None]
+        low, high = min(moved), (max(moved) if len(moved) == 2 else None)
+        return any(step >= low and (high is None or step < high) for step in steps)
+    return False
+
+
 def linked_receipt(receipts: dict[int, dict], step: int, path: Path, before_byte: int,
                    *, result_record: dict, require_paired: bool = True, resolved: str | None = None) -> dict | None:
     """The receipt that ties the result record at ``before_byte`` to a call, or None.

@@ -405,7 +405,8 @@ _EXIT_HEADER = re.compile(r"\ACreated At: [^\n]+\nCompleted At: [^\n]+\n\n"
                           r"The command exited with code (-?\d+)\.\n(?:Output|Stdout):\n")
 
 
-def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, receipts=None, sink=None):
+def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, receipts=None, sink=None,
+                         uses=None):
     """Read the host's display JSONL, not lifecycle hook payloads.
 
     CLI 1.2.9 emits JSON-encoded values in tool_calls[].args and omits call IDs.
@@ -415,6 +416,10 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
     cut keeps its visible text and is marked in the chunk meta. GENERIC results with no host receipt are
     ``legacy_unlinked`` only when they precede this conversation's first receipt (or it has none); a result after
     its first receipt that lacks one stays an unsupported, current-session defect.
+
+    ``uses`` (a set) receives the step of every result record whose output was derived from ``receipts``: exactly the
+    records an index would have to rewrite if the receipt of that step changed. Together with ``first_receipt``
+    (which decides ``legacy_unlinked``) that is everything the parse reads from ``receipts``.
     """
     sid = peek_session_id(path)
     if sid is None or (session_id is not None and sid != session_id.lower()):
@@ -541,6 +546,8 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 exit_code = record.get("exit_code") if kind == "RUN_COMMAND" else None
                 if exit_code is not None and type(exit_code) is not int:
                     raise ValueError("invalid exit_code")
+                if uses is not None:
+                    uses.add(step)
                 observation = linked_receipt(receipts, step, path, start, result_record=record,
                                              require_paired=False, resolved=resolved)
                 if (observation and not observation.get("paired") and status == "ERROR"

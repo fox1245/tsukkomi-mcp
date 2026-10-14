@@ -284,6 +284,92 @@ def test_an_anchor_is_checked_against_the_bytes_of_the_file_not_a_block_table(se
 
 # --- the sync side ---------------------------------------------------------------------------------------------
 
+def test_a_hook_cycle_never_reparses_the_transcript(session, scans, monkeypatch):
+    session.engine.upsert_contracts([{"id": "no-wipe", "type": "must_not", "scope": "tool_call", "provider": "agy",
+                                      "regex": r"rm\s+-rf"}])
+    step = blocks(session, 4)
+    info = session.sync()
+    cursor = info["byte_offset"]
+    from self_directing_mcp import agy as agy_module
+    parses = []
+    real = agy_module.parse_session_chunks
+    monkeypatch.setattr(agy_module, "parse_session_chunks",
+                        lambda *args, **kwargs: parses.append(kwargs.get("start_byte")) or real(*args, **kwargs))
+    scans.clear()
+    for number in range(3):
+        call = {"name": "run_command", "args": {"CommandLine": f"echo late {number}", "Cwd": "/synthetic"}}
+        append(session.path, planner(step, f"echo late {number}"))
+        assert isinstance(agy_hooks.run_hook("PreToolUse", session.payload(step + 1, call), engine=session.engine), dict)
+        append(session.path, result(step + 1))
+        assert agy_hooks.run_hook("PostToolUse", session.payload(step + 1, call, ""), engine=session.engine) == {}
+        step += 2
+    assert parses and all(start >= cursor > 0 for start in parses)  # the chunk parser began at the cursor each time
+    assert scans and min(scans) > 0  # and so did the ledger's
+    info = session.sync()
+    assert info["reindexed"] is False and info["reindex_reason"] is None
+    assert info["new_chunks"] == 0 and "unread_bytes" not in info["coverage"]["issues"]
+    assert set(session.linkages().values()) == {"host_step_receipt"}
+
+
+def test_the_stored_receipt_digest_follows_the_receipts_without_a_reparse(session):
+    step = blocks(session, 2)
+    session.sync()
+    append(session.path, planner(step))
+    session.pre(step + 1)
+    info = session.sync()
+    assert info["reindexed"] is False
+    coverage = info["coverage"]
+    assert "receipts_not_indexed" not in session.engine.audit_status(SID, provider="agy")["session"]["issues"]
+    assert coverage["receipt_digest"] == session.receipts.authority_token(SID)[2]
+
+
+def test_a_post_that_pairs_a_result_already_indexed_reparses_and_links_it(session):
+    write(session.path, [user(0), planner(1)])
+    session.pre(2)
+    append(session.path, result(2))
+    info = session.sync()  # the result is indexed while its receipt is still unpaired
+    assert session.linkages() == {2: "native_log_omits_call_id"} and info["reindexed"] is False
+    session.post(2)
+    info = session.sync()
+    assert info["reindexed"] is True and info["reindex_reason"] == "hook_receipts_changed"
+    assert session.linkages() == {2: "host_step_receipt"}
+
+
+@pytest.mark.parametrize("step,reparsed", [(1, True), (9, False)])
+def test_a_first_receipt_changes_the_index_only_for_results_below_or_above_it(session, step, reparsed):
+    write(session.path, [user(0), planner(1), result(2), planner(3), result(4)])
+    assert session.sync()["new_chunks"] > 0
+    assert set(session.linkages().values()) == {"legacy_unlinked"}
+    session.pre(step)  # results 2 and 4 are indexed; a receipt for step 1 predates them, one for step 9 does not
+    info = session.sync()
+    assert info["reindexed"] is reparsed
+    expected = "native_log_omits_call_id" if reparsed else "legacy_unlinked"
+    assert set(session.linkages().values()) == {expected}
+
+
+def test_an_index_that_never_stored_dependencies_reparses_once_and_then_stops(session):
+    step = blocks(session, 2)
+    session.sync()
+    with sqlite3.connect(session.database) as conn:  # an index written before dependencies existed
+        conn.execute("DELETE FROM session_receipt_deps")
+    append(session.path, planner(step))
+    session.pre(step + 1)
+    info = session.sync()
+    assert info["reindexed"] is True and info["reindex_reason"] == "hook_receipts_changed"
+    append(session.path, result(step + 1))
+    session.post(step + 1)
+    assert session.sync()["reindexed"] is False
+
+
+def test_dependencies_written_by_another_publication_are_not_used(session):
+    step = blocks(session, 2)
+    session.sync()
+    with sqlite3.connect(session.database) as conn:  # an older process republished the cursor
+        conn.execute("UPDATE session_receipt_deps SET synced_at = 'another publication'")
+    append(session.path, planner(step))
+    session.pre(step + 1)
+    assert session.sync()["reindex_reason"] == "hook_receipts_changed"
+
 
 def test_a_receipt_of_another_file_does_not_make_a_sync_read_the_transcript(session, scans):
     write(session.path, [user(0), planner(1)])
@@ -320,6 +406,33 @@ def test_receipts_decode_when_used():
     receipts = agy_receipts._Receipts(rows)
     assert len(receipts) == 2 and min(receipts) == 1 and receipts.get(2) is None and receipts[3] == {"n": 3}
     assert receipts._decoded == {3: {"n": 3}}  # only what was asked for
+
+
+def _rows(**by_step):
+    return sorted((int(name[1:]), json.dumps({"receipt": value})) for name, value in by_step.items())
+
+
+@pytest.mark.parametrize("then,indexed,now,affects", [
+    (_rows(s4="a", s7="b"), {4, 9}, _rows(s4="a", s7="b"), False),                    # nothing changed
+    (_rows(s4="a", s7="b"), {4, 9}, _rows(s4="changed", s7="b"), True),               # an indexed result's receipt
+    (_rows(s4="a", s7="b"), {4, 9}, _rows(s7="b"), True),                             # ... removed
+    (_rows(s4="a", s7="b"), {4, 9}, _rows(s4="a", s7="b", s9="new"), True),           # a receipt for result 9 appears
+    (_rows(s4="a", s7="b"), {4, 9}, _rows(s4="a", s7="b", s12="new"), False),         # a step with no indexed result
+    (_rows(s6="a"), {4, 9}, _rows(s2="x", s6="a"), True),                             # first receipt 6 -> 2: result 4
+    (_rows(s6="a"), {9}, _rows(s2="x", s6="a"), False),                               # ... but no result in [2, 6)
+    ([], {4}, _rows(s2="x"), True),                                                   # the first receipt appears
+    ([], {4}, _rows(s9="x"), False),                                                  # ... above every indexed result
+    (_rows(s2="x", s6="a"), {4}, _rows(s6="a"), True),                                # the first receipt goes away
+])
+def test_what_an_index_depends_on_is_exactly_what_can_change_it(then, indexed, now, affects):
+    deps = agy_receipts.dependencies(then, indexed)
+    assert agy_receipts.affects_index(deps, now) is affects
+
+
+def test_missing_or_foreign_dependencies_mean_reparse():
+    assert agy_receipts.affects_index(None, []) is True
+    assert agy_receipts.affects_index({"v": 99, "first": None, "steps": {}}, []) is True
+    assert agy_receipts.affects_index({"v": 1, "first": None, "steps": {}}, []) is False
 
 
 def test_an_old_receipts_database_gains_the_ledger_tables_and_keeps_working(tmp_path):
@@ -382,3 +495,29 @@ def test_a_full_parse_checks_every_receipt_anchor_without_rereading_the_file(ses
     assert hash_meter.lap() / size < 5.5
 
 
+def test_a_hook_hashes_the_file_a_constant_number_of_times(session, hash_meter):
+    step = _big_session(session, 250)
+    session.engine.upsert_contracts([{"id": "no-wipe", "type": "must_not", "scope": "tool_call", "provider": "agy",
+                                      "regex": r"rm\s+-rf"}])
+    session.sync()
+
+    def cycle(number):
+        nonlocal step
+        call = {"name": "run_command", "args": {"CommandLine": f"echo next {number}", "Cwd": "/synthetic"}}
+        append(session.path, planner(step, f"echo next {number}"))
+        hash_meter.lap()
+        agy_hooks.run_hook("PreToolUse", session.payload(step + 1, call), engine=session.engine)
+        pre = hash_meter.lap() / session.path.stat().st_size
+        append(session.path, result(step + 1))
+        hash_meter.lap()
+        agy_hooks.run_hook("PostToolUse", session.payload(step + 1, call, ""), engine=session.engine)
+        post = hash_meter.lap() / session.path.stat().st_size
+        step += 2
+        return pre, post
+
+    cycle(0)  # the first check of a contract builds its audit state once
+    pre, post = cycle(1)
+    # One pass for the receipt (its anchor and the ledger's check), one for the sync's own capture, and small windows
+    # (the old code: 250 more, one per linked result, plus a parse of the whole file).
+    assert pre < 3.2 and post < 3.2, (pre, post)
+    assert session.sync()["reindexed"] is False
