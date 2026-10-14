@@ -95,4 +95,44 @@ jobs:
           tests/test_claude_provider.py
           tests/test_claude_hooks.py
           tests/test_claude_install.py
+          tests/test_hook_import_budget.py
+          tests/test_hook_settings_parity.py
+          tests/test_runtime_threads.py
           --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file
+
+  bench:
+    # Hook cost on synthetic data (scripts/bench_hooks.py): cold command hooks, warm server calls and idle servers.
+    # Fails above 1.5x the targets for what this branch gates; the large (300 MB) session is a local, opt-in run.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package (dev)
+        run: python -m pip install -U pip && python -m pip install -e ".[dev]"
+
+      - name: Benchmark hook cost (small sessions)
+        timeout-minutes: 8
+        run: >-
+          python scripts/bench_hooks.py --check --contracts 10,100 --runs 12 --warm-repeat 8
+          --sessions 4 --servers 12 --out bench-hooks.json --markdown bench-hooks.md
+
+      - name: Publish the table
+        if: always()
+        run: test -f bench-hooks.md && cat bench-hooks.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-hooks-report
+          path: |
+            bench-hooks.json
+            bench-hooks.md
+          if-no-files-found: ignore
+          retention-days: 30

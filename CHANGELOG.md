@@ -2,6 +2,23 @@
 
 Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions follow `pyproject.toml`. Releases before 0.6.0 are not itemized here; see the git history.
 
+## Unreleased
+
+### Changed
+
+- **Lighter command-hook path.** A Claude Code or AGY hook is a fresh Python process for every tool call, so its imports are paid every time. The hooks no longer load NumPy, pydantic-settings, `python-dotenv`, `httpx` (with `certifi`, `idna`, `zstandard`) or `urllib.request`, and `mcp` stays out as before. Interleaved A/B on synthetic data (1 MB session, 10 contracts, 20 runs, median wall): Claude Code `PostToolUse` 189 → 52 ms, `UserPromptSubmit` 185 → 50 ms, `SessionStart` 316 → 208 ms, `PreToolUse` 407 → 281 ms, `Stop` 598 → 410 ms; AGY events 9 to 26 percent faster (their remaining cost is re-parsing the whole transcript on every call). The hook processes' peak RSS drops by 10 to 16 MB.
+  - `settings_core` holds the user-TOML `[paths]` source, `CODEX_SESSIONS_DIR`, the defaults, the `resolve_*` accessors and a field table, standard library only and shared with `config.Settings`. `settings_core.load_hook_settings()` reads the same sources with the same precedence and the same rejections as `config.hook_settings()` (never a working-directory `.env`); the hook adapters use it. `config.hook_settings()` remains as the reference implementation, and `tests/test_hook_settings_parity.py` compares the two on about 850 environment and TOML combinations, including inputs both must reject.
+  - `self_directing_mcp._runtime.np` is a lazy proxy and still the single loading point: NumPy loads, with one BLAS thread and the environment restored, at the first attribute access. A local-only server never loads it (idle RSS 89 → 79 MB; twelve servers 1073 → 949 MB); a server with an embedder loads it at startup as before.
+  - `engine`, `workflow`, `workflow_process`, `workflow_jev`, `embed.embedder` and `neograph_runner` import pydantic `Settings`, `httpx`, `dotenv` and `urllib` where they are used. `workflow_jev.httpx` and `embed.embedder.httpx` remain reachable.
+  - `claude_ids` holds the Claude Code session-id grammar, so `UserPromptSubmit`, `PostToolUse` and `PostToolUseFailure` import neither the transcript parser, pydantic nor the engine.
+  - Documented exceptions, with measured cost, in [Hook import budget](README.md#hook-import-budget): pydantic (`schemas.py`, about 75 ms) and `neograph_engine` (project rule: audits run through the native graph, about 40 ms).
+
+### Added
+
+- `scripts/bench_hooks.py`: a reproducible benchmark of cold command-hook processes (Claude Code and AGY, through the real entry scripts), concurrent-session bursts, warm calls through the FastMCP dispatcher and the memory of N idle stdio servers, with fixed, documented conditions, JSON and markdown output, an interleaved `--versus` mode and `--check` gating against 1.5 times the targets for what can be met now ("reported, not gated yet" for the rest). The 300 MB session is opt-in. See [Hook cost benchmark](README.md#hook-cost-benchmark).
+- `tests/test_hook_import_budget.py` (representative hook judgements must leave `numpy`, `mcp`, `pydantic_settings`, `httpx`, `dotenv` and `zstandard` unloaded and may load only the documented third-party packages), `tests/test_hook_settings_parity.py` and `tests/test_bench_hooks.py`.
+- CI: the import budget, settings parity and BLAS thread tests join the Linux regression job, and a `bench` job runs the small-session benchmark with `--check` and uploads its report.
+
 ## 0.6.0 - 2026-10-14
 
 Merged in [PR #7](https://github.com/fox1245/tsukkomi-mcp/pull/7) and [PR #11](https://github.com/fox1245/tsukkomi-mcp/pull/11). PR #7 also carried the unmerged commits of the AGY and workflow branch. The Claude Code integration, the shared hook policy, the masking work and AGY parser versions 6 and 7 were added to this release afterwards. Read "Upgrading to 0.6.0" in the [README](README.md) before restarting existing servers: restart every process that shares an index.
