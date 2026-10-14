@@ -7,21 +7,35 @@ import pytest
 
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
+from semantic_support import codex_user_anchor
+
+SID = "11111111-2222-3333-4444-555555555555"
 
 
 @pytest.fixture
 def engine(tmp_path: Path) -> SelfDirectEngine:
-    settings = Settings(use_fake_embedder=True, index_dir=tmp_path / "index",
+    root = tmp_path / "sessions"
+    root.mkdir()
+    (root / f"rollout-2026-09-09T01-00-00-{SID}.jsonl").write_text(
+        '{"type": "session_meta", "payload": {"id": "%s"}}\n' % SID, encoding="utf-8")
+    settings = Settings(use_fake_embedder=True, index_dir=tmp_path / "index", codex_sessions_dir=root,
                         contracts_path=tmp_path / "index" / "contracts.json")
     return SelfDirectEngine(settings=settings)
+
+
+def user_anchor(engine) -> str:
+    """The user's message that asks for a change: weakening or replacing an active contract needs one."""
+    (path,) = Path(engine.settings.codex_sessions_dir).glob("rollout-*.jsonl")
+    return codex_user_anchor(engine, path, SID)
 
 
 def test_source_quote_survives_revision(engine):
     try:
         engine.upsert_contracts([{"id": "no-prod-db", "type": "must_not", "regex": "prod-db",
                                   "source_quote": "운영 DB는 수정하지 마"}])
+        # Replacing the regex of an active contract is a change that needs the user's own message as its anchor.
         engine.upsert_contracts([{"id": "no-prod-db", "type": "must_not", "regex": "prod|production",
-                                  "description": "broadened"}])
+                                  "description": "broadened", "source_event_id": user_anchor(engine)}])
         contracts = engine.list_contracts()["contracts"]
         rule = next(c for c in contracts if c["id"] == "no-prod-db")
         assert rule["source_quote"] == "운영 DB는 수정하지 마"
@@ -64,7 +78,7 @@ def test_violation_reason_includes_source_quote_and_basis():
 def test_revoke_disables_rule_and_keeps_history(engine):
     try:
         engine.upsert_contracts([{"id": "temp", "type": "must_not", "regex": "TEMP"}])
-        result = engine.revoke_contract("temp")
+        result = engine.revoke_contract("temp", source_event_id=user_anchor(engine))
         assert result["ok"] and result["contract"]["enabled"] is False
         # Disabled rule no longer triggers.
         audit = engine.check_action("missing-session", {"tool_name": "shell", "arguments": "rm TEMP"})

@@ -222,7 +222,7 @@ def handle_stop(engine: SelfDirectEngine, call: HookCall, path: str, *, session_
         misses = [(rule, f) for rule, f in misses if rule.scope not in _FINAL_MESSAGE_SCOPES]
         notes.append(TRANSCRIPT_LAGS)
     if mode == "advisory":
-        return {"decision": "allow", "reason": "ADVISORY (not compliance): " + " ".join(notes)} if notes else {"decision": "allow"}
+        return {"decision": "allow", "reason": hook_policy.with_notes(notes, "ADVISORY (not compliance): ")} if notes else {"decision": "allow"}
     if misses and subagent:
         notes.append(SUBAGENT_NEVER_BLOCKS)
     elif misses:
@@ -233,7 +233,7 @@ def handle_stop(engine: SelfDirectEngine, call: HookCall, path: str, *, session_
                     + ". This is the only automatic continuation for this session."}
         notes.append(BUDGET_NOTE)
     if notes:
-        return {"decision": "allow", "reason": "Not verified (does not block stopping): " + " ".join(notes)}
+        return {"decision": "allow", "reason": hook_policy.with_notes(notes, "Not verified (does not block stopping): ")}
     return {"decision": "allow"}
 
 

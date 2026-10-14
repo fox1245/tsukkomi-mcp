@@ -2,7 +2,9 @@
 
 This module must stay importable when the rest of the runtime is not (missing native extension, broken
 dependency): ``scripts/agy_hook.py`` uses it to answer, record ``hook_health`` and honour user-selected
-high-risk contracts after an import failure. It therefore imports nothing outside the standard library.
+high-risk contracts after an import failure. It therefore imports nothing outside the standard library, apart
+from ``tool_payload`` (itself standard-library only, and the one builder of the tool-call text), which a copy of
+this module without its package does without: it then matches the unfiltered text, the more cautious side.
 
 Persistent state lives in ``<index_dir>/agy-hook-state.sqlite``:
 
@@ -24,6 +26,13 @@ import sqlite3
 import sys
 import time
 import tomllib
+
+try:
+    from self_directing_mcp.tool_payload import tool_call_text
+except ImportError:   # a standalone copy next to a broken package: prose fields are then matched too (asks more)
+    def tool_call_text(provider, tool_name, arguments, *, label="tool_call"):
+        return f"[{label}:{tool_name}] " + (arguments if isinstance(arguments, str) else json.dumps(
+            arguments, ensure_ascii=False, sort_keys=True))
 
 STATE_FILE = "agy-hook-state.sqlite"
 MODES = ("advisory", "confirmed_only", "enforced")
@@ -254,7 +263,7 @@ def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy"
     try:
         document = json.loads(Path(contracts_path).read_text(encoding="utf-8"))
         name, args = tool_call["name"], tool_call["args"]
-        text = f"[tool_call:{name}] " + (args if isinstance(args, str) else json.dumps(args, ensure_ascii=False, sort_keys=True))
+        text = tool_call_text(provider, name, args)   # the text the audit matches: prose fields excluded
         sid = session_id.lower() if isinstance(session_id, str) else None
         for rule in document.get("contracts", []):
             if (not isinstance(rule, dict) or rule.get("enabled", True) is not True or rule.get("risk") != "high"

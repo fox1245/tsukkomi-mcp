@@ -16,6 +16,7 @@ from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES,
 from self_directing_mcp.schemas import Chunk
 from self_directing_mcp.request_control import check_request
 from self_directing_mcp.source_blocks import BlockScan, FastFallback
+from self_directing_mcp.tool_payload import as_text  # noqa: F401  (shared with the hook-side text builders)
 
 
 def source_stamp(path: Path) -> tuple[int, ...]:
@@ -631,12 +632,6 @@ def source_scope(observation: SourceObservation):
         yield observation
     finally:
         _source_observation.reset(token)
-
-
-def as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 def content_hash(text: str) -> str:

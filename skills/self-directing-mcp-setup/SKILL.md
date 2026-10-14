@@ -193,6 +193,8 @@ Define strict prohibitions and required preconditions:
 }
 ```
 
+`source_event_id` must be the *user's* own message (a tool result or injected text is rejected, or makes the contract `unknown` with `anchor_not_user`). Disabling a contract with `revoke_contract` (pass `source_event_id`) or replacing it with a narrower regex, an added exception or fewer roles also needs a user anchor; without one the change is held as `pending` and the previous revision stays active.
+
 ### Pre-execution Checking (`check_action`)
 Before executing high-risk shell commands or tool steps, verify the proposed action:
 ```json

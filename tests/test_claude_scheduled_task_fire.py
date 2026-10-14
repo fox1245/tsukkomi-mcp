@@ -28,8 +28,9 @@ def fire(*, sub=False, **extra):
     return env("system", sub=sub, **fields)
 
 
-def test_parser_version_is_two_and_registered():
-    assert claude.PARSER_VERSION == 2 and current_parser_version("claude") == 2
+def test_parser_version_has_reached_two_and_is_registered():
+    # v3 moved a tool call's model-written prose out of the call text; this file is about the v2 subtype.
+    assert claude.PARSER_VERSION >= 2 and current_parser_version("claude") == claude.PARSER_VERSION
 
 
 @pytest.mark.parametrize("sub", [False, True], ids=["main", "subagent"])
@@ -172,6 +173,6 @@ def test_a_parser_bump_turns_the_unsupported_fire_into_runtime_metadata(engine, 
     assert first["parser_version"] == 1 and first["coverage"]["unsupported_event_count"] == 1
     assert first["coverage"]["complete"] is False
     second = sync(engine, path)
-    assert second["reindexed"] and second["reindex_reason"] == "parser_updated" and second["parser_version"] == 2
+    assert second["reindexed"] and second["reindex_reason"] == "parser_updated" and second["parser_version"] == claude.PARSER_VERSION
     assert second["coverage"]["complete"] is True and second["coverage"]["unsupported_event_count"] == 0
     assert not sync(engine, path)["reindexed"]

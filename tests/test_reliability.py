@@ -10,6 +10,7 @@ from self_directing_mcp.grokbot.parse import parse_session_chunks as grok_parse
 from self_directing_mcp.config import Settings
 from self_directing_mcp.embed.embedder import FakeEmbedder
 from self_directing_mcp.engine import SelfDirectEngine
+from semantic_support import codex_user_anchor
 
 SID = "11111111-2222-3333-4444-555555555555"
 
@@ -321,7 +322,9 @@ def test_contract_revisions_and_snapshot_change(session):
     engine, path = session
     engine.upsert_contracts([{"id": "r", "type": "must_not", "regex": "first"}])
     first = engine.audit_session(SID)
-    engine.upsert_contracts([{"id": "r", "type": "must_not", "regex": "second"}])
+    # Replacing the regex of an active contract carries the user's message that asked for it.
+    anchor = codex_user_anchor(engine, path, SID, "use the second pattern instead")
+    engine.upsert_contracts([{"id": "r", "type": "must_not", "regex": "second", "source_event_id": anchor}])
     second = engine.audit_session(SID)
     assert first["contracts_snapshot"] != second["contracts_snapshot"]
     assert second["findings"][0]["contract_revision"] == 2

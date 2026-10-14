@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from self_directing_mcp.tool_payload import tool_call_text
 from self_directing_mcp.session_events import (
     as_text, content_hash, iter_raw_lines, make_chunk, parse_error, result_success,
 )
@@ -34,7 +35,7 @@ def _classify_line(obj):
         if btype == "tool_use":
             name = block.get("name", "unknown")
             args = block.get("input", block.get("arguments"))
-            parts.append(("tool_call", f"[tool_call:{name}] {as_text(args)}",
+            parts.append(("tool_call", tool_call_text("grokbot", name, args),
                           {**base, "tool_name": name, "call_id": block.get("id"),
                            "block_type": btype}))
         elif btype == "tool_result":

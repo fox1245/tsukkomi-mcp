@@ -22,12 +22,15 @@ from pathlib import Path
 
 from self_directing_mcp.claude_ids import SUBAGENTS, STEM as _STEM, UUID as _UUID, session_parts, valid_id  # noqa: F401
 from self_directing_mcp.codex import discover as _codex_discover
-from self_directing_mcp.session_events import as_text, iter_raw_lines, make_chunk, parse_error, result_success
+from self_directing_mcp.session_events import iter_raw_lines, make_chunk, parse_error, result_success
+from self_directing_mcp.tool_payload import tool_call_parts
 
 # Bumping this triggers a lazy per-session reparse on the next sync/audit of each already-indexed session.
 # v1: initial Claude Code provider (main and subagent transcripts, origin-based user authority).
 # v2: the ``system`` record ``scheduled_task_fire`` (a cron task fired) as runtime metadata.
-PARSER_VERSION = 2
+# v3: a tool call's model-written ``description`` is kept out of the call text (``tool_payload``) and recorded in
+#     ``meta.tool_prose``; contracts match the payload only.
+PARSER_VERSION = 3
 
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
 _HOOK_NAME = re.compile(r"[A-Za-z0-9_.:*/@+-]{1,200}\Z")
@@ -489,8 +492,9 @@ def _assistant(base, record, state):
             if api_error or synthetic:
                 yield _unsupported(base, "[unsupported_content:tool_use] keys=-")
             else:
-                yield _Event("tool_call", f"[tool_call:{block['name']}] {as_text(block['input'])}",
-                             {**base, "role": "assistant", "tool_name": block["name"], "call_id": block["id"]})
+                text, prose = tool_call_parts("claude", block["name"], block["input"])
+                yield _Event("tool_call", text, {**base, "role": "assistant", "tool_name": block["name"],
+                                                 "call_id": block["id"], **prose})
         else:
             yield _unsupported_block(base, kind, block)
 

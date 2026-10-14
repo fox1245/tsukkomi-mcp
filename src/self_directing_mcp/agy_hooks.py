@@ -105,7 +105,7 @@ def handle_stop(engine: SelfDirectEngine, session_id: str, payload: dict[str, An
         return {"decision": "allow", "reason": hook_policy.NO_OUTSTANDING}
     notes, misses = hook_policy.checkpoint(engine, "agy", session_id, path, obligations, "AGY")
     if mode == "advisory":
-        return {"decision": "allow", "reason": "ADVISORY (not compliance): " + " ".join(notes)} if notes else {"decision": "allow"}
+        return {"decision": "allow", "reason": hook_policy.with_notes(notes, "ADVISORY (not compliance): ")} if notes else {"decision": "allow"}
     if misses:
         summary = hook_policy.miss_summary(misses)
         key = hook_policy.miss_key(misses)
@@ -115,7 +115,7 @@ def handle_stop(engine: SelfDirectEngine, session_id: str, payload: dict[str, An
                     + ". This is the only automatic continuation for this conversation."}
         notes.append(BUDGET_NOTE)
     if notes:
-        return {"decision": "allow", "reason": "Not verified (does not block stopping): " + " ".join(notes)}
+        return {"decision": "allow", "reason": hook_policy.with_notes(notes, "Not verified (does not block stopping): ")}
     return {"decision": "allow"}
 
 

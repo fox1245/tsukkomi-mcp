@@ -11,8 +11,10 @@ import random
 
 from self_directing_mcp.schemas import AuditEvent, ContractRule, ContractWhen
 
-WORDS = ["alpha", "beta", "gamma", "deploy", "test", "fail", "ok", "build", "push", "delete"]
-PATTERNS = ["alpha", "beta|gamma", "deploy", "test", "test.*ok", "^ok", "build", "push|delete", "fail", "alpha beta",
+WORDS = ["alpha", "beta", "gamma", "deploy", "test", "fail", "ok", "build", "push", "delete", "pytest"]
+# Tails that change what a recorded exit status means (audit/shellstatus.py): the evaluators must still agree.
+TAILS = ["", "", "", "", "", " || true", " | tee log", " --collect-only", " ; exit 0", " && echo ok", " &"]
+PATTERNS = ["alpha", "beta|gamma", "deploy", "test", "test.*ok", "^ok", "build", "push|delete", "fail", "alpha beta", "pytest",
             "(?i)DEPLOY", "ok$", "gamma", r"beta \[tool_call", r"alpha \[message", r"ok \[tool_result"]
 BAD_PATTERNS = ["(", "[a-", "*oops"]
 ROLES = ["assistant", "user", "tool", "runtime"]
@@ -68,13 +70,19 @@ class Session:
             self._add("turn", f"[message:assistant] {words(rng)}", {"role": "assistant"}, 0, start)
         elif choice < 0.62:
             call_id = self._call_id()
-            self._add("tool_call", f"[tool_call:shell] {words(rng)}",
+            self._add("tool_call", f"[tool_call:shell] {words(rng)}{rng.choice(TAILS)}",
                       {"role": "assistant", "call_id": call_id, "tool_name": "shell"}, 0, start)
         elif choice < 0.86:
             call_id = rng.choice(self.call_ids) if self.call_ids and rng.random() < 0.9 else None
             success = rng.choice([True, True, False, None])
-            self._add("tool_result", f"[tool_result] {words(rng)}",
-                      {"role": "tool", "call_id": call_id, "success": success}, 0, start)
+            meta = {"role": "tool", "call_id": call_id, "success": success}
+            if self.provider == "claude" and rng.random() < 0.25:
+                # the host's own decision on the call (a deny means the call never ran)
+                meta["permission_decision"] = rng.choice([
+                    "deny", {"behavior": "deny"}, {"decision": "reject", "source": "hook", "reasonType": "hook"},
+                    {"decision": "reject"}, {"decision": "reject", "source": "user"}, "allow", {"behavior": "ask"},
+                    {"decision": "accept", "source": "user"}, {"decision": "rejected"}, {}])
+            self._add("tool_result", f"[tool_result] {words(rng)}", meta, 0, start)
         elif choice < 0.93:
             self._add("meta", f"[meta] {words(rng)}", {"role": "runtime"}, 0, start)
         elif self.provider == "claude" and self.call_ids:
@@ -131,7 +139,7 @@ class Session:
             if linked:
                 call_id = f"agy-hook:{step}"
                 self.call_ids.append(call_id)
-                self._add("tool_call", f"[tool_call:shell] {words(rng)}",
+                self._add("tool_call", f"[tool_call:shell] {words(rng)}{rng.choice(TAILS)}",
                           {**base, "event_type": kind, "status": status, "role": "assistant", "call_id": call_id,
                            "tool_name": "shell"}, 0, start)
                 meta.update(call_id=call_id, linkage="host_step_receipt")
@@ -173,6 +181,14 @@ def pattern(rng, *, bad=0.04):
     return rng.choice(BAD_PATTERNS) if rng.random() < bad else rng.choice(PATTERNS)
 
 
+def source_anchor(rng, events):
+    """A random ``source_event_id``: mostly a user message (a valid origin), otherwise any event (then unknown)."""
+    users = [e.chunk_id for e in events if e.meta.get("role") == "user"]
+    if users and rng.random() < 0.7:
+        return rng.choice(users)
+    return rng.choice([e.chunk_id for e in events])
+
+
 def contracts(rng, provider, events, count, *, descriptions=0.0):
     """``count`` random rules covering every supported shape. ``descriptions`` is the share of description-only rules
     (no regex), which no monitor serves: the reference judges them in every mode."""
@@ -184,7 +200,7 @@ def contracts(rng, provider, events, count, *, descriptions=0.0):
             spec = {"id": f"r{number}", "type": kind, "description": "a rule that needs a verifier",
                     "roles": rng.sample(ROLES, rng.randint(1, 3))}
             if ids and rng.random() < 0.5:
-                spec["source_event_id"] = rng.choice(ids) if rng.random() < 0.8 else "missing-source"
+                spec["source_event_id"] = source_anchor(rng, events) if rng.random() < 0.8 else "missing-source"
             if ids and rng.random() < 0.3:
                 spec["applies_from_event_id"] = rng.choice(ids) if rng.random() < 0.8 else "missing-anchor"
             out.append(ContractRule(**spec))
@@ -194,7 +210,7 @@ def contracts(rng, provider, events, count, *, descriptions=0.0):
         spec["regex"] = pattern(rng)
         spec["scope"] = rng.choice(["any", "tool_call", "tool_result", "message"])
         if rng.random() < 0.1 and ids:
-            spec["source_event_id"] = rng.choice(ids) if rng.random() < 0.9 else "missing-source"
+            spec["source_event_id"] = source_anchor(rng, events) if rng.random() < 0.9 else "missing-source"
         if rng.random() < 0.18 and ids:
             spec["applies_from_event_id"] = rng.choice(ids[:max(1, len(ids) * 3 // 4)]) if rng.random() < 0.93 else "missing-anchor"
         if rng.random() < 0.08:

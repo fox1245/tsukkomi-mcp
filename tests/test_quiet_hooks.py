@@ -5,6 +5,7 @@ import pytest
 
 from self_directing_mcp.codex_hooks import handle_hook
 from test_hook_gating import hook_engine
+from semantic_support import codex_user_anchor
 
 
 @pytest.mark.parametrize("event", ["UserPromptSubmit", "PreToolUse", "Stop"])
@@ -82,7 +83,10 @@ def test_no_success_cache_for_repeated_mutation_and_stop_is_deduplicated(hook_en
     handle_hook(engine, "Stop", sid, str(path), turn_id="t")
     handle_hook(engine, "Stop", sid, str(path), turn_id="t")
     assert len(audits) == 1
-    engine.upsert_contracts([{"id": "deny", "type": "must_not", "scope": "tool_call", "regex": "NEW_RULE"}])
+    # Replacing the regex of an active contract carries the user's message that asked for it.
+    anchor = codex_user_anchor(engine, path, sid, "use NEW_RULE instead")
+    engine.upsert_contracts([{"id": "deny", "type": "must_not", "scope": "tool_call", "regex": "NEW_RULE",
+                              "source_event_id": anchor}])
     handle_hook(engine, "Stop", sid, str(path), turn_id="t")
     assert len(audits) == 2
 

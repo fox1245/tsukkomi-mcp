@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from self_directing_mcp.compressed_source import open_source
 from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.session_events import as_text
+from self_directing_mcp.tool_payload import tool_call_text
 from self_directing_mcp.codex.discover import ensure_under_root
 
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract
@@ -100,10 +101,10 @@ def _read_only(tool_name, tool_input):
 
 
 def _read_has_constraint(rules, tool_name, tool_input):
-    text = f"[tool_call:{tool_name}] {as_text(tool_input)}"
+    text = tool_call_text("codex", tool_name, tool_input)
     name, args = _unwrap(tool_name, tool_input)
     if name != tool_name:
-        text += f"\n[tool_call:{name}] {as_text(args)}"
+        text += "\n" + tool_call_text("codex", name, args)
     for rule in rules:
         check_request()
         if rule.scope not in ("tool_call", "any") or "assistant" not in rule.roles:
