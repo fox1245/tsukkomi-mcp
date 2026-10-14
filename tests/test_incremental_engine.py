@@ -548,3 +548,18 @@ def test_a_pattern_timeout_is_no_verdict_and_no_state(codex, monkeypatch, where,
     assert set(answer["incremental"]["rebuilt"]) == {"no-deploy"} and answer["incremental"]["mode"] == "full"
     write(path, codex_records(rng, 3, numbered), "a")
     assert twin.fast.audit_session(SID, provider="codex")["incremental"]["mode"] == "delta"
+
+
+def test_a_capacity_limit_met_by_a_delta_run_is_answered_in_a_second_pass(codex, monkeypatch):
+    twin, path = codex
+    monkeypatch.setattr(inc, "EXCEPTION_MAX_HITS", 3)
+    write(path, [call(f"echo quiet {i}", f"q{i}") for i in range(20)], "a")
+    twin.upsert([{"id": "ex", "type": "must_not", "scope": "tool_call", "regex": "alpha", "exception_regex": "beta",
+                  "roles": ["assistant"]}])
+    twin.audit(SID)
+    write(path, [call(f"echo alpha {i}", f"a{i}") for i in range(8)], "a")
+    fast, _ = twin.audit(SID)  # the delta run overflows, the second pass answers in full
+    assert fast["incremental"]["retry"]["rules"] == ["ex"] and fast["incremental"]["fallback"] == {"ex": "fallback"}
+    write(path, [call("echo alpha again", "again")], "a")
+    fast, _ = twin.audit(SID)  # remembered: straight to the full evaluator, no retry
+    assert "retry" not in fast["incremental"] and fast["incremental"]["fallback"]["ex"].startswith("overflow")

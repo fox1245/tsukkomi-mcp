@@ -866,6 +866,8 @@ class AuditPlan:
         chain_ok = (generation is not None and latest is not None
                     and latest["byte_offset"] == cursor["byte_offset"] and latest["prefix_hash"] == cursor["prefix_hash"]
                     and latest["synced_at"] == cursor["synced_at"])
+        if chain_ok and store.chunk_count(session_id, provider) != latest["event_count"]:
+            chain_ok = False  # rows came or went outside a commit: the log no longer describes the stored events
         digest = needs_digest(needs, link_calls, provider)
         states = store.load_audit_states(session_id, provider, digest)
         health = store.audit_health(session_id, provider, EVALUATOR_VERSION)

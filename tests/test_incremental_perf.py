@@ -75,16 +75,27 @@ def test_an_untouched_session_costs_no_event_rows_at_all(tmp_path):
     engine.close()
 
 
-def test_the_delta_read_uses_the_session_index(tmp_path):
-    engine, _path = session(tmp_path, 300, incremental=True)
+def vm_steps(connection, run):
+    """SQLite virtual-machine work done by ``run`` (progress callbacks every 1000 instructions)."""
+    steps = []
+    connection.set_progress_handler(lambda: steps.append(1) and 0, 1000)
+    try:
+        run()
+    finally:
+        connection.set_progress_handler(None, 0)
+    return len(steps)
+
+
+def test_the_store_reads_for_an_append_are_served_by_indexes(tmp_path):
+    engine, _path = session(tmp_path, 3000, incremental=True)  # 9,000 events
     engine.audit_session(SID, provider="codex")
-    plan = engine.store._conn.execute(
-        "EXPLAIN QUERY PLAN SELECT chunk_id FROM session_events WHERE session_id=? AND provider=? AND byte_start>=?"
-        " ORDER BY provider,session_id,byte_start,sub_index", (SID, "codex", 100)).fetchall()
-    text = " ".join(str(row[-1]) for row in plan)
-    assert "USING INDEX events_session" in text and "SCAN" not in text.replace("SEARCH", ""), text
-    lookup = engine.store._conn.execute(
-        "EXPLAIN QUERY PLAN SELECT chunk_id FROM session_events WHERE provider=? AND session_id=? AND +byte_start<?"
-        " AND json_extract(data,'$.meta.call_id') IN (?,?)", ("codex", SID, 10, "a", "b")).fetchall()
-    assert "events_call" in " ".join(str(row[-1]) for row in lookup)
+    store = engine.store
+    needs = [("tool_call", ("assistant",))]
+    whole = vm_steps(store._conn, lambda: store.capture_audit_events(SID, "codex", needs, link_calls=True))
+    last = store._conn.execute("SELECT MAX(byte_start) FROM session_events WHERE session_id=?", (SID,)).fetchone()[0]
+    with store._read_boundary():
+        tail = vm_steps(store._conn, lambda: store.capture_audit_tail(SID, "codex", needs, link_calls=True,
+                                                                      from_byte=last - 1000))
+        lookup = vm_steps(store._conn, lambda: store.audit_call_events(SID, "codex", ["c1", "c2", "c999"], 10**12))
+    assert whole > 100 and tail * 20 < whole and lookup * 50 < whole, (whole, tail, lookup)
     engine.close()

@@ -12,7 +12,7 @@ import pytest
 from self_directing_mcp.audit import incremental as inc
 from self_directing_mcp.index.ingest import SessionStore
 from self_directing_mcp.schemas import AuditEvent, ContractRule
-from incremental_store import SID, Harness
+from incremental_store import SID, Harness, chunk_of
 from incremental_support import Session, contracts, proposed_action
 
 PROVIDERS = ["codex", "claude", "agy", "omp"]
@@ -156,6 +156,7 @@ def test_a_contract_that_needs_more_text_rebuilds_every_state_once(tmp_path):
     harness.commit(session.events[n:n + 5])
     _r, report, _ = harness.audit([*rules, extra])
     assert report["mode"] == "full" and set(report["rebuilt"].values()) == {"no_state"}, report
+    assert {r.id for r in rules} | {"added"} <= set(report["rebuilt"]), report
     _r, report, _ = harness.audit([*rules, extra])
     assert report["mode"] == "delta" and not report["rebuilt"], report
 
@@ -195,18 +196,52 @@ def test_an_append_that_overwrites_a_stored_event_is_a_rewrite(tmp_path):
     assert report["mode"] == "full" and set(report["rebuilt"].values()) == {"no_state"}, report
 
 
-@pytest.mark.parametrize("stamped", [False, True])
-def test_a_state_never_outlives_a_foreign_cursor_move(tmp_path, stamped):
+@pytest.mark.parametrize("change,expected", [("hash", "lineage_unknown"), ("synced_at", "lineage_unknown"),
+                                             ("hash_and_stamp", "lineage_unknown"), ("unstamped", "parser_version")])
+def test_a_state_never_outlives_a_foreign_cursor_move(tmp_path, change, expected):
     rng, session, rules, harness, n = warm(tmp_path)
     harness.commit(session.events[n:n + 4])
     with harness.store._conn:
-        # An older process publishing a cursor leaves no commit-log row behind (and no parser stamp).
-        harness.store._conn.execute("UPDATE session_cursors SET synced_at='foreign', prefix_hash='x' WHERE session_id=?", (SID,))
-        if stamped:
-            harness.store._conn.execute("UPDATE session_parser_versions SET synced_at='foreign' WHERE session_id=?", (SID,))
+        # An older process publishing a cursor leaves no commit-log row behind. It also leaves no parser stamp, unless
+        # the test restamps to isolate what the commit log alone catches.
+        if change in ("hash", "hash_and_stamp"):
+            harness.store._conn.execute("UPDATE session_cursors SET prefix_hash='x' WHERE session_id=?", (SID,))
+        if change != "hash":
+            harness.store._conn.execute("UPDATE session_cursors SET synced_at='foreign' WHERE session_id=?", (SID,))
+        if change != "unstamped":
+            harness.store._conn.execute("UPDATE session_parser_versions SET synced_at=(SELECT synced_at FROM session_cursors"
+                                        " WHERE session_id=?) WHERE session_id=?", (SID, SID))
     _r, report, _ = harness.audit(rules)
-    expected = "lineage_unknown" if stamped else "parser_version"
     assert report["mode"] == "full" and set(report["rebuilt"].values()) == {expected}, report
+
+
+def test_a_state_from_another_generation_is_refused(tmp_path):
+    rng, session, rules, harness, n = warm(tmp_path)
+    harness.commit(session.events[n:n + 4])
+    with harness.store._conn:
+        harness.store._conn.execute("UPDATE audit_monitor_state SET generation = generation - 1")
+    _r, report, _ = harness.audit(rules)
+    assert report["mode"] == "full" and set(report["rebuilt"].values()) == {"generation"}, report
+
+
+def test_a_state_whose_commit_log_row_changed_is_refused(tmp_path):
+    rng, session, rules, harness, n = warm(tmp_path)
+    harness.commit(session.events[n:n + 4])
+    stored_offset = harness.store._conn.execute("SELECT MIN(byte_offset) FROM audit_monitor_state").fetchone()[0]
+    with harness.store._conn:
+        harness.store._conn.execute("UPDATE session_commit_log SET prefix_hash='forged' WHERE byte_offset=?", (stored_offset,))
+    _r, report, _ = harness.audit(rules)
+    assert report["mode"] == "full" and set(report["rebuilt"].values()) == {"lineage"}, report
+
+
+def test_the_event_count_is_not_cached_across_another_connections_writes(tmp_path):
+    rng, session, rules, harness, n = warm(tmp_path)
+    other = SessionStore(harness.store.db_path)
+    before = harness.store.chunk_count(SID, "codex")
+    assert harness.store.chunk_count(SID, "codex") == before
+    other.commit_events([chunk_of("codex", e) for e in session.events[n:n + 3]], session_id=SID, provider="codex",
+                        path=harness.source, offset=10**6, digest="d")
+    assert harness.store.chunk_count(SID, "codex") == before + 3
 
 
 def test_check_action_and_audit_session_keep_separate_states(tmp_path):
@@ -340,3 +375,13 @@ def test_duplicate_and_reserved_contract_ids_are_judged_in_full(tmp_path):
     _r, report, plan = harness.audit([twin, rules[0], reserved, *rules[2:]])
     assert report["fallback"][rules[0].id] == "contract id is not unique or reserved"
     assert report["fallback"]["#facts"] == "contract id is not unique or reserved", report
+
+
+def test_a_state_notices_events_that_vanished_from_the_stored_prefix(tmp_path):
+    rng, session, rules, harness, n = warm(tmp_path)
+    harness.commit(session.events[n:n + 3])
+    with harness.store._conn:
+        # Rows removed behind the store's back: the commit log and the cursor still look fine.
+        harness.store._conn.execute("DELETE FROM session_events WHERE chunk_id=?", (session.events[5].chunk_id,))
+    _r, report, _ = harness.audit(rules, shadow_every=0)
+    assert report["mode"] == "full" and set(report["rebuilt"].values()) == {"lineage_unknown"}, report
