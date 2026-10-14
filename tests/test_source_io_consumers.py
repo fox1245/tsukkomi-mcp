@@ -1,7 +1,14 @@
-"""A failed whole-prefix read must not be certified by a successful tail read."""
+"""A failed whole-prefix read must not be certified by a successful tail read.
+
+Later stages of a request check the source with bounded reads; a whole-prefix re-read happens only when asked for
+(``validate_prefix(full=True)``) or when the cheap signals demand it (the modification time moved while the size
+did not). These tests arm a read fault and then make the file's modification time move, so the stage that must
+settle it with a re-read really does, and the fault really hits it.
+"""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -48,6 +55,12 @@ class _ReadFault:
             return Reader(stream) if candidate == path and mode == "rb" else stream
 
         monkeypatch.setattr(Path, "open", open_source)
+
+
+def _touch(path):
+    """Same bytes, newer modification time: what a rewrite that restores nothing looks like to the cheap check."""
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
 
 
 @pytest.fixture
@@ -111,6 +124,8 @@ def test_final_full_read_failure_cannot_publish_clean(
         result = native_run(*args, **kwargs)
         if rewrite:
             path.write_bytes(changed)
+        if rewrite or io_failure:
+            _touch(path)  # whatever the file system's timestamp granularity: the modification time has moved
         fault.armed = True
         return result
 
@@ -127,6 +142,20 @@ def test_final_full_read_failure_cannot_publish_clean(
     assert result["action_executed"] is False
 
 
+@pytest.mark.parametrize("operation", ["check_action", "audit_session"])
+def test_an_unchanged_source_is_not_reread_after_evaluation(source_session, monkeypatch, operation):
+    """The efficiency half of the rule: with nothing moved, the stage check never re-reads the prefix, so an armed
+    read fault is never hit and the verdict stays clean."""
+    engine, path = source_session
+    invoke = lambda: (engine.check_action(SID, ACTION) if operation == "check_action"
+                      else engine.audit_session(SID))
+    assert invoke()["verdict"] == "clean"
+    fault = _ReadFault(monkeypatch, path, persistent=True)
+    fault.armed = True
+    result = invoke()
+    assert fault.errors == 0 and result["verdict"] == "clean" and result["coverage"]["complete"] is True
+
+
 def _checklist_change(engine):
     evidence = next(c for c in engine.store.list_chunks(SID, "codex") if c.kind == "tool_result")
     added = engine.update_checklist(SID, add=[{"text": "Verify synthetic behavior"}])
@@ -141,6 +170,7 @@ def test_checklist_save_never_publishes_verified_after_failed_full_read(source_s
     save = engine._save_checklist
 
     def fail_only_final_save(*args, **kwargs):
+        _touch(path)
         fault.armed = True
         try:
             return save(*args, **kwargs)
@@ -165,6 +195,7 @@ def test_checklist_read_downgrades_done_after_failed_full_read(source_session, m
     def arm_after_verification(*args, **kwargs):
         verified = verify(*args, **kwargs)
         assert verified is True
+        _touch(path)
         fault.armed = True
         return verified
 
@@ -183,6 +214,7 @@ def test_graph_context_rejects_failed_full_read(source_session, monkeypatch):
     def arm_after_refresh(*args, **kwargs):
         refreshed = refresh(*args, **kwargs)
         assert refreshed["ok"] and refreshed["coverage"]["complete"]
+        _touch(path)
         fault.armed = True
         return refreshed
 
@@ -206,14 +238,15 @@ def test_agy_receipt_preserves_prior_authority_after_failed_full_read(tmp_path, 
                                      "status": "DONE", "content": "The command exited with code 0."}) + "\n")
     before = receipts.read_capture(SID)
     fault = _ReadFault(monkeypatch, path)
-    completed = agy_receipts._completed_results
+    scan = agy_receipts._scan  # the one parse of the transcript a receipt makes (through the ledger)
 
     def arm_after_inspection(*args, **kwargs):
-        result = completed(*args, **kwargs)
+        result = scan(*args, **kwargs)
+        _touch(path)
         fault.armed = True
         return result
 
-    monkeypatch.setattr(agy_receipts, "_completed_results", arm_after_inspection)
+    monkeypatch.setattr(agy_receipts, "_scan", arm_after_inspection)
     with pytest.raises(ValueError, match="source changed during receipt preparation"):
         receipts.record(SID, path, 1, tool, event, error="" if event == "PostToolUse" else None)
     assert fault.errors == 1
@@ -226,12 +259,12 @@ def test_explicit_full_retry_recovers_transient_read_failure(tmp_path, monkeypat
     observation = session_events.capture_source(path)
     fault = _ReadFault(monkeypatch, path)
     fault.armed = True
-    assert observation.validate_prefix() is False
+    assert observation.validate_prefix(full=True) is False
     assert fault.errors == 1
     # These are distinct checks: callers must retain the failed full result even
     # when the bounded tail happens to remain readable (covered above).
     assert observation.validate_prefix(locked=True) is True
-    assert observation.validate_prefix() is True
+    assert observation.validate_prefix(full=True) is True
     assert observation.validate_prefix(locked=True) is True
 
 

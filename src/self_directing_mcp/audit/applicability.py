@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 
+from self_directing_mcp.audit.patterns import compile_contract
+
 from self_directing_mcp.request_control import check_request
 
 # AGY records a model's proposed call as a ``meta`` event with this text prefix until host receipts link it
@@ -34,7 +36,7 @@ def when_state(rule, events) -> str:
     if rule.when is None:
         return MET
     try:
-        condition = re.compile(rule.when.tool_call_regex, re.IGNORECASE | re.MULTILINE)
+        condition = compile_contract(rule.when.tool_call_regex)   # a timeout propagates to the contract's finding
     except re.error:
         return INVALID
     for event in events:

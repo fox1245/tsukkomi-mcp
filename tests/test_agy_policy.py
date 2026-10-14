@@ -115,8 +115,10 @@ def _suspicious(engine):
 
 
 def _unknown(engine, risk="normal"):
-    engine.upsert_contracts([{"id": "c", "type": "must_not", "provider": "agy", "risk": risk,
-                              "description": "no verifier exists for this rule"}])
+    # Unknown by construction: the contract applies to the action but its activation event is not in the session.
+    engine.upsert_contracts([{"id": "c", "type": "must_not", "provider": "agy", "risk": risk, "regex": "echo",
+                              "applies_from_event_id": "not-in-this-session",
+                              "description": "evidence for this rule is unavailable"}])
     return call("echo ok")
 
 

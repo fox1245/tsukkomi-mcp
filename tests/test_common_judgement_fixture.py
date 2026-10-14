@@ -154,7 +154,7 @@ def codex_action(host, command):
 def omp_action(host, command):
     """What extensions/tsukkomi-omp.ts does on a tool_call: ask check_action, block only if actionable."""
     result = host.engine.check_action(host.session_id, {"tool_name": "shell", "arguments": {"command": command}},
-                                      provider="omp", path=str(host.path))
+                                      provider="omp", path=str(host.path), verify="fast")
     blocked = result["verdict"] in OMP_ACTIONABLE
     return {"block": True} if blocked else {}
 
@@ -198,7 +198,9 @@ def _omp_actionable():
     source = (ROOT / "extensions" / "tsukkomi-omp.ts").read_text(encoding="utf-8")
     declared = re.search(r"const actionable: Record<string, true> = \{([^}]*)\}", source)
     assert declared, "the OMP extension no longer declares its actionable verdicts"
-    assert re.search(r"if \(actionable\[result\.verdict\]\) return \{ block: true", source)
+    # The block is returned for actionable verdicts only (optionally after resetting the check notice).
+    assert re.search(r"if \(actionable\[result\.verdict\]\) (?:\{ lastNotice\.check = \"\"; )?return \{ block: true",
+                     source)
     return set(re.findall(r"(\w+): true", declared.group(1)))
 
 
@@ -244,7 +246,8 @@ NO_FORCE_PUSH = {"id": "no-force-push", "type": "must_not", "scope": "tool_call"
 NO_PROD = {"id": "no-prod-deploy", "type": "must_not", "scope": "tool_call", "regex": r"deploy prod",
            "exception_regex": r"--dry-run"}
 PROSE = {"id": "prose-rule", "type": "must_not", "description": "Do not do the thing no verifier can see."}
-PROSE_HIGH = dict(PROSE, id="prose-high", risk="high")
+# A high-risk target names the actions it covers (a regex); unknown here because its activation event is absent.
+PROSE_HIGH = dict(PROSE, id="prose-high", risk="high", regex="echo", applies_from_event_id="not-in-this-session")
 ACK = {"id": "ack", "type": "must", "scope": "message", "regex": "VERIFIED", "auto_continue": True}
 
 

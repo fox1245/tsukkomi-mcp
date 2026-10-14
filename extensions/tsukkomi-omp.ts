@@ -31,7 +31,7 @@ type HookAPI = {
   }): void;
 };
 type Response = { id?: number; result?: unknown; error?: unknown };
-type Audit = { ok: true; verdict: "violation" | "suspicious" | "clean" | "unknown"; applicable_contracts?: number; findings?: Array<{ contract_id?: string; reason?: string; verdict?: string }> };
+type Audit = { ok: boolean; verdict: "violation" | "suspicious" | "clean" | "unknown"; error?: string; coverage?: { complete?: boolean; issues?: unknown[] }; applicable_contracts?: number; findings?: Array<{ contract_id?: string; reason?: string; verdict?: string }> };
 type Session = { session_id: string; provider: "omp"; path: string };
 
 const enabled = process.env.TSUKKOMI_OMP_MONITOR === "1";
@@ -130,9 +130,16 @@ class LocalMcp {
     const part = response.content.find((entry: unknown) => entry && typeof entry === "object" && "type" in entry && entry.type === "text");
     if (!part || typeof part !== "object" || !("text" in part) || typeof part.text !== "string") throw new Error("MCP result missing");
     const parsed: unknown = JSON.parse(part.text);
-    if (!parsed || typeof parsed !== "object" || !("ok" in parsed) || parsed.ok !== true ||
+    if (!parsed || typeof parsed !== "object" || !("ok" in parsed) ||
       !("verdict" in parsed) || typeof parsed.verdict !== "string" ||
       !["violation", "suspicious", "clean", "unknown"].includes(parsed.verdict)) {
+      throw new Error("MCP audit unavailable");
+    }
+    if (parsed.ok !== true && !(parsed.ok === false && parsed.verdict === "unknown" &&
+      "action_executed" in parsed && parsed.action_executed === false &&
+      "error" in parsed && typeof parsed.error === "string" &&
+      "coverage" in parsed && parsed.coverage !== null && typeof parsed.coverage === "object" &&
+      "complete" in parsed.coverage && parsed.coverage.complete === false)) {
       throw new Error("MCP audit unavailable");
     }
     return parsed as Audit;
@@ -160,6 +167,13 @@ function description(audit: Audit): string {
   return first ? `Tsukkomi ${audit.verdict}: ${first.contract_id || "contract"}: ${(first.reason || "confirmed contract finding").slice(0, 300)}`
     : `Tsukkomi ${audit.verdict}: confirmed contract finding`;
 }
+function incompleteReason(audit: Audit): string {
+  const issues = Array.isArray(audit.coverage?.issues) ? audit.coverage.issues : [];
+  const reasons = [audit.error, ...issues].filter((value): value is string =>
+    typeof value === "string" && /^[A-Za-z0-9_:-]{1,80}$/.test(value));
+  return reasons.length ? [...new Set(reasons)].slice(0, 4).join(", ") : "evidence or verification incomplete";
+}
+
 
 export default function tsukkomiOmp(pi: HookAPI): void {
   if (!enabled) return;
@@ -178,23 +192,26 @@ export default function tsukkomiOmp(pi: HookAPI): void {
     },
   });
   const bridge = new LocalMcp();
-  let lastNotice = "";
-  const notifyOnce = (ctx: Context, message: string) => {
-    if (message !== lastNotice) { lastNotice = message; announce(ctx, message); }
+  const lastNotice = { audit: "", check: "" };
+  const notifyOnce = (ctx: Context, channel: "audit" | "check", message: string) => {
+    if (message !== lastNotice[channel]) {
+      lastNotice[channel] = message;
+      announce(ctx, message);
+    }
   };
   const audit = async (ctx: Context) => {
     const current = session(ctx);
-    if (!current) { notifyOnce(ctx, "Tsukkomi monitoring unavailable: no OMP session path."); return; }
+    if (!current) { notifyOnce(ctx, "audit", "Tsukkomi monitoring unavailable: no OMP session path."); return; }
     try {
       const result = await bridge.tool("audit_session", current);
-      if (actionable[result.verdict]) notifyOnce(ctx, description(result));
-      else if (result.applicable_contracts === 0) notifyOnce(ctx, "Tsukkomi not applicable: no enabled contract for this OMP session.");
-      else if (result.verdict === "unknown") notifyOnce(ctx, "Tsukkomi audit unknown: evidence or verification incomplete.");
-      else lastNotice = "";
-    } catch { notifyOnce(ctx, "Tsukkomi monitoring unavailable: local MCP bridge/audit failed."); }
+      if (actionable[result.verdict]) notifyOnce(ctx, "audit", description(result));
+      else if (result.applicable_contracts === 0) notifyOnce(ctx, "audit", "Tsukkomi not applicable: no enabled contract for this OMP session.");
+      else if (result.verdict === "unknown") notifyOnce(ctx, "audit", `Tsukkomi audit unknown: ${incompleteReason(result)}.`);
+      else lastNotice.audit = "";
+    } catch { notifyOnce(ctx, "audit", "Tsukkomi monitoring unavailable: local MCP bridge/audit failed."); }
   };
-  pi.on("session_start", async (_event, ctx) => { lastNotice = ""; await audit(ctx); });
-  pi.on("session_switch", async (_event, ctx) => { lastNotice = ""; await audit(ctx); });
+  pi.on("session_start", async (_event, ctx) => { lastNotice.audit = lastNotice.check = ""; await audit(ctx); });
+  pi.on("session_switch", async (_event, ctx) => { lastNotice.audit = lastNotice.check = ""; await audit(ctx); });
   pi.on("tool_call", async (event, ctx) => {
     try {
       const name = event?.toolName;
@@ -203,13 +220,15 @@ export default function tsukkomiOmp(pi: HookAPI): void {
       if (typeof name !== "string" || !name ||
         /^(?:mcp[_:]|mcp__)(?:tsukkomi(?:-mcp)?|self[-_]directing[-_]mcp)(?:__|[_:])/i.test(name)) return;
       const current = session(ctx);
-      if (!current) { notifyOnce(ctx, "Tsukkomi monitoring unavailable: no OMP session path."); return; }
-      const result = await bridge.tool("check_action", { ...current, action: { tool_name: name, arguments: event.input ?? {} } });
-      if (actionable[result.verdict]) return { block: true, reason: description(result) };
-      if (result.applicable_contracts === 0) notifyOnce(ctx, "Tsukkomi not applicable: no enabled contract for this OMP session.");
-      else if (result.verdict === "unknown") notifyOnce(ctx, "Tsukkomi check unknown: evidence or verification incomplete; action not blocked.");
-      else lastNotice = "";
-    } catch { notifyOnce(ctx, "Tsukkomi monitoring unavailable: local MCP bridge/check failed; action not blocked."); }
+      if (!current) { notifyOnce(ctx, "check", "Tsukkomi monitoring unavailable: no OMP session path."); return; }
+      // Hook time: the resident bridge verifies the source cheaply (tail, latest and sampled blocks); the result's
+      // `integrity` says what was compared, and the server settles it in full whenever the cheap check cannot vouch.
+      const result = await bridge.tool("check_action", { ...current, verify: "fast", action: { tool_name: name, arguments: event.input ?? {} } });
+      if (actionable[result.verdict]) { lastNotice.check = ""; return { block: true, reason: description(result) }; }
+      if (result.applicable_contracts === 0) notifyOnce(ctx, "check", "Tsukkomi not applicable: no enabled contract for this OMP session.");
+      else if (result.verdict === "unknown") notifyOnce(ctx, "check", `Tsukkomi check unknown: ${incompleteReason(result)}; action not blocked.`);
+      else lastNotice.check = "";
+    } catch { notifyOnce(ctx, "check", "Tsukkomi monitoring unavailable: local MCP bridge/check failed; action not blocked."); }
   });
   pi.on("tool_result", async (_event, ctx) => { await audit(ctx); });
   pi.on("turn_end", async (_event, ctx) => { await audit(ctx); });

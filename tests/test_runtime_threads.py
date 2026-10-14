@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PROBE = """
 import os, sys
 import self_directing_mcp.engine
+from self_directing_mcp._runtime import np
+np.zeros(1)    # NumPy loads on first use (the engine import alone does not load it)
 print(len(os.listdir('/proc/self/task')), os.environ.get('OPENBLAS_NUM_THREADS'), os.environ.get('OMP_NUM_THREADS'))
 """
 

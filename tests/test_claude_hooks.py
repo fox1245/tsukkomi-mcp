@@ -202,8 +202,10 @@ def _suspicious(engine):
 
 
 def _unknown(engine, risk="normal"):
-    engine.upsert_contracts([{"id": "c", "type": "must_not", "provider": "claude", "risk": risk,
-                              "description": "no verifier exists for this rule"}])
+    # Unknown by construction: the contract applies to the action but its activation event is not in the session.
+    engine.upsert_contracts([{"id": "c", "type": "must_not", "provider": "claude", "risk": risk, "regex": "echo",
+                              "applies_from_event_id": "not-in-this-session",
+                              "description": "evidence for this rule is unavailable"}])
     return {"command": "echo ok"}
 
 
@@ -791,6 +793,7 @@ def test_internal_errors_fail_open_with_a_warning_in_every_mode(env, monkeypatch
     elif failure == "engine":
         monkeypatch.setattr("self_directing_mcp.engine.SelfDirectEngine", _raising)
         monkeypatch.setattr("self_directing_mcp.config.Settings", _raising)
+        monkeypatch.setattr("self_directing_mcp.settings_core.load_hook_settings", _raising)    # what hooks run on
         response = run_hook(event, message)
     else:
         message["session_id"] = "not-a-session-id"
@@ -1134,7 +1137,7 @@ class _Rule:
 
 
 def _audit(**overrides):
-    base = {"ok": True, "coverage": {"complete": True, "issues": []},
+    base = {"ok": True, "coverage": {"complete": True, "issues": []}, "integrity": {"mode": "full"},
             "findings": [{"contract_id": "a", "verdict": "violation", "contract_revision": 3,
                           "applicability": "applicable", "reason": "missing"}]}
     base.update(overrides)
@@ -1151,6 +1154,9 @@ def _audit(**overrides):
     {"findings": [{"contract_id": "a", "verdict": "violation", "contract_revision": 2}]},        # stale revision
     {"findings": [{"contract_id": "a", "verdict": "violation", "contract_revision": 3, "applicability": "not_applicable"}]},
     {"findings": [{"contract_id": "other", "verdict": "violation", "contract_revision": 3}]},
+    {"integrity": {"mode": "fast"}},   # restarting an agent needs the source verified in full
+    {"integrity": {}},
+    {"integrity": None},
 ])
 def test_only_a_fully_observed_current_applicable_violation_is_a_confirmed_miss(change):
     from self_directing_mcp import hook_policy

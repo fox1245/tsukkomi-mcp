@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TYPE_CHECKING
 from functools import wraps
 from threading import Condition, RLock
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import replace
+import copy
 import hashlib
 import json
 import sqlite3
@@ -23,7 +24,11 @@ from self_directing_mcp.audit.contracts import (
     scope_counts,
     visible_contracts,
 )
-from self_directing_mcp.audit.runner import _worse, action_applies, audit_needs, downgrade_unproven_absence, prefix_note, run_audit
+from self_directing_mcp.audit import incremental
+from self_directing_mcp.audit.patterns import compile_contract
+from self_directing_mcp.audit.runner import (
+    REGEX_TIMEOUT, _worse, action_applies, audit_needs, downgrade_unproven_absence, prefix_note, run_audit,
+)
 from self_directing_mcp.checklist import (
     INCOMPLETE_NOTE,
     ChecklistStore,
@@ -34,9 +39,11 @@ from self_directing_mcp.checklist import (
 from self_directing_mcp.codex import discover as codex_discover
 from self_directing_mcp.grokbot import discover as grokbot_discover
 from self_directing_mcp import omp, agy, claude
-from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
-from self_directing_mcp.index.ingest import AmbiguousSessionSource, SessionStore, ingest_session, coverage_from_capture
+from self_directing_mcp.index.ingest import (
+    AmbiguousSessionSource, AuditEventSnapshot, IntegrityPolicy, SessionStore, capture_for_cursor, coverage_from_capture,
+    ingest_session,
+)
 from self_directing_mcp.index.sparse import SparseIndex
 from self_directing_mcp.index.vector import build_vector_index
 from self_directing_mcp.index.locking import index_lock
@@ -51,7 +58,9 @@ from self_directing_mcp.neograph_runtime import ng, graph_operation
 from self_directing_mcp.request_control import (
     IndexBusy, RequestStopped, check_request, current_request, publication, request_operation, request_scope,
 )
-from self_directing_mcp.session_events import capture_source
+
+if TYPE_CHECKING:       # the pydantic Settings model is imported lazily: command hooks pass a light settings object
+    from self_directing_mcp.config import Settings
 
 
 def serialized(method):
@@ -103,6 +112,47 @@ def _mark_growth(coverage, observation) -> bool:
     return bool(unread)
 
 
+VERIFY_MODES = ("full", "fast")
+
+
+def _check_verify(verify):
+    if verify not in VERIFY_MODES:
+        raise ValueError("verify must be 'full' or 'fast'")
+    return verify
+
+
+def _event_start(chunk_id):
+    """Byte offset a chunk id encodes (``provider:session:start:sub:digest``); None when it cannot be read."""
+    try:
+        return int(chunk_id.rsplit(":", 3)[1])
+    except (AttributeError, IndexError, ValueError):
+        return None
+
+
+def _fast_gate(payload, integrity):
+    """Why a fast verdict may not stand, or None.
+
+    A fast check compared only some blocks of the prefix. A clean finding that rests on historical evidence (a
+    satisfied prerequisite) is accepted only when every cited event lies inside the region that was last verified
+    in FULL (``full_verified_through_byte``). Such findings carry ``verified_through``. Anything else is settled by a
+    full verification before it is reported; a fast verdict never turns missing or unverified evidence into a
+    satisfied obligation.
+    """
+    through = integrity.get("full_verified_through_byte")
+    for finding in payload.get("findings", []):
+        if finding.get("verdict") != "clean" or finding.get("applicability", "applicable") != "applicable":
+            continue
+        cited = [item["chunk_id"] for item in finding.get("evidence", [])
+                 if item.get("detail") != "triggering action" and not str(item["chunk_id"]).startswith("proposed:")]
+        if not cited:
+            continue
+        starts = [_event_start(chunk_id) for chunk_id in cited]
+        if through is None or any(start is None or start >= through for start in starts):
+            return "evidence_beyond_verified_region"
+        finding["verified_through"] = through
+    return None
+
+
 CHECKLIST_EVALUATION_ATTEMPTS = 3
 
 
@@ -119,7 +169,13 @@ class SelfDirectEngine:
         self._operation_depth = 0
         self._hook_lock = RLock()
         self._hook_states = OrderedDict()
-        self.settings = settings or get_settings()
+        self._last_activity = time.monotonic()
+        self._integrity_worker = None  # set only by a resident server (see integrity_worker)
+        self.integrity_policy: IntegrityPolicy | None = None  # tests may inject a clock / randomness
+        if settings is None:
+            from self_directing_mcp.config import get_settings    # the server's pydantic settings; hooks pass their own
+            settings = get_settings()
+        self.settings = settings
         self.store: SessionStore | None = None
         self.sparse: SparseIndex | None = None
         self.dense = None
@@ -177,7 +233,22 @@ class SelfDirectEngine:
         finally:
             with self._lifetime:
                 self._active_operations -= 1
+                self._last_activity = time.monotonic()
                 self._lifetime.notify_all()
+
+    def _policy(self) -> IntegrityPolicy:
+        return self.integrity_policy or IntegrityPolicy.from_settings(self.settings)
+
+    def attach_integrity_worker(self, worker) -> None:
+        self._integrity_worker = worker
+
+    def accepts_background_work(self) -> bool:
+        """False while closed or closing: a background worker must never reopen an engine that was shut down."""
+        return self._ready and not self._closing
+
+    def idle_seconds(self) -> float:
+        """0 while any request is running, else the time since the last one finished."""
+        return 0.0 if self._active_operations else time.monotonic() - self._last_activity
 
     def hook_obligations(self, session_id: str, provider: str = "codex", path: str | None = None) -> dict[str, Any]:
         """Read atomically replaced rule files without initializing indexes.
@@ -300,11 +371,21 @@ class SelfDirectEngine:
         path: str | None = None,
         provider: str | None = None,
         embed: bool = True,
+        verify: str = "full",
     ) -> dict[str, Any]:
-        info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=embed)
+        info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=embed,
+                                  verify=_check_verify(verify))
         return {key: value for key, value in info.items() if not key.startswith("_")}
 
-    def _sync_session(self, *, session_id=None, path=None, provider=None, embed=True, derived=True):
+    @detached_operation
+    def verify_integrity(self, session_id: str, provider: str | None = None, path: str | None = None) -> dict[str, Any]:
+        """Full verification of one session's source (the background worker's work; also callable directly)."""
+        info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=False, derived=False,
+                                  verify="full", watch=False)
+        return {key: value for key, value in info.items() if not key.startswith("_")}
+
+    def _sync_session(self, *, session_id=None, path=None, provider=None, embed=True, derived=True, verify="full",
+                      watch=True):
         assert self.store and self.sparse
         if self.settings.local_only and embed:
             return {"ok": False, "error": "local_only", "message": "embed=True is unavailable in local-only mode"}
@@ -360,6 +441,8 @@ class SelfDirectEngine:
                 guard=self._publication_guard,
                 # A local-only process (a hook) may share a server's index: leave vector cleanup journalled for it.
                 retain_dense_deletions=self.dense is None and any(Path(self.settings.index_dir).glob("vectors-v2-*")),
+                verify=verify,
+                policy=self._policy(),
             )
         except AmbiguousSessionSource as exc:
             return {"ok": False, "error": "ambiguous_session_source", "message": str(exc), "provider": resolved_provider,
@@ -370,6 +453,9 @@ class SelfDirectEngine:
             return {"ok": False, "error": exc.code, "message": str(exc), "provider": resolved_provider,
                     "path": str(resolved)}
         info["ok"] = True
+        worker = self._integrity_worker
+        if watch and worker is not None:
+            worker.note(resolved_provider, info["session_id"], str(resolved), info["integrity"])
         info["dense_backend"] = self.dense_backend
         info["embedder"] = type(self.embedder).__name__ if self.embedder else None
         info["embedder_degraded"] = self.embedder_degraded
@@ -466,7 +552,7 @@ class SelfDirectEngine:
             if documents:
                 self.sparse.upsert_many(documents)
 
-    def _refresh_evidence(self, sid, provider, path=None):
+    def _refresh_evidence(self, sid, provider, path=None, verify="full"):
         """Refresh only authority; return detached coverage and its exact inputs."""
         with self._publication_guard():
             record = self.store.cursor_record(sid, provider)
@@ -474,7 +560,7 @@ class SelfDirectEngine:
         try:
             info = self._sync_session(session_id=sid, provider=provider, embed=False,
                                       path=path if path is not None else record["path"] if record else None,
-                                      derived=False)
+                                      derived=False, verify=verify)
             if info.get("ok"):
                 return info
             failure, failed = info.get("error", "sync_failed"), info
@@ -491,13 +577,24 @@ class SelfDirectEngine:
         coverage["issues"].append(failure)
         coverage.update({key: failed[key] for key in ("indexed_path", "requested_path") if key in failed})
         return {"ok": False, "coverage": coverage, "_metadata_token": token,
-                "_source_observation": None, "_receipt_token": None}
+                "_source_observation": None, "_receipt_token": None,
+                "integrity": self._integrity_unavailable(verify, failure)}
 
-    def _audit(self, session_id, provider, proposed=None, path=None):
+    @staticmethod
+    def _integrity_unavailable(verify, failure):
+        """The source could not be verified for this request (the refresh failed); nothing is claimed about it."""
+        return {"mode": verify, "full_verified_through_byte": None, "full_verified_at": None,
+                "source_generation": None, "index_generation": None, "verification": "unavailable",
+                "reason": failure}
+
+    def _audit(self, session_id, provider, proposed=None, path=None, verify="full", escalated=None):
         started = time.perf_counter()
         provider = self._resolve_provider(provider)
         sid = session_id.lower() if provider in ("codex", "agy") else session_id
-        refreshed = self._refresh_evidence(sid, provider, path)
+        refreshed = self._refresh_evidence(sid, provider, path, verify)
+        integrity = dict(refreshed.get("integrity") or {})
+        if escalated:
+            integrity["full_reason"] = escalated
         coverage = dict(refreshed["coverage"])
         coverage["issues"] = list(coverage["issues"])
         sync_finished = time.perf_counter()
@@ -524,27 +621,122 @@ class SelfDirectEngine:
                   and rule.session_id in (None, sid)]
         history = any(rule.regex and (rule.type == "must" or planned is None) for rule in active)
         anchors = {anchor for rule in active for anchor in (rule.source_event_id, rule.applies_from_event_id) if anchor}
-        with self._publication_guard(), self.store._read_boundary():
-            metadata_token = self.store.state_token(sid, provider)
-            if metadata_token != refreshed["_metadata_token"]:
-                coverage["complete"] = False
-                coverage["issues"].append("metadata_changed_before_capture")
-            if history:
-                # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
-                needs, link_calls = audit_needs(active, planned)
-                evidence = self.store.capture_audit_events(sid, provider, needs, link_calls=link_calls)
-            else:
-                evidence = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
-            receipt_token = self._receipt_token(sid, provider)
-            if provider == "agy" and receipt_token != refreshed["_receipt_token"]:
-                coverage["complete"] = False
-                coverage["issues"].append("receipts_changed_before_capture")
         observation = refreshed["_source_observation"]
-        _mark_growth(coverage, observation)
-        # The actual native stages, model decoding and regex evaluation own no
-        # engine lease, shared SQLite handle or open read transaction.
-        result = run_audit(session_id=sid, contracts=contracts, store=evidence,
-                           provider=provider, proposed=planned, coverage=coverage)
+        report, plan, force_full = {}, None, frozenset()
+        use_plan = history and self.settings.audit_incremental
+        if use_plan and incremental.wants_call_index(active, provider):
+            try:
+                with self._publication_guard():
+                    self.store.ensure_call_index()
+            except (sqlite3.Error, RuntimeError, OSError) as exc:
+                use_plan = False
+                report.update(mode="full", fallback={"*": "call_index_unavailable:" + type(exc).__name__})
+        for attempt in range(2):
+            with self._publication_guard(), self.store._read_boundary():
+                metadata_token = self.store.state_token(sid, provider)
+                if metadata_token != refreshed["_metadata_token"] and "metadata_changed_before_capture" not in coverage["issues"]:
+                    coverage["complete"] = False
+                    coverage["issues"].append("metadata_changed_before_capture")
+                plan = None
+                if history:
+                    # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
+                    needs, link_calls = audit_needs(active, planned)
+                    minimum = self.settings.audit_incremental_min_events
+                    if use_plan and minimum and self.store.session_metrics(sid, provider)[0] < minimum:
+                        # A short session: one full evaluation costs less than keeping, rebuilding and
+                        # shadow-checking monitor states. Nothing is stored; the answer is the reference one.
+                        use_plan = False
+                        report.update(mode="full", below_min_events=minimum)
+                    if use_plan:
+                        report = {key: value for key, value in report.items() if key == "retry"}
+                        try:
+                            plan = incremental.AuditPlan.prepare(
+                                self.store, session_id=sid, provider=provider, active=active, planned=planned,
+                                needs=needs, link_calls=link_calls, shadow_every=self.settings.audit_shadow_every,
+                                force_full=force_full, report=report)
+                        except (RequestStopped, IndexBusy):
+                            raise
+                        except Exception as exc:  # the cache could not even be read: evaluate everything in full
+                            plan = None
+                            report.update(mode="full", fallback={"*": "prepare_failed:" + type(exc).__name__})
+                    if plan is not None:
+                        evidence = AuditEventSnapshot(sid, provider, tuple(plan.events), plan.count)
+                    else:
+                        evidence = self.store.capture_audit_events(sid, provider, needs, link_calls=link_calls)
+                else:
+                    evidence = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
+                receipt_token = self._receipt_token(sid, provider)
+                if (provider == "agy" and receipt_token != refreshed["_receipt_token"]
+                        and "receipts_changed_before_capture" not in coverage["issues"]):
+                    coverage["complete"] = False
+                    coverage["issues"].append("receipts_changed_before_capture")
+            _mark_growth(coverage, observation)
+            reference = None
+            if plan is not None and plan.shadow:
+                reference = AuditEventSnapshot(sid, provider, tuple(plan.reference), len(plan.reference))
+                reference_coverage = copy.deepcopy(coverage)
+            try:
+                # The actual native stages, model decoding and regex evaluation own no
+                # engine lease, shared SQLite handle or open read transaction.
+                result = run_audit(session_id=sid, contracts=contracts, store=evidence,
+                                   provider=provider, proposed=planned, coverage=coverage, plan=plan)
+            except incremental.PlanRetry as retry:
+                # A summary could not hold some input: those rules run on the full evaluator in a second pass, and
+                # the limit is remembered so later audits do not fail the same way.
+                force_full = retry.ids
+                report = {"retry": {"rules": sorted(retry.ids), "reason": retry.reason}}
+                try:
+                    with self._publication_guard():
+                        if retry.plan is not None:
+                            self.store.save_audit_states(sid, provider, retry.plan.digest,
+                                                         retry.plan.overflow_rows(), retry.plan.snapshot)
+                        if retry.drop:
+                            self.store.drop_audit_states(sid, provider, sorted(retry.ids))
+                        if retry.health:
+                            self.store.record_audit_health(sid, provider, incremental.EVALUATOR_VERSION,
+                                                           [*sorted(retry.ids), "#facts"], retry.health, retry.reason)
+                except (sqlite3.Error, OSError):
+                    pass
+                if attempt:
+                    raise
+                continue
+            break
+        mismatch = []
+        if reference is not None:
+            # Shadow: the full evaluator over the same events. It is the answer whenever the two differ.
+            full = run_audit(session_id=sid, contracts=contracts, store=reference, provider=provider,
+                             proposed=planned, coverage=reference_coverage)
+            timed_out = sorted({item.contract_id for item in full.findings if item.reason == REGEX_TIMEOUT})
+            if timed_out:
+                # A time limit is not a result: the full evaluator could not finish these contracts in its budget, so
+                # its (unknown) answer stands and the incremental state of those contracts is not trusted either.
+                # This is not a mismatch of the incremental path and disables nothing.
+                result = full
+                report["shadow_skipped"] = "reference_regex_timeout"
+                report["regex_timeout"] = timed_out
+                for contract_id in timed_out:
+                    if contract_id in plan.monitors:
+                        plan.monitors[contract_id].timed_out = True
+                        plan.timeouts.add(contract_id)
+                report["shadow"] = False
+                reference = None
+            else:
+                mismatch = incremental.compare(result, full)
+            if mismatch:
+                result = full
+                ids = sorted({item.contract_id for item in full.findings} & set(plan.monitors)
+                             if mismatch == ["#audit"] else set(mismatch))
+                report["incremental_mismatch"] = ids
+                try:
+                    with self._publication_guard():
+                        self.store.record_audit_health(
+                            sid, provider, incremental.EVALUATOR_VERSION, [*ids, "#facts"], "incremental_mismatch",
+                            "incremental result differed from the full evaluator at byte "
+                            f"{plan.snapshot['offset']}")
+                except (sqlite3.Error, OSError):
+                    pass
+            if reference is not None:
+                report["shadow_compared"] = True
         payload = result.model_dump(mode="json")
         payload.update(ok=True, provider=provider, action_executed=False,
                        applicable_contracts=len(active), requires_attention=result.verdict != "clean")
@@ -556,6 +748,8 @@ class SelfDirectEngine:
         payload["timings_ms"] = {
             "sync": round((sync_finished - started) * 1000, 2),
             "evaluation": round((time.perf_counter() - sync_finished) * 1000, 2)}
+        if report:
+            payload["incremental"] = report
         payload["nudge"] = (
             "Detect only. violation/suspicious: STOP and report; unknown: resolve missing evidence. "
             "clean is limited to the reported contracts and history snapshot, not execution authorization.")
@@ -563,7 +757,7 @@ class SelfDirectEngine:
         payload["contract_scope"] = {"session_id": sid, "scope": contract_scope(sid)}
         # Keep the full result: a transient read error does not latch a mismatch, so a later
         # successful bounded tail check must not certify this read.
-        source_ok = observation is None or observation.validate_prefix()  # full rehash off the shared lock
+        source_ok = observation is None or observation.validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             stale = []
             tokens = (
@@ -616,8 +810,24 @@ class SelfDirectEngine:
                     payload["verdict"] = _worse(payload["verdict"], "unknown")
                     payload["notes"].append("Current action prerequisites remain unverified while their required evidence is incomplete.")
             payload["requires_attention"] = payload["verdict"] != "clean"
-            with publication():
-                return payload
+            payload["integrity"] = integrity
+            if plan is not None and not mismatch:
+                # The monitor state is tied to the index commit it evaluated, not to how the source was verified: if a
+                # later full verification finds a rewrite, the reindex starts a new generation and drops these states.
+                try:
+                    if plan.timeouts:
+                        self.store.drop_audit_states(sid, provider, sorted(plan.timeouts))
+                    rows = plan.state_rows()
+                    report["state"] = (self.store.save_audit_states(sid, provider, plan.digest, rows, plan.snapshot)
+                                       if rows else "unchanged")
+                except (sqlite3.Error, OSError) as exc:
+                    report["state"] = "write_failed:" + type(exc).__name__  # a cache; the next audit rebuilds it
+            reason = _fast_gate(payload, integrity) if integrity.get("mode") == "fast" else None
+            if reason is None:
+                with publication():
+                    return payload
+        # Leave the guard before the long work: the fast verdict rested on evidence only a full scan can vouch for.
+        return self._audit(session_id, provider, proposed=proposed, path=path, verify="full", escalated=reason)
 
     def _receipt_token(self, sid, provider):
         if provider != "agy":
@@ -628,12 +838,19 @@ class SelfDirectEngine:
 
     @detached_operation
     def audit_session(self, session_id: str, provider: str | None = None, path: str | None = None) -> dict[str, Any]:
-        return self._audit(session_id, provider, path=path)
+        """Always a full verification of the source (``integrity.mode == "full"``); there is no fast variant."""
+        return self._audit(session_id, provider, path=path, verify="full")
 
     @detached_operation
-    def check_action(self, session_id: str, action: dict[str, Any], provider: str | None = None, path: str | None = None):
-        """Check a proposed tool call against refreshed history; never execute or persist it."""
-        return self._audit(session_id, provider, proposed=action, path=path)
+    def check_action(self, session_id: str, action: dict[str, Any], provider: str | None = None, path: str | None = None,
+                     verify: str = "full"):
+        """Check a proposed tool call against refreshed history; never execute or persist it.
+
+        ``verify="fast"`` is for hook-time checks: the source is verified by comparing its tail, latest blocks and a
+        random sample with the stored block digests instead of a scan of everything (see ``integrity`` in the
+        result, and the README's "Source integrity"). It is never used implicitly.
+        """
+        return self._audit(session_id, provider, proposed=action, path=path, verify=_check_verify(verify))
 
     @detached_operation
     def get_chunk(self, chunk_id: str) -> dict[str, Any]:
@@ -688,9 +905,15 @@ class SelfDirectEngine:
             else:
                 rules.append(ContractRule.model_validate(c))
         for rule in rules:
-            for pattern in (rule.regex, rule.before_regex, rule.when.tool_call_regex if rule.when else None):
+            for pattern in (rule.regex, rule.before_regex, rule.exception_regex,
+                            rule.when.tool_call_regex if rule.when else None):
                 if pattern:
-                    re.compile(pattern)
+                    compile_contract(pattern)   # the syntax gate of both engines (raises re.error)
+            if rule.risk == "high" and rule.type == "must_not" and not rule.regex:
+                # Applies to every action and can never be verified: every tool call would be unknown, hence asked
+                # (a denial when headless). A high-risk target must name the actions it covers.
+                raise ValueError(f"contract {rule.id!r}: a high-risk must_not needs a regex that names the actions it "
+                                 "covers; without one it would ask on every tool call")
         with self._publication_guard():
             raw, token = self.contracts.capture()
             document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
@@ -745,7 +968,7 @@ class SelfDirectEngine:
         payload = doc.model_dump_json(indent=2)
         source_ok = True
         if refreshed is not None and refreshed.get("_source_observation") is not None:
-            source_ok = refreshed["_source_observation"].validate_prefix()  # full rehash off the shared lock
+            source_ok = refreshed["_source_observation"].validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             path = self.checklists._path(doc.session_id)
             try:
@@ -875,8 +1098,9 @@ class SelfDirectEngine:
             receipt_token = self._receipt_token(sid, resolved_provider)
             evidence = self.store.capture_evidence(sid, resolved_provider)
         try:
-            observation = (capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],),
-                                          max_bytes=self.store.max_decompressed_bytes) if record else None)
+            observation = (capture_for_cursor(resolved_provider, Path(record["path"]), record,
+                                              (record["byte_offset"],), self.store.max_decompressed_bytes)
+                           if record else None)
         except RequestStopped:
             raise
         except (OSError, ValueError):
@@ -893,7 +1117,7 @@ class SelfDirectEngine:
                                                                                coverage["complete"])):
                 item.status = RequirementStatus.PENDING_VERIFICATION
                 item.verified = False
-        source_ok = observation is not None and observation.validate_prefix()  # full rehash off the shared lock
+        source_ok = observation is not None and observation.validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             state = {"_metadata_token": metadata_token, "_source_observation": observation,
                      "_receipt_token": receipt_token}
@@ -940,7 +1164,7 @@ class SelfDirectEngine:
 
         source_ok = True
         if path is not None and synced.get("_source_observation") is not None:
-            source_ok = synced["_source_observation"].validate_prefix()  # full rehash off the shared lock
+            source_ok = synced["_source_observation"].validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             if path is not None and (not source_ok or not self._evidence_current(sid, resolved_provider, synced)):
                 return {"ok": False, "error": "incomplete_history", "nodes": [], "edges": []}
@@ -1175,6 +1399,8 @@ class SelfDirectEngine:
             "index_schema": 2,
             "sparse_count": self.sparse.count(),
         }
+        worker = self._integrity_worker
+        status["integrity_worker"] = worker.snapshot() if worker is not None else None
         if self.embedder_degraded:
             status["degraded_flags"].append("embedder_fake_fallback")
         if self.dense_backend == "numpy":

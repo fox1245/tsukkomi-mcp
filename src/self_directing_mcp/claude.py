@@ -20,6 +20,7 @@ import json
 import re
 from pathlib import Path
 
+from self_directing_mcp.claude_ids import SUBAGENTS, STEM as _STEM, UUID as _UUID, session_parts, valid_id  # noqa: F401
 from self_directing_mcp.codex import discover as _codex_discover
 from self_directing_mcp.session_events import as_text, iter_raw_lines, make_chunk, parse_error, result_success
 
@@ -28,9 +29,6 @@ from self_directing_mcp.session_events import as_text, iter_raw_lines, make_chun
 # v2: the ``system`` record ``scheduled_task_fire`` (a cron task fired) as runtime metadata.
 PARSER_VERSION = 2
 
-SUBAGENTS = "subagents"
-_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
-_STEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
 _HOOK_NAME = re.compile(r"[A-Za-z0-9_.:*/@+-]{1,200}\Z")
 _CRON = re.compile(r"[0-9*/,?# -]{1,100}\Z")  # digits and cron punctuation only: no word can ride along
@@ -48,22 +46,6 @@ class PathTraversalError(ValueError):
 # Every record of a subagent file carries the PARENT's ``sessionId`` and ``agentId``, so neither is unique per
 # file; the composite id keeps parent and child in separate (provider, session) index partitions, keeps
 # duplicate agent ids under different parents apart, and still matches the workflow id alphabet.
-
-def session_parts(session_id) -> tuple[str, str | None] | None:
-    """``(session uuid, subagent stem or None)`` for a canonical Claude Code session id, else None."""
-    if not isinstance(session_id, str):
-        return None
-    if _UUID.fullmatch(session_id):
-        return session_id, None
-    if len(session_id) > 37 and session_id[36] == "_" and _UUID.fullmatch(session_id[:36]) \
-            and _STEM.fullmatch(session_id[37:]):
-        return session_id[:36], session_id[37:]
-    return None
-
-
-def valid_id(session_id) -> bool:
-    return session_parts(session_id) is not None
-
 
 def _id_from_parts(parts) -> str | None:
     """Session id for the trailing components of a transcript path (layout only; no I/O)."""

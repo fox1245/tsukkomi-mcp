@@ -19,7 +19,10 @@ from self_directing_mcp.compressed_source import CompressedSourceError
 from self_directing_mcp.schemas import AuditEvent, Chunk
 from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request, publication, request_operation
-from self_directing_mcp.session_events import capture_source, observed_source, source_scope
+from self_directing_mcp.session_events import (
+    SourceChanged, capture_source, capture_source_fast, observed_source, source_scope,
+)
+from self_directing_mcp.source_blocks import BlockDraft, BlockRecord, BlockTable, FastFallback, is_block_hash
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,18 @@ class AuditEvidenceSnapshot:
 
 
 _BATCH = 500
+
+
+def _load_deps(text):
+    """The stored receipt dependencies (see agy_receipts.dependencies), or None when absent or unreadable."""
+    try:
+        deps = json.loads(text) if text else None
+        if isinstance(deps, dict) and isinstance(deps.get("steps"), dict):
+            deps["steps"] = {int(step): digest for step, digest in deps["steps"].items()}
+            return deps
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def _batches(items, size=_BATCH):
@@ -264,6 +279,7 @@ class SessionStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._counts = {}
         try:
             with publication():
                 self._initialize_schema()
@@ -308,9 +324,54 @@ class SessionStore:
                 digest TEXT, synced_at TEXT NOT NULL,
                 PRIMARY KEY(provider,session_id)
             );
+            -- What the AGY events of a session were derived from besides its bytes: the receipt of each result step
+            -- and the first receipt (agy_receipts.dependencies). Bound to a cursor by synced_at like the receipt
+            -- digest above; a cursor written by an older process leaves it stale, which means "reparse", never "reuse".
+            CREATE TABLE IF NOT EXISTS session_receipt_deps (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL,
+                deps TEXT, synced_at TEXT NOT NULL,
+                PRIMARY KEY(provider,session_id)
+            );
             CREATE TABLE IF NOT EXISTS pending_index_deletions (
                 provider TEXT NOT NULL, session_id TEXT NOT NULL, chunk_id TEXT NOT NULL,
                 PRIMARY KEY(provider,session_id,chunk_id)
+            );
+            -- Block digests of the indexed prefix (see source_blocks). Bound to a cursor by synced_at; a cursor
+            -- written by an older process leaves it stale, which is detected, never trusted.
+            CREATE TABLE IF NOT EXISTS source_blocks (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, path TEXT NOT NULL,
+                dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+                block_size INTEGER NOT NULL, covered INTEGER NOT NULL, lines INTEGER NOT NULL,
+                digests BLOB NOT NULL, tail BLOB, root TEXT NOT NULL, synced_at TEXT NOT NULL,
+                full_verified_at TEXT, full_verified_through INTEGER,
+                PRIMARY KEY(provider, session_id)
+            );
+            -- Incremental audit support (see audit/incremental.py). Everything below is derived data: the events
+            -- and the cursor stay the authority, and a missing or disagreeing row only means "evaluate in full".
+            -- A generation counts the times a session's stored events were replaced; the commit log is the chain
+            -- of append-only commits inside the current generation.
+            CREATE TABLE IF NOT EXISTS session_generations (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                PRIMARY KEY(provider,session_id)
+            );
+            CREATE TABLE IF NOT EXISTS session_commit_log (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                byte_offset INTEGER NOT NULL, prefix_hash TEXT NOT NULL, event_count INTEGER NOT NULL,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY(provider,session_id,generation,byte_offset)
+            );
+            CREATE TABLE IF NOT EXISTS audit_monitor_state (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, monitor_id TEXT NOT NULL,
+                needs_digest TEXT NOT NULL, contract_revision INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+                parser_version INTEGER NOT NULL, evaluator_version INTEGER NOT NULL, generation INTEGER NOT NULL,
+                byte_offset INTEGER NOT NULL, prefix_hash TEXT NOT NULL, event_count INTEGER NOT NULL,
+                path TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY(provider,session_id,monitor_id,needs_digest)
+            );
+            CREATE TABLE IF NOT EXISTS audit_incremental_health (
+                provider TEXT NOT NULL, session_id TEXT NOT NULL, monitor_id TEXT NOT NULL,
+                evaluator_version INTEGER NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL,
+                PRIMARY KEY(provider,session_id,monitor_id,evaluator_version)
             );
         """)
         check_request()
@@ -356,30 +417,89 @@ class SessionStore:
             record["receipt_digest"] = receipt[0] if receipt and receipt[1] == record["synced_at"] else None
         return record
 
+    def receipt_deps(self, session_id, provider, synced_at):
+        """What the indexed events of an AGY session were derived from (``agy_receipts.dependencies``), or None:
+        absent, unreadable, or written for another publication than the cursor stamped ``synced_at``."""
+        with self._read_boundary():
+            row = self._conn.execute("SELECT deps,synced_at FROM session_receipt_deps WHERE provider=? AND session_id=?",
+                                     (provider, session_id)).fetchone()
+        return _load_deps(row[0]) if row and row[1] == synced_at else None
+
     def get_cursor(self, session_id, provider="codex"):
         record = self.cursor_record(session_id, provider)
         return (record["byte_offset"], record["path"]) if record else (0, None)
 
+    def source_block_record(self, session_id, provider="codex"):
+        """The stored block table of a session, or None. The caller must check ``bound_to(cursor)``."""
+        with self._read_boundary():
+            return self._source_block_record(session_id, provider)
+
+    def _source_block_record(self, session_id, provider):
+        row = self._conn.execute("SELECT * FROM source_blocks WHERE provider=? AND session_id=?",
+                                 (provider, session_id)).fetchone()
+        if row is None:
+            return None
+        table = BlockTable(covered=row["covered"], lines=row["lines"], digests=bytes(row["digests"]),
+                           tail=None if row["tail"] is None else bytes(row["tail"]), root=row["root"],
+                           block_size=row["block_size"])
+        return BlockRecord(provider=provider, session_id=session_id, path=row["path"], dev=_unsigned64(row["dev"]),
+                           ino=_unsigned64(row["ino"]),
+                           size=row["size"], mtime_ns=row["mtime_ns"], table=table, synced_at=row["synced_at"],
+                           full_verified_at=row["full_verified_at"], full_verified_through=row["full_verified_through"])
+
+    def mark_full_verified(self, session_id, provider, record, *, at, through, dev, ino, size, mtime_ns):
+        """Record that EVERY block of ``record``'s table matched the source at ``at``. Compare-and-set on the table's
+        publication and root: a table replaced meanwhile is never stamped."""
+        with self._conn, publication():
+            changed = self._conn.execute(
+                "UPDATE source_blocks SET full_verified_at=?, full_verified_through=?, dev=?, ino=?, size=?, mtime_ns=?"
+                " WHERE provider=? AND session_id=? AND synced_at=? AND root=?",
+                (at, through, _signed64(dev), _signed64(ino), size, mtime_ns, provider, session_id, record.synced_at,
+                 record.table.root)).rowcount
+            check_request()
+        return changed == 1
+
     def commit_events(self, chunks, *, session_id, provider, path, offset, digest, replace=False,
-                      parser_version=None, expected_token=None, prepared_rows=None, receipt_digest=None):
+                      parser_version=None, expected_token=None, prepared_rows=None, receipt_digest=None, blocks=None,
+                      receipt_deps=None):
+        """``blocks``: the ``BlockDraft`` published with the cursor in the same transaction. A publication without
+        one (a source whose cursor is a plain digest) removes the session's block row.
+
+        ``receipt_deps`` (AGY): the JSON of ``agy_receipts.dependencies`` for the events as they stand after this
+        commit, written with the cursor. A commit without it leaves none, which makes the next receipt change reparse."""
         spool = prepared_rows if isinstance(prepared_rows, RowSpool) else RowSpool.from_chunks(chunks)
         try:
             self._commit_spool(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
                                replace=replace, parser_version=parser_version, expected_token=expected_token,
-                               receipt_digest=receipt_digest)
+                               receipt_digest=receipt_digest, blocks=blocks, receipt_deps=receipt_deps)
         finally:
             if spool is not prepared_rows:
                 spool.close()
 
     def _commit_spool(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
-                      expected_token, receipt_digest):
+                      expected_token, receipt_digest, blocks=None, receipt_deps=None):
         check_request()
+        self._counts.clear()
+        try:
+            self._commit_rows(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
+                              replace=replace, parser_version=parser_version, expected_token=expected_token,
+                              receipt_digest=receipt_digest, blocks=blocks, receipt_deps=receipt_deps)
+        finally:
+            self._counts.clear()  # a rolled-back write leaves no trace in total_changes
+
+    def _commit_rows(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
+                     expected_token, receipt_digest, blocks=None, receipt_deps=None):
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             if expected_token is not None and self.state_token(session_id, provider) != expected_token:
                 raise ValueError("stale session preparation")
             metrics = self.session_metrics(session_id, provider)
             known = self.chunk_ids(session_id, provider)
+            previous = self._conn.execute("SELECT byte_offset FROM session_cursors WHERE provider=? AND session_id=?",
+                                          (provider, session_id)).fetchone()
+            # An append only adds rows at or after the previous cursor. Anything else (a replacement, a row that
+            # overwrites a stored id, a row before the cursor) changes the history audit state was built from.
+            touched_prefix = replace or previous is None
             prior = self._agy_tally(session_id) if provider == "agy" and not replace else Counter()
             tally = Counter()
             with publication():
@@ -397,6 +517,8 @@ class SessionStore:
                     for row in batch:
                         if row[1] != provider or row[2] != session_id:
                             raise ValueError("event scope differs from session publication")
+                        if not touched_prefix and (row[0] in known or row[3] < previous[0]):
+                            touched_prefix = True
                         if replace or row[0] not in known:
                             added += 1
                             flag = spool.flags.get(row[0], (False, False))
@@ -411,15 +533,50 @@ class SessionStore:
                                    (provider, session_id, str(path.resolve()), offset, digest, synced_at))
                 self._conn.execute("INSERT OR REPLACE INTO session_parser_versions VALUES (?,?,?,?)",
                                    (provider, session_id, current_parser_version(provider) if parser_version is None else parser_version, synced_at))
+                if blocks is None:
+                    self._conn.execute("DELETE FROM source_blocks WHERE provider=? AND session_id=?",
+                                       (provider, session_id))
+                else:
+                    table = blocks.table
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO source_blocks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (provider, session_id, str(path.resolve()), _signed64(blocks.dev), _signed64(blocks.ino), blocks.size,
+                         blocks.mtime_ns, table.block_size, table.covered, table.lines, table.digests, table.tail,
+                         table.root, synced_at, blocks.full_verified_at, blocks.full_verified_through))
                 if provider == "agy":
                     self._conn.execute("INSERT OR REPLACE INTO session_receipt_versions VALUES (?,?,?,?)",
                                        (provider, session_id, receipt_digest, synced_at))
+                    self._conn.execute("INSERT OR REPLACE INTO session_receipt_deps VALUES (?,?,?,?)",
+                                       (provider, session_id, receipt_deps, synced_at))
                     self._conn.execute("INSERT OR REPLACE INTO session_agy_stats VALUES (?,?,?)",
                                        (session_id, json.dumps(dict(prior + tally), sort_keys=True), synced_at))
                 self._conn.execute("INSERT OR REPLACE INTO session_metrics VALUES (?,?,?,?,?)",
                                    (provider, session_id, *metrics))
+                self._record_commit(provider, session_id, offset, digest, metrics[0], synced_at, touched_prefix)
                 check_request()
                 self._conn.commit()
+
+    _COMMIT_LOG_KEEP = 256
+
+    def _record_commit(self, provider, session_id, offset, digest, event_count, synced_at, rewrite):
+        """Chain this commit onto the session's append history, in the transaction that published it."""
+        row = self._conn.execute("SELECT generation FROM session_generations WHERE provider=? AND session_id=?",
+                                 (provider, session_id)).fetchone()
+        if rewrite or row is None:
+            generation = (row[0] if row else 0) + 1
+            self._conn.execute("INSERT OR REPLACE INTO session_generations VALUES (?,?,?)",
+                               (provider, session_id, generation))
+            self._conn.execute("DELETE FROM session_commit_log WHERE provider=? AND session_id=?", (provider, session_id))
+            self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=?", (provider, session_id))
+        else:
+            generation = row[0]
+        self._conn.execute("INSERT OR REPLACE INTO session_commit_log VALUES (?,?,?,?,?,?,?)",
+                           (provider, session_id, generation, offset, digest, event_count, synced_at))
+        self._conn.execute(
+            "DELETE FROM session_commit_log WHERE provider=? AND session_id=? AND generation=? AND byte_offset <"
+            " COALESCE((SELECT byte_offset FROM session_commit_log WHERE provider=? AND session_id=? AND generation=?"
+            " ORDER BY byte_offset DESC LIMIT 1 OFFSET ?), -1)",
+            (provider, session_id, generation, provider, session_id, generation, self._COMMIT_LOG_KEEP - 1))
 
     def pending_deletions(self, session_id, provider):
         return [row[0] for row in self._conn.execute(
@@ -519,6 +676,8 @@ class SessionStore:
             "SELECT chunk_id,data FROM session_events" + where + " ORDER BY provider,session_id,byte_start,sub_index", params).fetchall())
         return AuditEvidenceSnapshot(session_id, provider, rows, count)
 
+    audit_rows_fetched = 0  # slim audit rows read by this store object; tests and benchmarks read it
+
     def capture_audit_events(self, session_id, provider, needs, *, link_calls=False):
         """Ordered slim events; text is loaded only for events some ``(scope, roles)`` need can inspect.
 
@@ -526,55 +685,271 @@ class SessionStore:
         Rows are paged through a cursor and never held as raw JSON or pydantic models.
         """
         with self._read_boundary():
-            terms, term_params = [], []
-            for scope, roles in needs:
-                if scope == "attempt":
-                    # Host-logged model proposals (forbidden-attempt matching); never every runtime-role event.
-                    terms.append("json_extract(data,'$.meta.evidence_origin')='model_proposal'")
-                    continue
-                kind = _SCOPE_KINDS.get(scope)
-                parts = []
-                if kind is not None:
-                    parts.append("json_extract(data,'$.kind')=?")
-                    term_params.append(kind)
-                parts.append("json_extract(data,'$.meta.role') IN (" + ",".join("?" for _ in roles) + ")" if roles else "0")
-                term_params.extend(roles)
-                terms.append("(" + " AND ".join(parts) + ")")
-            if link_calls:
-                terms.append("json_extract(data,'$.kind') IN ('tool_call','tool_result')")
-            wanted = " OR ".join(terms) if terms else "0"
             count = self.chunk_count(session_id, provider)
-            check_request()
-            # Provider evidence classes (AGY truncation, pending, legacy, denial; Claude cut results) are read
-            # with one extra packed column.
-            packed_keys = _AUDIT_META.get(provider)
-            extra = ("json_extract(data,'" + "','".join("$.meta." + key for key in packed_keys) + "')"
-                     if packed_keys else "NULL")
-            cursor = self._conn.execute(
-                "SELECT chunk_id, json_extract(data,'$.kind'), json_extract(data,'$.meta.role'),"
-                " json_extract(data,'$.meta.call_id'), json_type(data,'$.meta.success'),"
-                " json_extract(data,'$.meta.success'), CASE WHEN " + wanted + " THEN json_extract(data,'$.text') END,"
-                " " + extra + " FROM session_events WHERE session_id=? AND provider=?"
-                " ORDER BY provider,session_id,byte_start,sub_index", term_params + [session_id, provider])
-            events = []
-            while True:
-                check_request()
-                page = cursor.fetchmany(512)
-                if not page:
-                    break
-                for cid, kind, role, call_id, success_type, success, text, packed in page:
-                    if success_type == "true":
-                        success = True
-                    elif success_type == "false":
-                        success = False
-                    elif success_type in (None, "null"):
-                        success = None
-                    meta = {"role": role, "call_id": call_id, "success": success}
-                    if packed is not None:
-                        meta.update((key, value) for key, value in zip(packed_keys, json.loads(packed))
-                                    if value is not None)
-                    events.append(AuditEvent(cid, kind, text or "", meta))
+            events = self._fetch_audit_events(session_id, provider, needs, link_calls, None)
             return AuditEventSnapshot(session_id, provider, tuple(events), count)
+
+    def capture_audit_tail(self, session_id, provider, needs, *, link_calls=False, from_byte=0):
+        """The slim events whose records start at ``from_byte`` or later, in order; call inside a read boundary.
+
+        Reads rows in proportion to the appended records, not to the session: the range is served by the
+        ``(provider, session_id, byte_start, sub_index)`` index.
+        """
+        return self._fetch_audit_events(session_id, provider, needs, link_calls, from_byte)
+
+    def _fetch_audit_events(self, session_id, provider, needs, link_calls, from_byte):
+        terms, term_params = [], []
+        for scope, roles in needs:
+            if scope == "attempt":
+                # Host-logged model proposals (forbidden-attempt matching); never every runtime-role event.
+                terms.append("json_extract(data,'$.meta.evidence_origin')='model_proposal'")
+                continue
+            kind = _SCOPE_KINDS.get(scope)
+            parts = []
+            if kind is not None:
+                parts.append("json_extract(data,'$.kind')=?")
+                term_params.append(kind)
+            parts.append("json_extract(data,'$.meta.role') IN (" + ",".join("?" for _ in roles) + ")" if roles else "0")
+            term_params.extend(roles)
+            terms.append("(" + " AND ".join(parts) + ")")
+        if link_calls:
+            terms.append("json_extract(data,'$.kind') IN ('tool_call','tool_result')")
+        wanted = " OR ".join(terms) if terms else "0"
+        check_request()
+        # Provider evidence classes (AGY truncation, pending, legacy, denial; Claude cut results) are read
+        # with one extra packed column.
+        packed_keys = _AUDIT_META.get(provider)
+        extra = ("json_extract(data,'" + "','".join("$.meta." + key for key in packed_keys) + "')"
+                 if packed_keys else "NULL")
+        tail, tail_params = ("", []) if from_byte is None else (" AND byte_start>=?", [from_byte])
+        cursor = self._conn.execute(
+            "SELECT chunk_id, json_extract(data,'$.kind'), json_extract(data,'$.meta.role'),"
+            " json_extract(data,'$.meta.call_id'), json_type(data,'$.meta.success'),"
+            " json_extract(data,'$.meta.success'), CASE WHEN " + wanted + " THEN json_extract(data,'$.text') END,"
+            " " + extra + ", byte_start, sub_index FROM session_events WHERE session_id=? AND provider=?" + tail
+            + " ORDER BY provider,session_id,byte_start,sub_index", term_params + [session_id, provider] + tail_params)
+        events = []
+        while True:
+            check_request()
+            page = cursor.fetchmany(512)
+            if not page:
+                break
+            for cid, kind, role, call_id, success_type, success, text, packed, byte_start, sub_index in page:
+                if success_type == "true":
+                    success = True
+                elif success_type == "false":
+                    success = False
+                elif success_type in (None, "null"):
+                    success = None
+                meta = {"role": role, "call_id": call_id, "success": success}
+                if packed is not None:
+                    meta.update((key, value) for key, value in zip(packed_keys, json.loads(packed))
+                                if value is not None)
+                events.append(AuditEvent(cid, kind, text or "", meta, (byte_start, sub_index)))
+            self.audit_rows_fetched += len(page)
+        return events
+
+    # --- Incremental audit state ------------------------------------------------------------------------------
+    # Derived data only. The events and the cursor are the authority; nothing here may make an audit cleaner.
+
+    def audit_lineage(self, session_id, provider):
+        """The cursor, the session's generation and its newest commit-log row, as of this read boundary."""
+        cursor = self._cursor_record(session_id, provider)
+        row = self._conn.execute("SELECT generation FROM session_generations WHERE provider=? AND session_id=?",
+                                 (provider, session_id)).fetchone()
+        latest = None
+        if row is not None:
+            found = self._conn.execute(
+                "SELECT byte_offset,prefix_hash,event_count,synced_at FROM session_commit_log"
+                " WHERE provider=? AND session_id=? AND generation=? ORDER BY byte_offset DESC LIMIT 1",
+                (provider, session_id, row[0])).fetchone()
+            latest = dict(found) if found is not None else None
+        return {"cursor": cursor, "generation": row[0] if row is not None else None, "latest": latest}
+
+    def lineage_row(self, session_id, provider, generation, offset):
+        found = self._conn.execute(
+            "SELECT byte_offset,prefix_hash,event_count,synced_at FROM session_commit_log"
+            " WHERE provider=? AND session_id=? AND generation=? AND byte_offset=?",
+            (provider, session_id, generation, offset)).fetchone()
+        return dict(found) if found is not None else None
+
+    def load_audit_states(self, session_id, provider, needs_digest):
+        rows = self._conn.execute(
+            "SELECT monitor_id,contract_revision,fingerprint,parser_version,evaluator_version,generation,byte_offset,"
+            "prefix_hash,event_count,path,state FROM audit_monitor_state"
+            " WHERE provider=? AND session_id=? AND needs_digest=?", (provider, session_id, needs_digest)).fetchall()
+        out = {}
+        for row in rows:
+            record = dict(row)
+            try:
+                record["state"] = json.loads(record["state"])
+            except ValueError:
+                continue  # an unreadable cache row is the same as no row
+            out[record["monitor_id"]] = record
+        return out
+
+    def audit_health(self, session_id, provider, evaluator_version):
+        return {row[0]: (row[1], row[2]) for row in self._conn.execute(
+            "SELECT monitor_id,status,detail FROM audit_incremental_health"
+            " WHERE provider=? AND session_id=? AND evaluator_version=?", (provider, session_id, evaluator_version))}
+
+    def record_audit_health(self, session_id, provider, evaluator_version, monitor_ids, status, detail):
+        """Persist 'do not trust incremental evaluation of this contract here' (until the evaluator changes)."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn, publication():
+            self._conn.execute("BEGIN IMMEDIATE")
+            for monitor_id in monitor_ids:
+                self._conn.execute("INSERT OR REPLACE INTO audit_incremental_health VALUES (?,?,?,?,?,?,?)",
+                                   (provider, session_id, monitor_id, evaluator_version, status, detail[:2000], now))
+                self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND monitor_id=?",
+                                   (provider, session_id, monitor_id))
+            check_request()
+
+    def drop_audit_states(self, session_id, provider, monitor_ids):
+        """Forget stored monitor states (all needs variants) without marking the contract unhealthy."""
+        with self._conn, publication():
+            self._conn.execute("BEGIN IMMEDIATE")
+            for monitor_id in monitor_ids:
+                self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND monitor_id=?",
+                                   (provider, session_id, monitor_id))
+            check_request()
+
+    def save_audit_states(self, session_id, provider, needs_digest, rows, snapshot):
+        """Write monitor states and the evaluated cursor in one transaction; returns ``"saved"`` or why not.
+
+        ``snapshot`` is what the evaluation read: ``generation`` (``None`` when no valid commit chain existed),
+        ``offset``, ``prefix_hash``, ``synced_at``, ``path`` and ``count``. The write is refused unless the index
+        still contains exactly that point: same chain and log row, or (when the chain is new) the same cursor. A
+        state is never written over a newer one of the same generation.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn, publication():
+            self._conn.execute("BEGIN IMMEDIATE")
+            cursor = self._conn.execute(
+                "SELECT byte_offset,prefix_hash,synced_at,path FROM session_cursors WHERE provider=? AND session_id=?",
+                (provider, session_id)).fetchone()
+            row = self._conn.execute("SELECT generation FROM session_generations WHERE provider=? AND session_id=?",
+                                     (provider, session_id)).fetchone()
+            if snapshot["generation"] is not None:
+                if row is None or row[0] != snapshot["generation"]:
+                    return "stale_generation"
+                logged = self._conn.execute(
+                    "SELECT prefix_hash,event_count FROM session_commit_log"
+                    " WHERE provider=? AND session_id=? AND generation=? AND byte_offset=?",
+                    (provider, session_id, snapshot["generation"], snapshot["offset"])).fetchone()
+                if logged is None or logged[0] != snapshot["prefix_hash"] or logged[1] != snapshot["count"]:
+                    return "stale_lineage"
+                generation = snapshot["generation"]
+            else:
+                if cursor is None or tuple(cursor) != (snapshot["offset"], snapshot["prefix_hash"],
+                                                        snapshot["synced_at"], snapshot["path"]):
+                    return "stale_cursor"
+                generation = (row[0] if row is not None else 0) + 1
+                self._conn.execute("INSERT OR REPLACE INTO session_generations VALUES (?,?,?)",
+                                   (provider, session_id, generation))
+                self._conn.execute("DELETE FROM session_commit_log WHERE provider=? AND session_id=?", (provider, session_id))
+                self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=?", (provider, session_id))
+                self._conn.execute("INSERT OR REPLACE INTO session_commit_log VALUES (?,?,?,?,?,?,?)",
+                                   (provider, session_id, generation, snapshot["offset"], snapshot["prefix_hash"],
+                                    snapshot["count"], snapshot["synced_at"]))
+            for item in rows:
+                check_request()
+                self._conn.execute(
+                    "INSERT INTO audit_monitor_state VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(provider,session_id,monitor_id,needs_digest) DO UPDATE SET"
+                    " contract_revision=excluded.contract_revision, fingerprint=excluded.fingerprint,"
+                    " parser_version=excluded.parser_version, evaluator_version=excluded.evaluator_version,"
+                    " generation=excluded.generation, byte_offset=excluded.byte_offset,"
+                    " prefix_hash=excluded.prefix_hash, event_count=excluded.event_count, path=excluded.path,"
+                    " state=excluded.state, updated_at=excluded.updated_at"
+                    " WHERE audit_monitor_state.generation < excluded.generation OR"
+                    " (audit_monitor_state.generation = excluded.generation AND"
+                    "  audit_monitor_state.byte_offset <= excluded.byte_offset)",
+                    (provider, session_id, item["monitor_id"], needs_digest, item["contract_revision"],
+                     item["fingerprint"], item["parser_version"], item["evaluator_version"], generation,
+                     snapshot["offset"], snapshot["prefix_hash"], snapshot["count"], snapshot["path"],
+                     json.dumps(item["state"], separators=(",", ":")), now))
+            # Keep the newest few needs variants of a monitor (audit and action checks differ), drop the rest.
+            self._conn.execute(
+                "DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND rowid IN ("
+                " SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY monitor_id ORDER BY updated_at DESC) AS n"
+                " FROM audit_monitor_state WHERE provider=? AND session_id=?) WHERE n > 4)",
+                (provider, session_id, provider, session_id))
+            check_request()
+            return "saved"
+
+    _CALL_INDEX = ("CREATE INDEX IF NOT EXISTS events_call ON session_events(provider, session_id,"
+                   " json_extract(data,'$.meta.call_id')) WHERE json_extract(data,'$.meta.call_id') IS NOT NULL")
+
+    def ensure_call_index(self):
+        """Index events by call id so a monitor can ask which calls and results share one. Built once per index.
+
+        Never call this inside a read boundary: creating the index writes.
+        """
+        if self._conn.in_transaction:
+            raise RuntimeError("ensure_call_index must run outside a read boundary")
+        if self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='events_call'").fetchone():
+            return
+        with self._conn, publication():
+            self._conn.execute(self._CALL_INDEX)
+            check_request()
+
+    def audit_call_events(self, session_id, provider, call_ids, before_byte):
+        """``{call_id: [(kind, (byte_start, sub_index), chunk_id)]}`` for stored calls and results of these ids."""
+        found = {}
+        ids = list(call_ids)
+        for start in range(0, len(ids), 400):
+            check_request()
+            batch = ids[start:start + 400]
+            rows = self._conn.execute(
+                "SELECT json_extract(data,'$.meta.call_id'), json_extract(data,'$.kind'), byte_start, sub_index, chunk_id"
+                # ``+byte_start``: keep the planner on the call-id index; a range on byte_start would scan the session.
+                " FROM session_events WHERE provider=? AND session_id=? AND +byte_start<?"
+                " AND json_extract(data,'$.meta.call_id') IN (" + ",".join("?" for _ in batch) + ")"
+                " AND json_extract(data,'$.kind') IN ('tool_call','tool_result')",
+                [provider, session_id, before_byte, *batch]).fetchall()
+            for call_id, kind, byte_start, sub_index, chunk_id in rows:
+                found.setdefault(call_id, []).append((kind, (byte_start, sub_index), chunk_id))
+        self.audit_rows_fetched += sum(len(v) for v in found.values())
+        return found
+
+    PROPOSAL_LOOKBACK = 4096  # events scanned back from the first appended one
+    PROPOSAL_ROWS = 128       # proposals of one tool kept from that window
+
+    def anchor_chunks(self, session_id, provider, anchors):
+        """The stored events named by ``anchors`` that belong to this session, as full chunks (no session scan)."""
+        found = []
+        for anchor in anchors:
+            check_request()
+            chunk = self.get_chunk(anchor)
+            if chunk is not None and chunk.session_id == session_id and chunk.provider == provider:
+                found.append(chunk)
+        return found
+
+    def audit_proposals_before(self, session_id, provider, name, before_byte):
+        """Model proposals of tool ``name`` among the last ``PROPOSAL_LOOKBACK`` events before ``before_byte``.
+
+        Returns ``(rows, complete)``, newest first, ``(key, text)`` each, at most ``PROPOSAL_ROWS``; ``complete`` is
+        false when the window did not reach the start of the session or held more proposals than that, so an older
+        one may exist.
+        """
+        check_request()
+        edge = self._conn.execute(
+            "SELECT 1 FROM (SELECT 1 FROM session_events WHERE provider=? AND session_id=? AND byte_start<?"
+            " ORDER BY byte_start DESC, sub_index DESC LIMIT ?) ", (provider, session_id, before_byte,
+                                                                    self.PROPOSAL_LOOKBACK + 1)).fetchall()
+        complete = len(edge) <= self.PROPOSAL_LOOKBACK
+        rows = self._conn.execute(
+            "SELECT byte_start, sub_index, json_extract(data,'$.text') FROM (SELECT byte_start, sub_index, data"
+            " FROM session_events WHERE provider=? AND session_id=? AND byte_start<?"
+            " ORDER BY byte_start DESC, sub_index DESC LIMIT ?)"
+            " WHERE json_extract(data,'$.meta.evidence_origin')='model_proposal'"
+            " AND json_extract(data,'$.meta.tool_name') IS ? ORDER BY byte_start DESC, sub_index DESC LIMIT ?",
+            (provider, session_id, before_byte, self.PROPOSAL_LOOKBACK, name, self.PROPOSAL_ROWS + 1)).fetchall()
+        if len(rows) > self.PROPOSAL_ROWS:
+            rows, complete = rows[:self.PROPOSAL_ROWS], False
+        self.audit_rows_fetched += len(rows)
+        return [((row[0], row[1]), row[2] or "") for row in rows], complete
 
     def agy_fallback_retries(self, session_id):
         """Sizes (None: missing) of the sibling full log recorded with this session's transient failed fallbacks."""
@@ -686,7 +1061,16 @@ class SessionStore:
             clauses.append("provider=?")
             params.append(provider)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        return self._conn.execute("SELECT COUNT(*) FROM session_events" + where, params).fetchone()[0]
+        # COUNT(*) walks the whole session's index range; a state token asks for it several times per request. The
+        # answer cannot change while neither this connection nor another one has written (``data_version`` moves
+        # for other connections, ``total_changes`` for this one), and this store's own writes drop the cache.
+        version = (self._conn.execute("PRAGMA data_version").fetchone()[0], self._conn.total_changes)
+        cached = self._counts.get((session_id, provider))
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        count = self._conn.execute("SELECT COUNT(*) FROM session_events" + where, params).fetchone()[0]
+        self._counts[(session_id, provider)] = (version, count)
+        return count
 
     def known_hashes(self, session_id, provider=None):
         return {c.content_hash for c in self.list_chunks(session_id, provider)}
@@ -721,6 +1105,127 @@ class SessionStore:
         return coverage
 
 
+@dataclass(frozen=True)
+class IntegrityPolicy:
+    """How source integrity is verified (see ``source_blocks`` and the README, "Source integrity")."""
+
+    recent_blocks: int = 4  # fast path: the latest complete blocks that are always compared
+    sample_blocks: int = 8  # fast path: random other blocks compared (drawn fresh for every call)
+    full_verify_interval_sec: float = 300.0  # a fast check is only allowed this long after the last full one
+    clock: Any = lambda: datetime.now(timezone.utc)
+    rng: Any = None  # None: fresh system randomness per call
+
+    @classmethod
+    def from_settings(cls, settings):
+        return cls(recent_blocks=settings.integrity_fast_recent_blocks,
+                   sample_blocks=settings.integrity_fast_sample_blocks,
+                   full_verify_interval_sec=settings.integrity_full_verify_interval_sec)
+
+    def new_rng(self):
+        return self.rng() if self.rng is not None else None
+
+
+def _signed64(value: int) -> int:
+    """SQLite integers are signed 64-bit; device and file ids may use the whole unsigned range (stored bit for bit)."""
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def _unsigned64(value: int) -> int:
+    return value + (1 << 64) if value < 0 else value
+
+
+def _blockable(provider, path) -> bool:
+    """Plain files of every provider but AGY keep a block table. AGY receipts bind to plain prefix digests, and a
+    ``.zst`` snapshot is validated by the digest of its (compressed) bytes; both keep full verification."""
+    from self_directing_mcp.compressed_source import is_compressed
+    return provider != "agy" and not is_compressed(path)
+
+
+def _cursor_kind(cursor):
+    """``"blocks"`` / ``"sha"`` by the cursor's stored hash; None without a cursor."""
+    if cursor is None:
+        return None
+    return "blocks" if is_block_hash(cursor["prefix_hash"]) else "sha"
+
+
+def capture_for_cursor(provider, path, cursor, checkpoints, max_bytes, *, publish=False):
+    """One full capture collecting what is needed to compare with ``cursor`` (and to publish, with ``publish``)."""
+    kind, blockable = _cursor_kind(cursor), _blockable(provider, path)
+    blocks = kind == "blocks" or (publish and blockable)
+    sha = kind == "sha" or (publish and not blockable) or not blocks
+    return capture_source(path, checkpoints=checkpoints, max_bytes=max_bytes, sha=sha, blocks=blocks)
+
+
+def _hash_matches(observation, offset, stored) -> bool:
+    return observation.cursor_hash(offset, "blocks" if is_block_hash(stored) else "sha") == stored
+
+
+def _parse_time(value):
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def _plan(provider, path, cursor, record, verify, policy):
+    """``(mode, reason)``: whether this request may verify in the cheap way. ``reason`` explains a full scan that a
+    fast one could have replaced; None when full was asked for."""
+    if not _blockable(provider, path):
+        return "full", "legacy_source"
+    if cursor is None:
+        return "full", "first_sync"
+    if verify != "fast":
+        return "full", None
+    if cursor["path"] != str(path):
+        return "full", "path_changed"
+    if cursor["parser_version"] != current_parser_version(provider):
+        return "full", "parser_updated"
+    if not is_block_hash(cursor["prefix_hash"]):
+        return "full", "migration"
+    if record is None or not record.bound_to(cursor):
+        return "full", "no_record"
+    verified = _parse_time(record.full_verified_at)
+    if verified is None:
+        return "full", "unverified"
+    age = (policy.clock() - verified).total_seconds()
+    # An interval of 0 means every check is full; a clock that jumped back is not evidence of recency.
+    if policy.full_verify_interval_sec <= 0 or age > policy.full_verify_interval_sec or age < -60:
+        return "full", "interval_elapsed"
+    return "fast", None
+
+
+def index_generation(cursor) -> str:
+    """Names one publication of one session's index state (changes with every cursor write)."""
+    stamp = f"{cursor['synced_at']}|{cursor['byte_offset']}|{cursor['parser_version']}"
+    return "i1:" + hashlib.sha256(stamp.encode()).hexdigest()[:16]
+
+
+def integrity_report(observation, cursor, record) -> dict:
+    """The ``integrity`` object of a response.
+
+    ``mode`` is how THIS request checked the source. ``full_verified_*`` describe the last verification of every
+    byte of the indexed prefix, a past event: they say nothing about the source as it is now. A fast request
+    compared only the blocks listed in ``fast_checked``.
+    """
+    at = through = None
+    if record is not None and record.bound_to(cursor) and cursor["path"] == str(observation.path):
+        at, through = record.full_verified_at, record.full_verified_through
+    elif observation.mode == "full":
+        # No stored table for this file (a source form without one, or a copy of the indexed source): the scan this
+        # request just did is the verification, of as much of the indexed prefix as this file holds.
+        at, through = observation.scanned_at, min(cursor["byte_offset"], observation.length)
+    report = {"mode": observation.mode, "full_verified_through_byte": through, "full_verified_at": at,
+              "source_generation": observation.generation, "index_generation": index_generation(cursor)}
+    if observation.mode == "fast":
+        report["fast_checked"] = observation.fast_checked
+    elif observation.full_reason:
+        report["full_reason"] = observation.full_reason
+        if observation.lag_sec is not None:
+            report["verification_lag_sec"] = round(observation.lag_sec, 3)
+    return report
+
+
 def coverage_from_capture(session_id, provider, record, metrics, observation=None, *, alias=False, max_bytes=None):
     """``alias``: ``observation`` is a verified copy or continuation of the indexed source, which lives at another path.
 
@@ -736,8 +1241,8 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
         if record["parser_version"] != current_parser_version(provider):
             issues.append("parser_outdated")
         try:
-            observation = observation or capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],),
-                                                        max_bytes=max_bytes)
+            observation = observation or capture_for_cursor(provider, Path(record["path"]), record,
+                                                            (record["byte_offset"],), max_bytes)
             if alias:
                 result.update(indexed_path=record["path"], requested_path=str(observation.path))
             if (str(observation.path) != record["path"] and not alias) or not observation.validate_prefix():
@@ -747,7 +1252,7 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
             result["pending_bytes"] = max(0, result["file_size"] - record["byte_offset"])
             if result["pending_bytes"]:
                 issues.append("unread_bytes")
-            if observation.prefix_digest(record["byte_offset"]) != record["prefix_hash"]:
+            if not _hash_matches(observation, record["byte_offset"], record["prefix_hash"]):
                 issues.append("source_changed")
         except RequestStopped:
             raise
@@ -784,7 +1289,8 @@ def agy_coverage(coverage, stats, receipts=None):
 
 @request_operation
 def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider="codex",
-                   embed=True, derived=True, guard=nullcontext, retain_dense_deletions=False):
+                   embed=True, derived=True, guard=nullcontext, retain_dense_deletions=False,
+                   verify="full", policy=None):
     """Serialize per (index, provider, session). Later callers find the cursor current and skip the parse.
 
     A parser-version bump therefore reparses a session once per process no matter how many hooks race on it;
@@ -794,7 +1300,15 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
     ``retain_dense_deletions``: this process has no dense index but the index directory does (a local-only hook
     sharing a server's index). Obsolete ids are removed from the sparse index and stay journalled until a process
     that can also remove their vectors syncs the session.
+
+    ``verify``: ``"full"`` scans the whole source prefix once; ``"fast"`` (hook-time checks) may compare only the
+    tail, the latest blocks and a random sample with the stored block digests (``IntegrityPolicy``), and falls
+    back to a full scan whenever it cannot vouch. The result's ``integrity`` object says which happened.
+
+    A source change detected while preparing (a rewrite, truncation or replacement between capture and
+    publication) discards the observation and recaptures, in full, a bounded number of times.
     """
+    policy = policy or IntegrityPolicy()
     requested = Path(path).resolve()
     with session_flight(_flight_key(store, provider, requested, session_id)):
         seen, target, captured = [], requested, None
@@ -803,17 +1317,20 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
             try:
                 info = _ingest_session(path=target, session_id=session_id, store=store, sparse=sparse, dense=dense,
                                        embedder=embedder, provider=provider, embed=embed, derived=derived,
-                                       guard=guard, seen=seen, observation=handed,
+                                       guard=guard, seen=seen, observation=handed, verify=verify, policy=policy,
                                        retain_dense_deletions=retain_dense_deletions)
             except _StaleObservation:
                 continue  # another process published past our capture: observe the file again
             except _IndexedElsewhere as elsewhere:
                 target, captured = elsewhere.path, elsewhere.observation  # a strict prefix: report the indexed source
                 continue
+            except SourceChanged:
+                verify = "full"  # whatever moved, the next attempt does not rest on a cheap check
+                continue
             if target != requested:
                 _mark_prefix_alias(info, requested)
             return info
-        raise ValueError("source changed during preparation")
+        raise SourceChanged("source changed during preparation")
 
 
 _RECAPTURE_ATTEMPTS = 3
@@ -849,24 +1366,24 @@ def _mark_prefix_alias(info, requested):
     coverage["complete"] = False
 
 
-def _other_source(cursor, path, observation, session_id, max_bytes=None):
+def _other_source(cursor, path, observation, session_id, max_bytes=None, provider="codex"):
     """Another file claims the session id whose cursor indexes ``cursor["path"]``. Streaming hashes only; no writes.
 
     "copy": this file starts with the indexed prefix and the indexed file still exists, "moved": the same but that
     file is gone, "replaced": it is gone and this file does not continue it (reindex, as before). A strict prefix of
     the indexed file raises _IndexedElsewhere; two files that disagree raise AmbiguousSessionSource.
     """
-    indexed, offset = Path(cursor["path"]), cursor["byte_offset"]
-    continues = observation.length >= offset and observation.prefix_digest(offset) == cursor["prefix_hash"]
+    indexed, offset, kind = Path(cursor["path"]), cursor["byte_offset"], _cursor_kind(cursor)
+    continues = observation.length >= offset and _hash_matches(observation, offset, cursor["prefix_hash"])
     present = indexed.is_file()
     if continues:
         return "copy" if present else "moved"
     if not present:
         return "replaced"
-    other = capture_source(indexed, checkpoints=(offset, observation.length), max_bytes=max_bytes)
-    if (other.length >= offset and other.prefix_digest(offset) == cursor["prefix_hash"]
+    other = capture_for_cursor(provider, indexed, cursor, (offset, observation.length), max_bytes)
+    if (other.length >= offset and _hash_matches(other, offset, cursor["prefix_hash"])
             and observation.length < offset
-            and other.prefix_digest(observation.length) == observation.prefix_digest(observation.length)):
+            and other.cursor_hash(observation.length, kind) == observation.cursor_hash(observation.length, kind)):
         raise _IndexedElsewhere(indexed, other)
     raise AmbiguousSessionSource(session_id, indexed, path)
 
@@ -896,22 +1413,74 @@ def _provider_parser(provider):
     return parse_session_chunks, peek_session_id
 
 
+def _draft(observation, offset, record):
+    """The block table to publish with a cursor at ``offset``. A full scan compared every block just now; a fast
+    check keeps the previous verification stamps (it verified nothing in full)."""
+    table = observation.table_at(offset)
+    stamp = observation.stamp
+    if observation.mode == "full":
+        verified_at, through = observation.scanned_at, offset
+    elif record is not None:
+        verified_at, through = record.full_verified_at, record.full_verified_through
+    else:
+        verified_at = through = None
+    return BlockDraft(table, stamp[0], stamp[1], stamp[2], stamp[3], verified_at, through)
+
+
+def _capture_observation(path, provider, known, record, hint, verify, policy, max_bytes):
+    """The request's capture: a fast check when allowed and possible, otherwise the one full scan of the prefix."""
+    mode, reason = _plan(provider, path, known, record, verify, policy)
+    lag = None
+    if reason == "interval_elapsed":
+        lag = (policy.clock() - _parse_time(record.full_verified_at)).total_seconds() - policy.full_verify_interval_sec
+    if mode == "fast":
+        try:
+            observation = capture_source_fast(path, record, recent=policy.recent_blocks, samples=policy.sample_blocks,
+                                              rng=policy.new_rng())
+        except FastFallback as fallback:
+            reason = fallback.reason  # the cheap signals (or a block) say this must be settled by a full scan
+        else:
+            observation.scanned_at = policy.clock().isoformat()
+            return observation
+    observation = capture_for_cursor(provider, path, known, hint, max_bytes, publish=True)
+    observation.full_reason, observation.lag_sec = reason, lag
+    observation.scanned_at = policy.clock().isoformat()
+    return observation
+
+
 def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard, seen,
-                    observation=None, retain_dense_deletions=False):
+                    observation=None, retain_dense_deletions=False, verify="full", policy=None):
     if embed and (dense is None or embedder is None):
         raise ValueError("embedding unavailable in local-only mode")
     parse_session_chunks, peek_session_id = _provider_parser(provider)
     path = Path(path).resolve()
+    policy = policy or IntegrityPolicy()
+    planned = None  # the cursor a fast capture was planned from; it must still be the current one
     if observation is None:
-        hint = ()
-        if session_id:
+        hint, known, record, sid_hint = (), None, None, session_id
+        if not sid_hint:
+            try:
+                sid_hint = peek_session_id(path)
+            except (OSError, ValueError):
+                sid_hint = None
+        if sid_hint:
             try:
                 with guard(), store._read_boundary():
-                    known = store.cursor_record(session_id.lower() if provider in ("codex", "agy") else session_id, provider)
+                    known = store.cursor_record(sid_hint.lower() if provider in ("codex", "agy") else sid_hint, provider)
+                    record = store.source_block_record(known["session_id"], provider) if known else None
                 hint = (known["byte_offset"],) if known and type(known["byte_offset"]) is int else ()
+                if provider == "agy":
+                    # Every receipt anchors to a prefix digest and the ledger to a verified length: hash the capture
+                    # at those offsets and none of them costs a second read of the file.
+                    from self_directing_mcp.agy_receipts import ReceiptStore
+                    hint += ReceiptStore(store.db_path.parent).checkpoints(sid_hint.lower(), path)
             except (OSError, sqlite3.Error):
-                hint = ()
-        observation = capture_source(path, checkpoints=hint, max_bytes=store.max_decompressed_bytes)
+                hint, known, record = (), None, None
+        observation = _capture_observation(path, provider, known, record, hint, verify, policy,
+                                           store.max_decompressed_bytes)
+        planned = known
+    if observation.scanned_at is None:  # an observation handed in by a retry: its scan finished before now
+        observation.scanned_at = policy.clock().isoformat()
     with source_scope(observation):
         sid = session_id or peek_session_id(path)
         if not sid:
@@ -923,21 +1492,26 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         claimed = peek_session_id(path)
         if claimed is not None and (claimed.lower() if provider in ("codex", "agy") else claimed) != sid:
             raise ValueError("session identity differs from observed source")
-        receipt_store, receipts, fallback_retries = None, {}, ()
+        receipt_store, receipts, fallback_retries, cursor_deps = None, {}, (), None
         with guard(), store._read_boundary():
             cursor = store.cursor_record(sid, provider)
+            record = store.source_block_record(sid, provider) if cursor else None
             expected_token = store.state_token(sid, provider)
             prior_calls = (store.prior_calls(sid, provider)
                            if provider == "omp" and cursor and observation.complete_end > cursor["byte_offset"] else ())
             if provider == "agy":
                 from self_directing_mcp.agy_receipts import ReceiptStore
                 fallback_retries = store.agy_fallback_retries(sid) if cursor else ()
+                cursor_deps = store.receipt_deps(sid, provider, cursor["synced_at"]) if cursor else None
                 receipt_store = ReceiptStore(store.db_path.parent)
                 receipt_capture = receipt_store.read_capture(sid)
                 receipt_authority_before = receipt_store.authority_token(sid)
                 if (receipt_authority_before[0] != "present"
                         or receipt_authority_before[2] != receipt_store.rows_digest(receipt_capture[0])):
                     raise ValueError("receipt authority changed during capture")
+        if observation.mode == "fast" and (cursor is None or planned is None
+                                           or cursor["synced_at"] != planned["synced_at"]):
+            raise _StaleObservation()  # the table the check used belongs to a publication that is gone
         if cursor and cursor["path"] == str(path) and type(cursor["byte_offset"]) is int \
                 and cursor["byte_offset"] > observation.length:
             # Never rewind a newer cursor from an older capture. Only a recapture that is still shorter than
@@ -949,14 +1523,14 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         # reindexing on a path change; elsewhere a copy or continuation of the indexed prefix is not a new source.
         relation = None
         if cursor and provider != "agy" and cursor["path"] != str(path) and type(cursor["byte_offset"]) is int:
-            relation = _other_source(cursor, path, observation, sid, store.max_decompressed_bytes)
+            relation = _other_source(cursor, path, observation, sid, store.max_decompressed_bytes, provider)
         parser_version = current_parser_version(provider)
         start = cursor["byte_offset"] if cursor else 0
         reindexed, reindex_reason = False, None
         if cursor:
             try:
                 changed = relation not in ("copy", "moved") and (
-                    str(path) != cursor["path"] or observation.prefix_digest(start) != cursor["prefix_hash"])
+                    str(path) != cursor["path"] or not _hash_matches(observation, start, cursor["prefix_hash"]))
             except ValueError:
                 changed = True
             if changed:
@@ -967,18 +1541,27 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 # A fallback that failed because the full log was missing or not yet at that step: it is retried
                 # once per change of the full log, and only for those transient failures.
                 start, reindexed, reindex_reason = 0, True, "truncated_fallback_retry"
-        receipt_digest = None
+        receipt_digest = receipt_ledger = None
+        receipts_dirty = False
         if receipt_store is not None:
-            receipt_rows, receipts, receipt_digest, indexed_digest = receipt_store.prepare_bindings(receipt_capture, path)
-            if cursor and (receipt_digest != indexed_digest or cursor.get("receipt_digest") != receipt_digest):
+            receipt_rows, receipts, receipt_digest, indexed_digest, receipt_ledger = receipt_store.prepare_bindings(
+                receipt_capture, path, session_id=sid, observation=observation)
+            from self_directing_mcp.agy_receipts import affects_index
+            receipts_dirty = bool(cursor) and (receipt_digest != indexed_digest
+                                               or cursor.get("receipt_digest") != receipt_digest)
+            # The receipts moved since the indexed events were built. Those events are still what a fresh parse
+            # would produce unless a receipt they were derived from changed (agy_receipts.dependencies): the usual
+            # case is a receipt for a step that has no result yet. Anything unproven reparses from byte 0.
+            if receipts_dirty and (reindexed or affects_index(cursor_deps, receipt_rows)):
                 start, reindexed, reindex_reason = 0, True, "hook_receipts_changed"
         chunks = RowSpool()
+        uses = set()
         try:
             if cursor and not reindexed and provider != "agy" and start >= observation.complete_end:
                 offset, parsed_sid = start, sid
             elif provider == "agy":
                 _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, receipts=receipts,
-                                                             sink=chunks)
+                                                             sink=chunks, uses=uses)
             elif provider == "omp" and start:
                 # This lookup is request-owned and bound to the captured cursor generation.
                 earliest = {}
@@ -992,21 +1575,28 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, sink=chunks)
             if parsed_sid != sid:
                 raise ValueError("session id changed while parsing")
-            digest = observation.prefix_digest(offset)
-            # The whole-prefix rehash stays outside the publication lock; the lock only re-checks identity, size and a
-            # bounded tail window (a rewrite elsewhere in that gap is caught by the next sync's cursor prefix_hash).
-            if not observation.validate_prefix():
-                raise ValueError("source changed during preparation")
+            blockable = _blockable(provider, path)
+            digest = observation.cursor_hash(offset, "blocks" if blockable else "sha")
+            draft = _draft(observation, offset, record) if blockable else None
+            receipt_deps = None
+            if receipt_store is not None:
+                from self_directing_mcp.agy_receipts import dependencies
+                # An append extends what the stored events depend on; without stored dependencies (an index from
+                # before they were kept) there is nothing to extend and the next receipt change reparses.
+                prior = None if reindexed or not cursor else cursor_deps
+                if reindexed or not cursor or prior is not None:
+                    receipt_deps = json.dumps(dependencies(receipt_rows, uses, prior), sort_keys=True)
         except BaseException:
             chunks.close()
             raise
     try:
         check_request()
-        if not observation.validate_prefix():  # full rehash, off the shared lock
-            raise ValueError("source changed during preparation")
+        # Bounded re-checks only: the capture was this request's one full scan of the prefix (see validate_prefix).
+        if not observation.validate_prefix():
+            raise SourceChanged("source changed during preparation")
         with guard():
             if not observation.validate_prefix(locked=True):
-                raise ValueError("source changed during preparation")
+                raise SourceChanged("source changed during preparation")
             current = store.cursor_record(sid, provider)
             changed_token = store.state_token(sid, provider) != expected_token
             equivalent = bool(changed_token and current and current["path"] == str(path)
@@ -1029,11 +1619,25 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 if receipt_store is not None:
                     if receipt_store.authority_token(sid) != receipt_authority_before:
                         raise ValueError("receipt authority changed during preparation")
-                    receipt_store.publish_bindings(sid, receipt_capture, receipt_rows)
-                if chunks.count or reindexed or cursor is None or offset != cursor["byte_offset"] or relation == "moved":
+                    receipt_store.publish_bindings(sid, receipt_capture, receipt_rows, receipt_ledger)
+                # A cursor without a block table (written before this version, by an older process, or after a
+                # change of source form) is republished with one, even when nothing else changed.
+                own = draft is not None and cursor is not None and cursor["path"] == str(path) and relation is None
+                bound = own and record is not None and record.bound_to(cursor)
+                needs_table = own and not bound
+                if (chunks.count or reindexed or cursor is None or offset != cursor["byte_offset"]
+                        or relation == "moved" or needs_table or receipts_dirty):
+                    # receipts_dirty: the events stand, but they now belong to these receipts (and their dependencies).
                     store.commit_events((), session_id=sid, provider=provider, path=path, offset=offset,
                                         digest=digest, replace=reindexed, parser_version=parser_version,
-                                        expected_token=expected_token, prepared_rows=chunks, receipt_digest=receipt_digest)
+                                        expected_token=expected_token, prepared_rows=chunks, receipt_digest=receipt_digest,
+                                        blocks=draft, receipt_deps=receipt_deps)
+                elif bound and observation.mode == "full":
+                    # Nothing to publish, but every block was just compared: stamp the stored table.
+                    stamp = observation.stamp
+                    store.mark_full_verified(sid, provider, record, at=observation.scanned_at,
+                                             through=record.table.covered, dev=stamp[0], ino=stamp[1],
+                                             size=stamp[2], mtime_ns=stamp[3])
                 if receipt_store is not None:
                     receipt_store.mark_indexed(sid, receipt_digest)
             else:
@@ -1041,6 +1645,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             with store._read_boundary():
                 committed_token = store.state_token(sid, provider)
                 committed_cursor = store.cursor_record(sid, provider)
+                committed_record = store.source_block_record(sid, provider)
                 metrics = store.session_metrics(sid, provider)
                 receipt_authority = receipt_store.authority_token(sid) if receipt_store is not None else None
                 agy_stats = store.agy_evidence_stats(sid) if provider == "agy" else None
@@ -1057,14 +1662,19 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             "reindexed": reindexed, "parser_version": parser_version, "reindex_reason": reindex_reason,
             "dense_restored": 0, "embedding_pending": 0, "embedding_error": None,
             "sparse_updated": 0, "coverage": coverage,
+            "integrity": integrity_report(observation, committed_cursor, committed_record),
             "_source_observation": observation, "_metadata_token": committed_token, "_receipt_token": receipt_authority}
+    if reindexed:
+        # What this request's verification found: the index was rebuilt from the source as it is now. For
+        # "source_changed" that is a mismatch of the stored digests, never a runtime failure.
+        info["integrity"]["reindex_reason"] = reindex_reason
     if alias:
         info["alias_of"] = committed_cursor["path"]
     if not derived:
         return info
 
     def finish():
-        source_ok = observation.validate_prefix()  # full rehash, off the shared lock
+        source_ok = observation.validate_prefix()  # bounded; see validate_prefix
         with guard():
             issues = []
             if store.state_token(sid, provider) != committed_token:

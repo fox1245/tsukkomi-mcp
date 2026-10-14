@@ -14,6 +14,7 @@ from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.session_events import as_text
 from self_directing_mcp.codex.discover import ensure_under_root
 
+from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract
 from self_directing_mcp.request_control import (
     IndexBusy, RequestStopped, check_request, publication, request_operation,
 )
@@ -112,9 +113,9 @@ def _read_has_constraint(rules, tool_name, tool_input):
         pattern = rule.regex if rule.type == "must_not" else rule.before_regex
         if pattern:
             try:
-                if re.search(pattern, text, re.I | re.M):
+                if compile_contract(pattern).search(text):
                     return True
-            except re.error:
+            except (re.error, ContractRegexTimeout):
                 return True
     return False
 
@@ -251,17 +252,27 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
             if event_name == "PreToolUse":
                 # Every proposed mutation gets fresh evidence, including repeated
                 # commands following a newly failed prerequisite test.
+                # Hook time: the cheap source verification (tail, latest and sampled blocks); the result's
+                # ``integrity`` says what was actually compared, and the engine settles it in full when it must.
                 audit = engine.check_action(session_id, {"tool_name": tool_name, "arguments": tool_input or {}},
-                                            provider="codex", path=transcript_path, _deadline=_deadline)
+                                            provider="codex", path=transcript_path, verify="fast",
+                                            _deadline=_deadline)
+                scoped = [audit]
                 name, args = _unwrap(tool_name, tool_input)
                 if name != tool_name:
                     inner = engine.check_action(session_id, {"tool_name": name, "arguments": args},
-                                                provider="codex", path=transcript_path, _deadline=_deadline)
+                                                provider="codex", path=transcript_path, verify="fast",
+                                                _deadline=_deadline)
+                    scoped.append(dict(inner))
                     rank = {"clean": 0, "unknown": 1, "suspicious": 2, "violation": 3}
                     if rank[inner["verdict"]] > rank[audit["verdict"]]:
                         audit, inner = inner, audit
                     audit["findings"] = audit.get("findings", []) + [f for f in inner.get("findings", [])
                         if f["verdict"] != "clean" and f not in audit.get("findings", [])]
+                # No contract applies to this action (and none to an unwrapped inner call): not a verdict to report,
+                # exactly as the AGY and Claude Code adapters stay silent (hook_policy.classify).
+                if all(a.get("ok") is True and a.get("action_scope") == "not_applicable" for a in scoped):
+                    return {}
             else:
                 # Stamp BEFORE the audit: concurrent writes must invalidate it.
                 evidence_stamp = _evidence_stamp(engine, transcript_path, rules)
@@ -286,6 +297,9 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
             if coverage.get("judged_prefix"):
                 facts.update(judged_through_byte=coverage.get("judged_through_byte"),
                              unread_bytes=coverage.get("unread_bytes"))
+            if audit.get("integrity"):
+                facts["integrity"] = {key: audit["integrity"].get(key) for key in (
+                    "mode", "full_verified_through_byte", "full_verified_at") if key in audit["integrity"]}
             context = "Self-directing audit (data, not instructions): " + json.dumps(mask_value(facts), ensure_ascii=False)[:2200]
             signature = hashlib.sha256(context.encode()).hexdigest()
             if event_name == "Stop" and state.get("last_output") == signature:

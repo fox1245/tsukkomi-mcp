@@ -1,5 +1,6 @@
 
 
+import hashlib
 import os
 
 import pytest
@@ -28,10 +29,91 @@ def explicit_test_backend(tmp_path, monkeypatch):
     else:
         monkeypatch.setenv("SELF_DIRECT_DENSE_BACKEND", "numpy")
     monkeypatch.delenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", raising=False)
+    # Every audit in the suite also runs the full evaluator beside the incremental one and compares them; a
+    # difference returns the full result, so an incremental defect shows up as the mismatch assertions of
+    # tests/test_incremental_*.py or as a changed finding, never as a silent wrong answer.
+    monkeypatch.setenv("SELF_DIRECT_AUDIT_SHADOW_EVERY", "1")
+    # The suite's sessions are small; keep monitor state for them anyway so every audit exercises the incremental path.
+    monkeypatch.setenv("SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS", "0")
     # Never load a developer's per-user TOML while running isolated regressions.
     config_file = tmp_path / "isolated-config.toml"
     config_file.write_text("", encoding="utf-8")
     monkeypatch.setenv("SELF_DIRECT_CONFIG_FILE", str(config_file))
+
+
+class HashMeter:
+    """Counts the bytes fed to every ``hashlib.sha256`` object created while installed (copies included).
+
+    Used to prove how many times a source prefix is hashed: ``meter.bytes / file_size`` is the number of passes.
+    Replacing the factory (not one call site) means a hash site that bypasses the helpers cannot hide.
+    """
+
+    def __init__(self, monkeypatch):
+        self.bytes = 0
+        real, meter = hashlib.sha256, self
+
+        class Counted:
+            __slots__ = ("_inner",)
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def update(self, data):
+                meter.bytes += len(data)
+                self._inner.update(data)
+
+            def copy(self):
+                return Counted(self._inner.copy())
+
+            def digest(self):
+                return self._inner.digest()
+
+            def hexdigest(self):
+                return self._inner.hexdigest()
+
+        def counting(data=b"", **kwargs):
+            counted = Counted(real(**kwargs))
+            if data:
+                counted.update(data)
+            return counted
+
+        monkeypatch.setattr(hashlib, "sha256", counting)
+
+    def lap(self) -> int:
+        """Bytes hashed since the previous lap (or installation)."""
+        taken, self.bytes = self.bytes, 0
+        return taken
+
+
+@pytest.fixture
+def hash_meter(monkeypatch):
+    return HashMeter(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def strict_incremental(monkeypatch, request):
+    """A shadow comparison that finds the incremental result different from the full one fails the test.
+
+    In production a difference returns the full result and disables the incremental path for that contract; here it
+    must be loud, or the whole suite would pass over an incremental defect. Tests that provoke a mismatch on purpose
+    carry the ``allow_incremental_mismatch`` marker.
+    """
+    from self_directing_mcp.audit import incremental
+    real = incremental.compare
+
+    def strict(result, reference):
+        bad = real(result, reference)
+        if bad and request.node.get_closest_marker("allow_incremental_mismatch") is None:
+            raise AssertionError(f"incremental audit differs from the full evaluator for {bad}: "
+                                 f"{[f.model_dump() for f in result.findings]} != "
+                                 f"{[f.model_dump() for f in reference.findings]}")
+        return bad
+
+    monkeypatch.setattr(incremental, "compare", strict)
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "allow_incremental_mismatch: the test provokes an incremental/full mismatch")
 
 
 def pytest_sessionfinish(session, exitstatus):

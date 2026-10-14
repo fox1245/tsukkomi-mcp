@@ -1,128 +1,36 @@
 from __future__ import annotations
 
-import os
-import tomllib
 from pathlib import Path
 from typing import Callable, Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
-from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES
+from self_directing_mcp import settings_core
+from self_directing_mcp.settings_core import SettingsAccessors, get_config_path  # noqa: F401  (public name here)
 
-
-_PATH_FIELDS = frozenset({
-    "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
-    "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file",
-})
-
-
-def get_config_path() -> Path:
-    selected = os.environ.get("SELF_DIRECT_CONFIG_FILE")
-    return Path(selected or Path.home() / ".config" / "tsukkomi-mcp" / "config.toml").expanduser().resolve()
-
-
-def _toml_path(value: object, directory: Path) -> Path:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("TOML paths must be nonempty strings")
-    path = Path(value).expanduser()
-    return (path if path.is_absolute() else directory / path).resolve()
-
-
-def _toml_path_settings() -> dict[str, object]:
-    source = get_config_path()
-    try:
-        with source.open("rb") as stream:
-            document = tomllib.load(stream)
-    except FileNotFoundError:
-        if os.environ.get("SELF_DIRECT_CONFIG_FILE"):
-            raise ValueError("Configured TOML path file does not exist") from None
-        return {}
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
-        raise ValueError("Unable to read valid TOML path configuration") from None
-    if set(document) - {"paths"}:
-        raise ValueError("TOML path configuration only supports [paths]")
-    paths = document.get("paths", {})
-    if not isinstance(paths, dict) or set(paths) - _PATH_FIELDS:
-        raise ValueError("Invalid or unknown TOML path setting")
-    resolved: dict[str, object] = {}
-    for name, value in paths.items():
-        if name == "grokbot_transcripts_dir":
-            from self_directing_mcp.grokbot.discover import parse_transcripts_dirs
-            if isinstance(value, str):
-                if not value.strip():
-                    raise ValueError("TOML paths must be nonempty strings")
-                values = [str(path) for path in parse_transcripts_dirs(value)]
-            elif isinstance(value, list):
-                values = value
-            else:
-                raise ValueError("TOML Grokbot paths must be a string or array")
-            resolved[name] = [_toml_path(item, source.parent) for item in values]
-        elif name == "agy_app_data_dirs":
-            if not isinstance(value, list):
-                raise ValueError("TOML AGY paths must be an array")
-            resolved[name] = [_toml_path(item, source.parent) for item in value]
-        else:
-            resolved[name] = _toml_path(value, source.parent)
-    return resolved
-
-
-def _codex_environment_settings() -> dict[str, object]:
-    value = os.environ.get("CODEX_SESSIONS_DIR")
-    return {"codex_sessions_dir": value} if value else {}
-
-
-def _default_codex_sessions_dir() -> Path:
-    # Windows: %USERPROFILE%\.codex\sessions ; Linux/macOS: ~/.codex/sessions
-    override = os.environ.get("SELF_DIRECT_CODEX_SESSIONS_DIR") or os.environ.get("CODEX_SESSIONS_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".codex" / "sessions"
-
-
-def _default_grokbot_transcripts_dir() -> str:
-    """Empty by default; set SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR to enable."""
-    return os.environ.get("SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR") or ""
-
-
-def _default_omp_sessions_dir() -> Path:
-    return Path(os.environ.get("SELF_DIRECT_OMP_SESSIONS_DIR") or Path.home() / ".omp" / "sessions")
-
-
-def _default_claude_projects_dir() -> Path:
-    # Claude Code keeps its projects under CLAUDE_CONFIG_DIR when set; the MCP server and hooks inherit it.
-    configured = os.environ.get("SELF_DIRECT_CLAUDE_PROJECTS_DIR")
-    if configured:
-        return Path(configured)
-    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+# The sources and defaults below live in ``settings_core`` (standard library only), shared with the light reader
+# the command hooks use; these names stay importable from here for existing callers.
+_PATH_FIELDS = settings_core.PATH_FIELDS
+_toml_path = settings_core.toml_path
+_toml_path_settings = settings_core.toml_path_settings
+_codex_environment_settings = settings_core.codex_environment_settings
+_default_codex_sessions_dir = settings_core.default_codex_sessions_dir
+_default_grokbot_transcripts_dir = settings_core.default_grokbot_transcripts_dir
+_default_omp_sessions_dir = settings_core.default_omp_sessions_dir
+_default_claude_projects_dir = settings_core.default_claude_projects_dir
+_default_index_dir = settings_core.default_index_dir
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _default_index_dir() -> Path:
-    override = os.environ.get("SELF_DIRECT_INDEX_DIR")
-    if override:
-        return Path(override).expanduser().resolve()
-    return Path.home() / ".self_direct_index"
-
-
 def _default_sqlite_vector_path() -> Path | None:
-    override = os.environ.get("SELF_DIRECT_SQLITE_VECTOR_PATH")
-    if override:
-        return Path(override).expanduser().resolve()
-    repo = _repo_root()
-    # scripts/setup_sqlite_vector.py defaults to .native/; older installs used native/.
-    for directory in ("native", ".native"):
-        for ext in ("vector.so", "vector.dll", "vector.dylib"):
-            cand = repo / directory / ext
-            if cand.is_file():
-                return cand.resolve()
-    return None
+    return settings_core.default_sqlite_vector_path(_repo_root())    # tests relocate the checkout through _repo_root
 
 
-class Settings(BaseSettings):
+class Settings(SettingsAccessors, BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SELF_DIRECT_",
         env_file=".env",
@@ -133,56 +41,103 @@ class Settings(BaseSettings):
     grokbot_transcripts_dir: str | list[Path] = Field(default_factory=_default_grokbot_transcripts_dir)
     omp_sessions_dir: Path = Field(default_factory=_default_omp_sessions_dir)
     claude_projects_dir: Path = Field(default_factory=_default_claude_projects_dir)
-    agy_app_data_dirs: list[Path] = Field(default_factory=lambda: [
-        Path.home() / ".gemini" / name
-        for name in ("antigravity", "antigravity-cli", "antigravity-ide")
-    ])
-    agy_enforcement: Literal["confirmed_only", "advisory", "enforced"] = "confirmed_only"
-    claude_enforcement: Literal["confirmed_only", "advisory", "enforced"] = "confirmed_only"
-    session_provider: Literal["codex", "grokbot", "omp", "agy", "claude"] = "codex"
+    agy_app_data_dirs: list[Path] = Field(default_factory=settings_core.default_agy_app_data_dirs)
+    agy_enforcement: Literal["confirmed_only", "advisory", "enforced"] = settings_core.DEFAULT_ENFORCEMENT
+    claude_enforcement: Literal["confirmed_only", "advisory", "enforced"] = settings_core.DEFAULT_ENFORCEMENT
+    session_provider: Literal["codex", "grokbot", "omp", "agy", "claude"] = settings_core.DEFAULT_SESSION_PROVIDER
     index_dir: Path = Field(default_factory=_default_index_dir)
     contracts_path: Path | None = Field(
         default=None,
         description="Optional JSON contracts file; default index_dir/contracts.json",
     )
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
-    embedding_model: str = "qwen/qwen3-embedding-8b"
-    embedding_dim: int = 1024
-    embedding_base_url: str = "https://openrouter.ai/api/v1"
+    embedding_model: str = settings_core.DEFAULT_EMBEDDING_MODEL
+    embedding_dim: int = settings_core.DEFAULT_EMBEDDING_DIM
+    embedding_base_url: str = settings_core.DEFAULT_EMBEDDING_BASE_URL
     use_fake_embedder: bool = False
     local_only: bool = False
-    dense_backend: Literal["sqlite-vector", "numpy"] = "sqlite-vector"
+    dense_backend: Literal["sqlite-vector", "numpy"] = settings_core.DEFAULT_DENSE_BACKEND
     sqlite_vector_path: Path | None = Field(default_factory=_default_sqlite_vector_path)
     openrouter_api_key_file: Path | None = Field(
         default=None,
         description="Authorized dotenv file containing OPENROUTER_API_KEY; never log its contents",
     )
     seed_example_contracts: bool = False
-    lock_wait_timeout_sec: float = Field(default=1.0, gt=0)
-    audit_timeout_sec: float = Field(default=8.0, gt=0)
-    request_timeout_sec: float = Field(default=45.0, gt=0)
-    graph_update_timeout_sec: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    lock_wait_timeout_sec: float = Field(default=settings_core.DEFAULT_LOCK_WAIT_TIMEOUT_SEC, gt=0)
+    audit_timeout_sec: float = Field(default=settings_core.DEFAULT_AUDIT_TIMEOUT_SEC, gt=0)
+    request_timeout_sec: float = Field(default=settings_core.DEFAULT_REQUEST_TIMEOUT_SEC, gt=0)
+    graph_update_timeout_sec: float = Field(default=settings_core.DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC, gt=0,
+                                            allow_inf_nan=False)
     max_tool_timeout_sec: float = Field(
-        default=600.0,
+        default=settings_core.DEFAULT_MAX_TOOL_TIMEOUT_SEC,
         gt=0,
         description="Upper bound for client-provided timeout_ms on long-running tools.",
     )
     max_concurrent_calls: int = Field(
-        default=4,
+        default=settings_core.DEFAULT_MAX_CONCURRENT_CALLS,
         ge=1,
         description="Max heavy tool calls (sync/search/audit/checklist/hooks) running at once; "
                     "excess requests queue within their own deadline. SELF_DIRECT_MAX_CONCURRENT_CALLS.",
     )
     max_decompressed_session_bytes: int = Field(
-        default=DEFAULT_MAX_DECOMPRESSED_BYTES,
+        default=settings_core.DEFAULT_MAX_DECOMPRESSED_BYTES,
         ge=1,
         description="Upper bound on the declared decompressed size of a zstd-compressed Codex session "
                     "(rollout-*.jsonl.zst). A larger file is reported as zstd_too_large and not decoded. "
                     "SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES.",
     )
-    rrf_k: int = 60
-    retrieve_top_k: int = 20
-    search_top_k: int = 10
+    integrity_fast_recent_blocks: int = Field(
+        default=settings_core.DEFAULT_INTEGRITY_FAST_RECENT_BLOCKS, ge=0,
+        description="Fast (hook-time) source check: the latest complete 1 MiB blocks always compared with their "
+                    "stored digests. SELF_DIRECT_INTEGRITY_FAST_RECENT_BLOCKS.",
+    )
+    integrity_fast_sample_blocks: int = Field(
+        default=settings_core.DEFAULT_INTEGRITY_FAST_SAMPLE_BLOCKS, ge=0,
+        description="Fast source check: random other blocks compared, drawn fresh for every call. "
+                    "SELF_DIRECT_INTEGRITY_FAST_SAMPLE_BLOCKS.",
+    )
+    integrity_full_verify_interval_sec: float = Field(
+        default=settings_core.DEFAULT_INTEGRITY_FULL_VERIFY_INTERVAL_SEC, ge=0, allow_inf_nan=False,
+        description="A fast check is allowed only this long after the last full verification of every block; "
+                    "after that the next check is full (0: always full). SELF_DIRECT_INTEGRITY_FULL_VERIFY_INTERVAL_SEC.",
+    )
+    integrity_background_verify: bool = Field(
+        default=True,
+        description="Resident MCP servers re-verify watched sources in full on one background thread while idle. "
+                    "Short-lived hook processes never do. SELF_DIRECT_INTEGRITY_BACKGROUND_VERIFY.",
+    )
+    integrity_background_idle_sec: float = Field(
+        default=settings_core.DEFAULT_INTEGRITY_BACKGROUND_IDLE_SEC, gt=0, allow_inf_nan=False,
+        description="Idle time before the background verification starts. SELF_DIRECT_INTEGRITY_BACKGROUND_IDLE_SEC.",
+    )
+    integrity_background_max_scans: int = Field(
+        default=settings_core.DEFAULT_INTEGRITY_BACKGROUND_MAX_SCANS, ge=1,
+        description="Most background full verifications started per wake-up (they run one at a time, never "
+                    "concurrently). SELF_DIRECT_INTEGRITY_BACKGROUND_MAX_SCANS.",
+    )
+    audit_incremental: bool = Field(
+        default=True,
+        description="Evaluate contracts incrementally from stored per-contract monitor state (see README, 'Incremental "
+                    "audits'). false evaluates every audit over the whole session. SELF_DIRECT_AUDIT_INCREMENTAL.",
+    )
+    audit_shadow_every: int = Field(
+        default=settings_core.DEFAULT_AUDIT_SHADOW_EVERY,
+        ge=0,
+        description="Also run the full evaluator beside the incremental one on about every Nth audit and compare. A "
+                    "mismatch returns the full result and disables incremental evaluation of that contract in that "
+                    "session until the evaluator version changes. 1 compares every audit; 0 compares only when state "
+                    "was just rebuilt. SELF_DIRECT_AUDIT_SHADOW_EVERY.",
+    )
+    audit_incremental_min_events: int = Field(
+        default=settings_core.DEFAULT_AUDIT_INCREMENTAL_MIN_EVENTS,
+        ge=0,
+        description="Sessions with fewer stored events are evaluated in full without keeping monitor state: below "
+                    "this size a full evaluation costs less than storing, rebuilding and shadow-checking states. "
+                    "0 keeps state for every session. SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS.",
+    )
+    rrf_k: int = settings_core.DEFAULT_RRF_K
+    retrieve_top_k: int = settings_core.DEFAULT_RETRIEVE_TOP_K
+    search_top_k: int = settings_core.DEFAULT_SEARCH_TOP_K
 
     @classmethod
     def settings_customise_sources(
@@ -196,44 +151,6 @@ class Settings(BaseSettings):
         return (init_settings, env_settings, _codex_environment_settings,
                 _toml_path_settings, dotenv_settings, file_secret_settings)
 
-    def resolve_api_key(self) -> str | None:
-        if self.openrouter_api_key_file is not None:
-            from dotenv import dotenv_values
-            source = self.openrouter_api_key_file.expanduser().resolve()
-            if not source.is_file():
-                raise ValueError("Configured OpenRouter key file does not exist")
-            key = dotenv_values(source, interpolate=False).get("OPENROUTER_API_KEY")
-            if not key or not key.strip():
-                raise ValueError("Configured OpenRouter key file has no OPENROUTER_API_KEY")
-            return key.strip()
-        return self.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
-
-    def resolve_sessions_dir(self) -> Path:
-        return Path(self.codex_sessions_dir)
-
-
-    def resolve_omp_sessions_dir(self) -> Path:
-        return Path(self.omp_sessions_dir)
-
-    def resolve_claude_projects_dir(self) -> Path:
-        return Path(self.claude_projects_dir)
-
-    def resolve_agy_app_data_dirs(self) -> list[Path]:
-        return [Path(root).expanduser().resolve() for root in self.agy_app_data_dirs]
-
-    def resolve_grokbot_transcripts_dirs(self) -> list[Path]:
-        from self_directing_mcp.grokbot.discover import parse_transcripts_dirs
-
-        return parse_transcripts_dirs(self.grokbot_transcripts_dir)
-
-    def resolve_session_provider(self) -> Literal["codex", "grokbot", "omp", "agy", "claude"]:
-        return self.session_provider
-
-    def resolve_contracts_path(self) -> Path:
-        if self.contracts_path:
-            return Path(self.contracts_path)
-        return Path(self.index_dir) / "contracts.json"
-
 
 def hook_settings() -> Settings:
     """Settings for lifecycle hooks: environment and the user TOML only, never a ``.env`` in the working directory.
@@ -241,6 +158,10 @@ def hook_settings() -> Settings:
     Hosts run hooks in the project being worked on, so a ``.env`` there is content the audited agent can write.
     Reading it would let that agent point the hook at an empty index or another mode and silence its own checks.
     The hook state modules resolve the same keys from the same two sources.
+
+    This is the reference implementation. The command hooks themselves read ``settings_core.load_hook_settings()``,
+    which applies the same sources, precedence and errors without importing pydantic-settings (about 30 ms per hook
+    process); ``tests/test_hook_settings_parity.py`` keeps the two in agreement.
     """
     return Settings(_env_file=None)
 

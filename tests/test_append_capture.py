@@ -114,38 +114,112 @@ def _tamper(path, kind):
         path.unlink()
 
 
+def _assert_index_is_the_current_file(engine, path):
+    """The index holds exactly what the file holds NOW, never what an earlier, discarded preparation parsed."""
+    chunks, _offset, _sid = codex_parser.parse_session_chunks(path, session_id=SID)
+    assert [c.chunk_id for c in engine.store.list_chunks(SID)] == [c.chunk_id for c in chunks]
+    assert [c.text for c in engine.store.list_chunks(SID)] == [c.text for c in chunks]
+
+
+def _count_commits(engine, monkeypatch):
+    commits = []
+    real = engine.store.commit_events
+
+    def counting(*args, **kwargs):
+        commits.append(kwargs.get("replace"))
+        return real(*args, **kwargs)
+    monkeypatch.setattr(engine.store, "commit_events", counting)
+    return commits
+
+
 @pytest.mark.parametrize("kind", ["overwrite", "overwrite_append", "truncate", "replace", "delete"])
-def test_tampering_after_parse_is_still_rejected(session, monkeypatch, kind):
+def test_tampering_after_parse_discards_the_preparation_and_observes_the_source_again(session, monkeypatch, kind):
+    """A change detected between capture and publication is never published: the observation is thrown away and
+    the file is captured (and fully scanned) again. A vanished file cannot be."""
     engine, path = session
     write(path, [call("first", "c1")], "a")
     engine.ensure_ready()
+    commits = _count_commits(engine, monkeypatch)
     with pause_first(monkeypatch, codex_parser, "parse_session_chunks") as (pool, entered, release):
         pending = pool.submit(engine.sync_session, session_id=SID, embed=False)
         assert entered.wait(5)
         _tamper(path, kind)
         release.set()
-        with pytest.raises((ValueError, OSError)):
-            pending.result(5)
-    assert engine.store.cursor_record(SID) is None
-    assert engine.store.chunk_ids(SID) == set()
+        if kind == "delete":
+            with pytest.raises((ValueError, OSError)):
+                pending.result(5)
+            assert engine.store.cursor_record(SID) is None and engine.store.chunk_ids(SID) == set()
+            return
+        info = pending.result(5)
+    assert info["ok"] and len(commits) == 1  # one publication: the recapture's
+    _assert_index_is_the_current_file(engine, path)
+    if kind in ("overwrite", "overwrite_append"):
+        assert any("FIRST" in text for text in _texts(engine)) and not any("first" in t for t in _texts(engine))
 
 
 @pytest.mark.parametrize("kind", ["overwrite", "overwrite_append", "truncate", "replace", "delete"])
-def test_tampering_with_appended_session_is_still_rejected_for_cursor(session, monkeypatch, kind):
+def test_tampering_with_appended_session_is_reindexed_never_appended_for_cursor(session, monkeypatch, kind):
     """A synced prefix that was rewritten is a reindex or an error, never an incremental append."""
     engine, path = session
     write(path, [call("first", "c1")], "a")
     engine.sync_session(session_id=SID, embed=False)
     before = engine.store.cursor_record(SID)
     write(path, [call("later", "c2")], "a")
+    commits = _count_commits(engine, monkeypatch)
     with pause_first(monkeypatch, codex_parser, "parse_session_chunks") as (pool, entered, release):
         pending = pool.submit(engine.sync_session, session_id=SID, embed=False)
         assert entered.wait(5)
         _tamper(path, kind)
         release.set()
-        with pytest.raises((ValueError, OSError)):
-            pending.result(5)
-    assert engine.store.cursor_record(SID) == before
+        if kind == "delete":
+            with pytest.raises((ValueError, OSError)):
+                pending.result(5)
+            assert engine.store.cursor_record(SID) == before and commits == []
+            return
+        info = pending.result(5)
+    assert info["ok"] and len(commits) == 1
+    if kind == "replace":  # identical bytes under a new inode: the same content, so a normal incremental append
+        assert not info["reindexed"]
+    else:
+        assert info["reindexed"] and info["reindex_reason"] == "source_changed"
+    _assert_index_is_the_current_file(engine, path)
+
+
+def _flip_after_every_parse(monkeypatch, path):
+    """The source keeps changing: every parse is followed by a same-size rewrite (the bytes alternate)."""
+    real, calls = codex_parser.parse_session_chunks, []
+
+    def parse_then_rewrite(*args, **kwargs):
+        result = real(*args, **kwargs)
+        calls.append(1)
+        data = bytearray(path.read_bytes())
+        data[40] ^= 0x01
+        path.write_bytes(bytes(data))
+        return result
+
+    monkeypatch.setattr(codex_parser, "parse_session_chunks", parse_then_rewrite)
+    return calls
+
+
+@pytest.mark.parametrize("synced", [False, True])
+def test_a_source_that_keeps_changing_is_rejected_after_bounded_retries(session, monkeypatch, synced):
+    """Today's error behaviour is kept: when no stable observation can be had, nothing is published."""
+    engine, path = session
+    write(path, [call("first", "c1")], "a")
+    engine.ensure_ready()
+    before = None
+    if synced:
+        engine.sync_session(session_id=SID, embed=False)
+        write(path, [call("later", "c2")], "a")
+        before = (engine.store.cursor_record(SID), engine.store.chunk_ids(SID))
+    calls = _flip_after_every_parse(monkeypatch, path)
+    with pytest.raises(session_events.SourceChanged, match="source changed during preparation"):
+        engine.sync_session(session_id=SID, embed=False)
+    assert len(calls) == 3  # bounded: the same number of captures the stale-cursor recapture allows
+    if synced:
+        assert (engine.store.cursor_record(SID), engine.store.chunk_ids(SID)) == before
+    else:
+        assert engine.store.cursor_record(SID) is None and engine.store.chunk_ids(SID) == set()
 
 
 def test_audit_never_claims_records_appended_during_audit(session, monkeypatch):

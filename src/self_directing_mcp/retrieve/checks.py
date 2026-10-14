@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract
+
 from self_directing_mcp.index.ingest import SessionStore
 from self_directing_mcp.schemas import Chunk, SearchHit
 from self_directing_mcp.security.mask import mask_secrets
@@ -19,14 +21,19 @@ def regex_search(
     provider: str | None = None,
 ) -> list[SearchHit]:
     try:
-        cre = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+        cre = compile_contract(pattern)
     except re.error as e:
         raise ValueError(f"invalid regex: {e}") from e
     hits: list[SearchHit] = []
     for chunk in store.list_chunks(session_id, provider):
         if kind and chunk.kind != kind:
             continue
-        if cre.search(chunk.text):
+        try:
+            matched = cre.search(chunk.text)
+        except ContractRegexTimeout:
+            # Partial results would read as "searched everything"; report the limit instead.
+            raise ValueError("regex_timeout: the pattern exceeded its time limit; simplify it") from None
+        if matched:
             hits.append(
                 SearchHit(
                     chunk_id=chunk.chunk_id,

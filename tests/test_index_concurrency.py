@@ -245,8 +245,10 @@ def test_equal_offset_rewrite_cannot_replace_newer_generation(session, monkeypat
         engine.sync_session(session_id=SID, embed=False)
         latest = engine.store.cursor_record(SID)
         release.set()
-        with pytest.raises(ValueError):
-            old.result(5)
+        # The stale preparation discards itself and recaptures: it finds the newer generation already current
+        # (nothing to publish) and reports it; it can never publish its own, older view over it.
+        outcome = old.result(5)
+    assert outcome["ok"] and outcome["new_chunks"] == 0, outcome
     assert engine.store.cursor_record(SID) == latest
     assert any("new-command" in c.text for c in engine.store.list_chunks(SID))
     assert not any("old-command" in c.text for c in engine.store.list_chunks(SID))

@@ -15,6 +15,10 @@ from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.neograph_runtime import run_stages
 from self_directing_mcp.request_control import check_request, request_operation
 
+from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
+
+REGEX_TIMEOUT = "regex_timeout: a contract pattern exceeded its time limit, so this contract could not be evaluated"
+
 
 def _checked(items):
     for item in items:
@@ -49,11 +53,11 @@ def action_applies(rule, proposed) -> bool:
     if not pattern:
         return True
     try:
-        applies = re.search(pattern, proposed.text, re.IGNORECASE | re.MULTILINE) is not None
+        applies = compile_contract(pattern).search(proposed.text) is not None
         check_request()
         return applies
-    except re.error:
-        return True
+    except (re.error, ContractRegexTimeout):
+        return True   # unknown scope is treated as applying; the contract's own evaluation reports it
 
 
 def prefix_note(coverage) -> str:
@@ -134,7 +138,28 @@ class _Presence:
         return "violation", "required calls completed without success", items
 
 
-def audit_contract(rule, *, session_id, store, retriever=None, provider=None, proposed=None, chunks=None):
+def _regex_timeout_finding(rule) -> Finding:
+    return Finding(contract_id=rule.id, contract_revision=rule.revision, severity=rule.severity, verdict="unknown",
+                   reason=REGEX_TIMEOUT, evidence=[], basis=f"{rule.id}: pattern evaluation timed out",
+                   applicability="applicable")
+
+
+def _patterns(rule) -> tuple:
+    return tuple(p for p in (rule.regex, rule.before_regex, rule.exception_regex,
+                             rule.when.tool_call_regex if rule.when else None) if p)
+
+
+def audit_contract(rule, **kwargs):
+    """One contract's finding. A pattern that exceeds its time limit makes this contract unknown (never clean)."""
+    with contract_budget():
+        try:
+            return _audit_contract(rule, **kwargs)
+        except ContractRegexTimeout:
+            check_request()
+            return _regex_timeout_finding(rule)
+
+
+def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, proposed=None, chunks=None):
     """Regex checks operate on events. Retrieval ranks are never verification evidence."""
     check_request()
     def finding(verdict, reason, items=None, basis=None, applicability="applicable"):
@@ -155,8 +180,8 @@ def audit_contract(rule, *, session_id, store, retriever=None, provider=None, pr
     if not rule.regex:
         return finding("unknown", "description-only contract needs a verifier; retrieval is not proof")
     try:
-        regex = re.compile(rule.regex, re.IGNORECASE | re.MULTILINE)
-        trigger = re.compile(rule.before_regex, re.IGNORECASE | re.MULTILINE) if rule.before_regex else None
+        regex = compile_contract(rule.regex)
+        trigger = compile_contract(rule.before_regex) if rule.before_regex else None
     except re.error:
         return finding("unknown", "invalid contract regex")
     start = ids[rule.applies_from_event_id] + 1 if rule.applies_from_event_id else 0
@@ -176,7 +201,7 @@ def audit_contract(rule, *, session_id, store, retriever=None, provider=None, pr
         exception = None
         if rule.exception_regex:
             try:
-                exception = re.compile(rule.exception_regex, re.IGNORECASE | re.MULTILINE)
+                exception = compile_contract(rule.exception_regex)
             except re.error:
                 return finding("unknown", "invalid exception_regex",
                                basis=f"{rule.id}.exception_regex failed to compile")
@@ -207,8 +232,45 @@ def audit_contract(rule, *, session_id, store, retriever=None, provider=None, pr
     return finding(verdict, reason, supporting)
 
 
+
+def _post_process(evidence_rules, rules, findings, events, **kwargs) -> None:
+    """Run a provider's post-pass; a contract whose pattern times out there becomes unknown, the others still run.
+
+    The pass mutates findings in place, so it starts from a copy each time and only a complete pass is kept.
+    """
+    pending = [i for i, item in enumerate(findings) if item.reason != REGEX_TIMEOUT]
+    for _ in range(len(pending) + 1):
+        work = [findings[i].model_copy(deep=True) for i in pending]
+        try:
+            with contract_budget():
+                evidence_rules([rules[i] for i in pending], work, events, **kwargs)
+        except ContractRegexTimeout as exc:
+            culprits = [i for i in pending if exc.pattern in _patterns(rules[i])] or pending
+            for i in culprits:
+                findings[i] = _regex_timeout_finding(rules[i])
+            pending = [i for i in pending if i not in culprits]
+            continue
+        for i, item in zip(pending, work):
+            findings[i] = item
+        return
+
+
+def full_findings(active, chunks, *, session_id, store, provider, proposed, coverage):
+    """The reference evaluation: every rule over the whole event list, then the provider's evidence classes."""
+    findings = [audit_contract(r, session_id=session_id, store=store, provider=provider,
+                               proposed=proposed, chunks=chunks) for r in _checked(active)]
+    # Provider-specific partial-observation passes post-process the findings; other providers have none.
+    evidence_rules = _EVIDENCE_RULES.get(provider)
+    if evidence_rules is not None:
+        _post_process(evidence_rules, active, findings, chunks, proposed=proposed, coverage=coverage)
+    return findings
+
+
 @request_operation
-def run_audit(*, session_id, contracts, store, retriever=None, provider=None, proposed=None, coverage=None):
+def run_audit(*, session_id, contracts, store, retriever=None, provider=None, proposed=None, coverage=None,
+              plan=None):
+    """``plan`` (see ``audit.incremental``) replaces how events are loaded and rules evaluated; the stage graph, the
+    selection and the aggregation are the same. Without a plan every rule runs over the whole event list."""
     snapshot = hashlib.sha256(json.dumps([c.model_dump(mode="json") for c in _checked(contracts)],
                                         sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     notes = [
@@ -224,6 +286,9 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
                   and (r.session_id is None or r.session_id == session_id)]
     def load_evidence():
         nonlocal chunks
+        if plan is not None:
+            plan.load(active)
+            return
         needs_history = any(r.regex and (r.type == "must" or proposed is None) for r in active)
         if needs_history:
             chunks = store.list_chunks(session_id, provider)
@@ -233,12 +298,11 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
                       and c.session_id == session_id and (provider is None or c.provider == provider)]
     def evaluate_contracts():
         nonlocal findings
-        findings = [audit_contract(r, session_id=session_id, store=store, provider=provider,
-                                   proposed=proposed, chunks=chunks) for r in _checked(active)]
-        # Provider-specific partial-observation passes post-process the findings; other providers have none.
-        evidence_rules = _EVIDENCE_RULES.get(provider)
-        if evidence_rules is not None:
-            evidence_rules(active, findings, chunks, proposed=proposed, coverage=coverage)
+        if plan is not None:
+            findings = plan.evaluate(active, proposed=proposed, coverage=coverage)
+            return
+        findings = full_findings(active, chunks, session_id=session_id, store=store, provider=provider,
+                                 proposed=proposed, coverage=coverage)
     def aggregate_findings():
         nonlocal overall
         if coverage and not coverage.get("complete"):
@@ -360,7 +424,7 @@ def _window(rule, events, ids, proposed):
     end = len(events)
     if rule.type == "must" and rule.before_regex and proposed is None:
         try:
-            trigger = re.compile(rule.before_regex, re.IGNORECASE | re.MULTILINE)
+            trigger = compile_contract(rule.before_regex)
         except re.error:
             return start, end
         positions = [i for i in range(start, end) if _eligible(events[i], rule) and trigger.search(events[i].text)]
@@ -512,7 +576,7 @@ _EVIDENCE_RULES = {"agy": agy_evidence_rules, "claude": claude_evidence_rules}
 
 def _attempted(rule, events, positions, blocked) -> bool:
     try:
-        regex = re.compile(rule.regex, re.IGNORECASE | re.MULTILINE)
+        regex = compile_contract(rule.regex)
     except re.error:
         return False
     return any(_meta(events[i]).get("evidence_origin") == "model_proposal" and i not in blocked
@@ -523,8 +587,8 @@ def _attempt_hits(rule, item, events, positions, blocked) -> None:
     """A forbidden call attempt is a violation whatever came back (ERROR, INVALID, no receipt): the host log
     preserves the proposal and its arguments. Proposals the Pre hook blocked never ran and are not counted."""
     try:
-        regex = re.compile(rule.regex, re.IGNORECASE | re.MULTILINE)
-        exception = re.compile(rule.exception_regex, re.IGNORECASE | re.MULTILINE) if rule.exception_regex else None
+        regex = compile_contract(rule.regex)
+        exception = compile_contract(rule.exception_regex) if rule.exception_regex else None
     except re.error:
         return
     hits = [events[i] for i in positions if _meta(events[i]).get("evidence_origin") == "model_proposal"
@@ -550,7 +614,7 @@ def _hidden_trigger(rule, events, positions, cut, blocked):
         return (_TRUNCATED_CODE.get(field, "truncated_" + field),
                 f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{field} may hide the triggering call")
     try:
-        trigger = re.compile(rule.before_regex, re.IGNORECASE | re.MULTILINE)
+        trigger = compile_contract(rule.before_regex)
     except re.error:
         return None
     window = [events[i] for i in positions]
