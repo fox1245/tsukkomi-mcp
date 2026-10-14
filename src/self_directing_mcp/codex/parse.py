@@ -7,7 +7,10 @@ from self_directing_mcp.session_events import (
     as_text, iter_raw_lines, make_chunk, parse_error, result_success,
 )
 
-PARSER_VERSION = 2
+# Bumping this triggers a lazy per-session reparse on the next sync/audit of each already-indexed
+# session (index.ingest compares the recorded version); unchanged event ids, anchors and vectors survive.
+# v3: multi-agent messaging, tool-search discovery, inter-agent metadata and new-style session headers.
+PARSER_VERSION = 3
 _WEB_TERMINAL = {"completed": True, "failed": False, "cancelled": False, "incomplete": False}
 _WEB_PENDING = {"in_progress", "searching", "queued"}
 
@@ -29,6 +32,96 @@ def peek_session_id(path: Path) -> str | None:
     except OSError:
         pass
     return None
+
+
+_TOP_FIELDS = {"timestamp", "type", "payload", "ordinal", "metadata"}
+_PASSTHROUGH = "internal_chat_message_metadata_passthrough"
+_HEADER_STR = ("id", "session_id", "timestamp", "cwd", "originator", "cli_version", "model_provider", "history_mode",
+               "thread_source", "agent_nickname", "agent_path", "multi_agent_version", "parent_thread_id",
+               "forked_from_id", "creator_account_id", "creator_user_id")
+_HEADER_KINDS = {**dict.fromkeys(_HEADER_STR, str), "base_instructions": dict, "context_window": dict, "git": dict,
+                 "history_base": dict, "dynamic_tools": list, "runtime_workspace_roots": list}
+_HEADER_REQUIRED = ("id", "session_id", "timestamp", "cwd", "originator", "cli_version", "model_provider",
+                    "base_instructions", "context_window", "history_mode")
+# Indexed header fields. System prompt, tool schemas, context window, git/history data, account ids and
+# workspace roots are validated for shape but never indexed.
+_HEADER_INDEXED = ("id", "session_id", "timestamp", "cwd", "originator", "cli_version", "model_provider",
+                   "history_mode", "thread_source", "agent_nickname", "agent_path", "multi_agent_version",
+                   "parent_thread_id", "forked_from_id", "subagent_history_start_ordinal")
+
+
+def _plain_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _header_new_style(payload):
+    return bool({"session_id", "base_instructions", "context_window", "history_mode"} & set(payload))
+
+
+def _header_ok(payload):
+    """Type-check known header keys; new-style headers must also carry the always-present set."""
+    if not isinstance(payload, dict):
+        return False
+    if _header_new_style(payload) and not set(_HEADER_REQUIRED) <= set(payload):
+        return False
+    if any(type(payload[key]) is not kind for key, kind in _HEADER_KINDS.items() if key in payload):
+        return False
+    if "source" in payload and not isinstance(payload["source"], (str, dict)):
+        return False
+    return "subagent_history_start_ordinal" not in payload or _plain_int(payload["subagent_history_start_ordinal"])
+
+
+def _top_ok(obj):
+    """Top-level envelope for the newly supported shapes; client-authored records have unclear semantics."""
+    meta = obj.get("metadata", {})
+    return (set(obj) <= _TOP_FIELDS and ("ordinal" not in obj or _plain_int(obj["ordinal"]))
+            and isinstance(meta, dict) and set(meta) <= {"client_authored", "user_input_order"}
+            and meta.get("client_authored", False) is False
+            and (meta.get("user_input_order") is None or _plain_int(meta["user_input_order"])))
+
+
+def _passthrough_ok(item):
+    value = item.get(_PASSTHROUGH, {})
+    return (isinstance(value, dict) and set(value) <= {"create_time", "turn_id"}
+            and all(isinstance(v, (str, int, float)) and not isinstance(v, bool) for v in value.values()))
+
+
+def _optional_str(item, *keys):
+    return all(isinstance(item[key], str) for key in keys if key in item)
+
+
+def _agent_message(obj, item):
+    """Inter-agent text is runtime evidence: never user authority and never tool evidence."""
+    content = item.get("content")
+    ok = (_top_ok(obj) and set(item) <= {"type", "id", "author", "recipient", "content", _PASSTHROUGH}
+          and _optional_str(item, "id") and isinstance(item.get("author"), str) and isinstance(item.get("recipient"), str)
+          and _passthrough_ok(item) and isinstance(content, list)
+          and all(isinstance(block, dict) and (
+              (set(block) == {"type", "text"} and block["type"] == "input_text" and isinstance(block["text"], str))
+              or (set(block) == {"type", "encrypted_content"} and block["type"] == "encrypted_content"
+                  and isinstance(block["encrypted_content"], str))) for block in content))
+    if not ok:
+        return None
+    # Encrypted blocks keep a placeholder only.
+    body = " ".join(block["text"] if block["type"] == "input_text" else "[encrypted_content]" for block in content)
+    return f"[agent_message:{item['author']}->{item['recipient']}] {body}"
+
+
+def _tool_search(obj, item, item_type):
+    """Tool discovery, not an action on the user's system; tool lists are never indexed."""
+    args = item.get("arguments")
+    common = (_top_ok(obj) and _optional_str(item, "id", "status", "execution") and isinstance(item.get("call_id"), str)
+              and _passthrough_ok(item))
+    fields = {"type", "id", "call_id", "status", "execution", _PASSTHROUGH}
+    if item_type == "tool_search_call":
+        if not (common and set(item) <= fields | {"arguments"} and isinstance(args, dict)
+                and set(args) <= {"query", "limit"} and isinstance(args.get("query"), str)
+                and ("limit" not in args or _plain_int(args["limit"]))):
+            return None
+        return f"[tool_search_call] {args['query']}"
+    if not (common and set(item) <= fields | {"tools"} and isinstance(item.get("tools"), list)):
+        return None
+    return "[tool_search_output] [tools omitted]"
 
 
 def _classify_and_text(obj):
@@ -57,7 +150,21 @@ def _classify_and_text(obj):
                     meta[key] = payload[key]
         # Keep the complete payload and the previous text/cache identity.
         return "meta", f"[{etype}] {as_text(payload)}", meta
-    if etype in ("session_meta", "config_snapshot", "turn_context"):
+    if etype == "inter_agent_communication_metadata":
+        meta.update(role="runtime", evidence_origin="inter_agent_metadata")
+        if not (_top_ok(obj) and isinstance(obj.get("payload"), dict) and set(payload) == {"trigger_turn"}
+                and isinstance(payload["trigger_turn"], bool)):
+            meta["unsupported_event"] = True
+        return "meta", "[inter_agent_communication_metadata]", meta
+    if etype == "session_meta":
+        meta.update(role="runtime", evidence_origin="session_meta")
+        if not _header_ok(obj.get("payload")):
+            meta["unsupported_event"] = True
+        safe = {key: payload[key] for key in _HEADER_INDEXED if key in payload}
+        if isinstance(payload.get("source"), str):
+            safe["source"] = payload["source"]
+        return "meta", f"[session_meta] {as_text(safe)}" if safe else "[session_meta]", meta
+    if etype in ("config_snapshot", "turn_context"):
         kind = "policy" if etype == "config_snapshot" else "meta"
         return kind, f"[{etype}] {as_text(payload or obj)}", meta
     if etype == "event_msg":
@@ -70,6 +177,15 @@ def _classify_and_text(obj):
         item_type = str(item.get("type") or item.get("item_type") or "unknown")
         meta["item_type"] = item_type
         meta["call_id"] = item.get("call_id") or item.get("tool_call_id") or item.get("tool_use_id")
+        if etype == "response_item" and item_type in ("agent_message", "tool_search_call", "tool_search_output"):
+            origin = "agent_message" if item_type == "agent_message" else "tool_search"
+            meta.update(role="runtime", evidence_origin=origin)
+            text = (_agent_message(obj, item) if item_type == "agent_message" and isinstance(obj.get("payload"), dict)
+                    else _tool_search(obj, item, item_type) if isinstance(obj.get("payload"), dict) else None)
+            if text is None:
+                meta["unsupported_event"] = True
+                text = f"[response_item:{item_type}] [unsupported shape]"
+            return "meta", text, meta
         if item_type == "web_search_call" and etype == "response_item":
             action = item.get("action")
             status = item.get("status")
@@ -117,12 +233,19 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
             obj = json.loads(raw)
             if not isinstance(obj, dict):
                 raise ValueError("JSONL record is not an object")
+            foreign = False
             if obj.get("type") == "session_meta":
                 payload = obj.get("payload") or {}
                 claimed = payload.get("id") if isinstance(payload, dict) else None
-                if claimed and str(claimed).lower() != sid:
+                foreign = bool(claimed and str(claimed).lower() != sid)
+                # Only a complete new-style header after the first record may belong to another thread
+                # (e.g. inherited parent history); a first-line or legacy mismatch is still an error.
+                if foreign and not (start > 0 and isinstance(payload, dict) and _header_new_style(payload)
+                                    and _header_ok(payload)):
                     raise ValueError("session id does not match requested session")
             kind, text, meta = _classify_and_text(obj)
+            if obj.get("type") == "session_meta" and foreign:
+                meta["evidence_origin"] = "inherited_session_meta"
             timestamp = obj.get("timestamp") or obj.get("created_at") or obj.get("time")
             chunks.append(make_chunk("codex", sid, kind, text, meta, line, start, end,
                                      timestamp=str(timestamp) if timestamp is not None else None))

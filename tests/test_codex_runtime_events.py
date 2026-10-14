@@ -162,7 +162,7 @@ def test_parser_upgrade_replays_unchanged_file_and_reuses_cached_vectors(session
     calls = spy.calls
     assert "parser_outdated" in engine.store.session_status(SID)["issues"]
     updated = engine.sync_session(session_id=SID, embed=False)
-    assert updated["reindex_reason"] == "parser_updated" and updated["parser_version"] == 2
+    assert updated["reindex_reason"] == "parser_updated" and updated["parser_version"] == 3
     assert updated["coverage"]["complete"] is True
     assert updated["embedding_pending"] == 0 and spy.calls == calls
     assert updated["dense_restored"] == 1
