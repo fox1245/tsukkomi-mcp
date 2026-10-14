@@ -384,6 +384,58 @@ Several files can carry the same session id, for example when sub-agent session 
 
 A rewrite or truncation of the same path is still reparsed or rejected as before. A plain rollout and its zstd-compressed twin (`.jsonl` and `.jsonl.zst`) are compared by their decompressed bytes, so every row above applies to that pair too; see [Compressed Codex sessions](#compressed-codex-sessions).
 
+### Incremental audits
+
+An audit used to re-read and re-evaluate every stored event of the session, so its cost grew with the session even when
+nothing had been appended. Audits now keep a small **monitor state** per contract and fold in only the events that
+arrived after it. The answer is the same: verdicts, findings, evidence, notes, `coverage` (including
+`judged_through_byte`, `unread_bytes` and every unknown reason) and the NeoGraph stage trace are identical to the full
+evaluation, which remains the reference. The audit still runs through the native `contract_audit` graph; only what its
+`load_evidence` and `evaluate_contracts` stages do changes.
+
+- **What is stored.** `meta.sqlite` gains derived tables (`audit_monitor_state`, `session_commit_log`,
+  `session_generations`, `audit_incremental_health`) and, once a `requires_success` contract or a Claude Code result
+  contract is audited, an index on tool-call ids. Nothing in them is authority: the events and the cursor are. A missing,
+  unreadable or disagreeing row only means the contract is evaluated in full again.
+- **Per contract kind** the state holds: anchors and the activation point (`applies_from_event_id`); whether a
+  `when` condition was seen; for `must_not` the match count, the first 20 matches and (with an `exception_regex`, which
+  is matched against the join of all matches) the match texts; for `must` the last three regex hits and, for
+  `requires_success`, a per-call tracker (how many calls share the latest hit's id, how many results followed and whether
+  the first succeeded); for `before_regex` the worst verdict, the distinct reasons, the first 20 evidence items and the
+  last trigger position, because each triggering action is judged at its own position from the prefix alone. Provider
+  evidence classes keep Claude Code's cut results and AGY's truncated fields, still-`RUNNING` results, legacy results,
+  host-logged proposals and denied proposals.
+- **A normal append does not invalidate state.** A state is reused only if all of this holds, otherwise the contract is
+  rebuilt by a full pass: same contract (revision **and** content), parser version, evaluator version and `needs` (which
+  events had their text loaded); same index generation and cursor path; the stored `(byte_offset, prefix_hash,
+  event_count)` is a row of the session's commit log, and the log's newest row is the current cursor; and the number of
+  events after the stored offset is what the cursor's count implies. A reindex, a rewrite (`source_changed`), a parser
+  bump, a moved or copied source (`alias`/path change), an append that overwrites a stored event, or a cursor written by an
+  older server process each start a new generation or fail one of those checks. State and the evaluated cursor are written
+  in one transaction, after the index commit they depend on, and never over a newer state.
+- **Limits are explicit.** Tables are bounded (hit texts for an `exception_regex`, pending results, blocked proposals, cut
+  results, notice targets). A run that would exceed one reports it, evaluates that contract with the full evaluator
+  and remembers the limit, so the next audit goes straight there. Where state cannot be summarized faithfully the contract
+  stays on full evaluation: a `must_not` whose `exception_regex` has more match text than the cap; an AGY denial whose
+  proposal lies beyond the 4,096-event look-back window for a contract that has its own matching proposals; any contract
+  disabled by a shadow mismatch (below). Adding a contract that needs text of events no other contract reads changes the
+  `needs` and rebuilds every state once. AGY conversations rebuild whenever a hook receipt is added, because ingestion itself
+  reindexes then.
+- **Shadow verification.** About every `SELF_DIRECT_AUDIT_SHADOW_EVERY`th audit (default 16; `1` compares every audit,
+  `0` only after state was rebuilt) also runs the full evaluator on the same events and compares findings, verdict, notes,
+  coverage and trace. On a difference the **full result is returned**, `incremental.mismatch` names the contracts, an
+  `incremental_mismatch` row is written to `audit_incremental_health` and that contract is evaluated in full in that session
+  until the evaluator version changes. The comparison is skipped (`incremental.shadow_skipped: "deadline"`) when the request's
+  remaining time budget could not cover the full evaluation. The test suite compares every audit and fails on any
+  difference.
+- **Reporting.** Results carry an `incremental` object: `mode` (`delta` reads only appended events, `full` reads all),
+  `events_read`, `rebuilt` (contract to reason), `fallback` (contracts on full evaluation and why), `shadow`,
+  `shadow_compared`, `mismatch`, `retry` and `state`. `SELF_DIRECT_AUDIT_INCREMENTAL=false` switches the whole feature off.
+- **What it does not do.** It does not make an unknown clean and does not change coverage: unread bytes, parse errors,
+  unsupported events and rewrites are judged by the unchanged ingestion and coverage code, and a state describes the index,
+  not the source file. The source verification (hashing) that precedes every audit is a separate cost; see
+  `scripts/bench_audit.py` for a before/after measurement on a synthetic session of any size.
+
 ### Source capture
 
 Sync captures at most the length measured at the first `fstat`, in 1 MiB blocks, keeping only SHA-256 states at the cursor, at the last complete record and at the end. No file bytes are retained, so memory does not scale with the session size.

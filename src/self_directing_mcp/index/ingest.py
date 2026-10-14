@@ -264,6 +264,7 @@ class SessionStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._counts = {}
         try:
             with publication():
                 self._initialize_schema()
@@ -401,6 +402,16 @@ class SessionStore:
     def _commit_spool(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
                       expected_token, receipt_digest):
         check_request()
+        self._counts.clear()
+        try:
+            self._commit_rows(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
+                              replace=replace, parser_version=parser_version, expected_token=expected_token,
+                              receipt_digest=receipt_digest)
+        finally:
+            self._counts.clear()  # a rolled-back write leaves no trace in total_changes
+
+    def _commit_rows(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
+                     expected_token, receipt_digest):
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             if expected_token is not None and self.state_token(session_id, provider) != expected_token:
@@ -794,7 +805,8 @@ class SessionStore:
             batch = ids[start:start + 400]
             rows = self._conn.execute(
                 "SELECT json_extract(data,'$.meta.call_id'), json_extract(data,'$.kind'), byte_start, sub_index, chunk_id"
-                " FROM session_events WHERE provider=? AND session_id=? AND byte_start<?"
+                # ``+byte_start``: keep the planner on the call-id index; a range on byte_start would scan the session.
+                " FROM session_events WHERE provider=? AND session_id=? AND +byte_start<?"
                 " AND json_extract(data,'$.meta.call_id') IN (" + ",".join("?" for _ in batch) + ")"
                 " AND json_extract(data,'$.kind') IN ('tool_call','tool_result')",
                 [provider, session_id, before_byte, *batch]).fetchall()
@@ -805,6 +817,16 @@ class SessionStore:
 
     PROPOSAL_LOOKBACK = 4096  # events scanned back from the first appended one
     PROPOSAL_ROWS = 128       # proposals of one tool kept from that window
+
+    def anchor_chunks(self, session_id, provider, anchors):
+        """The stored events named by ``anchors`` that belong to this session, as full chunks (no session scan)."""
+        found = []
+        for anchor in anchors:
+            check_request()
+            chunk = self.get_chunk(anchor)
+            if chunk is not None and chunk.session_id == session_id and chunk.provider == provider:
+                found.append(chunk)
+        return found
 
     def audit_proposals_before(self, session_id, provider, name, before_byte):
         """Model proposals of tool ``name`` among the last ``PROPOSAL_LOOKBACK`` events before ``before_byte``.
@@ -941,7 +963,16 @@ class SessionStore:
             clauses.append("provider=?")
             params.append(provider)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        return self._conn.execute("SELECT COUNT(*) FROM session_events" + where, params).fetchone()[0]
+        # COUNT(*) walks the whole session's index range; a state token asks for it several times per request. The
+        # answer cannot change while neither this connection nor another one has written (``data_version`` moves
+        # for other connections, ``total_changes`` for this one), and this store's own writes drop the cache.
+        version = (self._conn.execute("PRAGMA data_version").fetchone()[0], self._conn.total_changes)
+        cached = self._counts.get((session_id, provider))
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        count = self._conn.execute("SELECT COUNT(*) FROM session_events" + where, params).fetchone()[0]
+        self._counts[(session_id, provider)] = (version, count)
+        return count
 
     def known_hashes(self, session_id, provider=None):
         return {c.content_hash for c in self.list_chunks(session_id, provider)}

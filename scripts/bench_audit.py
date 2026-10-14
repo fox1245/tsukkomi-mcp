@@ -18,6 +18,7 @@ rest (reads, evaluation, state). ``evaluation_cpu`` is CPU spent after the sync 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -93,8 +94,10 @@ def child(args):
         payload = getattr(engine, method)(*call)
         wall, cpu = time.perf_counter() - wall, time.process_time() - cpu
         timings = payload.get("timings_ms", {})
+        shape = json.dumps([payload["verdict"], payload["findings"], payload["notes"]], sort_keys=True, default=str)
         return {"wall": wall, "cpu": cpu, "sync_ms": timings.get("sync"), "evaluation_ms": timings.get("evaluation"),
-                "verdict": payload["verdict"], "incremental": (payload.get("incremental") or {}).get("mode")}
+                "verdict": payload["verdict"], "incremental": (payload.get("incremental") or {}).get("mode"),
+                "answer": hashlib.sha256(shape.encode()).hexdigest()[:12]}
 
     def run(method, *call):
         return lambda: timed(method, *call)
@@ -121,7 +124,8 @@ def child(args):
                 "wall_s": round(median["wall"], 4), "cpu_s": round(median["cpu"], 4),
                 "sync_ms": median["sync_ms"], "evaluation_ms": median["evaluation_ms"],
                 "evaluation_cpu_s_est": round(max(0.0, median["cpu"] - (median["sync_ms"] or 0) / 1000.0), 4),
-                "verdict": median["verdict"], "mode": median["incremental"]}
+                "verdict": median["verdict"], "mode": median["incremental"],
+                "answers": sorted({sample["answer"] for sample in samples})}
     report["index_mb"] = round(sum(f.stat().st_size for f in Path(args.index).iterdir() if f.is_file()) / 1e6, 1)
     print(json.dumps(report), flush=True)
     engine.close()
@@ -145,6 +149,7 @@ def main():
     parser.add_argument("--events", type=int, default=225_000)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--baseline-src", help="src directory of an older tree to measure as the 'before'")
+    parser.add_argument("--only", help="comma separated run labels to measure (default: all)")
     parser.add_argument("--child", action="store_true")
     parser.add_argument("--index-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--index")
@@ -180,6 +185,8 @@ def main():
     if not snapshot.exists():
         shutil.copy(session, snapshot)
     for label, src, incremental, shadow in runs:
+        if args.only and label not in args.only.split(","):
+            continue
         index = work / f"index-{label}"
         if index.exists():
             shutil.rmtree(index)
@@ -188,6 +195,12 @@ def main():
         print(f"measuring {label} ...", flush=True)
         out[label] = measure(label, src, args, index, incremental, shadow)
     print(json.dumps(out, indent=2))
+    labels = [label for label in out if isinstance(out[label], dict) and "calls" in out[label]]
+    for key in out[labels[0]]["calls"] if labels else ():
+        answers = {label: out[label]["calls"][key]["answers"] for label in labels}
+        # Appends differ between trees only in timing, never in content, so every tree must give the same answers.
+        if len({json.dumps(v) for v in answers.values()}) > 1:
+            print(f"WARNING: trees disagree on {key}: {answers}", file=sys.stderr)
 
 
 if __name__ == "__main__":

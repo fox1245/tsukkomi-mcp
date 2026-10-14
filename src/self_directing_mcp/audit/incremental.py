@@ -29,11 +29,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES
 from self_directing_mcp.audit import runner
 from self_directing_mcp.audit.applicability import PROPOSED_CALL_PREFIX, not_applicable_reason
-from self_directing_mcp.request_control import check_request
+from self_directing_mcp.request_control import check_request, current_request
 from self_directing_mcp.schemas import Evidence, Finding
 from self_directing_mcp.security.mask import mask_secrets
 
@@ -41,6 +42,11 @@ from self_directing_mcp.security.mask import mask_secrets
 # stored state and re-enables contracts that a shadow mismatch disabled.
 EVALUATOR_VERSION = 1
 STATE_VERSION = 1
+
+# The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
+# is skipped when the request's remaining budget cannot cover it with margin; it must never turn a request that
+# the full evaluator alone would have answered in time into a timeout.
+SHADOW_SECONDS_PER_EVENT = 30e-6
 
 EVIDENCE_LIMIT = 20
 EXCEPTION_MAX_HITS = 512
@@ -731,6 +737,13 @@ class PlanRetry(Exception):
         self.ids, self.reason, self.plan = frozenset(ids), reason, plan
 
 
+def _shadow_affordable(events) -> bool:
+    control = current_request()
+    if control is None or control.deadline is None:
+        return True
+    return control.deadline - time.monotonic() > events * SHADOW_SECONDS_PER_EVENT * 1.5 + 0.5
+
+
 def _shadow_sample(session_id, offset, active, every) -> bool:
     if every <= 0:
         return False
@@ -864,6 +877,9 @@ class AuditPlan:
         facts_offset = facts_row["byte_offset"] if facts_row is not None else 0
         sampled = _shadow_sample(session_id, cursor["byte_offset"], active, shadow_every)
         shadow = sampled or bool(rebuilds) or bool(facts_rebuild)
+        if shadow and not _shadow_affordable(store.session_metrics(session_id, provider)[0]):
+            shadow = False
+            report["shadow_skipped"] = "deadline"
 
         def tail_mismatch(events, mode):
             """Consumers whose stored prefix no longer holds the number of events it was built from."""
@@ -899,7 +915,8 @@ class AuditPlan:
                 bad = tail_mismatch(reference, "full")
                 if bad:
                     drop(bad)
-                    full = shadow = True
+                    full = True
+                    shadow = shadow or "shadow_skipped" not in report
         events, mode, count = [], "delta", latest["event_count"] if chain_ok else 0
         if not full:
             from_byte = min([*offsets.values(), *([facts_row["byte_offset"]] if facts_row is not None else [])])
@@ -907,7 +924,8 @@ class AuditPlan:
             bad = tail_mismatch(events, "delta")
             if bad:
                 drop(bad)
-                full = shadow = True
+                full = True
+                shadow = shadow or "shadow_skipped" not in report
                 if reference is None:
                     snapshot_events = store.capture_audit_events(session_id, provider, needs, link_calls=link_calls)
                     reference = list(snapshot_events.events)
@@ -917,7 +935,7 @@ class AuditPlan:
             bad = tail_mismatch(events, "full")
             if bad:
                 drop(bad)
-                shadow = True
+                shadow = shadow or "shadow_skipped" not in report
         monitors = {}
         for rule in history:
             if rule.id in routes:
@@ -955,9 +973,9 @@ class AuditPlan:
         free = [r for r in active if r.id not in history_ids]
         support = None
         if mode == "delta" and free:
+            # Rules that need no history see only their anchor events (as in the non-history audit path).
             anchors = {a for r in free for a in (r.source_event_id, r.applies_from_event_id) if a}
-            support = store.capture_evidence(session_id, provider, history=False, anchors=anchors).list_chunks(
-                session_id, provider)
+            support = store.anchor_chunks(session_id, provider, anchors)
         snapshot = {"generation": generation if chain_ok else None, "offset": cursor["byte_offset"],
                     "prefix_hash": cursor["prefix_hash"], "synced_at": cursor["synced_at"], "path": cursor["path"],
                     "count": count}

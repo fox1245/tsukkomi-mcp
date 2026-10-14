@@ -443,3 +443,21 @@ def test_agy_sessions_with_pending_truncated_and_legacy_results(tmp_path):
         assert modes.count("delta") >= 4, twin.reports[-6:]
     finally:
         twin.close()
+
+
+def test_a_shadow_run_is_skipped_when_the_request_cannot_afford_it(codex, monkeypatch):
+    import time
+    twin, path = codex
+    rng = random.Random(12)
+    numbered = []
+    write(path, codex_records(rng, 25, numbered), "a")
+    twin.upsert(RULES)
+    twin.fast.settings.audit_shadow_every = 1
+    monkeypatch.setattr(inc, "SHADOW_SECONDS_PER_EVENT", 100.0)
+    answer = twin.fast.audit_session(SID, provider="codex", _deadline=time.monotonic() + 30)
+    assert answer["incremental"]["shadow"] is False and answer["incremental"]["shadow_skipped"] == "deadline"
+    assert stable(answer) == stable(twin.full.audit_session(SID, provider="codex"))
+    # No deadline, nothing to protect: the comparison runs.
+    write(path, codex_records(rng, 3, numbered), "a")
+    answer = twin.fast.audit_session(SID, provider="codex")
+    assert answer["incremental"]["shadow"] is True and answer["incremental"]["shadow_compared"] is True
