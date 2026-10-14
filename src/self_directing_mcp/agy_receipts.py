@@ -191,10 +191,15 @@ class ReceiptStore:
 
 
 def linked_receipt(receipts: dict[int, dict], step: int, path: Path, before_byte: int,
-                   *, result_record: dict, require_paired: bool = True) -> dict | None:
+                   *, result_record: dict, require_paired: bool = True, resolved: str | None = None) -> dict | None:
+    """The receipt that ties the result record at ``before_byte`` to a call, or None.
+
+    ``resolved`` is ``str(path.resolve())`` when the caller already has it (the parser resolves once, not once per
+    result record)."""
     row = receipts.get(step)
     if (not row or row.get("preexisting_result") or (require_paired and not row.get("paired"))
-            or row.get("path") != str(path.resolve()) or row.get("result_hash") != result_digest(result_record)):
+            or row.get("path") != (resolved if resolved is not None else str(path.resolve()))
+            or row.get("result_hash") != result_digest(result_record)):
         return None
     length = row.get("prefix_length", 0)
     if not length or length > before_byte:

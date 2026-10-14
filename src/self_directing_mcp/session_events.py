@@ -616,7 +616,11 @@ _source_observation: ContextVar[SourceObservation | None] = ContextVar("source_o
 
 def observed_source(path: Path) -> SourceObservation | None:
     observation = _source_observation.get()
-    return observation if observation is not None and Path(path).resolve() == observation.path else None
+    if observation is None:
+        return None
+    candidate = Path(path)
+    # ``observation.path`` is resolved: an equal path needs no filesystem lookup (one per result record otherwise).
+    return observation if candidate == observation.path or candidate.resolve() == observation.path else None
 
 
 @contextmanager
