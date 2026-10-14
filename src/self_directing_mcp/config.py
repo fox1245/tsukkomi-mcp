@@ -138,6 +138,12 @@ class Settings(SettingsAccessors, BaseSettings):
     rrf_k: int = settings_core.DEFAULT_RRF_K
     retrieve_top_k: int = settings_core.DEFAULT_RETRIEVE_TOP_K
     search_top_k: int = settings_core.DEFAULT_SEARCH_TOP_K
+    daemon: Literal["off", "on"] = Field(
+        default=settings_core.DEFAULT_DAEMON,
+        description="Resident daemon (experimental, Linux only): 'on' makes command hooks and the MCP entry point "
+                    "thin clients of one per-user process; 'off' (default) is the standalone mode. The entry points "
+                    "read it from the process environment before importing anything else. SELF_DIRECT_DAEMON.",
+    )
 
     @classmethod
     def settings_customise_sources(

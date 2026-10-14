@@ -295,6 +295,7 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES` | `4294967296` | **New in 0.6.0.** Largest decompressed size a `.jsonl.zst` Codex session may declare; larger files are refused as `zstd_too_large`. |
 | `SELF_DIRECT_RETRIEVE_TOP_K`, `SELF_DIRECT_SEARCH_TOP_K`, `SELF_DIRECT_RRF_K` | `20`, `10`, `60` | Retrieval tuning. |
 | `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS` | `false` | Seed disabled demonstration contracts. |
+| `SELF_DIRECT_DAEMON` | `off` | **Experimental.** `on` makes hooks and the MCP entry point clients of the resident daemon (Linux only; read from the process environment by the entry points). See [Resident daemon](#resident-daemon-experimental-off-by-default), which also lists the daemon's own `SELF_DIRECT_DAEMON_*` limits. |
 
 #### Credentials
 
@@ -580,6 +581,103 @@ Cheap signals only ever escalate to full: a different file identity (a new inode
 
 ---
 
+## Resident daemon (experimental, off by default)
+
+In production a coding agent's integrations add up to many processes: Claude Code and AGY start a fresh Python process for **every hook event**, each OMP session starts its own stdio MCP server, and AGY starts one per session (16 processes and about 1.3 GB in the case that prompted this, [#15](https://github.com/fox1245/tsukkomi-mcp/issues/15)). The resident daemon replaces them with **one process per user and OS environment**; hooks and MCP servers become thin clients of it. It is a stage-1 skeleton behind a flag: Linux (including WSL) only, off by default, and judged by the same code as the standalone processes.
+
+```
+Claude Code / AGY hook event ─ scripts/*_hook.py (stdlib client) ┐
+OMP / AGY MCP server ───────── self-directing-mcp (stdlib relay) ┼─ Unix socket ─ python -m self_directing_mcp.daemon
+                                                                 ┘                 ├─ hook lane: claude_hooks.run_hook / agy_hooks.run_hook
+                                                                                   ├─ heavy lane: the FastMCP tool functions of server.py
+                                                                                   └─ one SelfDirectEngine (+ integrity worker) per resolved-settings key
+```
+
+### Turning it on, and off
+
+Set `SELF_DIRECT_DAEMON=on` in the environment of the hook command (the installers' `env`) and of the MCP server entry. The entry points read it from the **process environment** before importing anything else (a `.env` or the TOML cannot switch it; `config.Settings` and the light hook reader validate the same two values, `off` and `on`, identically, and an invalid value is a settings error like any other). `off`, the default, is the explicit **standalone** mode: nothing about hooks or servers changes. On a platform other than Linux `on` behaves as `off` and says so once on stderr (a marker file in `~/.cache/tsukkomi/notices/` keeps later processes quiet).
+
+`self-directing-mcp` and `tsukkomi-mcp` now point at `self_directing_mcp.entry:main`, which decides before importing the MCP SDK. Installations whose console script still points at `server:main` get the relay too (`server.main` delegates), at the cost of the imports. `python -m self_directing_mcp.daemon --status` prints the running daemon's counters (no request content), `--stop` asks it to drain and exit.
+
+### Threat model
+
+The authentication boundary is **the operating-system user**, and nothing finer.
+
+- The runtime directory is `$XDG_RUNTIME_DIR/tsukkomi/` when that variable names a usable directory (yours, not group- or world-writable), else `~/.cache/tsukkomi/run/`. It is created mode 0700 and **verified on every use**: a real directory (never a symbolic link), owned by the current user, mode exactly 0700; otherwise the daemon and the clients refuse it with a clear error and nothing is created or reused. The verified directory is held open as a file descriptor, files are opened relative to it and a long path is reached through `/proc/self/fd/<n>/`, so the check and the use cannot be separated by a swapped path component.
+- The socket (mode 0600, no TCP of any kind) lives in that directory, and every accepted connection's `SO_PEERCRED` user id must equal the daemon's; another uid is closed without a word.
+- **Processes of the same user are not isolated from each other**: any of them can connect, run hooks and MCP sessions as that user, and drain the daemon. That is no weaker than their access to the index and the contracts file today, and no stronger.
+- No credential travels. A client forwards a whitelist of its environment (`SELF_DIRECT_*`, `TSUKKOMI_*`, `HOME`, `CODEX_SESSIONS_DIR`, `CLAUDE_CONFIG_DIR`), never `OPENROUTER_API_KEY` or any name that looks like a key, token, secret or password (the key-file *path* setting is fine); the daemon re-checks what it receives. The daemon reads a key file itself, exactly as a standalone process does, so use `SELF_DIRECT_OPENROUTER_API_KEY_FILE`: an `OPENROUTER_API_KEY` in a client's environment is not forwarded and is ignored by the daemon, which starts with a scrubbed environment and never uses an ambient key. For an MCP session the daemon also reads `.env` in the client's working directory, as the standalone server would.
+- `daemon.log` (mode 0600, rotated at 256 KiB) holds event names, sizes, durations and error classes. Request and response bodies, payloads, paths and exception messages are never logged, and a log field that is not a short identifier is dropped.
+- A frame is a 4-byte length plus UTF-8 JSON, at most 16 MiB; a zero or oversized length, a body that is not a JSON object, and a connection that stays silent after connecting are protocol errors that close that connection only.
+
+### Lifecycle
+
+- **Start.** The first client that finds no daemon takes a non-blocking lock, starts one detached (own session, stdio on `/dev/null`) and waits for its socket for a bounded time (`AVAILABILITY_FAST_SEC` 0.3 s for `PreToolUse`, `PostToolUse`, `UserPromptSubmit` and `PreInvocation`; `AVAILABILITY_SLOW_SEC` 3 s for `Stop`, `SubagentStop` and `SessionStart`; an MCP relay waits up to 15 s). The interpreter is the checkout's `.venv` Python, else the client's own; `SELF_DIRECT_DAEMON_PYTHON` overrides it. The daemon's environment carries no settings: every request brings its own.
+- **One instance.** A lock file (`flock`) is held for the daemon's lifetime; a second daemon exits at once, and a successor started while its predecessor drains waits up to 10 s for the lock. Never two writers.
+- **Leaving.** After `SELF_DIRECT_DAEMON_IDLE_EXIT_SEC` (900) with no connection and no request; after a request when its resident set exceeds `SELF_DIRECT_DAEMON_MAX_RSS_MB` (400): it stops accepting, finishes what is running and exits, and the next client starts a new one; on SIGTERM/SIGINT; and when a newer client asks (below). Each exit flushes its counters, closes its engines and removes the socket and the pid file.
+- **Judging.** Hook requests run on their own thread pool and MCP tool calls on another, so a long `sync_session` never queues a `PreToolUse`. Requests are bounded per session (`SELF_DIRECT_DAEMON_SESSION_BOUND`, 16) and in total (128); beyond the bound the answer is `unknown(queue_full)`. Each request's environment is a per-request view of `os.environ` (managed names come from the request alone), settings are resolved with `settings_core.load_hook_settings` (hooks) or `Settings` (MCP; `--omp-bridge` validation through the same `server.omp_bridge_settings`), and engines are created lazily, one per resolved-settings key and reused, each with one resident integrity worker. An engine serializes its own operations exactly as in a standalone process.
+
+### Failure behaviour: never an in-process fallback
+
+With the flag on, a hook's whole answer comes from the daemon or from a visible fail-open. If the daemon cannot be reached or started the client **never imports the engine and never judges itself**; it answers through `claude_hook_state.fail_open` / `agy_hook_state.fail_open`: no deny, a visible warning with the reason, the failure recorded in `hook_health`, and **`ask` when a contract marked `risk: high` matches the proposed action** (the same policy as every other unavailability).
+
+| Situation | Reason in the warning |
+|---|---|
+| Daemon unreachable after the availability budget; the daemon died mid-request; the spawned interpreter exited | `daemon_unavailable` |
+| More than 3 daemon starts within 5 minutes (recorded in the runtime directory; a daemon that is still starting is waited for, not started twice) | `daemon_unavailable:crash-loop`, also a stderr warning |
+| The runtime directory is unsafe (symlink, wrong owner or mode) | `daemon_unavailable:runtime_dir`, reason on stderr |
+| No answer within the request budget (`SELF_DIRECT_REQUEST_TIMEOUT_SEC`, default 45 s, plus 5 s) | `daemon_timeout` |
+| A session beyond its bound | `queue_full` |
+| The daemon runs another version (see below) | `version_mismatch` |
+| A payload above the 16 MiB frame limit | `frame_too_large` |
+
+The availability budget is not the judgement deadline: once connected, a request has the normal hook budget. An MCP relay behaves the same way: a failure becomes a JSON-RPC error for the host's first request (`initialize`) plus a non-zero exit (2 for a configuration the daemon rejected, such as an `--omp-bridge` without its key file or native library; 1 otherwise), never a silent standalone server. If the daemon goes away while a session is running (memory cap, version switch, crash), the relay answers the requests that were in flight with a JSON-RPC error, reconnects (starting a successor), replays the host's `initialize` handshake and carries on; five recoveries within a minute end the process.
+
+### Versions
+
+`hello` reports `proto`, `package_version`, `index_schema`, `parser_versions`, `evaluator_version`, `features` and `pid`. A client whose package version or proto is **newer** than the daemon's asks it to drain (it stops accepting, finishes in-flight requests, closes its engines and exits) and starts the successor; **an older client never replaces the daemon**: it gets `unknown(version_mismatch)` and its hook fails open. During any switchover other hooks fail open (`daemon_unavailable`) rather than being judged twice. The version is the package version: two checkouts with the same number share one daemon, so after switching branches without a version bump run `python -m self_directing_mcp.daemon --stop`.
+
+### Observability
+
+MCP tool results the daemon served carry `served_by: "daemon"` (a standalone server's results are unchanged, so existing consumers see no new key). Host hook JSON gets **no** extra key; where a hook was served is recorded in the hook state database that already holds `hook_health` (`<index_dir>/claude-hook-state.sqlite`, `agy-hook-state.sqlite`), in a `served_by` table of counters per event, written at most every 30 s and at exit; a database without `daemon` rows was never served by it. Failures a client could not hand to the daemon are `hook_health` rows as usual.
+
+### Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SELF_DIRECT_DAEMON` | `off` | `on`: hooks and the MCP entry point are clients of the daemon (Linux). |
+| `SELF_DIRECT_DAEMON_IDLE_EXIT_SEC` | `900` | Daemon-side: leave after this long with no connection and no request. |
+| `SELF_DIRECT_DAEMON_MAX_RSS_MB` | `400` | Daemon-side: drain and exit after a request when the resident set exceeds this. |
+| `SELF_DIRECT_DAEMON_SESSION_BOUND` | `16` | Daemon-side: queued plus running hook requests per session before `queue_full`. |
+| `SELF_DIRECT_DAEMON_PYTHON` | the `.venv` Python, else the client's | Client-side: interpreter that starts the daemon. |
+
+The `SELF_DIRECT_DAEMON_*` limits are read from the daemon's own environment (clients pass them on when they start it); a malformed value stops the daemon with an error instead of using a default.
+
+### Limits of this stage
+
+Linux and WSL only; one daemon version at a time; the `.env`-in-working-directory behaviour of an MCP server depends on the client's directory; every client of a user must see the same `XDG_RUNTIME_DIR` (or all fall back to the cache directory), or they would start separate daemons (index locking keeps that safe, not efficient); a request that exceeds its budget leaves its worker thread running until its cooperative deadline; the judgement itself is unchanged, so what is slow in a standalone hook (AGY re-parses its whole transcript on every call, ingest of appended bytes, audits over a long history) is exactly as slow inside the daemon (see the measurements); a hook arriving while the daemon is restarting fails open instead of waiting for it. Daemon-side `served_by` for hooks is a counter, not a per-call record.
+
+### Measurements
+
+Measured with `scripts/bench_daemon.py` on synthetic data (AMD Ryzen 7 5800X under WSL2, ext4, Python 3.12, other work running on the machine: load average about 2; 1 MB sessions, 10 contracts, local-only, 30 interleaved runs per cell after a discarded warm-up). The "daemon" columns are the real hook script as a fresh process talking to a warm daemon; the standalone columns are the same script with the flag unset on a separate, identically built index.
+
+| Event (new process, wall ms) | standalone p50 / p95 | through the daemon p50 / p95 | judgement inside the daemon p50 / p95 | rest of the daemon's request p50 / p95 |
+|---|---|---|---|---|
+| Claude Code `UserPromptSubmit` | 50 / 65 | **21 / 25** | 0.7 / 0.8 | 0.2 / 0.2 |
+| Claude Code `PreToolUse` (nothing appended) | 240 / 277 | 53 / 66 | 32 / 41 | 0.2 / 0.3 |
+| Claude Code `PreToolUse` (4 KB appended) | 261 / 312 | 59 / 89 | 37 / 68 | 0.2 / 0.3 |
+| Claude Code `Stop` (nothing appended) | 279 / 320 | 85 / 126 | 64 / 104 | 0.2 / 0.3 |
+| AGY `PreToolUse` (nothing appended) | 613 / 651 | 436 / 473 | 414 / 451 | 0.2 / 0.3 |
+| AGY `Stop` (nothing appended) | 325 / 346 | 136 / 155 | 115 / 134 | 0.3 / 0.3 |
+
+What the daemon removes is the process cost: interpreter start, imports, settings, engine and index setup (about 190 ms of a 240 ms Claude Code `PreToolUse`). The thin client alone costs about 20 ms end to end (12.6 ms of it is the bare interpreter start; the client adds the standard-library imports and one socket round trip), its peak resident set is about 14 MB (a bare interpreter: 11 MB; a standalone judging hook: 68 to 77 MB), and the daemon's own handling beyond the judgement is about 0.25 ms. What it does not remove is the judgement: contract evaluation over the session, the ingest of appended bytes and, for AGY, the re-parse of the whole transcript on every call are the same work as in a standalone hook and now dominate. (`bench_daemon.py`'s "client peak RSS" column reads `ru_maxrss`, which includes the benchmark process's own size at fork, about 23 MB, as `bench_hooks.py`'s does.)
+
+Idle MCP sessions (12, one shared index, after the handshake and one tool call): twelve standalone servers use 971 MB resident (588 MB proportional); twelve relays plus one daemon use **251 MB** (119 MB proportional): each relay 13.7 to 14.4 MB, the daemon 83.5 MB. After the hook runs above the daemon, holding two engines, was at 99.9 MB.
+
+Against the roundtable's provisional targets: relay at most 15 MB, met (14.4 MB); daemon at most 120 MB, met (83.5 to 99.9 MB); 12 sessions at most 300 MB in total, met (251 MB); the new-process hook p95 of at most 40 ms is **met for events without a judgement** (`UserPromptSubmit`: 25 ms) and **not met** for `PreToolUse` (Claude Code 66 ms, AGY 473 ms) because of the judgement; the daemon-side processing p95 of at most 15 ms is **met for the daemon's own work** (0.3 ms beyond the judgement, 1 ms for `UserPromptSubmit`) and **not met** where the judgement itself exceeds it (Claude Code `PreToolUse` 41 ms, AGY 451 ms). Reaching those two targets needs the judgement to get faster (incremental ingest and audit for short sessions, an incremental AGY parser), which this change deliberately does not touch.
+
+---
+
 ## Memory, concurrency and deadlines
 
 Long-running servers sharing one index had grown to many gigabytes in a real deployment ([#5](https://github.com/fox1245/tsukkomi-mcp/issues/5)). The causes were whole-file captures per request, concurrent reparses of the same session and heap that was freed but not returned. 0.6.0 changes:
@@ -763,7 +861,10 @@ python -m pytest -q
 python -m build
 python scripts/benchmark.py
 python scripts/bench_hooks.py --out bench-hooks.json --markdown bench-hooks.md   # hook cost, see below
+python scripts/bench_daemon.py --out bench-daemon.json --markdown bench-daemon.md  # resident daemon, Linux (experimental)
 ```
+
+The resident daemon's tests live in `tests/daemon/` (Linux only; other platforms skip them): framing and directory checks, peer credentials, bounds, version switching, idle exit and the memory drain, byte-identical hook output through the daemon and standalone (Claude Code and AGY: deny, allow with a satisfied prerequisite, `Stop`), concurrency, every fail-open path, the client import budget, MCP parity through the relay, and a fixture that fails any test that leaves a daemon process running (and the session, if one survives).
 
 ### CI
 
