@@ -1,0 +1,87 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/claude_hook.py --event=SessionStart",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/claude_hook.py --event=UserPromptSubmit",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/claude_hook.py --event=PreToolUse",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/claude_hook.py --event=PostToolUse",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/claude_hook.py --event=PostToolUseFailure",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/claude_hook.py --event=Stop",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/claude_hook.py --event=SubagentStop",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "SELF_DIRECT_CLAUDE_ENFORCEMENT": "confirmed_only"
+  }
+}
