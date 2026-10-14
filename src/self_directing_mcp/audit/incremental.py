@@ -13,7 +13,8 @@ What is summarized, per contract kind (all state is bounded and JSON-serializabl
 * ``must_not``: the match count, the first 20 matches as evidence and, with an ``exception_regex`` (which the
   reference matches against the join of every hit), the hit texts up to a cap;
 * ``must``: the last three regex hits as evidence plus, for ``requires_success``, a tracker of the latest hit's
-  call (how many calls share its id, how many results followed, whether the first one succeeded);
+  call (how many calls share its id, how many results followed, whether the first one succeeded, and whether that
+  success is the required command's at all: ``shellstatus``);
 * ``before_regex``: each triggering action is judged at its own position (the verdict depends on the prefix
   only), so the worst verdict, the distinct reasons, the first 20 evidence items and the last trigger position
   are kept;
@@ -33,7 +34,7 @@ import time
 from bisect import bisect_left
 
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES
-from self_directing_mcp.audit import runner
+from self_directing_mcp.audit import runner, shellstatus
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 from self_directing_mcp.audit import patterns as _patterns
 from self_directing_mcp.audit.applicability import PROPOSED_CALL_PREFIX, not_applicable_reason
@@ -43,7 +44,7 @@ from self_directing_mcp.security.mask import mask_secrets
 
 # Bump when the semantics of any evaluation changes (rules, evidence classes, evidence text); it invalidates every
 # stored state and re-enables contracts that a shadow mismatch disabled.
-EVALUATOR_VERSION = 2
+EVALUATOR_VERSION = 3
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
@@ -471,7 +472,10 @@ class RuleMonitor:
         if self.rs:
             call_id = event.meta.get("call_id")
             if call_id:
-                self.lh = [_k(call_id), pools.earlier_calls(call_id, self.from_key, event.key) + 1, 0, 0, None]
+                # [call id, calls sharing it, results after it (capped), result status, success evidence, why the
+                # recorded success would not be the required command's (``shellstatus``), or None]
+                self.lh = [_k(call_id), pools.earlier_calls(call_id, self.from_key, event.key) + 1, 0, 0, None,
+                           shellstatus.unverifiable(event.text, self.regex)]
             else:
                 self.lh = None
 
@@ -539,6 +543,9 @@ class RuleMonitor:
         unresolved = True
         if lh is not None and lh[1] == 1 and lh[2] == 1 and lh[3] != 0:
             if lh[3] == 1:
+                if lh[5]:
+                    return "unknown", runner.success_unverifiable(lh[5]), [
+                        self.last3[-1], {**lh[4], "d": "linked tool result (success not attributable)"}]
                 return "clean", "required call has linked successful result", [self.last3[-1], lh[4]]
             unresolved = False
         if unresolved:

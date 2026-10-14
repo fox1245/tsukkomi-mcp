@@ -15,9 +15,17 @@ from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.neograph_runtime import run_stages
 from self_directing_mcp.request_control import check_request, request_operation
 
+from self_directing_mcp.audit import shellstatus
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 
 REGEX_TIMEOUT = "regex_timeout: a contract pattern exceeded its time limit, so this contract could not be evaluated"
+SUCCESS_UNVERIFIABLE = "success_unverifiable"
+
+
+def success_unverifiable(why) -> str:
+    """The reason of an obligation whose only success evidence cannot be attributed to the required command."""
+    return (f"{SUCCESS_UNVERIFIABLE}: the recorded success is not necessarily the required command's "
+            f"({shellstatus.REASONS.get(why, why)})")
 
 
 def _checked(items):
@@ -98,7 +106,7 @@ class _Presence:
     """Index prerequisites once; each checkpoint is a binary search plus a bounded evidence slice."""
 
     def __init__(self, rule, regex, active):
-        self.rule, self.active = rule, active
+        self.rule, self.active, self.regex = rule, active, regex
         self.hits, self.calls, self.outputs = [], {}, {}
         for index, chunk in enumerate(_checked(active)):
             if chunk.kind == "tool_call":
@@ -129,6 +137,12 @@ class _Presence:
             if end - start == 1 and active[outputs[start]].meta.get("success") is not None:
                 output = active[outputs[start]]
                 if output.meta["success"] is True:
+                    # A host records the status of the whole command line; `|| true`, a pipe without pipefail, a
+                    # following command or --collect-only make it someone else's status (audit/shellstatus.py).
+                    why = shellstatus.unverifiable(chunk.text, self.regex)
+                    if why:
+                        return "unknown", success_unverifiable(why), [
+                            evidence(chunk), evidence(output, "linked tool result (success not attributable)")]
                     return "clean", "required call has linked successful result", [
                         evidence(chunk), evidence(output, "linked successful tool result")]
                 unresolved = False

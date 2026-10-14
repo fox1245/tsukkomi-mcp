@@ -11,8 +11,10 @@ import random
 
 from self_directing_mcp.schemas import AuditEvent, ContractRule, ContractWhen
 
-WORDS = ["alpha", "beta", "gamma", "deploy", "test", "fail", "ok", "build", "push", "delete"]
-PATTERNS = ["alpha", "beta|gamma", "deploy", "test", "test.*ok", "^ok", "build", "push|delete", "fail", "alpha beta",
+WORDS = ["alpha", "beta", "gamma", "deploy", "test", "fail", "ok", "build", "push", "delete", "pytest"]
+# Tails that change what a recorded exit status means (audit/shellstatus.py): the evaluators must still agree.
+TAILS = ["", "", "", "", "", " || true", " | tee log", " --collect-only", " ; exit 0", " && echo ok", " &"]
+PATTERNS = ["alpha", "beta|gamma", "deploy", "test", "test.*ok", "^ok", "build", "push|delete", "fail", "alpha beta", "pytest",
             "(?i)DEPLOY", "ok$", "gamma", r"beta \[tool_call", r"alpha \[message", r"ok \[tool_result"]
 BAD_PATTERNS = ["(", "[a-", "*oops"]
 ROLES = ["assistant", "user", "tool", "runtime"]
@@ -68,7 +70,7 @@ class Session:
             self._add("turn", f"[message:assistant] {words(rng)}", {"role": "assistant"}, 0, start)
         elif choice < 0.62:
             call_id = self._call_id()
-            self._add("tool_call", f"[tool_call:shell] {words(rng)}",
+            self._add("tool_call", f"[tool_call:shell] {words(rng)}{rng.choice(TAILS)}",
                       {"role": "assistant", "call_id": call_id, "tool_name": "shell"}, 0, start)
         elif choice < 0.86:
             call_id = rng.choice(self.call_ids) if self.call_ids and rng.random() < 0.9 else None
@@ -131,7 +133,7 @@ class Session:
             if linked:
                 call_id = f"agy-hook:{step}"
                 self.call_ids.append(call_id)
-                self._add("tool_call", f"[tool_call:shell] {words(rng)}",
+                self._add("tool_call", f"[tool_call:shell] {words(rng)}{rng.choice(TAILS)}",
                           {**base, "event_type": kind, "status": status, "role": "assistant", "call_id": call_id,
                            "tool_name": "shell"}, 0, start)
                 meta.update(call_id=call_id, linkage="host_step_receipt")
