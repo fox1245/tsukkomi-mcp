@@ -435,6 +435,10 @@ evaluation, which remains the reference. The audit still runs through the native
   until the evaluator version changes. The comparison is skipped (`incremental.shadow_skipped: "deadline"`) when the request's
   remaining time budget could not cover the full evaluation. The test suite compares every audit and fails on any
   difference.
+- **Small sessions.** A session with fewer than `SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS` stored events (default 500)
+  is evaluated in full and no state is kept (`incremental.mode: "full"`, `below_min_events`). Below that size one full
+  evaluation costs less than storing states, rebuilding them and shadow-checking the rebuild; on the scripted evaluation
+  harness (short sessions) keeping state roughly doubled the Codex `Stop` latency. `0` keeps state for every session.
 - **Reporting.** Results carry an `incremental` object: `mode` (`delta` reads only appended events, `full` reads all),
   `events_read`, `rebuilt` (contract to reason), `fallback` (contracts on full evaluation and why), `shadow`,
   `shadow_compared`, `incremental_mismatch`, `retry` and `state`. `SELF_DIRECT_AUDIT_INCREMENTAL=false` switches the whole feature off.

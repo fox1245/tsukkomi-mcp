@@ -156,7 +156,7 @@ FIELD_KINDS = {
     "integrity_fast_recent_blocks": "int", "integrity_fast_sample_blocks": "int",
     "integrity_full_verify_interval_sec": "float", "integrity_background_verify": "bool",
     "integrity_background_idle_sec": "float", "integrity_background_max_scans": "int",
-    "audit_incremental": "bool", "audit_shadow_every": "int",
+    "audit_incremental": "bool", "audit_shadow_every": "int", "audit_incremental_min_events": "int",
 }
 FREE_TEXT = {"embedding_model": ["m", "", " spaced model ", "a/b:c"], "embedding_base_url": ["http://x", "", "u r l"],
              "openrouter_api_key": ["k", "", " k ", "sk-synthetic"]}

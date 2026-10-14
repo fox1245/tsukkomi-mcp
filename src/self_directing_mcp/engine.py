@@ -641,6 +641,12 @@ class SelfDirectEngine:
                 if history:
                     # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
                     needs, link_calls = audit_needs(active, planned)
+                    minimum = self.settings.audit_incremental_min_events
+                    if use_plan and minimum and self.store.session_metrics(sid, provider)[0] < minimum:
+                        # A short session: one full evaluation costs less than keeping, rebuilding and
+                        # shadow-checking monitor states. Nothing is stored; the answer is the reference one.
+                        use_plan = False
+                        report.update(mode="full", below_min_events=minimum)
                     if use_plan:
                         report = {key: value for key, value in report.items() if key == "retry"}
                         try:

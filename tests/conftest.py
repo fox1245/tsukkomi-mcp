@@ -33,6 +33,8 @@ def explicit_test_backend(tmp_path, monkeypatch):
     # difference returns the full result, so an incremental defect shows up as the mismatch assertions of
     # tests/test_incremental_*.py or as a changed finding, never as a silent wrong answer.
     monkeypatch.setenv("SELF_DIRECT_AUDIT_SHADOW_EVERY", "1")
+    # The suite's sessions are small; keep monitor state for them anyway so every audit exercises the incremental path.
+    monkeypatch.setenv("SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS", "0")
     # Never load a developer's per-user TOML while running isolated regressions.
     config_file = tmp_path / "isolated-config.toml"
     config_file.write_text("", encoding="utf-8")

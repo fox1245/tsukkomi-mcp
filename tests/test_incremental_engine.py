@@ -324,6 +324,23 @@ def test_incremental_audits_can_be_switched_off(codex):
     assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_monitor_state").fetchone()[0] == 0
 
 
+def test_a_session_below_the_minimum_size_is_evaluated_in_full_without_state(codex):
+    twin, path = codex
+    rng = random.Random(12)
+    numbered = []
+    write(path, codex_records(rng, 20, numbered), "a")
+    twin.upsert(RULES[:2])
+    twin.fast.settings.audit_incremental_min_events = 10_000
+    fast, _full = twin.audit(SID)
+    assert fast["incremental"]["mode"] == "full" and fast["incremental"]["below_min_events"] == 10_000
+    assert "shadow_compared" not in fast["incremental"]
+    assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_monitor_state").fetchone()[0] == 0
+    twin.fast.settings.audit_incremental_min_events = 1           # once the session is large enough: state is kept
+    fast, _full = twin.audit(SID)
+    assert "below_min_events" not in fast["incremental"]
+    assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_monitor_state").fetchone()[0] > 0
+
+
 # --- the other providers --------------------------------------------------------------------------------------
 
 def test_claude_sessions_with_cut_tool_results(tmp_path, monkeypatch):

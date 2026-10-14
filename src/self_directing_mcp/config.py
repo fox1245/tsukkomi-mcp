@@ -128,6 +128,13 @@ class Settings(SettingsAccessors, BaseSettings):
                     "session until the evaluator version changes. 1 compares every audit; 0 compares only when state "
                     "was just rebuilt. SELF_DIRECT_AUDIT_SHADOW_EVERY.",
     )
+    audit_incremental_min_events: int = Field(
+        default=settings_core.DEFAULT_AUDIT_INCREMENTAL_MIN_EVENTS,
+        ge=0,
+        description="Sessions with fewer stored events are evaluated in full without keeping monitor state: below "
+                    "this size a full evaluation costs less than storing, rebuilding and shadow-checking states. "
+                    "0 keeps state for every session. SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS.",
+    )
     rrf_k: int = settings_core.DEFAULT_RRF_K
     retrieve_top_k: int = settings_core.DEFAULT_RETRIEVE_TOP_K
     search_top_k: int = settings_core.DEFAULT_SEARCH_TOP_K
