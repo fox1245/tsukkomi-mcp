@@ -22,7 +22,7 @@ from self_directing_mcp.audit.contracts import (
     scope_counts,
     visible_contracts,
 )
-from self_directing_mcp.audit.runner import _worse, action_applies, downgrade_unproven_absence, prefix_note, run_audit
+from self_directing_mcp.audit.runner import _worse, action_applies, audit_needs, downgrade_unproven_absence, prefix_note, run_audit
 from self_directing_mcp.checklist import (
     INCOMPLETE_NOTE,
     ChecklistStore,
@@ -495,7 +495,12 @@ class SelfDirectEngine:
             if metadata_token != refreshed["_metadata_token"]:
                 coverage["complete"] = False
                 coverage["issues"].append("metadata_changed_before_capture")
-            evidence = self.store.capture_evidence(sid, provider, history=history, anchors=anchors)
+            if history:
+                # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
+                needs, link_calls = audit_needs(active, planned)
+                evidence = self.store.capture_audit_events(sid, provider, needs, link_calls=link_calls)
+            else:
+                evidence = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
             receipt_token = self._receipt_token(sid, provider)
             if provider == "agy" and receipt_token != refreshed["_receipt_token"]:
                 coverage["complete"] = False

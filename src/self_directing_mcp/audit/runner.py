@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from bisect import bisect_left, bisect_right
 
 from self_directing_mcp.retrieve.checks import scope_matches
 from self_directing_mcp.schemas import AuditResult, Evidence, Finding
@@ -68,34 +69,67 @@ def downgrade_unproven_absence(findings, rules) -> bool:
     return changed
 
 
-def _presence(rule, matches, prefix):
-    if not matches:
-        return "violation", "required evidence missing before checkpoint", []
-    if not rule.requires_success:
-        return "clean", "required regex evidenced", [evidence(matches[-1])]
-    unresolved = False
-    # A newer failed/pending run invalidates older success at this checkpoint.
-    for chunk in matches[-1:]:
-        call_id = chunk.meta.get("call_id")
-        if not call_id:
-            unresolved = True
-            continue
-        calls = [c for c in _checked(prefix) if c.kind == "tool_call" and c.meta.get("call_id") == call_id]
-        if len(calls) != 1:
-            unresolved = True
-            continue
-        position = next(i for i, c in enumerate(_checked(prefix)) if c.chunk_id == chunk.chunk_id)
-        outputs = [c for c in _checked(prefix[position + 1:])
-                   if c.kind == "tool_result" and c.meta.get("call_id") == call_id]
-        if len(outputs) != 1 or outputs[0].meta.get("success") is None:
-            unresolved = True
-            continue
-        if outputs[0].meta["success"] is True:
-            return "clean", "required call has linked successful result", [
-                evidence(chunk), evidence(outputs[0], "linked successful tool result")]
-    if unresolved:
-        return "unknown", "required call has no unambiguous completion status", [evidence(c) for c in matches[-3:]]
-    return "violation", "required calls completed without success", [evidence(c) for c in matches[-3:]]
+def _key(value):
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return json.dumps(value, sort_keys=True, default=str)
+
+
+def audit_needs(active, proposed):
+    """What the history reader must keep text for: ``(scope, roles)`` pairs and whether call linkage is used."""
+    rules = [r for r in active if r.regex and (r.type == "must" or proposed is None)]
+    return [(r.scope, tuple(r.roles)) for r in rules], any(r.requires_success for r in rules)
+
+
+class _Presence:
+    """Prerequisite lookups over ``active`` built once; each checkpoint costs O(log n), not a prefix rescan."""
+
+    def __init__(self, rule, regex, active):
+        self.rule, self.active = rule, active
+        self.hits, self.calls, self.outputs = [], {}, {}
+        for index, chunk in enumerate(_checked(active)):
+            if chunk.kind == "tool_call":
+                self.calls.setdefault(_key(chunk.meta.get("call_id")), []).append(index)
+            elif chunk.kind == "tool_result":
+                self.outputs.setdefault(_key(chunk.meta.get("call_id")), []).append(index)
+            if _eligible(chunk, rule) and regex.search(chunk.text):
+                self.hits.append(index)
+
+    def before(self, position):
+        """Verdict for a checkpoint whose prefix is ``active[:position]``."""
+        check_request()
+        rule, active = self.rule, self.active
+        matches = self.hits[:bisect_left(self.hits, position)]
+        if not matches:
+            return "violation", "required evidence missing before checkpoint", []
+        if not rule.requires_success:
+            return "clean", "required regex evidenced", [evidence(active[matches[-1]])]
+        unresolved = False
+        # A newer failed/pending run invalidates older success at this checkpoint.
+        for index in matches[-1:]:
+            chunk = active[index]
+            call_id = chunk.meta.get("call_id")
+            if not call_id:
+                unresolved = True
+                continue
+            calls = self.calls.get(_key(call_id), ())
+            if bisect_left(calls, position) != 1:
+                unresolved = True
+                continue
+            outputs = self.outputs.get(_key(call_id), ())
+            outputs = outputs[bisect_right(outputs, index):bisect_left(outputs, position)]
+            if len(outputs) != 1 or active[outputs[0]].meta.get("success") is None:
+                unresolved = True
+                continue
+            if active[outputs[0]].meta["success"] is True:
+                return "clean", "required call has linked successful result", [
+                    evidence(chunk), evidence(active[outputs[0]], "linked successful tool result")]
+        items = [evidence(active[i]) for i in matches[-3:]]
+        if unresolved:
+            return "unknown", "required call has no unambiguous completion status", items
+        return "violation", "required calls completed without success", items
 
 
 def audit_contract(rule, *, session_id, store, retriever=None, provider=None, proposed=None, chunks=None):
@@ -153,16 +187,14 @@ def audit_contract(rule, *, session_id, store, retriever=None, provider=None, pr
         if not checkpoints:
             return finding("clean", "no triggering action in inspected events")
         overall, reasons, items = "clean", [], []
+        presence = _Presence(rule, regex, active)
         for position, checkpoint in _checked(checkpoints):
-            prefix = active[:position]
-            matches = [c for c in _checked(prefix) if _eligible(c, rule) and regex.search(c.text)]
-            verdict, reason, supporting = _presence(rule, matches, prefix)
+            verdict, reason, supporting = presence.before(position)
             overall = _worse(overall, verdict)
             reasons.append(reason)
             items.extend([evidence(checkpoint, "triggering action"), *supporting])
         return finding(overall, "; ".join(dict.fromkeys(reasons)), items[:20])
-    matches = [c for c in _checked(active) if _eligible(c, rule) and regex.search(c.text)]
-    verdict, reason, supporting = _presence(rule, matches, active)
+    verdict, reason, supporting = _Presence(rule, regex, active).before(len(active))
     return finding(verdict, reason, supporting)
 
 
