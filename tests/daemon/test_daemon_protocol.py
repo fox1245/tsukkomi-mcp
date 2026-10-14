@@ -171,13 +171,13 @@ def test_versions_parse_numerically_not_textually():
 
 def test_only_the_relevant_environment_travels_and_no_credential_does():
     environ = {"SELF_DIRECT_INDEX_DIR": "/idx", "self_direct_local_only": "true", "TSUKKOMI_WORKFLOW_STATE": "/s",
-               "HOME": "/home/u", "CODEX_SESSIONS_DIR": "/c", "CLAUDE_CONFIG_DIR": "/cc",
+               "HOME": "/h/u", "CODEX_SESSIONS_DIR": "/c", "CLAUDE_CONFIG_DIR": "/cc",
                "OPENROUTER_API_KEY": "sk-synthetic-secret", "SELF_DIRECT_OPENROUTER_API_KEY": "sk-also-secret",
                "SELF_DIRECT_OPENROUTER_API_KEY_FILE": "/keys/.env", "SELF_DIRECT_SOME_TOKEN": "t",
                "SELF_DIRECT_DB_PASSWORD": "p", "PATH": "/bin", "AWS_SECRET_ACCESS_KEY": "no", "LANG": "C"}
     sent = P.forwarded_environment(environ)
     assert sent == {"SELF_DIRECT_INDEX_DIR": "/idx", "self_direct_local_only": "true",
-                    "TSUKKOMI_WORKFLOW_STATE": "/s", "HOME": "/home/u", "CODEX_SESSIONS_DIR": "/c",
+                    "TSUKKOMI_WORKFLOW_STATE": "/s", "HOME": "/h/u", "CODEX_SESSIONS_DIR": "/c",
                     "CLAUDE_CONFIG_DIR": "/cc", "SELF_DIRECT_OPENROUTER_API_KEY_FILE": "/keys/.env"}
     assert "sk-synthetic-secret" not in json.dumps(sent) and "sk-also-secret" not in json.dumps(sent)
 
