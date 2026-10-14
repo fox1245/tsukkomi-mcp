@@ -13,6 +13,9 @@ from self_directing_mcp.request_control import check_request, publication, reque
 
 
 class NativeVectorStore:
+    """One SQLite connection shared by the methods below. Not thread-safe on its own: callers serialize every
+    use, as the engine does through its publication guard (the in-process lock and the index file lease)."""
+
     table: str
     id_column: str
 
