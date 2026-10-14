@@ -865,6 +865,8 @@ python scripts/memory_soak.py --check --dense-backend sqlite-vector --vector-pat
 
 Use a separate virtual environment per profile, because the sanitizer build replaces the release wheel. `TSUKKOMI_TEST_DENSE_BACKEND=sqlite-vector` with `SQLITE_VECTOR_TEST_PATH` runs any suite against a native vector library. Known limit: CPython 3.12 builds where interned strings are immortal (Ubuntu 24.04's 3.12.3, for example) keep each path component that `pathlib` interns, about 150 bytes per distinct session path. This is bounded by the number of sessions; newer 3.12 releases and 3.13 release them.
 
+Known third-party exemption: sqlite-vector 1.1.0 computes `1 << 31` on an `int` in `cpu_supports_avx512()` (`src/distance-cpu.c`), which UBSan reports as `shift-base` on CPUs that reach that AVX-512 probe (GitHub runners do; a Zen 3 workstation does not). The ASan build of that one library is compiled with `-fno-sanitize=shift-base`; NeoGraph and the canaries keep the full `-fsanitize=undefined` set. The sanitizer suites run pytest without output capture (`-s`), so a native report reaches the job log.
+
 ### Shared-index queue PoC
 
 The opt-in `scripts/poc_shared_index_queue.py` experiment connects separate client processes to one authenticated IPv4 loopback service. It uses the real NeoGraph `RequestQueue` through a small C++/ctypes bridge and runs real `SelfDirectEngine` operations against a temporary synthetic index. It does not replace the deployed MCP transport, touch existing indexes, load API keys or add a CI gate.
