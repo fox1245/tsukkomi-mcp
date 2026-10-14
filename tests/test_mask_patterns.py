@@ -7,7 +7,7 @@ import time
 import pytest
 
 from self_directing_mcp.security import mask
-from self_directing_mcp.security.mask import mask_error, mask_secrets, mask_value, register_secret
+from self_directing_mcp.security.mask import mask_secrets, mask_value, register_secret
 
 RANDOM_B64 = ("Zm9vYmFyQmF6" * 30) + "QUJDREVGZ2hpSktMTW5vUFFSU1RVVldYWVowMTIzNDU2Nzg5"
 
@@ -147,7 +147,6 @@ def test_registered_exact_secret_is_masked_in_any_format(monkeypatch):
     register_secret("plain-format-key-0042")
     register_secret("short")  # too short to register safely
     assert mask_secrets("echo plain-format-key-0042 short") == "echo *** short"
-    assert mask_error(ValueError("bad plain-format-key-0042")) == "ValueError: bad ***"
 
 
 def test_pathological_inputs_stay_bounded():

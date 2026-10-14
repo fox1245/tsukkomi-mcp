@@ -263,7 +263,7 @@ def omp_scenario(tmp_path, monkeypatch):
     engine.close()
 
 
-def test_omp_every_tool_and_bridge_path_is_masked_while_raw_audit_detects(omp_scenario):
+def test_omp_every_tool_and_bridge_path_is_masked_while_raw_audit_detects(omp_scenario, capfd):
     sc = omp_scenario
     seeds, capture, path, engine = sc["seeds"], Capture(), sc["path"], sc["engine"]
     synced = tool("sync_session", session_id="omp-1", provider="omp", path=path, embed=False)
@@ -276,8 +276,24 @@ def test_omp_every_tool_and_bridge_path_is_masked_while_raw_audit_detects(omp_sc
     capture.add("run_neograph_update", tool("run_neograph_update", session_id="omp-1", provider="omp"))
     capture.add("sync_embed", tool("sync_session", session_id="omp-1", provider="omp", path=path, embed=True))
     assert "local_only" in capture.text()
+    captured = capfd.readouterr()  # native runtimes write to the real file descriptors
+    capture.add("process-stdout", captured.out)
+    capture.add("process-stderr", captured.err)
     capture.assert_clean(seeds.tags)
     verify_canonical_detection(sc)
+
+
+def test_sparse_index_holds_masked_text_so_search_is_not_a_secret_oracle(omp_scenario):
+    sc = omp_scenario
+    engine, seeds = sc["engine"], sc["seeds"]
+    assert tool("sync_session", session_id="omp-1", provider="omp", path=sc["path"], embed=False)["ok"]
+    assert tool("search_history", query="steer", session_id="omp-1", provider="omp", mode="sparse")["hits"]
+    stored = " ".join(row[0] for row in engine.sparse._conn.execute("SELECT text FROM chunks_fts"))
+    assert "sk-***" in stored and not [tag for tag in seeds.tags if tag in stored]
+    # The raw token is indexed nowhere, so querying for it reveals nothing about the history.
+    probe = sk("OMPUSERZQ").rsplit("-", 1)[-1]
+    assert any(probe in chunk.text for chunk in engine.store.list_chunks("omp-1", "omp"))
+    assert tool("search_history", query=probe, session_id="omp-1", provider="omp", mode="sparse")["hits"] == []
 
 
 # --------------------------------------------------------------------------------------------------
@@ -305,7 +321,7 @@ def codex_records(seeds):
         item({"type": "message", "role": "assistant",
               "content": [{"type": "output_text", "text": f"ok, password={seeds('CXASSISTZQ')}"}]}),
         {"type": "response_item", "ordinal": 3, "payload": {
-            "type": "agent_message", "id": "m1", "author": "/root", "recipient": "/root/worker",
+            "type": "agent_message", "id": "m1", "author": "/root", "recipient": f"/root/worker-{sk(seeds('CXRECIPZQ'))}",
             "content": [{"type": "input_text", "text": f"relay {sk(seeds('CXAGENTZQ'))}"},
                         {"type": "encrypted_content", "encrypted_content": seeds.hidden("CXENCBLOCKZQ") + BLOB}],
             "internal_chat_message_metadata_passthrough": {"turn_id": "u"}}},
@@ -359,7 +375,7 @@ def codex_scenario(tmp_path, monkeypatch):
     engine.close()
 
 
-def test_codex_remote_payloads_tools_hooks_and_errors_are_masked(codex_scenario, monkeypatch):
+def test_codex_remote_payloads_tools_hooks_and_errors_are_masked(codex_scenario, monkeypatch, capfd):
     sc = codex_scenario
     seeds, capture = sc["seeds"], Capture()
     engine, sid, path = sc["engine"], sc["sid"], sc["path"]
@@ -391,6 +407,9 @@ def test_codex_remote_payloads_tools_hooks_and_errors_are_masked(codex_scenario,
     capture.add("hook-odd-session", handle_hook(engine, "UserPromptSubmit", sk(seeds.input_only("HOOKSIDZQ")), path,
                                                 prompt="never do this"))
     assert "violation" in capture.text() and "Self-directing audit" in capture.text()
+    captured = capfd.readouterr()  # native runtimes write to the real file descriptors
+    capture.add("process-stdout", captured.out)
+    capture.add("process-stderr", captured.err)
     capture.assert_clean(seeds.tags)
     # Remote payloads: embedding documents/queries and the graph extraction prompt.
     remote = "\n".join(json.dumps(post["json"]) for post in FakeHttp.posts) + "\n" + "\n".join(prompts)
@@ -585,6 +604,39 @@ def test_contract_rule_logic_round_trips_while_text_fields_are_masked(tmp_path, 
         assert tool("upsert_contracts", contracts=[listed])["contracts"][0]["regex"] == r"password=\S+"
     finally:
         engine.close()
+
+
+def test_workflow_cli_output_and_errors_are_masked_but_the_grant_is_handed_over(monkeypatch, capsys):
+    from self_directing_mcp import workflow, workflow_cli
+
+    seeds = Seeds()
+    results = {"authorize": {"ok": True, "grant": "Zm9vYmFy-single-use_grant.0123456789",
+                             "reason": f"note password={seeds.input_only('CLIOKZQ')}"}}
+
+    class Controller:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def authorize(self, **kwargs):
+            return results["authorize"]
+
+        def status(self, **kwargs):
+            raise ValueError(f"cannot read {sk(seeds.input_only('CLIERRZQ'))}")
+
+    monkeypatch.setattr(workflow, "WorkflowController", Controller)
+    action = Path("action.json")
+    base = ["tsukkomi-workflow", "{}", "--approval", "/approved", "--state", "/state", "--session", "s1"]
+    monkeypatch.setattr(sys, "argv", [*base[:1], "authorize", *base[2:], "--classification", "c1", "--action", str(action)])
+    monkeypatch.setattr(Path, "read_text", lambda self, encoding=None: "{}")
+    workflow_cli.main()
+    out = capsys.readouterr()
+    assert json.loads(out.out)["grant"] == "Zm9vYmFy-single-use_grant.0123456789"
+    assert "CLIOKZQ" not in out.out + out.err and "password=***" in out.out
+    monkeypatch.setattr(sys, "argv", [*base[:1], "status", *base[2:]])
+    with pytest.raises(SystemExit):
+        workflow_cli.main()
+    out = capsys.readouterr()
+    assert "CLIERRZQ" not in out.out + out.err and "sk-***" in out.err
 
 
 def test_duplicate_source_error_paths_and_messages_are_masked(tmp_path, monkeypatch):
