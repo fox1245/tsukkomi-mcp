@@ -12,7 +12,7 @@ Every check returns one of four verdicts: `clean`, `violation`, `suspicious` or 
 ```
                   ┌──────────────────────────────────────────────┐
                   │          Autonomous Agent Client             │
-                  │  (Antigravity / Codex / OMP / Cursor, Grok)  │
+                  │ (Claude Code / AGY / Codex / OMP / Grok Bot) │
                   └──────────────────────┬───────────────────────┘
                                          │
                       Lifecycle hooks (host dependent) or MCP calls
@@ -31,11 +31,11 @@ Every check returns one of four verdicts: `clean`, `violation`, `suspicious` or 
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Session evidence stays on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter. Known secret patterns are masked before embedding and graph extraction, and the workflow classifier refuses context in which a secret pattern is found. See [SECURITY.md](SECURITY.md) and [Verification scope](#verification-scope).
+Session evidence stays on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter. The canonical index keeps raw text so audits see the truth; everything that leaves it (tool results, errors, hook output, logs, remote payloads) is masked for known secret patterns, and the workflow classifier refuses context in which a secret pattern is found. See the [masking contract](SECURITY.md#masking-contract), [SECURITY.md](SECURITY.md) and [Verification scope](#verification-scope).
 
 ## What is new in 0.6.0
 
-Version 0.6.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly fixes memory growth, append handling and concurrency in long-running servers.
+Version 0.6.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly fixes memory growth, append handling and concurrency in long-running servers. It also adds a Claude Code integration, a shared hook policy and an egress masking contract.
 
 - **Dependency:** `neograph-engine==0.14.1` (was 0.12.1).
 - **Appending sessions sync normally ([#4](https://github.com/fox1245/tsukkomi-mcp/issues/4)).** Source capture streams a SHA-256 over the file up to its length at the first measurement and keeps no bytes. Records appended afterwards are reported as `unread_bytes` instead of failing the sync.
@@ -46,6 +46,11 @@ Version 0.6.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly fixes memory growth, app
 - **Duplicate session sources ([#10](https://github.com/fox1245/tsukkomi-mcp/issues/10)).** Copies and continuations of an indexed session are recognised instead of reparsed on every sync (`alias_of`, `ambiguous_session_source`).
 - **Parsers.** OMP parser v8 (host notices, images, steering attribution, `session_init`, `model_usage`, `branch_summary`, `redactedThinking`; [#9](https://github.com/fox1245/tsukkomi-mcp/issues/9)) and Codex parser v3 (multi-agent messages, tool search, new `session_meta` fields). Each bump reparses lazily, one session at a time.
 - **CI.** A new Linux `memory-audit-regressions` job runs small offline memory, freshness and concurrency tests next to the existing smoke job.
+- **Claude Code ([docs/claude-installation.md](docs/claude-installation.md)).** A `claude` provider (parser version 1) for Claude Code session and subagent transcripts, and opt-in command hooks installed by `scripts/install_claude_hooks.py` for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop` and `SubagentStop`. By default (`SELF_DIRECT_CLAUDE_ENFORCEMENT=confirmed_only`) they deny only a confirmed `violation` and ask on `suspicious`; they never answer `allow`, `SubagentStop` only reports, and every internal error fails open with a visible warning.
+- **One hook policy for AGY and Claude Code ([docs/agy-installation.md](docs/agy-installation.md)).** The AGY hook default is now `confirmed_only` (it was `enforced`): `unknown` passes with a visible warning unless the contract is marked `risk: "high"`, a `Stop` continues the agent at most once per conversation and only for a confirmed `auto_continue` miss, and hook errors fail open with a `hook_health` banner. `enforced` stays an explicit opt-in, and `advisory` never gates an approved workflow either.
+- **AGY parser version 6.** Truncated fields fall back to the same step of `transcript_full.jsonl`; what stays cut is `unknown`, never `clean`. `RUNNING`, `ERROR`, `INVALID`, `CHECKPOINT` and media records are handled, and results from before a conversation's first hook receipt are classified as `legacy_unlinked`.
+- **Contract fields `risk`, `auto_continue` and `when`**, and four disabled high-risk presets. See [Contract fields](#contract-fields-risk-auto_continue-and-when).
+- **Masking contract.** Every egress path is masked, the sparse text index is masked for new rows, and a logging filter covers server logs. See the [masking contract](SECURITY.md#masking-contract).
 - **Also in this release since 0.5.0:** the shared-index snapshot and request-deadline work ([#3](https://github.com/fox1245/tsukkomi-mcp/issues/3)), the AGY evidence workflow and approved-workflow layer, user path configuration in TOML, and a default index directory outside the checkout. Read [Upgrading to 0.6.0](#upgrading-to-060) before restarting existing servers.
 
 ---
@@ -55,8 +60,20 @@ Version 0.6.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly fixes memory growth, app
 ### 1. Invariant contracts (`upsert_contracts`)
 - **Prohibitions (`must_not`)** match a regex against proposed or recorded actions (`decision: deny` on hosts that enforce).
 - **Obligations (`must`)** require matching evidence before a gated action (`before_regex`) or at a completion checkpoint, optionally with a successful linked tool result (`requires_success: true`).
-- AGY returns `force_ask` for suspicious exceptions so a cached Always Allow grant does not replace confirmation.
+- AGY returns `force_ask` for suspicious exceptions so a cached Always Allow grant does not replace confirmation; Claude Code, which has no force-ask, returns `ask`.
 - Contracts are global or scoped to one session. A description-only contract stays `unknown`, and search rankings are never violation evidence.
+
+#### Contract fields: `risk`, `auto_continue` and `when`
+
+Three optional fields refine how hosts act on a contract. They never change what a regex matched. At their defaults they are omitted from the stored contract, so existing `contracts.json` files load and are rewritten unchanged and older processes keep reading files that do not use them.
+
+| Field | Values | Applies to | Effect |
+|---|---|---|---|
+| `risk` | `normal` (default) or `high` | any contract | Declares that the actions the contract applies to are high-risk. When such an action cannot be verified (`unknown`), the AGY and Claude Code hooks ask the user instead of silently allowing it (`confirmed_only`), including after an internal hook error unless the mode is `advisory`. It does not change the verdict. Codex hooks are advisory and the OMP extension blocks only confirmed findings, so `risk` does not change their behavior. |
+| `when` | `{"tool_call_regex": "<regex>"}` | `must` only | The obligation applies only if some tool call observed earlier in the same session matches the regex (case-insensitive, multiline). Otherwise the finding is reported as `clean` with `applicability: "not_applicable"` and a reason, never dropped. While coverage is incomplete, an unmet condition becomes `unknown` because the call may be in unread evidence. An AGY model proposal counts as the condition being met. |
+| `auto_continue` | `true` or `false` (default) | `must` with a `regex` and no `before_regex` | A confirmed, fully observed miss of this completion obligation may resume a stopping agent: once per conversation on AGY (`continue`) and once per session on Claude Code (`block`). Unknown evidence, partial coverage and hook errors never resume it. Any other contract shape is rejected when it is saved. |
+
+Set these only when the user asked for them. The high-risk presets in [`src/self_directing_mcp/resources/high_risk_presets.json`](src/self_directing_mcp/resources/high_risk_presets.json) are four example `must_not` contracts with `risk: "high"`: `preset-no-recursive-delete`, `preset-no-write-outside-workspace` (a path-pattern approximation to replace with your own boundary), `preset-no-force-push` and `preset-no-branch-delete`. They ship with `enabled: false` and exist in the contract store only when `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS=true`, where they are added if their id is missing and are never altered or re-enabled. The owner enables the ones they want.
 
 ### 2. Checklist with evidence gating (`update_checklist`)
 - Track user requirements with provenance and completion criteria.
@@ -71,7 +88,7 @@ Version 0.6.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly fixes memory growth, app
 
 ### 4. Hybrid history search
 - Dense cosine similarity (`sqlite-vector`, native), SQLite FTS5 BM25 and regex, fused with reciprocal-rank fusion.
-- **Secret masking:** known credential patterns are masked before embedding or retrieval. This is not a guarantee that arbitrary personal data or every secret format is removed.
+- **Secret masking:** known credential patterns are masked before embedding, in sparse search text and in everything returned to the client. This is not a guarantee that arbitrary personal data or every secret format is removed; see the [masking contract](SECURITY.md#masking-contract).
 
 ---
 
@@ -79,12 +96,21 @@ Version 0.6.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly fixes memory growth, app
 
 | Host | Provider id | Evidence source | Lifecycle integration | Blocks actions? | Parser version |
 |---|---|---|---|---|---|
-| Google Antigravity (AGY) | `agy` | `brain/<conversation-id>/.system_generated/logs/transcript*.jsonl` plus hook receipts | Stdio hooks: `PreToolUse`, `PostToolUse`, `PreInvocation`, `Stop` | Yes in the default `enforced` mode; `advisory` is explicit. See [docs/agy-installation.md](docs/agy-installation.md) | 5 |
+| Google Antigravity (AGY) | `agy` | `brain/<conversation-id>/.system_generated/logs/transcript*.jsonl` plus hook receipts | Stdio hooks: `PreToolUse`, `PostToolUse`, `PreInvocation`, `Stop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`force_ask`); `unknown` passes with a warning, or asks for a `risk: "high"` contract. `advisory` and `enforced` are explicit. See [docs/agy-installation.md](docs/agy-installation.md) | 6 |
+| Claude Code | `claude` | `<projects>/<project>/<session-uuid>.jsonl` plus `<session-uuid>/subagents/agent-*.jsonl` | Opt-in command hooks from `scripts/install_claude_hooks.py`: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`ask`); never an explicit `allow`. A `Stop` blocks at most once per session for a confirmed `auto_continue` miss. `SubagentStop` never blocks. See [docs/claude-installation.md](docs/claude-installation.md) | 1 |
 | OpenAI Codex CLI | `codex` | Rollout JSONL in the Codex sessions directory | Three `mcp_tool` hooks installed by `scripts/install_codex.py`: `UserPromptSubmit`, `PreToolUse`, `Stop` | No. Hooks are advisory | 3 |
 | OMP | `omp` | OMP session JSONL | Opt-in extension `extensions/tsukkomi-omp.ts` | Only confirmed `violation`/`suspicious` on model-issued tools. `unknown` and transport failures never block | 8 |
 | Cursor / Grok Bot | `grokbot` | `agent-transcripts` roots | None; call the MCP tools manually | No | 1 (unversioned) |
 
 A parser version is recorded per session. When a provider's version is raised, each already-indexed session is reparsed from byte 0 on its next sync or audit, one session at a time. Unchanged event ids, anchors and cached vectors survive, and no embedding API is called when `embed=false`. A running MCP process only picks up a new parser after it is restarted.
+
+### AGY parser (version 6)
+
+Fields the host cut (`truncated_fields`) are restored from the same step of the sibling `transcript_full.jsonl` when it matches; otherwise the visible text is kept, marked as truncated, and any verdict that depends on the cut field is `unknown` with a `truncated_<field>` reason. A match that is visible still counts. `RUNNING` results are pending (`pending_running`), `ERROR`, `INVALID` and `CANCELED` results are never success, `CHECKPOINT` and `ERROR_MESSAGE` records are runtime context, and media payloads become placeholders. Results from before the conversation's first hook receipt are `legacy_unlinked` and leave dependent obligations `unknown` (`unsupported_legacy`); coverage reports `receipts_since`, `legacy_unlinked_count` and `result_dependent_complete`. Details are in [docs/agy-installation.md](docs/agy-installation.md#parser-version-6-truncated-fields-result-statuses-and-legacy-results).
+
+### Claude Code parser (version 1)
+
+Only a record the host stamped `origin.kind == "human"` (or, in a main transcript, a legacy prompt from before origin stamps, or a human `queued_command` prompt) is a user turn. Task notifications, peer and coordinator messages, injected meta messages, compaction summaries, attachments, hook output, tool results and a subagent's task prompt are runtime evidence. Unknown record, attachment, block and origin shapes are unsupported events that keep coverage incomplete. Opaque payloads (thinking, images, hook output) are placeholders. A subagent transcript is its own session, `<session-uuid>_agent-<agent-id>`. See [docs/claude-installation.md](docs/claude-installation.md#9-how-the-claude-parser-decides-who-is-the-user).
 
 ### OMP parser (version 8)
 
@@ -123,7 +149,7 @@ Runtime records are indexed as metadata or `runtime`-role events. They are never
 | | `propose_graph_update` | Validate node/edge additions with evidence chunk requirements. |
 | | `commit_graph_update` | Atomically commit validated graph updates with cursor progression. |
 | | `run_neograph_update` | Run the LLM GraphRAG extraction pipeline through NeoGraph. |
-| **Search & Analytics** | `sync_session` | Incremental evidence sync for Codex, Grok Bot, OMP and AGY transcripts. |
+| **Search & Analytics** | `sync_session` | Incremental evidence sync for Codex, Grok Bot, OMP, AGY and Claude Code transcripts. |
 | | `search_history` | Hybrid retrieval (dense vector + BM25 + regex) over history. |
 | | `get_chunk` | Retrieve a raw evidence chunk with secret masking. |
 | | `analyze_activity` | SQLite time-series analysis: retry gaps, error bursts, stalled items. |
@@ -165,7 +191,7 @@ The script pins release 1.1.0, verifies the official archive's SHA-256 and check
 
 ### 3. Configure
 
-Settings come from, in order of precedence: explicit `Settings` arguments, environment variables, the TOML path file, a `.env` in the **current working directory**, then defaults. A server started by an MCP host usually has an unrelated working directory, so do not depend on a `.env` there; use explicit `SELF_DIRECT_*` variables in the host's server entry or the TOML file below.
+Settings come from, in order of precedence: explicit `Settings` arguments, environment variables, the TOML path file, a `.env` in the **current working directory**, then defaults. A server started by an MCP host usually has an unrelated working directory, so do not depend on a `.env` there; use explicit `SELF_DIRECT_*` variables in the host's server entry or the TOML file below. Lifecycle hooks (AGY and Claude Code) never read a working-directory `.env`: they use the environment and the TOML only, because that file is content the audited agent can write.
 
 #### User path configuration (TOML)
 
@@ -179,7 +205,7 @@ openrouter_api_key_file = "../credentials/openrouter.env"
 sqlite_vector_path = "native/vector.so"
 ```
 
-The eight supported keys are `index_dir`, `codex_sessions_dir`, `omp_sessions_dir`, `grokbot_transcripts_dir`, `agy_app_data_dirs`, `contracts_path`, `sqlite_vector_path` and `openrouter_api_key_file`. AGY roots use a string array; Grokbot accepts its existing delimiter-separated string or an array of individual paths. Empty arrays disable those optional roots.
+The nine supported keys are `index_dir`, `codex_sessions_dir`, `omp_sessions_dir`, `claude_projects_dir`, `grokbot_transcripts_dir`, `agy_app_data_dirs`, `contracts_path`, `sqlite_vector_path` and `openrouter_api_key_file`. AGY roots use a string array; Grokbot accepts its existing delimiter-separated string or an array of individual paths. Empty arrays disable those optional roots.
 
 TOML paths expand `~`; relative paths resolve against the canonical TOML file's directory, not the working directory or a symlink's directory. `${ENV_VAR}` interpolation is not performed. The selector `SELF_DIRECT_CONFIG_FILE` is environment-only, so a `.env` cannot silently select another TOML file. An absent default file keeps the defaults. An explicitly selected missing file, malformed TOML, an unknown section or key, or an invalid path value fails instead of silently selecting another index. Settings capture the selected sources, so restart affected servers and extensions after changing them.
 
@@ -191,12 +217,14 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 |---|---|---|
 | `SELF_DIRECT_INDEX_DIR` | `~/.self_direct_index` | Private index directory (events, FTS, vectors, contracts, checklists). |
 | `SELF_DIRECT_CONTRACTS_PATH` | `<index_dir>/contracts.json` | Contracts file. |
-| `SELF_DIRECT_SESSION_PROVIDER` | `codex` | Provider used when a tool call omits `provider`: `codex`, `grokbot`, `omp` or `agy`. |
+| `SELF_DIRECT_SESSION_PROVIDER` | `codex` | Provider used when a tool call omits `provider`: `codex`, `grokbot`, `omp`, `agy` or `claude`. |
 | `SELF_DIRECT_CODEX_SESSIONS_DIR`, `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Codex session root. |
 | `SELF_DIRECT_OMP_SESSIONS_DIR` | `~/.omp/sessions` | OMP session root. |
 | `SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR` | empty (disabled) | Cursor / Grok Bot transcript roots. |
 | `SELF_DIRECT_AGY_APP_DATA_DIRS` | `~/.gemini/antigravity`, `-cli`, `-ide` | JSON array of AGY app-data directories. |
-| `SELF_DIRECT_AGY_ENFORCEMENT` | `enforced` | `enforced` or `advisory`. |
+| `SELF_DIRECT_CLAUDE_PROJECTS_DIR` | `$CLAUDE_CONFIG_DIR/projects` if `CLAUDE_CONFIG_DIR` is set, else `~/.claude/projects` | Claude Code projects root (TOML `claude_projects_dir`). The environment variable wins over TOML, and TOML over the default. |
+| `SELF_DIRECT_AGY_ENFORCEMENT` | `confirmed_only` | AGY hook policy: `confirmed_only`, `advisory` (never blocks) or `enforced` (also denies an unverifiable `PreToolUse`). Hook errors fail open in every mode. |
+| `SELF_DIRECT_CLAUDE_ENFORCEMENT` | `confirmed_only` | Claude Code hook policy, same values, independent of the AGY setting. `scripts/install_claude_hooks.py` writes it into the Claude Code settings `env`. |
 | `SELF_DIRECT_USE_FAKE_EMBEDDER` | `false` | Offline/test embedder; never a silent fallback. |
 | `SELF_DIRECT_LOCAL_ONLY` | `false` | Explicit offline mode: no embedder or dense index; embedding, dense/hybrid search and LLM graph updates are rejected. |
 | `SELF_DIRECT_DENSE_BACKEND` | `sqlite-vector` | `sqlite-vector` or `numpy`. |
@@ -235,7 +263,7 @@ Configure `tsukkomi-mcp` in your `mcp_config.json`:
 }
 ```
 
-To enable deterministic pre-tool lifecycle interception in AGY, register `scripts/agy_hook.py` as your workspace hook command. See [docs/agy-installation.md](docs/agy-installation.md) for the hook file, enforcement modes and host boundaries.
+To enable lifecycle interception in AGY, register `scripts/agy_hook.py` as your workspace hook command. By default only confirmed findings gate a tool call. See [docs/agy-installation.md](docs/agy-installation.md) for the hook file, enforcement modes and host boundaries.
 
 ### OpenAI Codex CLI
 
@@ -247,6 +275,18 @@ python scripts/install_codex.py --verify
 ```
 
 The installer registers explicit `SELF_DIRECT_INDEX_DIR`, session-root, backend and key-file settings in the Codex MCP entry, so it is not affected by the default index location. See [docs/codex-installation.md](docs/codex-installation.md).
+
+### Claude Code
+
+Register the MCP server and, if the user wants lifecycle controls, review and then install the opt-in hooks:
+
+```bash
+claude mcp add --scope user tsukkomi-mcp -- /absolute/path/to/venv/bin/python -m self_directing_mcp
+python scripts/install_claude_hooks.py --print --python /absolute/path/to/venv/bin/python
+python scripts/install_claude_hooks.py --apply --settings /absolute/path/to/settings.json --python /absolute/path/to/venv/bin/python
+```
+
+`--print` is the default and changes nothing; `--apply` merges into the settings file you name, keeps unrelated hooks, backs the file up when it changes and replaces it atomically. Add `--index-dir /absolute/path/to/index` to point the hooks at the index whose contracts should apply (the one the MCP server writes to); hooks never read a project `.env`. See [docs/claude-installation.md](docs/claude-installation.md) for the policy table, the Stop budget, subagents, fail-open behavior and verification steps, and [docs/claude-hooks.example.json](docs/claude-hooks.example.json) for the complete hooks block.
 
 ### OMP (OpenRouter-backed retrieval, deterministic contract hooks)
 
@@ -386,12 +426,14 @@ Default combined writer-lock wait (1 second), audit budget (8 seconds), ordinary
 ## Upgrading to 0.6.0
 
 1. **Restart every process that uses the index.** Stop and restart all MCP servers and extensions that share an index (Codex, OMP, AGY, any manual `python -m self_directing_mcp`) from the new package. A running process keeps the old code and old parser, and a process on an older version can write cursors that a newer one must then reparse. Updating a checkout or a wheel does not update processes that are already running.
-2. **Parser bumps reparse lazily.** The OMP parser is now version 8 (0.5.0 had 2) and the Codex parser version 3 (was 2). Each session is reparsed once, on its next sync or audit, within the bounded-memory path. There is no upfront migration step and no storm of reparses.
+2. **Parser bumps reparse lazily.** The OMP parser is now version 8 (0.5.0 had 2) and the Codex parser version 3 (was 2). The AGY parser is version 6 and the new Claude Code parser is version 1. Each session is reparsed once, on its next sync or audit, within the bounded-memory path. There is no upfront migration step and no storm of reparses.
 3. **Existing indexes are preserved.** Events, anchors, model-specific vector caches, contracts and checklists are kept. Unchanged event ids and cached vectors survive a reparse. Obsolete entries are cleaned through a durable journal, so an interrupted upgrade resumes.
 4. **Check the index location.** The default index is `~/.self_direct_index` unless `SELF_DIRECT_INDEX_DIR` or `index_dir` in TOML overrides it. Older versions defaulted to a `.self_direct_index` inside the checkout. An install that relied on that default must set `SELF_DIRECT_INDEX_DIR` (or TOML `index_dir`) to the existing absolute directory before restarting; nothing is moved or copied automatically. The Codex installer and managed OMP registrations already pass an explicit path.
 5. **Check how the key file is selected.** A checkout `.env` is no longer treated as an authoritative key file. Select it explicitly with `SELF_DIRECT_OPENROUTER_API_KEY_FILE` or TOML `openrouter_api_key_file`, or supply `OPENROUTER_API_KEY` through the environment or a `.env` in the server's working directory.
 6. **Reinstall dependencies.** `neograph-engine` must be exactly 0.14.1. `pip install -e ".[dev]"` or `scripts/install_codex.py` takes care of it.
-7. **Re-verify.** Run `python scripts/install_codex.py --verify` for Codex and `audit_status` for any host. Confirm `neograph_version`, `embedder`, `dense_backend` and that `degraded_flags` is empty.
+7. **AGY hook policy.** The default is now `confirmed_only`. An install that relied on the earlier `enforced` default (an unverifiable `PreToolUse` denied, unverified items continuing a `Stop`, an unavailable runtime denying `PreToolUse`) must set `SELF_DIRECT_AGY_ENFORCEMENT=enforced` explicitly, and even then hook errors fail open.
+8. **Sparse index masking.** Sparse (FTS) rows written before 0.6.0 hold raw text. Delete `sparse.sqlite` while the servers are stopped to have it rebuilt, masked, from the canonical store; see the [masking contract](SECURITY.md#masking-contract).
+9. **Re-verify.** Run `python scripts/install_codex.py --verify` for Codex and `audit_status` for any host. Confirm `neograph_version`, `embedder`, `dense_backend` and that `degraded_flags` is empty.
 
 ---
 
@@ -497,7 +539,7 @@ Use a fresh classification ID for each `workflow_transition`. A completion choic
 
 Pass the returned grant and the **identical action** to `workflow_execute`. It rechecks state, versions, classification, cancellation, and Lean policy immediately before consuming the grant. Only successful owned execution sets `complete`. Started, succeeded, failed, and uncertain outcomes are distinct; a crash after consumption cannot replay the grant. A timeout after launch never claims that no action ran. The local completion sandbox permits writes to the actual approved project, but not private host state/credentials or network access. No shell interpolation is performed, and cancellation/timeout terminates the sandbox process group and descendants.
 
-AGY rejects direct mapped completion actions and directs the agent to the owned executor; its normal Stop hook holds an incomplete workflow and provides requirements, evidence, and permitted recovery actions. Cancellation, error stops, and pauses for background work are not restarted. Reads, repairs, and checks remain available unless a separate explicit contract restricts them. **Unmapped tools, direct shell access outside registered hooks, and the advisory Codex adapter are not an enforcement boundary.**
+The AGY and Claude Code hooks reject direct mapped completion actions and direct the agent to the owned executor; on a normal stop they continue an incomplete workflow once (the same once-per-conversation or once-per-session budget as `auto_continue`) and provide requirements, evidence, and permitted recovery actions. In `advisory` mode they neither reject nor continue. Cancellation, error stops, and pauses for background work are not restarted. Reads, repairs, and checks remain available unless a separate explicit contract restricts them. **Unmapped tools, direct shell access outside registered hooks, and the advisory Codex adapter are not an enforcement boundary.**
 
 Lean proves the policy/model under its stated assumptions; it does not prove arbitrary Python/TypeScript implementations equivalent to that model. Real tests supply implementation evidence only for exercised cases. The workflow is separate from session GraphRAG extraction and does not require an LLM to decide whether recorded tests passed.
 
@@ -514,7 +556,7 @@ The benchmark compares 640 finite stage/class/evidence combinations with an inde
 
 ## Testing and verification
 
-The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, append capture and prefix judgement, duplicate session sources, single-flight and concurrency, workflow version/grant invalidation, proof rejection, path isolation and MCP transport. Tests use synthetic sessions and offline embeddings. Lean integration tests, Windows-only path tests and bubblewrap tests report a skip when the toolchain or platform is unavailable.
+The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, append capture and prefix judgement, duplicate session sources, single-flight and concurrency, workflow version/grant invalidation, proof rejection, path isolation and MCP transport. Tests use synthetic sessions and offline embeddings. Lean integration tests, Windows-only path tests and bubblewrap tests report a skip when the toolchain or platform is unavailable, and symlink tests report a skip with a reason where Windows denies symlink creation (`WinError 1314`, Developer Mode off).
 
 ```bash
 python -m pytest -q
@@ -527,7 +569,7 @@ python scripts/benchmark.py
 GitHub Actions runs two jobs on pushes and pull requests. Superseded runs for the same ref are cancelled, and no API keys or paid model calls are used.
 
 - **`test`** (Ubuntu and Windows, Python 3.12, 10 minutes): the explicit MCP transport, Jev boundary and Windows session-path smoke tests, then builds the source distribution and wheel.
-- **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, checklist conflicts, quiet hooks, AGY hooks and hook gating. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
+- **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, checklist conflicts, quiet hooks, AGY and Claude Code hooks, the Claude Code installer and provider, and hook gating. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
 
 The full suite, real Lean proof checks, native vector tests and all performance, large-session and concurrency benchmarks are local deep checks, not CI gates. A green CI run does not establish full workflow or native-proof coverage or performance guarantees. Live model validation needs a separate model and budget approval.
 

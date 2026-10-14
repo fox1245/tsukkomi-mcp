@@ -47,6 +47,20 @@ unknown. Unknown/transport failure is advisory and does not block; only
 confirmed violation/suspicious findings block model-issued OMP tools. OMP hook
 coverage does not include out-of-band actions or unpersisted session evidence.
 
+Claude Code hooks are opt-in and separate from the Codex installer. Run
+`python scripts/install_claude_hooks.py --print` first and show the user the exact
+hooks block; apply it with `--apply --settings /absolute/path/to/settings.json` only
+when the user asks, and remove it with `--uninstall`. `SELF_DIRECT_CLAUDE_ENFORCEMENT`
+defaults to `confirmed_only`: only a confirmed violation is denied and a suspicious
+finding asks; unknown passes with a visible warning (an ask for a `risk: high`
+contract); `advisory` never gates. The hooks never answer an explicit allow, since a
+clean verdict is not permission and must not skip Claude Code's own prompt. SubagentStop
+only reports, a Stop blocks at most once per session and only for a confirmed
+`auto_continue` miss, and every internal error fails open with a warning and a
+`hook_health` entry. Do not hide hook failures or hand-edit the settings file to work
+around them. Hooks never read a project `.env`; point them at the right index with `--index-dir`, the user TOML or the settings `env`. The AGY adapter follows the same policy (`SELF_DIRECT_AGY_ENFORCEMENT`,
+default `confirmed_only`). See docs/claude-installation.md and docs/agy-installation.md.
+
 Use the official [sqliteai/sqlite-vector release](https://github.com/sqliteai/sqlite-vector/releases/tag/1.1.0)
 library directly. Python wheels and local compilation are not required: Windows uses vector.dll,
 Linux vector.so, and macOS vector.dylib. After installing Python dependencies, run:
@@ -147,7 +161,7 @@ Use check_action for actions affected by active constraints. A fresh hook result
 - unknown: resolve the relevant gap before claiming compliance; continue independent authorized work.
 - clean: limited to the returned evidence/contract snapshot; not new permission.
 
-Regex checks are primary. Search ranks are not violation evidence. Description-only contracts remain unknown. Codex hooks never auto-execute or auto-block; the opt-in OMP extension blocks only confirmed findings. Example contracts are disabled by default.
+Regex checks are primary. Search ranks are not violation evidence. Description-only contracts remain unknown. Codex hooks never auto-execute or auto-block; the opt-in OMP extension blocks only confirmed findings, and the opt-in AGY and Claude Code hooks do so by default. Example contracts are disabled by default. Set the contract fields `risk`, `auto_continue` and `when` only when the user asked for them (see the README).
 
 ## Coverage of growing sessions, duplicate sources and concurrency
 
@@ -190,6 +204,12 @@ tool_search_call/output as runtime metadata (not user authority, not tool eviden
 session_meta fields are validated, but base_instructions, dynamic_tools, account ids and tool
 lists are never indexed. A complete inherited parent session_meta in the middle of a sub-agent
 file is accepted; a first-line id mismatch is still an error.
+
+AGY parser v6 restores fields the host cut from the sibling transcript_full.jsonl when it matches;
+what stays cut leaves dependent verdicts unknown, never clean, and results from before the
+conversation's first hook receipt are legacy_unlinked (unsupported_legacy). Claude Code parser v1
+takes user authority only from a recorded origin.kind of human (plus the documented legacy and
+queued-command cases); everything else, including a subagent's task prompt, is runtime evidence.
 
 OMP parser v8 treats host notices, image blocks, session_init, model_usage, branch_summary,
 redactedThinking, ttsr_injection and developer messages as runtime records, not user
