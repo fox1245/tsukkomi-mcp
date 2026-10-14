@@ -33,9 +33,9 @@ class SourceObservation:
     The file may keep growing. Only bytes ``[0, length)`` were observed; ``complete_end`` is the last record
     boundary inside them. No file bytes are retained: the observation keeps device/inode, a streaming
     SHA-256 state per requested checkpoint (with its line count) and the digest of the whole prefix.
-    ``validate()`` is the strict "file untouched since capture" test; ``validate_prefix()`` accepts pure
-    growth after verifying the captured prefix still hashes identically. ``validate_prefix(locked=True)`` is the
-    bounded variant for use under the publication guard (see there).
+    ``validate()`` compares captured metadata only; equal stamps do not prove unchanged bytes.
+    ``validate_prefix()`` accepts pure growth after verifying the captured prefix still hashes identically.
+    ``validate_prefix(locked=True)`` is the bounded variant for use under the publication guard (see there).
     """
 
     def __init__(self, path, stamp, length, complete_end, full_digest, checkpoints, tail_digest=None):
@@ -45,9 +45,8 @@ class SourceObservation:
         self.complete_end = complete_end
         self._full_digest = full_digest
         self._checkpoints = checkpoints  # offset -> (sha256 state, newline count)
-        self._verified_stamp = stamp
         self._tail_digest = tail_digest  # SHA-256 of the last <= _TAIL_WINDOW bytes of [0, length)
-        self._prefix_ok = True  # False once a full verification failed; the prefix does not heal
+        self._prefix_ok = True  # A detected identity/size/content mismatch does not heal
 
     @property
     def identity(self) -> tuple[int, int]:
@@ -86,7 +85,7 @@ class SourceObservation:
         return digest.copy(), lines
 
     def validate(self) -> bool:
-        """Strict: the file's identity, size and timestamps are exactly the captured ones."""
+        """Compare identity, size and timestamps only; this does not verify content equality."""
         check_request()
         try:
             return source_stamp(self.path) == self.stamp
@@ -99,13 +98,17 @@ class SourceObservation:
     def validate_prefix(self, *, locked: bool = False) -> bool:
         """Growth tolerant: same file, and the captured prefix is byte-for-byte what was hashed.
 
-        The default re-reads and hashes the whole prefix; call it OUTSIDE the publication guard. With
-        ``locked=True`` (inside the guard) only identity, size >= captured length and the digest of a bounded
-        tail window are checked, and a failed earlier full check still fails. Residual risk: a rewrite
+        The default always re-reads and hashes the whole prefix, even when stamps are unchanged (a same-size
+        rewrite can keep size, mtime and ctime); call it OUTSIDE the publication guard. With ``locked=True``
+        (inside the guard) only identity, size >= captured length and the digest of a bounded tail window are
+        checked, also without trusting stamps. A detected mismatch stays failed even if the original bytes
+        return. Residual risk: a rewrite
         outside the tail window between the last full check and the lock is accepted at that moment; the next
         sync compares the stored cursor ``prefix_hash`` and reindexes.
         """
         check_request()
+        if not self._prefix_ok:
+            return False
         if locked:
             return self._validate_tail()
         try:
@@ -113,23 +116,21 @@ class SourceObservation:
                 before = os.fstat(stream.fileno())
                 if not same_identity(_identity(before), self.identity) or before.st_size < self.length:
                     return self._fail()
-                if _stamp(before) == self._verified_stamp:
-                    return True
                 digest, remaining = hashlib.sha256(), self.length
+                buffer = bytearray(min(remaining, _BLOCK))  # one reused buffer: no per-block bytes objects
+                view = memoryview(buffer)
                 while remaining:
                     check_request()
-                    block = stream.read(min(remaining, _BLOCK))
-                    if not block:
+                    count = stream.readinto(view[:min(remaining, len(buffer))])
+                    if not count:
                         return self._fail()
-                    digest.update(block)
-                    remaining -= len(block)
+                    digest.update(view[:count])
+                    remaining -= count
                 after = os.fstat(stream.fileno())
         except OSError:
             return False
         if digest.hexdigest() != self._full_digest or not same_identity(_identity(after), self.identity) or after.st_size < self.length:
             return self._fail()
-        if _stamp(after) == _stamp(before):
-            self._verified_stamp = _stamp(after)
         return True
 
     def _fail(self) -> bool:
@@ -137,15 +138,11 @@ class SourceObservation:
         return False
 
     def _validate_tail(self) -> bool:
-        if not self._prefix_ok:
-            return False
         try:
             with self.path.open("rb") as stream:
                 before = os.fstat(stream.fileno())
                 if not same_identity(_identity(before), self.identity) or before.st_size < self.length:
                     return self._fail()
-                if _stamp(before) == self._verified_stamp:
-                    return True
                 if self._tail_digest is None:
                     return False
                 window = min(self.length, _TAIL_WINDOW)
@@ -231,13 +228,11 @@ def capture_source(path: Path, *, checkpoints=()) -> SourceObservation:
             or (path_stamp[2] == after.st_size and path_stamp[3] != after.st_mtime_ns)):
         raise ValueError("source changed during preparation")
     observation = SourceObservation(path, path_stamp, length, boundary, full_digest, states, tail_digest)
-    observation._verified_stamp = _stamp(after)
     if after.st_size == length and path_stamp[2] == length:
         if _stamp(after) != _stamp(before):
             raise ValueError("source changed during preparation")  # same size, new mtime: rewritten in place
     else:
         # Grew while hashing: appended bytes are fine, a rewritten prefix is not.
-        observation._verified_stamp = None
         if not observation.validate_prefix():
             raise ValueError("source changed during preparation")
     return observation
