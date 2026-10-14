@@ -37,7 +37,9 @@ from self_directing_mcp.grokbot import discover as grokbot_discover
 from self_directing_mcp import omp, agy, claude
 from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
-from self_directing_mcp.index.ingest import AmbiguousSessionSource, SessionStore, ingest_session, coverage_from_capture
+from self_directing_mcp.index.ingest import (
+    AmbiguousSessionSource, IntegrityPolicy, SessionStore, capture_for_cursor, coverage_from_capture, ingest_session,
+)
 from self_directing_mcp.index.sparse import SparseIndex
 from self_directing_mcp.index.vector import build_vector_index
 from self_directing_mcp.index.locking import index_lock
@@ -52,7 +54,6 @@ from self_directing_mcp.neograph_runtime import ng, graph_operation
 from self_directing_mcp.request_control import (
     IndexBusy, RequestStopped, check_request, current_request, publication, request_operation, request_scope,
 )
-from self_directing_mcp.session_events import capture_source
 
 
 def serialized(method):
@@ -104,6 +105,47 @@ def _mark_growth(coverage, observation) -> bool:
     return bool(unread)
 
 
+VERIFY_MODES = ("full", "fast")
+
+
+def _check_verify(verify):
+    if verify not in VERIFY_MODES:
+        raise ValueError("verify must be 'full' or 'fast'")
+    return verify
+
+
+def _event_start(chunk_id):
+    """Byte offset a chunk id encodes (``provider:session:start:sub:digest``); None when it cannot be read."""
+    try:
+        return int(chunk_id.rsplit(":", 3)[1])
+    except (AttributeError, IndexError, ValueError):
+        return None
+
+
+def _fast_gate(payload, integrity):
+    """Why a fast verdict may not stand, or None.
+
+    A fast check compared only some blocks of the prefix. A clean finding that rests on historical evidence (a
+    satisfied prerequisite) is accepted only when every cited event lies inside the region that was last verified
+    in FULL (``full_verified_through_byte``). Such findings carry ``verified_through``. Anything else is settled by a
+    full verification before it is reported; a fast verdict never turns missing or unverified evidence into a
+    satisfied obligation.
+    """
+    through = integrity.get("full_verified_through_byte")
+    for finding in payload.get("findings", []):
+        if finding.get("verdict") != "clean" or finding.get("applicability", "applicable") != "applicable":
+            continue
+        cited = [item["chunk_id"] for item in finding.get("evidence", [])
+                 if item.get("detail") != "triggering action" and not str(item["chunk_id"]).startswith("proposed:")]
+        if not cited:
+            continue
+        starts = [_event_start(chunk_id) for chunk_id in cited]
+        if through is None or any(start is None or start >= through for start in starts):
+            return "evidence_beyond_verified_region"
+        finding["verified_through"] = through
+    return None
+
+
 CHECKLIST_EVALUATION_ATTEMPTS = 3
 
 
@@ -120,6 +162,9 @@ class SelfDirectEngine:
         self._operation_depth = 0
         self._hook_lock = RLock()
         self._hook_states = OrderedDict()
+        self._last_activity = time.monotonic()
+        self._integrity_worker = None  # set only by a resident server (see integrity_worker)
+        self.integrity_policy: IntegrityPolicy | None = None  # tests may inject a clock / randomness
         self.settings = settings or get_settings()
         self.store: SessionStore | None = None
         self.sparse: SparseIndex | None = None
@@ -178,7 +223,22 @@ class SelfDirectEngine:
         finally:
             with self._lifetime:
                 self._active_operations -= 1
+                self._last_activity = time.monotonic()
                 self._lifetime.notify_all()
+
+    def _policy(self) -> IntegrityPolicy:
+        return self.integrity_policy or IntegrityPolicy.from_settings(self.settings)
+
+    def attach_integrity_worker(self, worker) -> None:
+        self._integrity_worker = worker
+
+    def accepts_background_work(self) -> bool:
+        """False while closed or closing: a background worker must never reopen an engine that was shut down."""
+        return self._ready and not self._closing
+
+    def idle_seconds(self) -> float:
+        """0 while any request is running, else the time since the last one finished."""
+        return 0.0 if self._active_operations else time.monotonic() - self._last_activity
 
     def hook_obligations(self, session_id: str, provider: str = "codex", path: str | None = None) -> dict[str, Any]:
         """Read atomically replaced rule files without initializing indexes.
@@ -301,11 +361,21 @@ class SelfDirectEngine:
         path: str | None = None,
         provider: str | None = None,
         embed: bool = True,
+        verify: str = "full",
     ) -> dict[str, Any]:
-        info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=embed)
+        info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=embed,
+                                  verify=_check_verify(verify))
         return {key: value for key, value in info.items() if not key.startswith("_")}
 
-    def _sync_session(self, *, session_id=None, path=None, provider=None, embed=True, derived=True):
+    @detached_operation
+    def verify_integrity(self, session_id: str, provider: str | None = None, path: str | None = None) -> dict[str, Any]:
+        """Full verification of one session's source (the background worker's work; also callable directly)."""
+        info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=False, derived=False,
+                                  verify="full", watch=False)
+        return {key: value for key, value in info.items() if not key.startswith("_")}
+
+    def _sync_session(self, *, session_id=None, path=None, provider=None, embed=True, derived=True, verify="full",
+                      watch=True):
         assert self.store and self.sparse
         if self.settings.local_only and embed:
             return {"ok": False, "error": "local_only", "message": "embed=True is unavailable in local-only mode"}
@@ -361,6 +431,8 @@ class SelfDirectEngine:
                 guard=self._publication_guard,
                 # A local-only process (a hook) may share a server's index: leave vector cleanup journalled for it.
                 retain_dense_deletions=self.dense is None and any(Path(self.settings.index_dir).glob("vectors-v2-*")),
+                verify=verify,
+                policy=self._policy(),
             )
         except AmbiguousSessionSource as exc:
             return {"ok": False, "error": "ambiguous_session_source", "message": str(exc), "provider": resolved_provider,
@@ -371,6 +443,9 @@ class SelfDirectEngine:
             return {"ok": False, "error": exc.code, "message": str(exc), "provider": resolved_provider,
                     "path": str(resolved)}
         info["ok"] = True
+        worker = self._integrity_worker
+        if watch and worker is not None:
+            worker.note(resolved_provider, info["session_id"], str(resolved), info["integrity"])
         info["dense_backend"] = self.dense_backend
         info["embedder"] = type(self.embedder).__name__ if self.embedder else None
         info["embedder_degraded"] = self.embedder_degraded
@@ -467,7 +542,7 @@ class SelfDirectEngine:
             if documents:
                 self.sparse.upsert_many(documents)
 
-    def _refresh_evidence(self, sid, provider, path=None):
+    def _refresh_evidence(self, sid, provider, path=None, verify="full"):
         """Refresh only authority; return detached coverage and its exact inputs."""
         with self._publication_guard():
             record = self.store.cursor_record(sid, provider)
@@ -475,7 +550,7 @@ class SelfDirectEngine:
         try:
             info = self._sync_session(session_id=sid, provider=provider, embed=False,
                                       path=path if path is not None else record["path"] if record else None,
-                                      derived=False)
+                                      derived=False, verify=verify)
             if info.get("ok"):
                 return info
             failure, failed = info.get("error", "sync_failed"), info
@@ -492,13 +567,24 @@ class SelfDirectEngine:
         coverage["issues"].append(failure)
         coverage.update({key: failed[key] for key in ("indexed_path", "requested_path") if key in failed})
         return {"ok": False, "coverage": coverage, "_metadata_token": token,
-                "_source_observation": None, "_receipt_token": None}
+                "_source_observation": None, "_receipt_token": None,
+                "integrity": self._integrity_unavailable(verify, failure)}
 
-    def _audit(self, session_id, provider, proposed=None, path=None):
+    @staticmethod
+    def _integrity_unavailable(verify, failure):
+        """The source could not be verified for this request (the refresh failed); nothing is claimed about it."""
+        return {"mode": verify, "full_verified_through_byte": None, "full_verified_at": None,
+                "source_generation": None, "index_generation": None, "verification": "unavailable",
+                "reason": failure}
+
+    def _audit(self, session_id, provider, proposed=None, path=None, verify="full", escalated=None):
         started = time.perf_counter()
         provider = self._resolve_provider(provider)
         sid = session_id.lower() if provider in ("codex", "agy") else session_id
-        refreshed = self._refresh_evidence(sid, provider, path)
+        refreshed = self._refresh_evidence(sid, provider, path, verify)
+        integrity = dict(refreshed.get("integrity") or {})
+        if escalated:
+            integrity["full_reason"] = escalated
         coverage = dict(refreshed["coverage"])
         coverage["issues"] = list(coverage["issues"])
         sync_finished = time.perf_counter()
@@ -564,7 +650,7 @@ class SelfDirectEngine:
         payload["contract_scope"] = {"session_id": sid, "scope": contract_scope(sid)}
         # Keep the full result: a transient read error does not latch a mismatch, so a later
         # successful bounded tail check must not certify this read.
-        source_ok = observation is None or observation.validate_prefix()  # full rehash off the shared lock
+        source_ok = observation is None or observation.validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             stale = []
             tokens = (
@@ -617,8 +703,13 @@ class SelfDirectEngine:
                     payload["verdict"] = _worse(payload["verdict"], "unknown")
                     payload["notes"].append("Current action prerequisites remain unverified while their required evidence is incomplete.")
             payload["requires_attention"] = payload["verdict"] != "clean"
-            with publication():
-                return payload
+            payload["integrity"] = integrity
+            reason = _fast_gate(payload, integrity) if integrity.get("mode") == "fast" else None
+            if reason is None:
+                with publication():
+                    return payload
+        # Leave the guard before the long work: the fast verdict rested on evidence only a full scan can vouch for.
+        return self._audit(session_id, provider, proposed=proposed, path=path, verify="full", escalated=reason)
 
     def _receipt_token(self, sid, provider):
         if provider != "agy":
@@ -629,12 +720,19 @@ class SelfDirectEngine:
 
     @detached_operation
     def audit_session(self, session_id: str, provider: str | None = None, path: str | None = None) -> dict[str, Any]:
-        return self._audit(session_id, provider, path=path)
+        """Always a full verification of the source (``integrity.mode == "full"``); there is no fast variant."""
+        return self._audit(session_id, provider, path=path, verify="full")
 
     @detached_operation
-    def check_action(self, session_id: str, action: dict[str, Any], provider: str | None = None, path: str | None = None):
-        """Check a proposed tool call against refreshed history; never execute or persist it."""
-        return self._audit(session_id, provider, proposed=action, path=path)
+    def check_action(self, session_id: str, action: dict[str, Any], provider: str | None = None, path: str | None = None,
+                     verify: str = "full"):
+        """Check a proposed tool call against refreshed history; never execute or persist it.
+
+        ``verify="fast"`` is for hook-time checks: the source is verified by comparing its tail, latest blocks and a
+        random sample with the stored block digests instead of a scan of everything (see ``integrity`` in the
+        result, and the README's "Source integrity"). It is never used implicitly.
+        """
+        return self._audit(session_id, provider, proposed=action, path=path, verify=_check_verify(verify))
 
     @detached_operation
     def get_chunk(self, chunk_id: str) -> dict[str, Any]:
@@ -752,7 +850,7 @@ class SelfDirectEngine:
         payload = doc.model_dump_json(indent=2)
         source_ok = True
         if refreshed is not None and refreshed.get("_source_observation") is not None:
-            source_ok = refreshed["_source_observation"].validate_prefix()  # full rehash off the shared lock
+            source_ok = refreshed["_source_observation"].validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             path = self.checklists._path(doc.session_id)
             try:
@@ -882,8 +980,9 @@ class SelfDirectEngine:
             receipt_token = self._receipt_token(sid, resolved_provider)
             evidence = self.store.capture_evidence(sid, resolved_provider)
         try:
-            observation = (capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],),
-                                          max_bytes=self.store.max_decompressed_bytes) if record else None)
+            observation = (capture_for_cursor(resolved_provider, Path(record["path"]), record,
+                                              (record["byte_offset"],), self.store.max_decompressed_bytes)
+                           if record else None)
         except RequestStopped:
             raise
         except (OSError, ValueError):
@@ -900,7 +999,7 @@ class SelfDirectEngine:
                                                                                coverage["complete"])):
                 item.status = RequirementStatus.PENDING_VERIFICATION
                 item.verified = False
-        source_ok = observation is not None and observation.validate_prefix()  # full rehash off the shared lock
+        source_ok = observation is not None and observation.validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             state = {"_metadata_token": metadata_token, "_source_observation": observation,
                      "_receipt_token": receipt_token}
@@ -947,7 +1046,7 @@ class SelfDirectEngine:
 
         source_ok = True
         if path is not None and synced.get("_source_observation") is not None:
-            source_ok = synced["_source_observation"].validate_prefix()  # full rehash off the shared lock
+            source_ok = synced["_source_observation"].validate_prefix()  # bounded stage check (identity, size, tail; see validate_prefix), off the shared lock
         with self._publication_guard():
             if path is not None and (not source_ok or not self._evidence_current(sid, resolved_provider, synced)):
                 return {"ok": False, "error": "incomplete_history", "nodes": [], "edges": []}
@@ -1182,6 +1281,8 @@ class SelfDirectEngine:
             "index_schema": 2,
             "sparse_count": self.sparse.count(),
         }
+        worker = self._integrity_worker
+        status["integrity_worker"] = worker.snapshot() if worker is not None else None
         if self.embedder_degraded:
             status["degraded_flags"].append("embedder_fake_fallback")
         if self.dense_backend == "numpy":

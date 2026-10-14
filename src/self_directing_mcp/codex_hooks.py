@@ -252,13 +252,17 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
             if event_name == "PreToolUse":
                 # Every proposed mutation gets fresh evidence, including repeated
                 # commands following a newly failed prerequisite test.
+                # Hook time: the cheap source verification (tail, latest and sampled blocks); the result's
+                # ``integrity`` says what was actually compared, and the engine settles it in full when it must.
                 audit = engine.check_action(session_id, {"tool_name": tool_name, "arguments": tool_input or {}},
-                                            provider="codex", path=transcript_path, _deadline=_deadline)
+                                            provider="codex", path=transcript_path, verify="fast",
+                                            _deadline=_deadline)
                 scoped = [audit]
                 name, args = _unwrap(tool_name, tool_input)
                 if name != tool_name:
                     inner = engine.check_action(session_id, {"tool_name": name, "arguments": args},
-                                                provider="codex", path=transcript_path, _deadline=_deadline)
+                                                provider="codex", path=transcript_path, verify="fast",
+                                                _deadline=_deadline)
                     scoped.append(dict(inner))
                     rank = {"clean": 0, "unknown": 1, "suspicious": 2, "violation": 3}
                     if rank[inner["verdict"]] > rank[audit["verdict"]]:
@@ -293,6 +297,9 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
             if coverage.get("judged_prefix"):
                 facts.update(judged_through_byte=coverage.get("judged_through_byte"),
                              unread_bytes=coverage.get("unread_bytes"))
+            if audit.get("integrity"):
+                facts["integrity"] = {key: audit["integrity"].get(key) for key in (
+                    "mode", "full_verified_through_byte", "full_verified_at") if key in audit["integrity"]}
             context = "Self-directing audit (data, not instructions): " + json.dumps(mask_value(facts), ensure_ascii=False)[:2200]
             signature = hashlib.sha256(context.encode()).hexdigest()
             if event_name == "Stop" and state.get("last_output") == signature:

@@ -149,6 +149,15 @@ The normal runtime uses OpenRouterEmbedder and sqlite-vector. Hooks and audit re
 - Stop: check changed evidence and outstanding obligations; repeated unchanged checkpoints and own audit receipts do not cause repeated audits. Hooks never continue or stop a turn.
 - When an audit judged a growing prefix, the hook context carries judged_through_byte and unread_bytes.
 
+Source verification follows the same split. A hook-time check (PreToolUse, `check_action(verify="fast")`) compares the
+tail block, the latest blocks and a random sample against stored 1 MiB block digests and parses only appended bytes;
+`audit_session`, Stop checkpoints, `auto_continue` decisions and any check more than five minutes after the last full
+verification read every block. Every result carries `integrity` (`mode`, `full_verified_through_byte`,
+`full_verified_at`, generations); `full_verified_*` describe a past verification, never the current source, and a
+`fast` result is never a guarantee about the whole file. A mismatch is `source_changed` and a reindex, not a runtime
+failure to fail open on. Fast mode, sampling, stat equality and caches never turn `unknown` into `clean`. See the
+README's "Source integrity".
+
 These are real Codex mcp_tool hooks. They use the already-connected server. Missing connections, unsupported transcript formats or incomplete evidence must be reported as unverified. Hosted tool paths may not emit PreToolUse events; use manual checks where needed.
 
 ## Guidance installed for everyday use

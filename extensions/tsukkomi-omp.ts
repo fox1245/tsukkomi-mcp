@@ -204,7 +204,9 @@ export default function tsukkomiOmp(pi: HookAPI): void {
         /^(?:mcp[_:]|mcp__)(?:tsukkomi(?:-mcp)?|self[-_]directing[-_]mcp)(?:__|[_:])/i.test(name)) return;
       const current = session(ctx);
       if (!current) { notifyOnce(ctx, "Tsukkomi monitoring unavailable: no OMP session path."); return; }
-      const result = await bridge.tool("check_action", { ...current, action: { tool_name: name, arguments: event.input ?? {} } });
+      // Hook time: the resident bridge verifies the source cheaply (tail, latest and sampled blocks); the result's
+      // `integrity` says what was compared, and the server settles it in full whenever the cheap check cannot vouch.
+      const result = await bridge.tool("check_action", { ...current, verify: "fast", action: { tool_name: name, arguments: event.input ?? {} } });
       if (actionable[result.verdict]) return { block: true, reason: description(result) };
       if (result.applicable_contracts === 0) notifyOnce(ctx, "Tsukkomi not applicable: no enabled contract for this OMP session.");
       else if (result.verdict === "unknown") notifyOnce(ctx, "Tsukkomi check unknown: evidence or verification incomplete; action not blocked.");

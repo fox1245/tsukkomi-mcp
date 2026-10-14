@@ -180,6 +180,35 @@ class Settings(BaseSettings):
                     "(rollout-*.jsonl.zst). A larger file is reported as zstd_too_large and not decoded. "
                     "SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES.",
     )
+    integrity_fast_recent_blocks: int = Field(
+        default=4, ge=0,
+        description="Fast (hook-time) source check: the latest complete 1 MiB blocks always compared with their "
+                    "stored digests. SELF_DIRECT_INTEGRITY_FAST_RECENT_BLOCKS.",
+    )
+    integrity_fast_sample_blocks: int = Field(
+        default=8, ge=0,
+        description="Fast source check: random other blocks compared, drawn fresh for every call. "
+                    "SELF_DIRECT_INTEGRITY_FAST_SAMPLE_BLOCKS.",
+    )
+    integrity_full_verify_interval_sec: float = Field(
+        default=300.0, ge=0, allow_inf_nan=False,
+        description="A fast check is allowed only this long after the last full verification of every block; "
+                    "after that the next check is full (0: always full). SELF_DIRECT_INTEGRITY_FULL_VERIFY_INTERVAL_SEC.",
+    )
+    integrity_background_verify: bool = Field(
+        default=True,
+        description="Resident MCP servers re-verify watched sources in full on one background thread while idle. "
+                    "Short-lived hook processes never do. SELF_DIRECT_INTEGRITY_BACKGROUND_VERIFY.",
+    )
+    integrity_background_idle_sec: float = Field(
+        default=2.0, gt=0, allow_inf_nan=False,
+        description="Idle time before the background verification starts. SELF_DIRECT_INTEGRITY_BACKGROUND_IDLE_SEC.",
+    )
+    integrity_background_max_scans: int = Field(
+        default=1, ge=1,
+        description="Most background full verifications started per wake-up (they run one at a time, never "
+                    "concurrently). SELF_DIRECT_INTEGRITY_BACKGROUND_MAX_SCANS.",
+    )
     rrf_k: int = 60
     retrieve_top_k: int = 20
     search_top_k: int = 10

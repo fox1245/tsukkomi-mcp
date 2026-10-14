@@ -1136,7 +1136,7 @@ class _Rule:
 
 
 def _audit(**overrides):
-    base = {"ok": True, "coverage": {"complete": True, "issues": []},
+    base = {"ok": True, "coverage": {"complete": True, "issues": []}, "integrity": {"mode": "full"},
             "findings": [{"contract_id": "a", "verdict": "violation", "contract_revision": 3,
                           "applicability": "applicable", "reason": "missing"}]}
     base.update(overrides)
@@ -1153,6 +1153,9 @@ def _audit(**overrides):
     {"findings": [{"contract_id": "a", "verdict": "violation", "contract_revision": 2}]},        # stale revision
     {"findings": [{"contract_id": "a", "verdict": "violation", "contract_revision": 3, "applicability": "not_applicable"}]},
     {"findings": [{"contract_id": "other", "verdict": "violation", "contract_revision": 3}]},
+    {"integrity": {"mode": "fast"}},   # restarting an agent needs the source verified in full
+    {"integrity": {}},
+    {"integrity": None},
 ])
 def test_only_a_fully_observed_current_applicable_violation_is_a_confirmed_miss(change):
     from self_directing_mcp import hook_policy

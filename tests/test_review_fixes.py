@@ -107,7 +107,7 @@ def _hashed_bytes(monkeypatch):
     return total
 
 
-def test_locked_validation_reads_only_the_tail_window(tmp_path, monkeypatch):
+def test_stage_validation_reads_only_the_tail_window_and_the_full_reread_is_explicit(tmp_path, monkeypatch):
     path = _big(tmp_path)
     observation = capture_source(path)
     with path.open("ab") as stream:
@@ -116,7 +116,10 @@ def test_locked_validation_reads_only_the_tail_window(tmp_path, monkeypatch):
     assert observation.validate_prefix(locked=True)
     assert 0 < total[0] <= WINDOW
     total[0] = 0
-    assert observation.validate_prefix()  # the unlocked check still hashes everything
+    assert observation.validate_prefix()  # the unlocked stage check is bounded as well: the pass was the one scan
+    assert 0 < total[0] <= WINDOW
+    total[0] = 0
+    assert observation.validate_prefix(full=True)  # a whole-prefix re-read stays available, only when asked for
     assert total[0] >= observation.length
 
 
@@ -138,15 +141,17 @@ def test_locked_validation_rejects_truncation_and_replacement(tmp_path):
     assert not observation.validate_prefix(locked=True)
 
 
-def test_rewrite_outside_window_is_caught_by_full_check_and_stays_failed(tmp_path):
+def test_rewrite_outside_window_is_caught_by_an_explicit_full_check_and_stays_failed(tmp_path):
     path = _big(tmp_path)
     observation = capture_source(path)
     data = bytearray(path.read_bytes())
     data[5] ^= 1
     path.write_bytes(bytes(data) + b"more\n")
-    assert observation.validate_prefix(locked=True)  # documented residual window
-    assert not observation.validate_prefix()  # the full check outside the lock catches it
+    assert observation.validate_prefix(locked=True)  # documented residual window ...
+    assert observation.validate_prefix()  # ... which the later bounded stage check shares (see validate_prefix) ...
+    assert not observation.validate_prefix(full=True)  # ... and the next full scan (here: explicit) closes
     assert not observation.validate_prefix(locked=True)  # and the failure sticks
+    assert not observation.validate_prefix()
 
 
 def test_sync_does_full_rehash_only_outside_the_guard(session, monkeypatch):
@@ -166,9 +171,9 @@ def test_sync_does_full_rehash_only_outside_the_guard(session, monkeypatch):
     engine._publication_guard = guard
     real = SourceObservation.validate_prefix
 
-    def spy(self, *, locked=False):
+    def spy(self, *, locked=False, full=False):
         seen.append((locked, depth[0]))
-        return real(self, locked=locked)
+        return real(self, locked=locked, full=full)
     monkeypatch.setattr(SourceObservation, "validate_prefix", spy)
     engine.sync_session(session_id=SID, embed=False)
     write(path, [call("two", "c2")], "a")
