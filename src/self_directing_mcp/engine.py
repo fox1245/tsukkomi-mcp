@@ -355,6 +355,8 @@ class SelfDirectEngine:
                 embed=embed,
                 derived=derived,
                 guard=self._publication_guard,
+                # A local-only process (a hook) may share a server's index: leave vector cleanup journalled for it.
+                retain_dense_deletions=self.dense is None and any(Path(self.settings.index_dir).glob("vectors-v2-*")),
             )
         except AmbiguousSessionSource as exc:
             return {"ok": False, "error": "ambiguous_session_source", "message": str(exc), "provider": resolved_provider,

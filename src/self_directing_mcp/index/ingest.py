@@ -771,12 +771,16 @@ def agy_coverage(coverage, stats, receipts=None):
 
 @request_operation
 def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider="codex",
-                   embed=True, derived=True, guard=nullcontext):
+                   embed=True, derived=True, guard=nullcontext, retain_dense_deletions=False):
     """Serialize per (index, provider, session). Later callers find the cursor current and skip the parse.
 
     A parser-version bump therefore reparses a session once per process no matter how many hooks race on it;
     other sessions reparse lazily, each on its own first sync, never in a storm. Copies of one session id in
     several folders share a flight; across processes the state token still decides who publishes.
+
+    ``retain_dense_deletions``: this process has no dense index but the index directory does (a local-only hook
+    sharing a server's index). Obsolete ids are removed from the sparse index and stay journalled until a process
+    that can also remove their vectors syncs the session.
     """
     requested = Path(path).resolve()
     with session_flight(_flight_key(store, provider, requested, session_id)):
@@ -786,7 +790,8 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
             try:
                 info = _ingest_session(path=target, session_id=session_id, store=store, sparse=sparse, dense=dense,
                                        embedder=embedder, provider=provider, embed=embed, derived=derived,
-                                       guard=guard, seen=seen, observation=handed)
+                                       guard=guard, seen=seen, observation=handed,
+                                       retain_dense_deletions=retain_dense_deletions)
             except _StaleObservation:
                 continue  # another process published past our capture: observe the file again
             except _IndexedElsewhere as elsewhere:
@@ -879,7 +884,7 @@ def _provider_parser(provider):
 
 
 def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard, seen,
-                    observation=None):
+                    observation=None, retain_dense_deletions=False):
     if embed and (dense is None or embedder is None):
         raise ValueError("embedding unavailable in local-only mode")
     parse_session_chunks, peek_session_id = _provider_parser(provider)
@@ -1073,7 +1078,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             sparse.delete_ids(stale)
             if dense is not None:
                 dense.delete_ids(stale)
-        if pending:
+        if pending and not (dense is None and retain_dense_deletions):
             store.finish_deletions(sid, provider, pending)
         session_ids = sorted(store.chunk_ids(sid, provider))
         indexed = sparse.present(session_ids)
