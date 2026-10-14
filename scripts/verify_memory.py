@@ -324,9 +324,12 @@ def command_test(args) -> int:
     tests = list(args.pytest_args)
     if args.profile == "tsan":
         tests += [f"--deselect={test}" for test in TSAN_DESELECT]
+    # Unbuffered output (below) keeps the progress written before a native exit, so a run that dies early still
+    # shows how far it got. pytest keeps its default fd capture: the MCP stdio tests hand sys.stderr to a child.
     command = [*prefix, sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *tests]
     print("+", " ".join(command), flush=True)
     # UBSan writes to stderr even when ASan logs to files, so the run's output is kept and scanned too.
+    env = {**env, "PYTHONUNBUFFERED": "1"}
     with subprocess.Popen(command, env=env, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, errors="replace") as process, open(logs / "pytest.out", "w") as copy:
         for line in process.stdout:

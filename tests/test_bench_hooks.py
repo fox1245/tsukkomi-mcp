@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -120,6 +121,11 @@ def test_compare_renders_before_and_after_rows(bench):
     assert "| claude | Stop | 10 | 200 | 100 |" in text
 
 
+# The benchmark gives its hook processes a clean environment, so under the sanitizer profiles of
+# scripts/verify_memory.py they would load the instrumented native extension without the preloaded runtime. Timings
+# under a sanitizer mean nothing anyway; the CI bench job runs this end to end.
+@pytest.mark.skipif(any(name in os.environ.get("LD_PRELOAD", "") for name in ("libasan", "libtsan")),
+                    reason="hook timings are meaningless under a sanitizer runtime")
 def test_a_small_end_to_end_run_produces_a_valid_report_and_no_fail_open(tmp_path):
     report_path, table_path = tmp_path / "bench.json", tmp_path / "bench.md"
     done = subprocess.run(
