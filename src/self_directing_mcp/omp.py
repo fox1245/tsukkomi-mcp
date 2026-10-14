@@ -7,13 +7,14 @@ from pathlib import Path
 
 from self_directing_mcp.session_events import as_text, iter_raw_lines, make_chunk, parse_error, result_success
 
-PARSER_VERSION = 4
+PARSER_VERSION = 6
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _EVENT_FIELDS = {"id", "parentId", "timestamp", "type"}
 _ADMIN_FIELDS = {
     "title_change": _EVENT_FIELDS | {"title", "source", "previousTitle", "trigger"},
     "credential_pin": _EVENT_FIELDS | {"provider", "hash"},
     "service_tier_change": _EVENT_FIELDS | {"serviceTier"},
+    "ttsr_injection": _EVENT_FIELDS | {"injectedRules"},
     "mode_change": _EVENT_FIELDS | {"mode", "data"},
     "compaction": _EVENT_FIELDS | {"summary", "shortSummary", "firstKeptEntryId",
                                    "tokensBefore", "tokensAfter", "method",
@@ -24,6 +25,7 @@ _SERVICE_TIER_PROVIDERS = {"openai", "anthropic", "google"}
 _SERVICE_TIER_VALUES = {"auto", "default", "flex", "scale", "priority", "ultrafast"}
 _CUSTOM_MESSAGE_FIELDS = _EVENT_FIELDS | {"customType", "attribution", "display", "content", "details"}
 _TODO_HUD_FIELDS = _EVENT_FIELDS | {"customType", "data"}
+_DEVELOPER_MESSAGE_FIELDS = {"role", "content", "timestamp", "attribution", "synthetic", "userInitiated"}
 
 
 class PathTraversalError(ValueError):
@@ -144,6 +146,10 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                     and set(obj) <= _TODO_HUD_FIELDS and isinstance(obj.get("data"), dict)
                     and set(obj["data"]) <= {"sourceEntryId", "fingerprint", "visibility"}
                 ) or agent_message
+                if record_type == "ttsr_injection":
+                    metadata_only = (set(obj) <= _ADMIN_FIELDS["ttsr_injection"]
+                                     and isinstance(obj.get("injectedRules"), list)
+                                     and all(isinstance(rule, str) and rule for rule in obj["injectedRules"]))
                 if record_type == "custom" and custom_type == "tool_execution_start":
                     data = obj.get("data")
                     if isinstance(data, dict):
@@ -162,9 +168,19 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
             content = msg.get("content")
             timestamp = obj.get("timestamp") or msg.get("timestamp")
             timestamp = str(timestamp) if timestamp is not None else None
-            if role not in ("user", "assistant", "toolResult") or not isinstance(content, list):
+            if role not in ("user", "assistant", "toolResult", "developer") or not isinstance(content, list):
                 raise ValueError("unsupported OMP message shape")
             base = {"event_type": "message", "role": "tool" if role == "toolResult" else role}
+            if role == "developer":
+                if (not set(msg) <= _DEVELOPER_MESSAGE_FIELDS
+                        or (msg.get("attribution") is not None and not isinstance(msg["attribution"], str))
+                        or any(flag in msg and type(msg[flag]) is not bool
+                               for flag in ("synthetic", "userInitiated"))
+                        or any(not isinstance(block, dict) or not set(block) <= {"type", "text"}
+                               or block.get("type") != "text" or not isinstance(block.get("text"), str)
+                               for block in content)):
+                    raise ValueError("unsupported OMP developer message shape")
+                base.update(role="runtime", evidence_origin="developer", attribution=msg.get("attribution"))
             if role == "toolResult":
                 call_id = msg.get("toolCallId")
                 if not isinstance(call_id, str) or not call_id:
@@ -188,7 +204,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 kind = block.get("type")
                 meta = dict(base)
                 if kind == "text" and isinstance(block.get("text"), str):
-                    event_kind, text = "turn", f"[message:{role}] {block['text']}"
+                    event_kind, text = ("meta" if role == "developer" else "turn"), f"[message:{role}] {block['text']}"
                 elif kind == "toolCall" and role == "assistant" and isinstance(block.get("id"), str) and block["id"] and isinstance(block.get("name"), str) and block["name"]:
                     name = block["name"]
                     meta.update(tool_name=name, call_id=block["id"])
