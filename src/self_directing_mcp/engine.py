@@ -1005,6 +1005,13 @@ class SelfDirectEngine:
                     anchor_status="unresolved" if rule.source_event_id else "missing", base_revision=previous.revision)
             payload = document.model_dump_json(indent=2)
             self.contracts.publish_document(document, payload, token)
+        try:
+            # Informational report of equivalent spellings the regexes miss. Imported here and nowhere else, so
+            # hook paths never load the variant library; it runs after the save and can only add this section.
+            from self_directing_mcp.audit.variants import fragility_report
+            fragility = fragility_report(updated)
+        except Exception as exc:
+            fragility = {"informational": True, "status": "unavailable", "error": type(exc).__name__}
         result = {
             "ok": True,
             "returned": "upserted",
@@ -1014,6 +1021,7 @@ class SelfDirectEngine:
                 "upserted": len(updated),
                 "store": len(document.contracts),
             },
+            "fragility": fragility,
         }
         checks = [{"contract_id": rule.id, "source_event_id": rule.source_event_id,
                    "anchor": anchors[rule.source_event_id][0]} for rule in rules if rule.source_event_id]

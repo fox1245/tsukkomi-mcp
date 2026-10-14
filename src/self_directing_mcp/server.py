@@ -434,7 +434,14 @@ async def upsert_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
     agent once per session; when limits a must obligation to sessions where a
     matching tool call was observed (otherwise it is reported not_applicable).
     The response contains only the contracts from this call after save,
-    not the full store. session_id=null means a global rule that applies
+    not the full store. It also carries an informational "fragility" report:
+    for each saved prohibition regex (or before_regex of an obligation) that
+    matches a standard spelling of a known risky action, the equivalent
+    spellings it does not match (for example rm -r -f for rm -rf). The report
+    names its library_version, lists unverified candidates only, is bounded,
+    and never blocks the save or changes any regex or verdict; a regex that
+    times out is reported as regex_timeout.
+    session_id=null means a global rule that applies
     to every audited session. Use list_contracts(session_id=...) to inspect
     the current session plus globals.
     """
