@@ -58,7 +58,7 @@ clean verdict is not permission and must not skip Claude Code's own prompt. Suba
 only reports, a Stop blocks at most once per session and only for a confirmed
 `auto_continue` miss, and every internal error fails open with a warning and a
 `hook_health` entry. Do not hide hook failures or hand-edit the settings file to work
-around them. The AGY adapter follows the same policy (`SELF_DIRECT_AGY_ENFORCEMENT`,
+around them. Hooks never read a project `.env`; point them at the right index with `--index-dir`, the user TOML or the settings `env`. The AGY adapter follows the same policy (`SELF_DIRECT_AGY_ENFORCEMENT`,
 default `confirmed_only`). See docs/claude-installation.md and docs/agy-installation.md.
 
 Use the official [sqliteai/sqlite-vector release](https://github.com/sqliteai/sqlite-vector/releases/tag/1.1.0)

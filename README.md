@@ -191,7 +191,7 @@ The script pins release 1.1.0, verifies the official archive's SHA-256 and check
 
 ### 3. Configure
 
-Settings come from, in order of precedence: explicit `Settings` arguments, environment variables, the TOML path file, a `.env` in the **current working directory**, then defaults. A server started by an MCP host usually has an unrelated working directory, so do not depend on a `.env` there; use explicit `SELF_DIRECT_*` variables in the host's server entry or the TOML file below.
+Settings come from, in order of precedence: explicit `Settings` arguments, environment variables, the TOML path file, a `.env` in the **current working directory**, then defaults. A server started by an MCP host usually has an unrelated working directory, so do not depend on a `.env` there; use explicit `SELF_DIRECT_*` variables in the host's server entry or the TOML file below. Lifecycle hooks (AGY and Claude Code) never read a working-directory `.env`: they use the environment and the TOML only, because that file is content the audited agent can write.
 
 #### User path configuration (TOML)
 
@@ -286,7 +286,7 @@ python scripts/install_claude_hooks.py --print --python /absolute/path/to/venv/b
 python scripts/install_claude_hooks.py --apply --settings /absolute/path/to/settings.json --python /absolute/path/to/venv/bin/python
 ```
 
-`--print` is the default and changes nothing; `--apply` merges into the settings file you name, keeps unrelated hooks, backs the file up when it changes and replaces it atomically. See [docs/claude-installation.md](docs/claude-installation.md) for the policy table, the Stop budget, subagents, fail-open behavior and verification steps, and [docs/claude-hooks.example.json](docs/claude-hooks.example.json) for the complete hooks block.
+`--print` is the default and changes nothing; `--apply` merges into the settings file you name, keeps unrelated hooks, backs the file up when it changes and replaces it atomically. Add `--index-dir /absolute/path/to/index` to point the hooks at the index whose contracts should apply (the one the MCP server writes to); hooks never read a project `.env`. See [docs/claude-installation.md](docs/claude-installation.md) for the policy table, the Stop budget, subagents, fail-open behavior and verification steps, and [docs/claude-hooks.example.json](docs/claude-hooks.example.json) for the complete hooks block.
 
 ### OMP (OpenRouter-backed retrieval, deterministic contract hooks)
 
@@ -556,7 +556,7 @@ The benchmark compares 640 finite stage/class/evidence combinations with an inde
 
 ## Testing and verification
 
-The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, append capture and prefix judgement, duplicate session sources, single-flight and concurrency, workflow version/grant invalidation, proof rejection, path isolation and MCP transport. Tests use synthetic sessions and offline embeddings. Lean integration tests, Windows-only path tests and bubblewrap tests report a skip when the toolchain or platform is unavailable.
+The suite covers parsers, host receipt linkage, restricted reads, temporal obligations, append capture and prefix judgement, duplicate session sources, single-flight and concurrency, workflow version/grant invalidation, proof rejection, path isolation and MCP transport. Tests use synthetic sessions and offline embeddings. Lean integration tests, Windows-only path tests and bubblewrap tests report a skip when the toolchain or platform is unavailable, and symlink tests report a skip with a reason where Windows denies symlink creation (`WinError 1314`, Developer Mode off).
 
 ```bash
 python -m pytest -q

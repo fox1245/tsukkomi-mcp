@@ -28,7 +28,7 @@ claude mcp add --scope user tsukkomi-mcp -- /absolute/path/to/venv/bin/python -m
 
 Check `claude mcp add --help` for the flags of your Claude Code version (scope and environment options have changed between versions) and `claude mcp list` afterwards. Tool names appear to the agent as `mcp__tsukkomi-mcp__<tool>`.
 
-Keep the settings that must agree between the server and the hooks in the shared TOML file `~/.config/tsukkomi-mcp/config.toml` (or the file named by `SELF_DIRECT_CONFIG_FILE`) instead of in the server entry. The hook command lines carry no environment of their own, so the index directory, the contracts file and the projects root must resolve to the same values in both processes. See [config.example.toml](../config.example.toml) and the [README path contract](../README.md#user-path-configuration-toml). The relevant keys are `index_dir`, `contracts_path` and `claude_projects_dir`.
+Contracts are written by the MCP server and read by the hooks, so both must use the same index. Keep the settings that must agree in the shared TOML file `~/.config/tsukkomi-mcp/config.toml` (or the file named by `SELF_DIRECT_CONFIG_FILE`) instead of in the server entry: the index directory, the contracts file and the projects root must resolve to the same values in both processes. See [config.example.toml](../config.example.toml) and the [README path contract](../README.md#user-path-configuration-toml). The relevant keys are `index_dir`, `contracts_path` and `claude_projects_dir`. If the hooks must use a specific index regardless of the environment, install them with `--index-dir` (see [section 3](#where-the-hooks-read-their-settings)).
 
 For the default OpenRouter-backed retrieval, also provide `SELF_DIRECT_OPENROUTER_API_KEY_FILE` and `SELF_DIRECT_SQLITE_VECTOR_PATH` (TOML keys `openrouter_api_key_file` and `sqlite_vector_path`) as described in the README. For a credential-free setup, set `SELF_DIRECT_LOCAL_ONLY=true` in the server's environment; embedding, dense and hybrid search and LLM graph updates are then rejected rather than replaced by a fallback.
 
@@ -66,6 +66,7 @@ Apply only when the user asked for the hooks. The complete `--print` output with
 | `--events A,B,...` | Comma-separated subset of the seven events. Default all. |
 | `--python PATH` | Interpreter that runs the hook command. Default: the interpreter running the installer. |
 | `--script PATH` | Path of `scripts/claude_hook.py`. Default: the copy next to the installer. |
+| `--index-dir PATH` | Absolute index directory, baked into every hook command as `--index-dir=PATH`. A relative path is rejected (exit status 2). See [below](#where-the-hooks-read-their-settings). |
 | `--local-only` | Append `--local-only` to each hook command. See below. |
 
 ### Events
@@ -91,6 +92,18 @@ The tool matchers stay `*`. Reads can be restricted by a contract, and a tool na
 - **Atomic write.** The new content goes to a temporary file in the same directory and replaces the target with `os.replace`. File mode and the original indentation are kept. A symlinked settings file is written through, not replaced.
 - **The `env` key.** `--apply` always sets `env.SELF_DIRECT_CLAUDE_ENFORCEMENT` to the `--mode` value (default `confirmed_only`), so rerunning without `--mode` resets an earlier choice. `--uninstall` removes that key.
 - **Interpreter and checkout.** `scripts/claude_hook.py` starts with whatever `--python` names. If a `.venv` exists in the checkout and the running interpreter is not that one, the script re-executes itself with the checkout's `.venv` interpreter. If the package cannot be imported at all, a standard-library fallback answers fail-open and records `hook_health` (see [section 7](#7-failures-fail-open)).
+
+### Where the hooks read their settings
+
+Hosts run lifecycle hooks inside the project being edited. A `.env` in that directory is content the audited agent can write, so the hooks never read it: they build their settings from the process environment and the user TOML file only (`config.hook_settings()`), the same sources the standard-library fallback uses. Otherwise a project `.env` could point a hook at an empty index or at `advisory` mode and turn a confirmed violation into an allow. The MCP server is different: it still reads a `.env` in its own working directory, at the lowest precedence.
+
+So the index directory, the contracts path and the enforcement mode of the hooks must come from one of these:
+
+- The user TOML (`index_dir`, `contracts_path`, `claude_projects_dir`), shared with the MCP server. This is the simplest way to keep both on one index.
+- The environment the hook command inherits from Claude Code, for example the settings `env` block. The installer writes `SELF_DIRECT_CLAUDE_ENFORCEMENT` there.
+- `--index-dir /absolute/path/to/index`. The installer adds `--index-dir=/absolute/path/to/index` to every hook command, and the hook entry point (and its standard-library fallback) sets `SELF_DIRECT_INDEX_DIR` from it, overriding the inherited environment. Contracts, the continue budget, queued warnings and `hook_health` then live in that index. This is the recommended way to point the hooks at the index whose contracts should apply, that is, the index of the MCP server the user registers contracts with.
+
+The installer does not write `SELF_DIRECT_INDEX_DIR` into the settings `env`, for the same reason it does not write `SELF_DIRECT_LOCAL_ONLY`: that block is session-wide and would also reach every MCP server Claude Code starts.
 
 ### Why `--local-only` is a flag and `SELF_DIRECT_LOCAL_ONLY` is not in `env`
 

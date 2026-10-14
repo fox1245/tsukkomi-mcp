@@ -26,13 +26,17 @@ The project's data-handling model is part of what this policy covers:
 - Session transcripts, the index and contracts stay on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter and only with a key the owner configured. With `SELF_DIRECT_LOCAL_ONLY=true`, embeddings and LLM graph updates are rejected, and workflow classification stays off unless the workflow owner approves remote synthetic context.
 - Known secret patterns are masked before embedding and graph extraction and in everything the server and its hooks return, and the workflow classifier refuses context in which a secret pattern is found. Masking is pattern-based; it does not guarantee that every secret format or all personal data is removed. See the [masking contract](#masking-contract).
 
-In scope, for example: leaking a credential or session text outside the documented remote calls, a bypass of secret masking for a known pattern, an escape from the configured session roots or sandbox, a way for an agent to forge host receipts or workflow approvals through the MCP API, and a verdict reported as `clean` when the evidence is changed or unread.
+In scope, for example: leaking a credential or session text outside the documented remote calls, a bypass of secret masking for a known pattern, a project-controlled file (such as a `.env` in the working directory) that changes the index, contracts or mode a lifecycle hook reads, an escape from the configured session roots or sandbox, a way for an agent to forge host receipts or workflow approvals through the MCP API, and a verdict reported as `clean` when the evidence is changed or unread.
 
 Out of scope, for example:
 
 - An attacker with write access as the same OS user to the index, contracts, hook configuration, approval directories or credential files. Those must be protected by the host.
 - Actions the hooks do not see: hosted tools that emit no `PreToolUse` event, out-of-band shell access, in-memory sessions and records not yet written to disk. The Codex hooks are advisory by design and never block. The AGY and Claude Code hooks block only what their documented mode says (by default a confirmed `violation`, and `suspicious` as a confirmation request) and fail open on their own errors.
 - Vulnerabilities in dependencies or services (NeoGraph, the MCP SDK, sqlite-vector, OpenRouter, Lean, bubblewrap); report those upstream.
+
+## Hook configuration
+
+Hosts run lifecycle hooks inside the project being edited, so anything in the working directory is content the audited agent can write. The AGY and Claude Code hooks therefore build their settings from the process environment and the user TOML only and never read a working-directory `.env`; otherwise a project `.env` could point a hook at an empty index or at `advisory` mode and turn a confirmed violation into an allow. The MCP server keeps reading `./.env` at the lowest precedence. The hook's index, contracts path and enforcement mode must be set through its environment, the user TOML or the installer's `--index-dir`. A user or process with write access to those, to the hook script or to the host settings remains out of scope (see above).
 
 ## Masking contract
 
