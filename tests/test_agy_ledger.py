@@ -401,6 +401,17 @@ def test_the_bound_check_never_calls_an_unbound_receipt_bound(fields, bound):
     assert bool(json.loads(text).get("result_hash")) is bound  # exactly the decoded meaning
 
 
+@pytest.mark.parametrize("data,found", [
+    (b"plain ascii", False), ("caf\u00e9 and \u2603 are valid UTF-8".encode(), False), (b"caf\xe9", True), (b"\xff", True),
+    (b"\x80 at the start", True), (b'an escaped lone surrogate stays text: "\\ud800"', False), ("\ud7ff\ue000".encode(), False),
+])
+def test_undecodable_bytes_are_found_exactly_as_the_character_loop_found_them(data, found):
+    from self_directing_mcp.agy import has_undecodable
+    raw = data.decode("utf-8", errors="surrogateescape")
+    assert has_undecodable(raw) is found
+    assert has_undecodable(raw) is any(0xDC80 <= ord(char) <= 0xDCFF for char in raw)
+
+
 def test_receipts_decode_when_used():
     rows = [(3, json.dumps({"n": 3})), (1, json.dumps({"n": 1}))]
     receipts = agy_receipts._Receipts(rows)
