@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Sequence
 
 import httpx
-import numpy as np
+from self_directing_mcp._runtime import np
 
 from self_directing_mcp.security.mask import mask_secrets, register_secret
 from self_directing_mcp.request_control import check_request, current_request, request_operation

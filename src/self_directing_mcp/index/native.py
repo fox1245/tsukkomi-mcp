@@ -7,7 +7,7 @@ from pathlib import Path
 import sqlite3
 from urllib.parse import quote
 
-import numpy as np
+from self_directing_mcp._runtime import np
 
 from self_directing_mcp.request_control import check_request, publication, request_operation
 
