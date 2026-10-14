@@ -581,12 +581,46 @@ python scripts/benchmark.py
 
 ### CI
 
-GitHub Actions runs two jobs on pushes and pull requests. Superseded runs for the same ref are cancelled, and no API keys or paid model calls are used.
+GitHub Actions runs two workflows. Superseded runs for the same ref are cancelled, and no API keys or paid model calls are used.
 
-- **`test`** (Ubuntu and Windows, Python 3.12, 10 minutes): the explicit MCP transport, Jev boundary and Windows session-path smoke tests, then builds the source distribution and wheel.
+The `CI` workflow runs two jobs on every push and pull request:
+
+- **`test`** (Ubuntu and Windows, Python 3.12, 10 minutes): the explicit MCP transport, Jev boundary and Windows session-path smoke tests and the compressed Codex session tests (without their two 50 MB allocation probes), then builds the source distribution and wheel.
 - **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, checklist conflicts, quiet hooks, AGY and Claude Code hooks, the Claude Code installer and provider, and hook gating. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
 
-The full suite, real Lean proof checks, native vector tests and all performance, large-session and concurrency benchmarks are local deep checks, not CI gates. A green CI run does not establish full workflow or native-proof coverage or performance guarantees. Live model validation needs a separate model and budget approval.
+The `Memory` workflow (pull requests to `main`, `main`, nightly and on demand) is described in [Memory verification](#memory-verification).
+
+Real Lean proof checks and the performance, large-session and concurrency benchmarks are local deep checks, not CI gates. A green CI run does not establish full workflow or native-proof coverage or performance guarantees. Live model validation needs a separate model and budget approval.
+
+### Memory verification
+
+tsukkomi is Python, but it runs native code: neograph-engine (the audit and GraphRAG graphs) and the sqlite-vector extension (dense search). After the 0.5.x memory incident the project checks both the native code and the long-running server, modelled on NeoGraph's sanitizer CI. `.github/workflows/memory.yml` runs three jobs:
+
+| Job | What runs | Fails on |
+|---|---|---|
+| `asan` | neograph-engine and sqlite-vector rebuilt with AddressSanitizer + UndefinedBehaviorSanitizer; the whole suite with the runtime preloaded, `PYTHONMALLOC=malloc` and the native vector backend | any ASan or UBSan report; a direct leak allocated by neograph or sqlite-vector code |
+| `tsan` | the same libraries rebuilt with ThreadSanitizer; the whole suite under `setarch -R` | any data race or deadlock report |
+| `soak` | `scripts/memory_soak.py` with the official sqlite-vector release: one long-lived process drives the MCP tool entry points through steady, growing and churning sessions | retained Python heap growing in both measured windows of a phase, or growing file descriptors or threads |
+
+How the sanitizer jobs work (`scripts/verify_memory.py`, standard library only, Linux and GCC):
+
+- `native` downloads the neograph-engine sdist pinned in `pyproject.toml` and checks its SHA-256 against both PyPI and the digest pinned in the script, clones sqlite-vector `1.1.0` and checks that it resolves to the pinned commit, and builds both with the profile's flags. The builds are cached by these pins; a cold build of neograph-engine takes about 45 minutes on a hosted runner.
+- `canary` builds a small library with one deliberate defect per check (heap overflow, signed overflow, a leak, a data race) and requires the sanitizer to report each. A run without reports therefore means the sanitizer was live, not that it was missing.
+- `test` refuses to run unless the installed neograph module links the sanitizer runtime, so the release wheel can never be tested by mistake. It then runs the suite and scans the sanitizer logs and the test output.
+- LeakSanitizer does not run at interpreter exit, where CPython leaves thousands of objects unfreed by design. `tests/conftest.py` runs LSan's recoverable check when the pytest session finishes, while live Python objects are still reachable. Each direct leak is attributed to the first frame above the allocator: neograph or sqlite-vector code fails the run, while CPython and third-party leaks are counted and printed.
+- Under TSan, `/bin/sh` itself crashes with the runtime preloaded, so the two installer tests that start hook commands through a shell are deselected there.
+
+Run them locally:
+
+```bash
+python scripts/verify_memory.py native --profile asan --out build/memory/asan
+python -m pip install build/memory/asan/wheels/neograph_engine-*.whl && python -m pip install -e ".[dev]"
+python scripts/verify_memory.py canary --profile asan --out build/memory/asan
+python scripts/verify_memory.py test --profile asan --out build/memory/asan    # same for --profile tsan, in its own venv
+python scripts/memory_soak.py --check --dense-backend sqlite-vector --vector-path /absolute/path/to/vector.so
+```
+
+Use a separate virtual environment per profile, because the sanitizer build replaces the release wheel. `TSUKKOMI_TEST_DENSE_BACKEND=sqlite-vector` with `SQLITE_VECTOR_TEST_PATH` runs any suite against a native vector library. Known limit: CPython 3.12 builds where interned strings are immortal (Ubuntu 24.04's 3.12.3, for example) keep each path component that `pathlib` interns, about 150 bytes per distinct session path. This is bounded by the number of sessions; newer 3.12 releases and 3.13 release them.
 
 ### Shared-index queue PoC
 
