@@ -473,7 +473,7 @@ def agy_scenario(tmp_path, monkeypatch):
                         openrouter_api_key_file=None)
     engine = SelfDirectEngine(settings)
     monkeypatch.setattr(server, "_engine", engine)
-    monkeypatch.setattr(engine_module, "SelfDirectEngine", lambda: SelfDirectEngine(settings))
+    monkeypatch.setattr(engine_module, "SelfDirectEngine", lambda *_args, **_kwargs: SelfDirectEngine(settings))  # hooks pass hook_settings()
     yield {"engine": engine, "sid": AGY_SID, "provider": "agy", "path": paths[AGY_SID], "path2": paths[AGY_SID2],
            "seeds": seeds, "canonical": [tag for tag in seeds.canonical if tag.startswith("AG")]}
     engine.close()
