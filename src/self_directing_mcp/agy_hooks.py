@@ -89,7 +89,9 @@ def handle_stop(engine: SelfDirectEngine, session_id: str, payload: dict[str, An
         return {"decision": "allow", "reason": "No outstanding obligations; not a compliance verdict."}
     synced = engine.sync_session(session_id=session_id, provider="agy", path=path, embed=False)
     reasons = []
-    if not synced.get("ok") or not synced.get("coverage", {}).get("complete"):
+    coverage = synced.get("coverage", {})
+    # Records the host is still appending are judged next time; any other gap blocks verification.
+    if not synced.get("ok") or not (coverage.get("complete") or set(coverage.get("issues", [])) == {"unread_bytes"}):
         reasons.append("AGY history is incomplete; completion cannot be verified.")
     checklist = engine.get_checklist(session_id, provider="agy")
     pending = [item for item in checklist["items"] if item["status"] not in ("done", "revoked")]

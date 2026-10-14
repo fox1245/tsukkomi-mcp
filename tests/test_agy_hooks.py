@@ -229,3 +229,29 @@ def test_forged_checklist_result_ids_do_not_unlock_stop(engine):
         {"item_id": "req-001", "status": "done", "verified": True, "evidence_chunk_ids": ["invented-result"]}])
     assert claimed["updated"][0]["status"] == "pending_verification"
     assert handle_stop(obj, SID, {"transcriptPath": str(path), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"})["decision"] == "continue"
+
+
+def _clean_history(path):
+    path.write_text(json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+                                "created_at": "2026-10-01T00:00:00Z", "content": "<USER_REQUEST>hi</USER_REQUEST>"}) + "\n")
+
+
+def test_stop_judges_a_growing_transcript_up_to_its_captured_prefix(engine):
+    obj, path = engine
+    prohibit(obj, "private-file")
+    _clean_history(path)
+    with path.open("a") as stream:
+        stream.write('{"step_index": 1, "source": "MODEL"')  # the host is still writing this record
+    payload = {"transcriptPath": str(path), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"}
+    assert handle_stop(obj, SID, payload) == {"decision": "allow"}
+
+
+def test_stop_still_continues_when_history_has_gaps_beyond_growth(engine):
+    obj, path = engine
+    prohibit(obj, "private-file")
+    _clean_history(path)
+    with path.open("a") as stream:
+        stream.write("not json\n")
+    payload = {"transcriptPath": str(path), "fullyIdle": True, "terminationReason": "NO_TOOL_CALL"}
+    response = handle_stop(obj, SID, payload)
+    assert response["decision"] == "continue" and "incomplete" in response["reason"]
