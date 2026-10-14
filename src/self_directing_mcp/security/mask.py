@@ -62,22 +62,23 @@ _rule(("cookie",),
 _rule(("bearer",), r"(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*", "Bearer ***")
 
 # --- Provider token formats (value based; the prefix is kept so the kind of leak stays visible) --
-_rule(("sk-",), r"\bsk-[A-Za-z0-9_\-]{8,}\b", "sk-***")  # OpenAI sk-/sk-proj-, OpenRouter sk-or-v1-, Anthropic sk-ant-
-_rule(("_live_", "_test_"), r"\b((?:sk|rk)_(?:live|test)_)[A-Za-z0-9]{8,}\b", r"\1***")  # Stripe
-_rule(("whsec_",), r"\b(whsec_)[A-Za-z0-9]{16,}\b", r"\1***")
-_rule(("ghp_", "gho_", "ghu_", "ghs_", "ghr_"), r"\b(gh[pousr]_)[A-Za-z0-9]{20,}\b", r"\1***")  # GitHub
-_rule(("github_pat_",), r"\b(github_pat_)[A-Za-z0-9_]{20,}\b", r"\1***")
+# ``(?<![A-Za-z0-9])`` rather than ``\\b``: a token glued to an underscore (``key_sk-...``) is still a token.
+_rule(("sk-",), r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_\-]{8,}\b", "sk-***")  # OpenAI sk-/sk-proj-, OpenRouter sk-or-v1-, Anthropic sk-ant-
+_rule(("_live_", "_test_"), r"(?<![A-Za-z0-9])((?:sk|rk)_(?:live|test)_)[A-Za-z0-9]{8,}\b", r"\1***")  # Stripe
+_rule(("whsec_",), r"(?<![A-Za-z0-9])(whsec_)[A-Za-z0-9]{16,}\b", r"\1***")
+_rule(("ghp_", "gho_", "ghu_", "ghs_", "ghr_"), r"(?<![A-Za-z0-9])(gh[pousr]_)[A-Za-z0-9]{20,}\b", r"\1***")  # GitHub
+_rule(("github_pat_",), r"(?<![A-Za-z0-9])(github_pat_)[A-Za-z0-9_]{20,}\b", r"\1***")
 _rule(tuple(f"gl{kind}-" for kind in ("pat", "ptt", "rt", "dt", "oas", "cbt", "imt", "ft", "soat", "agent")),
-      r"\b(gl(?:pat|ptt|rt|dt|oas|cbt|imt|ft|soat|agent)-)[A-Za-z0-9_.-]{16,}", r"\1***")  # GitLab
-_rule(("xox", "xapp-"), r"\b(xox[abeprs]-|xapp-)[A-Za-z0-9-]{8,}", r"\1***")  # Slack
+      r"(?<![A-Za-z0-9])(gl(?:pat|ptt|rt|dt|oas|cbt|imt|ft|soat|agent)-)[A-Za-z0-9_.-]{16,}", r"\1***")  # GitLab
+_rule(("xox", "xapp-"), r"(?<![A-Za-z0-9])(xox[abeprs]-|xapp-)[A-Za-z0-9-]{8,}", r"\1***")  # Slack
 _rule(("akia", "asia", "agpa", "aida", "aipa", "anpa", "anva", "aroa"),
-      r"\b((?:AKIA|ASIA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA))[A-Z0-9]{16}\b", r"\1***")  # AWS key ids
-_rule(("aiza",), r"\b(AIza)[0-9A-Za-z_-]{30,}", r"\1***")  # Google API keys
-_rule(("ya29.", "gocspx-"), r"\b(ya29\.|GOCSPX-)[0-9A-Za-z_-]{20,}", r"\1***")  # Google OAuth
-_rule(("hf_", "api_org_"), r"\b(hf_|api_org_)[A-Za-z0-9]{20,}\b", r"\1***")  # Hugging Face
-_rule(("npm_",), r"\b(npm_)[A-Za-z0-9]{30,}\b", r"\1***")
-_rule(("pypi-",), r"\b(pypi-)AgEIcHlwaS5vcmc[A-Za-z0-9_-]{20,}", r"\1***")
-_rule(("eyj",), r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*", "eyJ***")  # JWT
+      r"(?<![A-Za-z0-9])((?:AKIA|ASIA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA))[A-Z0-9]{16}\b", r"\1***")  # AWS key ids
+_rule(("aiza",), r"(?<![A-Za-z0-9])(AIza)[0-9A-Za-z_-]{30,}", r"\1***")  # Google API keys
+_rule(("ya29.", "gocspx-"), r"(?<![A-Za-z0-9])(ya29\.|GOCSPX-)[0-9A-Za-z_-]{20,}", r"\1***")  # Google OAuth
+_rule(("hf_", "api_org_"), r"(?<![A-Za-z0-9])(hf_|api_org_)[A-Za-z0-9]{20,}\b", r"\1***")  # Hugging Face
+_rule(("npm_",), r"(?<![A-Za-z0-9])(npm_)[A-Za-z0-9]{30,}\b", r"\1***")
+_rule(("pypi-",), r"(?<![A-Za-z0-9])(pypi-)AgEIcHlwaS5vcmc[A-Za-z0-9_-]{20,}", r"\1***")
+_rule(("eyj",), r"(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*", "eyJ***")  # JWT
 
 # --- Key/value pairs: JSON, env/.env, YAML, URL query strings, CLI assignments -------------------
 # A key stem need not start at a word boundary (DB_PASSWORD, client_secret, X-Api-Key, SessionToken).
