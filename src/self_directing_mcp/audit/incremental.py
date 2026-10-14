@@ -35,7 +35,7 @@ from bisect import bisect_left
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES
 from self_directing_mcp.audit import runner
 from self_directing_mcp.audit.applicability import PROPOSED_CALL_PREFIX, not_applicable_reason
-from self_directing_mcp.request_control import check_request, current_request
+from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request, current_request
 from self_directing_mcp.schemas import Evidence, Finding
 from self_directing_mcp.security.mask import mask_secrets
 
@@ -67,6 +67,24 @@ class NeedFull(Exception):
     def __init__(self, reason):
         super().__init__(reason)
         self.reason = reason
+
+
+class RegexTimeout(Exception):
+    """A contract pattern ran out of time on some text. (Stand-in: when guarded patterns exist, ``TIMEOUTS`` names
+    their exception and ``_compile`` returns their compiled form; nothing else in this module changes.)"""
+
+
+TIMEOUTS = (RegexTimeout,)
+
+
+def _compile(pattern):
+    """The only place this module compiles a contract pattern (same flags as the reference evaluator).
+
+    A pattern that times out never produces a finding or a stored state here: the monitor is dropped for the run
+    (``RuleMonitor.timed_out``), the rule is judged by the full evaluator, and ``AuditPlan.evaluate`` is the one
+    place that handles it.
+    """
+    return re.compile(pattern, re.IGNORECASE | re.MULTILINE)
 
 
 def _k(value):
@@ -301,14 +319,14 @@ class RuleMonitor:
         self.regex = self.trigger = self.when_re = None
         self.regex_invalid = self.when_invalid = False
         try:
-            self.regex = re.compile(rule.regex, re.IGNORECASE | re.MULTILINE)
-            self.trigger = re.compile(rule.before_regex, re.IGNORECASE | re.MULTILINE) if rule.before_regex else None
+            self.regex = _compile(rule.regex)
+            self.trigger = _compile(rule.before_regex) if rule.before_regex else None
         except re.error:
             self.regex = self.trigger = None
             self.regex_invalid = True
         if rule.when is not None:
             try:
-                self.when_re = re.compile(rule.when.tool_call_regex, re.IGNORECASE | re.MULTILINE)
+                self.when_re = _compile(rule.when.tool_call_regex)
             except re.error:
                 self.when_invalid = True
         self.static_unknown = self.regex_invalid or self.when_invalid
@@ -332,6 +350,7 @@ class RuleMonitor:
         self.overflow = None
         self.dirty = False
         self.new = False  # built from nothing in this run
+        self.timed_out = False  # a pattern timed out on some text: no verdict and no state from this monitor
         if not (self.agy or self.when_re or self.src_id or self.from_id) and not self.static_unknown:
             # No anchors, no `when`, no provider classes: the plain path does the same as ``feed`` with less work.
             self.feed = self._feed_forbidden if self.is_must_not else self._feed_required
@@ -566,7 +585,7 @@ class RuleMonitor:
             exception = None
             if rule.exception_regex:
                 try:
-                    exception = re.compile(rule.exception_regex, re.IGNORECASE | re.MULTILINE)
+                    exception = _compile(rule.exception_regex)
                 except re.error:
                     return self._make("unknown", "invalid exception_regex",
                                       basis=f"{rule.id}.exception_regex failed to compile"), {}
@@ -686,7 +705,7 @@ class RuleMonitor:
     def _attempt_hits(self, item, blocked):
         rule = self.rule
         try:
-            exception = re.compile(rule.exception_regex, re.IGNORECASE | re.MULTILINE) if rule.exception_regex else None
+            exception = _compile(rule.exception_regex) if rule.exception_regex else None
         except re.error:
             return
         gone = sum(1 for key, (_name, text) in blocked.items()
@@ -756,9 +775,11 @@ def wants_call_index(active, provider) -> bool:
 class PlanRetry(Exception):
     """A delta run met an input its summaries cannot hold; run again with these rules on the full evaluator."""
 
-    def __init__(self, ids, reason, plan=None):
+    def __init__(self, ids, reason, plan=None, health=None, drop=False):
         super().__init__(reason)
-        self.ids, self.reason, self.plan = frozenset(ids), reason, plan
+        # ``health``: a status to record for these rules ("error"), so a defect is not hit again on every audit.
+        # ``drop``: delete these rules' stored states (a pattern timed out: nothing of that run may be reused).
+        self.ids, self.reason, self.plan, self.health, self.drop = frozenset(ids), reason, plan, health, drop
 
 
 def _shadow_affordable(events) -> bool:
@@ -782,15 +803,19 @@ def fold(events, monitors, facts, pools):
     ``(facts, offset)`` or ``None``); a consumer skips events whose record starts before its offset."""
     shared, shared_offset = facts if facts is not None else (None, 0)
     shared_on = shared is not None and not shared.overflow
-    feeds = [(monitor.feed, offset) for monitor, offset in monitors]
+    feeds = [(monitor.feed, offset, monitor) for monitor, offset in monitors]
     note = pools.note if pools.track_calls or pools.track_proposals else None
     for number, event in enumerate(events):
         if not number & 511:
             check_request()
         start = event.key[0]
-        for feed, offset in feeds:
+        for feed, offset, monitor in feeds:
             if start >= offset:
-                feed(event, pools)
+                try:
+                    feed(event, pools)
+                except TIMEOUTS:
+                    # Marked here, handled in ``AuditPlan.evaluate``; the monitor takes no more events.
+                    monitor.timed_out = monitor.inert = True
         if shared_on and start >= shared_offset:
             shared.feed(event, pools)
             shared_on = not shared.overflow
@@ -822,7 +847,7 @@ class AuditPlan:
         self.support, self.snapshot, self.shadow = support, snapshot, shadow
         self.digest, self.parser_version, self.report = digest, parser_version, report
         self.fed = False
-        self.overflowed = {}
+        self.overflowed, self.errors, self.timeouts = {}, {}, set()
 
     # --- preparation (inside the read boundary) ---
 
@@ -873,14 +898,24 @@ class AuditPlan:
             return None
 
         routes, rebuilds, deltas = {}, {}, {}
+        counts = {}
+        for rule in history:
+            counts[rule.id] = counts.get(rule.id, 0) + 1
         for rule in history:
             if rule.id in health:
                 routes[rule.id] = "health:" + health[rule.id][0]
             elif rule.id in force_full:
                 routes[rule.id] = "fallback"
+            elif counts[rule.id] > 1 or rule.id.startswith("#"):
+                routes[rule.id] = "contract id is not unique or reserved"
             else:
                 row = states.get(rule.id)
                 why = reject(row, rule_fingerprint(rule, provider, parser_version, digest), rule.revision)
+                if why is None:
+                    try:
+                        RuleMonitor(rule, provider).load(row["state"])
+                    except (KeyError, TypeError, ValueError, IndexError):
+                        why = "corrupt_state"  # an unreadable cache is no cache
                 if why is None:
                     deltas[rule.id] = row
                 elif why == "overflow":
@@ -893,8 +928,12 @@ class AuditPlan:
             row = states.get("#facts")
             facts_why = reject(row, facts_fingerprint(provider, parser_version, digest))
             if facts_why is None:
-                facts.load(row["state"])
-                facts_row = row
+                try:
+                    facts.load(row["state"])
+                except (KeyError, TypeError, ValueError, IndexError):
+                    facts, facts_why = make_facts(provider, needs, history), "corrupt_state"
+                else:
+                    facts_row = row
             elif facts_why == "overflow":
                 for rule in history:
                     if rule.id not in routes:
@@ -1029,8 +1068,15 @@ class AuditPlan:
         if self.fed:
             return
         self.fed = True
-        fold(self.events, [(monitor, self.offsets[monitor.rule.id]) for monitor in self.monitors.values()],
-             (self.facts, self.facts_offset) if self.facts.needed else None, self.pools)
+        try:
+            fold(self.events, [(monitor, self.offsets[monitor.rule.id]) for monitor in self.monitors.values()],
+                 (self.facts, self.facts_offset) if self.facts.needed else None, self.pools)
+        except (RequestStopped, IndexBusy):
+            raise
+        except Exception as exc:
+            if self.mode != "full":
+                raise PlanRetry(self.monitors, "monitor_error:" + type(exc).__name__, None, "error") from exc
+            raise
 
     def evaluate(self, active, *, proposed, coverage):
         self.load(active)
@@ -1038,15 +1084,33 @@ class AuditPlan:
         reference, free = [], []
         for index, rule in enumerate(active):
             monitor = self.monitors.get(rule.id)
-            if monitor is not None:
+            if monitor is not None and monitor.timed_out:
+                self.timeouts.add(rule.id)
+                if self.mode != "full":
+                    raise PlanRetry({rule.id}, "regex_timeout", None, None, drop=True)
+                reference.append(index)
+            elif monitor is not None:
                 try:
                     findings[index] = monitor.finding(proposed, self.facts)
                     continue
+                except (RequestStopped, IndexBusy):
+                    raise
+                except TIMEOUTS as exc:
+                    monitor.timed_out = True
+                    self.timeouts.add(rule.id)
+                    if self.mode != "full":
+                        raise PlanRetry({rule.id}, "regex_timeout", None, None, drop=True) from exc
+                    reference.append(index)
                 except NeedFull as exc:
                     monitor.overflow = monitor.overflow or exc.reason
                     if self.mode != "full":
                         raise PlanRetry({rule.id}, exc.reason, self) from exc
                     self.overflowed[rule.id] = exc.reason
+                    reference.append(index)
+                except Exception as exc:  # a defect in a monitor: answer from the reference and stop trusting it
+                    self.errors[rule.id] = "monitor_error:" + type(exc).__name__
+                    if self.mode != "full":
+                        raise PlanRetry({rule.id}, self.errors[rule.id], None, "error") from exc
                     reference.append(index)
             elif rule.id in self.history_ids:
                 reference.append(index)
@@ -1082,6 +1146,8 @@ class AuditPlan:
         """Monitor and facts states to store at the evaluated cursor (only those that advanced)."""
         rows = []
         for rule_id, monitor in self.monitors.items():
+            if rule_id in self.errors or monitor.timed_out:
+                continue
             if monitor.dirty or monitor.new or monitor.overflow:
                 rows.append({"monitor_id": rule_id, "contract_revision": monitor.rule.revision,
                              "fingerprint": rule_fingerprint(monitor.rule, self.provider, self.parser_version, self.digest),

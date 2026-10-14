@@ -716,6 +716,15 @@ class SessionStore:
                                    (provider, session_id, monitor_id))
             check_request()
 
+    def drop_audit_states(self, session_id, provider, monitor_ids):
+        """Forget stored monitor states (all needs variants) without marking the contract unhealthy."""
+        with self._conn, publication():
+            self._conn.execute("BEGIN IMMEDIATE")
+            for monitor_id in monitor_ids:
+                self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND monitor_id=?",
+                                   (provider, session_id, monitor_id))
+            check_request()
+
     def save_audit_states(self, session_id, provider, needs_digest, rows, snapshot):
         """Write monitor states and the evaluated cursor in one transaction; returns ``"saved"`` or why not.
 

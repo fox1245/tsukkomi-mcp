@@ -551,10 +551,16 @@ class SelfDirectEngine:
                     needs, link_calls = audit_needs(active, planned)
                     if use_plan:
                         report = {key: value for key, value in report.items() if key == "retry"}
-                        plan = incremental.AuditPlan.prepare(
-                            self.store, session_id=sid, provider=provider, active=active, planned=planned, needs=needs,
-                            link_calls=link_calls,
-                            shadow_every=self.settings.audit_shadow_every, force_full=force_full, report=report)
+                        try:
+                            plan = incremental.AuditPlan.prepare(
+                                self.store, session_id=sid, provider=provider, active=active, planned=planned,
+                                needs=needs, link_calls=link_calls, shadow_every=self.settings.audit_shadow_every,
+                                force_full=force_full, report=report)
+                        except (RequestStopped, IndexBusy):
+                            raise
+                        except Exception as exc:  # the cache could not even be read: evaluate everything in full
+                            plan = None
+                            report.update(mode="full", fallback={"*": "prepare_failed:" + type(exc).__name__})
                     if plan is not None:
                         evidence = AuditEventSnapshot(sid, provider, tuple(plan.events), plan.count)
                     else:
@@ -581,13 +587,18 @@ class SelfDirectEngine:
                 # the limit is remembered so later audits do not fail the same way.
                 force_full = retry.ids
                 report = {"retry": {"rules": sorted(retry.ids), "reason": retry.reason}}
-                if retry.plan is not None:
-                    try:
-                        with self._publication_guard():
+                try:
+                    with self._publication_guard():
+                        if retry.plan is not None:
                             self.store.save_audit_states(sid, provider, retry.plan.digest,
                                                          retry.plan.overflow_rows(), retry.plan.snapshot)
-                    except (sqlite3.Error, OSError):
-                        pass
+                        if retry.drop:
+                            self.store.drop_audit_states(sid, provider, sorted(retry.ids))
+                        if retry.health:
+                            self.store.record_audit_health(sid, provider, incremental.EVALUATOR_VERSION,
+                                                           [*sorted(retry.ids), "#facts"], retry.health, retry.reason)
+                except (sqlite3.Error, OSError):
+                    pass
                 if attempt:
                     raise
                 continue
@@ -602,11 +613,11 @@ class SelfDirectEngine:
                 result = full
                 ids = sorted({item.contract_id for item in full.findings} & set(plan.monitors)
                              if mismatch == ["#audit"] else set(mismatch))
-                report["mismatch"] = ids
+                report["incremental_mismatch"] = ids
                 try:
                     with self._publication_guard():
                         self.store.record_audit_health(
-                            sid, provider, incremental.EVALUATOR_VERSION, [*ids, "#facts"], "mismatch",
+                            sid, provider, incremental.EVALUATOR_VERSION, [*ids, "#facts"], "incremental_mismatch",
                             "incremental result differed from the full evaluator at byte "
                             f"{plan.snapshot['offset']}")
                 except (sqlite3.Error, OSError):
@@ -687,6 +698,8 @@ class SelfDirectEngine:
             payload["requires_attention"] = payload["verdict"] != "clean"
             if plan is not None and not mismatch:
                 try:
+                    if plan.timeouts:
+                        self.store.drop_audit_states(sid, provider, sorted(plan.timeouts))
                     rows = plan.state_rows()
                     report["state"] = (self.store.save_audit_states(sid, provider, plan.digest, rows, plan.snapshot)
                                        if rows else "unchanged")

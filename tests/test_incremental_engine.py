@@ -265,22 +265,22 @@ def test_a_shadow_mismatch_returns_the_full_result_and_disables_that_contract(co
     answer = twin.fast.audit_session(SID, provider="codex")
     reference = twin.full.audit_session(SID, provider="codex")
     assert stable(answer) == stable(reference) and answer["verdict"] == "clean"
-    assert answer["incremental"]["mismatch"] == ["no-deploy"] and answer["incremental"]["shadow_compared"]
+    assert answer["incremental"]["incremental_mismatch"] == ["no-deploy"] and answer["incremental"]["shadow_compared"]
     health = twin.fast.store._conn.execute("SELECT status FROM audit_incremental_health WHERE monitor_id='no-deploy'").fetchall()
-    assert [row[0] for row in health] == ["mismatch"]
+    assert [row[0] for row in health] == ["incremental_mismatch"]
     assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_monitor_state WHERE monitor_id='no-deploy'").fetchone()[0] == 0
     # From now on that contract is evaluated in full, in this process and after a restart.
     twin.fast.settings.audit_shadow_every = 0
     write(path, [call("echo more", "more")], "a")
     answer = twin.fast.audit_session(SID, provider="codex")
-    assert answer["incremental"]["fallback"]["no-deploy"] == "health:mismatch"
+    assert answer["incremental"]["fallback"]["no-deploy"] == "health:incremental_mismatch"
     assert stable(answer) == stable(twin.full.audit_session(SID, provider="codex"))
     twin.fast.close()
     reopened = SelfDirectEngine(twin.fast.settings)
     try:
         write(path, [call("echo once more", "again2")], "a")
         answer = reopened.audit_session(SID, provider="codex")
-        assert answer["incremental"]["fallback"]["no-deploy"] == "health:mismatch"
+        assert answer["incremental"]["fallback"]["no-deploy"] == "health:incremental_mismatch"
         # A new evaluator version is a new chance.
         monkeypatch.setattr(inc, "EVALUATOR_VERSION", inc.EVALUATOR_VERSION + 1)
         write(path, [call("echo and again", "again3")], "a")
@@ -461,3 +461,90 @@ def test_a_shadow_run_is_skipped_when_the_request_cannot_afford_it(codex, monkey
     write(path, codex_records(rng, 3, numbered), "a")
     answer = twin.fast.audit_session(SID, provider="codex")
     assert answer["incremental"]["shadow"] is True and answer["incremental"]["shadow_compared"] is True
+
+
+def test_a_defect_in_a_monitor_never_costs_an_answer(codex, monkeypatch):
+    twin, path = codex
+    rng = random.Random(14)
+    numbered = []
+    write(path, codex_records(rng, 25, numbered), "a")
+    twin.upsert(RULES)
+    twin.audit(SID)
+    write(path, codex_records(rng, 4, numbered), "a")
+    real = inc.RuleMonitor._feed_forbidden
+
+    def broken(self, event, pools):
+        raise RuntimeError("synthetic defect")
+
+    monkeypatch.setattr(inc.RuleMonitor, "_feed_forbidden", broken)
+    answer = twin.fast.audit_session(SID, provider="codex")
+    assert stable(answer) == stable(twin.full.audit_session(SID, provider="codex"))
+    assert answer["incremental"]["retry"]["reason"] == "monitor_error:RuntimeError"
+    rows = twin.fast.store._conn.execute("SELECT status FROM audit_incremental_health WHERE monitor_id='no-deploy'").fetchall()
+    assert [r[0] for r in rows] == ["error"]
+    # Remembered: the broken monitors are not tried again, and the answers stay right.
+    monkeypatch.setattr(inc.RuleMonitor, "_feed_forbidden", real)
+    write(path, codex_records(rng, 3, numbered), "a")
+    answer = twin.fast.audit_session(SID, provider="codex")
+    assert stable(answer) == stable(twin.full.audit_session(SID, provider="codex"))
+    assert answer["incremental"]["fallback"]["no-deploy"] == "health:error"
+
+
+def test_a_cache_that_cannot_be_read_falls_back_to_the_full_evaluation(codex, monkeypatch):
+    import sqlite3
+    twin, path = codex
+    rng = random.Random(15)
+    numbered = []
+    write(path, codex_records(rng, 25, numbered), "a")
+    twin.upsert(RULES)
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("synthetic")
+
+    monkeypatch.setattr(type(twin.fast.store), "audit_lineage", boom)
+    answer = twin.fast.audit_session(SID, provider="codex")
+    assert stable(answer) == stable(twin.full.audit_session(SID, provider="codex"))
+    assert answer["incremental"]["fallback"] == {"*": "prepare_failed:OperationalError"}
+
+
+@pytest.mark.parametrize("where", ["feed", "finding"])
+@pytest.mark.parametrize("warm", [True, False])
+def test_a_pattern_timeout_is_no_verdict_and_no_state(codex, monkeypatch, where, warm):
+    """A contract pattern that runs out of time never yields a finding or a stored state from the monitor: the rule
+    is judged by the full evaluator, its stored state is dropped, and nothing is marked unhealthy."""
+    twin, path = codex
+    rng = random.Random(16)
+    numbered = []
+    write(path, codex_records(rng, 25, numbered), "a")
+    twin.upsert(RULES)
+    if warm:
+        twin.audit(SID)
+        write(path, codex_records(rng, 4, numbered), "a")
+    real_feed, real_finding = inc.RuleMonitor._feed_forbidden, inc.RuleMonitor.finding
+
+    def feed(self, event, pools):
+        if self.rule.id == "no-deploy":
+            raise inc.RegexTimeout()
+        return real_feed(self, event, pools)
+
+    def finding(self, proposed, facts):
+        if self.rule.id == "no-deploy":
+            raise inc.RegexTimeout()
+        return real_finding(self, proposed, facts)
+
+    monkeypatch.setattr(inc.RuleMonitor, "_feed_forbidden" if where == "feed" else "finding",
+                        feed if where == "feed" else finding)
+    answer = twin.fast.audit_session(SID, provider="codex")
+    assert stable(answer) == stable(twin.full.audit_session(SID, provider="codex"))
+    stored = {row[0] for row in twin.fast.store._conn.execute("SELECT monitor_id FROM audit_monitor_state")}
+    assert "no-deploy" not in stored and stored - {"#facts"}, stored
+    assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_incremental_health").fetchone()[0] == 0
+    if warm:
+        assert answer["incremental"]["retry"]["reason"] == "regex_timeout"
+    monkeypatch.undo()
+    write(path, codex_records(rng, 3, numbered), "a")
+    answer = twin.fast.audit_session(SID, provider="codex")
+    assert stable(answer) == stable(twin.full.audit_session(SID, provider="codex"))
+    assert set(answer["incremental"]["rebuilt"]) == {"no-deploy"} and answer["incremental"]["mode"] == "full"
+    write(path, codex_records(rng, 3, numbered), "a")
+    assert twin.fast.audit_session(SID, provider="codex")["incremental"]["mode"] == "delta"

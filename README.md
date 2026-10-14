@@ -423,14 +423,14 @@ evaluation, which remains the reference. The audit still runs through the native
   reindexes then.
 - **Shadow verification.** About every `SELF_DIRECT_AUDIT_SHADOW_EVERY`th audit (default 16; `1` compares every audit,
   `0` only after state was rebuilt) also runs the full evaluator on the same events and compares findings, verdict, notes,
-  coverage and trace. On a difference the **full result is returned**, `incremental.mismatch` names the contracts, an
-  `incremental_mismatch` row is written to `audit_incremental_health` and that contract is evaluated in full in that session
+  coverage and trace. On a difference the **full result is returned**, `incremental.incremental_mismatch` names the contracts, a row with status
+  `incremental_mismatch` is written to `audit_incremental_health` and that contract is evaluated in full in that session
   until the evaluator version changes. The comparison is skipped (`incremental.shadow_skipped: "deadline"`) when the request's
   remaining time budget could not cover the full evaluation. The test suite compares every audit and fails on any
   difference.
 - **Reporting.** Results carry an `incremental` object: `mode` (`delta` reads only appended events, `full` reads all),
   `events_read`, `rebuilt` (contract to reason), `fallback` (contracts on full evaluation and why), `shadow`,
-  `shadow_compared`, `mismatch`, `retry` and `state`. `SELF_DIRECT_AUDIT_INCREMENTAL=false` switches the whole feature off.
+  `shadow_compared`, `incremental_mismatch`, `retry` and `state`. `SELF_DIRECT_AUDIT_INCREMENTAL=false` switches the whole feature off.
 - **What it does not do.** It does not make an unknown clean and does not change coverage: unread bytes, parse errors,
   unsupported events and rewrites are judged by the unchanged ingestion and coverage code, and a state describes the index,
   not the source file. The source verification (hashing) that precedes every audit is a separate cost; see

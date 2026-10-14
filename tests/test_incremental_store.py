@@ -317,3 +317,26 @@ def test_a_state_write_is_refused_when_the_index_moved(tmp_path):
     harness.store._conn.execute("DELETE FROM session_commit_log WHERE session_id=? AND byte_offset=?", (SID, plan.snapshot["offset"]))
     harness.store._conn.commit()
     assert harness.store.save_audit_states(SID, "codex", plan.digest, plan.state_rows(), plan.snapshot) == "stale_lineage"
+
+
+# --- a cache that is wrong, unreadable or reserved never costs an answer ----------------------------------------
+
+def test_an_unreadable_state_row_is_a_rebuild_not_a_failure(tmp_path):
+    rng, session, rules, harness, n = warm(tmp_path)
+    harness.commit(session.events[n:n + 3])
+    with harness.store._conn:
+        harness.store._conn.execute("UPDATE audit_monitor_state SET state='{\"truncated\": true}' WHERE monitor_id='r1'")
+        harness.store._conn.execute("UPDATE audit_monitor_state SET state='not json at all' WHERE monitor_id='r2'")
+    _r, report, _ = harness.audit(rules)
+    assert report["rebuilt"]["r1"] == "corrupt_state" and report["rebuilt"]["r2"] == "no_state", report
+    _r, report, _ = harness.audit(rules)
+    assert report["mode"] == "delta" and not report["rebuilt"], report
+
+
+def test_duplicate_and_reserved_contract_ids_are_judged_in_full(tmp_path):
+    rng, session, rules, harness, n = warm(tmp_path)
+    twin = rules[0].model_copy(update={"regex": "alpha|beta|gamma"})
+    reserved = rules[1].model_copy(update={"id": "#facts"})
+    _r, report, plan = harness.audit([twin, rules[0], reserved, *rules[2:]])
+    assert report["fallback"][rules[0].id] == "contract id is not unique or reserved"
+    assert report["fallback"]["#facts"] == "contract id is not unique or reserved", report
