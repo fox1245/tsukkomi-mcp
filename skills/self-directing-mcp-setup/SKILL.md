@@ -46,7 +46,7 @@ uv pip install -e . --python .venv/bin/python
 ```
 
 Key installed packages:
-- `neograph-engine==0.12.1` (C++ graph agent execution engine)
+- `neograph-engine==0.14.0` (C++ graph agent execution engine)
 - `mcp>=1.0,<2` (Model Context Protocol SDK / FastMCP)
 - `pydantic>=2.0` & `pydantic-settings`
 - `numpy>=1.26`
