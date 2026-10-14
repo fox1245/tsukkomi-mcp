@@ -654,7 +654,7 @@ def test_v7b_runtime_origins(local_engine):
             _ASSIST({"type": "redactedThinking", "data": "x"}))
     _check_read(engine, file)
     usage, branch, red = _new_chunks(engine)
-    assert all(c.kind == "meta" and c.meta["role"] == "runtime" and not c.meta["unsupported_event"]
+    assert all(c.kind == "meta" and c.meta["role"] == "runtime" and not c.meta.get("unsupported_event")
                for c in (usage, branch, red))
     assert usage.meta["evidence_origin"] == "model_usage" and branch.meta["evidence_origin"] == "branch_summary"
     assert red.meta["evidence_origin"] == "thinking" and red.text == "[redacted_thinking]"
