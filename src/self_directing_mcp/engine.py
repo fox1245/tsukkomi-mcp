@@ -39,8 +39,7 @@ from self_directing_mcp import omp, agy, claude
 from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
 from self_directing_mcp.index.ingest import (
-    AmbiguousSessionSource, AuditEventSnapshot, SessionStore, coverage_from_capture, current_parser_version,
-    ingest_session,
+    AmbiguousSessionSource, AuditEventSnapshot, SessionStore, coverage_from_capture, ingest_session,
 )
 from self_directing_mcp.index.sparse import SparseIndex
 from self_directing_mcp.index.vector import build_vector_index
