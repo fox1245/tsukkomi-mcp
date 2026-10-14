@@ -148,6 +148,30 @@ def prefix_note(coverage) -> str:
             f"{coverage.get('unread_bytes', 0)} appended byte(s) were not reviewed.")
 
 
+ABSENCE_UNPROVEN = "incomplete evidence cannot prove the absence of a forbidden match"
+TRIGGER_UNPROVEN = "incomplete evidence cannot prove that no triggering action occurred"
+
+
+def downgrade_unproven_clean(rules, findings) -> bool:
+    """Format drift: with incomplete coverage an absence proof of a history audit is unknown, not clean.
+
+    An unsupported, unparsed or unread record may hold the forbidden match (``must_not``) or the triggering action
+    of an order rule (``before_regex``). A ``clean`` that rests on observed positive evidence (a satisfied
+    prerequisite) is not touched, and neither is a confirmed violation found anywhere else.
+    """
+    changed = False
+    for rule, item in zip(rules, findings):
+        if item.verdict != "clean" or item.applicability != "applicable":
+            continue
+        why = (ABSENCE_UNPROVEN if rule.type == "must_not"
+               else TRIGGER_UNPROVEN if rule.before_regex and item.reason.startswith("no triggering action") else None)
+        if why:
+            item.verdict, item.reason = "unknown", why
+            item.basis = (item.basis or "") + "; incomplete coverage prevents proving absence"
+            changed = True
+    return changed
+
+
 def downgrade_unproven_absence(findings, rules) -> bool:
     """Late growth: a missing/failed obligation cannot be proven when bytes are unread. Dict findings."""
     kinds = {rule.id: rule.type for rule in rules}
@@ -419,6 +443,8 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
                     item.reason = "incomplete evidence cannot prove a missing or failed obligation"
                     item.basis = (item.basis or "") + "; incomplete coverage prevents proving absence"
             downgrade_unproven_inapplicability(findings)
+            if proposed is None and not coverage.get("judged_prefix"):
+                downgrade_unproven_clean(active, findings)
         overall = "clean"
         for item in _checked(findings):
             overall = _worse(overall, item.verdict)

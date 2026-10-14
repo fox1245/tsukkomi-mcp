@@ -356,6 +356,15 @@ Set `SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR` (or `grokbot_transcripts_dir` in TOML)
 
 Audit and `check_action` results also carry `requires_attention`, which is `true` whenever the verdict is not `clean`.
 
+### Format drift: unsupported records
+
+A record the parser does not know (an unsupported record type or step, a parse error) is kept visible and makes `coverage.complete` false (`unsupported_events`, `parse_errors`). It may hold the forbidden call or the commit an order rule waits for, so a history audit does not vouch for the records it could not read:
+
+- A `must_not` with no match and a `before_regex` rule with no triggering action are `unknown` (reasons `incomplete evidence cannot prove the absence of a forbidden match` / `... that no triggering action occurred`), and so is the overall verdict.
+- A `must` obligation that rests on missing evidence is `unknown` (as before), and a proposed action's `before_regex` / `requires_success` prerequisite cannot be established by incomplete history.
+- A violation confirmed from the parsed evidence stays a violation, in the findings and overall; a proposed action that matches a prohibition is a violation whatever the history coverage; a `clean` that rests on positive evidence (a satisfied prerequisite) is not touched.
+- Appended, unread bytes are not drift: they keep the `judged_prefix` behaviour below.
+
 ### Growing sessions
 
 Agents append to their own session file while they work, so an audit usually sees a file that is still growing. The audit judges the bytes captured at the start and says so.
