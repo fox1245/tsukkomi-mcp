@@ -173,10 +173,17 @@ def capture_source(path: Path, *, checkpoints=()) -> SourceObservation:
         length = before.st_size
         full_digest, boundary, states = _hash_prefix(stream, length, checkpoints)
         after = os.fstat(stream.fileno())
-    if _identity(after) != _identity(before) or after.st_size < length:
+    path_stamp = source_stamp(path)
+    # Some runtimes (e.g. 9p/drvfs) give stat and fstat different ctime semantics. Compare full stamps
+    # within each API, and only identity, size and mtime across them. validate() later compares stat to
+    # stat, so the observation keeps the path stamp.
+    if (_identity(after) != _identity(before) or after.st_size < length
+            or path_stamp[:2] != _identity(after) or path_stamp[2] < after.st_size
+            or (path_stamp[2] == after.st_size and path_stamp[3] != after.st_mtime_ns)):
         raise ValueError("source changed during preparation")
-    observation = SourceObservation(path, _stamp(after), length, boundary, full_digest, states)
-    if after.st_size == length:
+    observation = SourceObservation(path, path_stamp, length, boundary, full_digest, states)
+    observation._verified_stamp = _stamp(after)
+    if after.st_size == length and path_stamp[2] == length:
         if _stamp(after) != _stamp(before):
             raise ValueError("source changed during preparation")  # same size, new mtime: rewritten in place
     else:
