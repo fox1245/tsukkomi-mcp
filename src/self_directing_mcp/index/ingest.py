@@ -134,7 +134,7 @@ def prefix_digest(path: Path, length: int) -> str:
 
 
 class RowSpool:
-    """Prepared event rows spooled to disk (memory below 8 MiB); parsers append, publication replays in batches."""
+    """Prepared event rows spooled to disk (memory below 1 MiB); parsers append, publication replays in batches."""
 
     def __init__(self):
         self._file = tempfile.SpooledTemporaryFile(max_size=1 << 20, mode="w+", encoding="utf-8", newline="\n")
@@ -652,11 +652,25 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
     other sessions reparse lazily, each on its own first sync, never in a storm.
     """
     with session_flight((str(store.db_path), provider, str(Path(path).resolve()))):
-        return _ingest_session(path=path, session_id=session_id, store=store, sparse=sparse, dense=dense,
-                               embedder=embedder, provider=provider, embed=embed, derived=derived, guard=guard)
+        seen = []
+        for _ in range(_RECAPTURE_ATTEMPTS):
+            try:
+                return _ingest_session(path=path, session_id=session_id, store=store, sparse=sparse, dense=dense,
+                                       embedder=embedder, provider=provider, embed=embed, derived=derived,
+                                       guard=guard, seen=seen)
+            except _StaleObservation:
+                continue  # another process published past our capture: observe the file again
+        raise ValueError("source changed during preparation")
 
 
-def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard):
+_RECAPTURE_ATTEMPTS = 3
+
+
+class _StaleObservation(Exception):
+    """The committed cursor lies beyond the captured prefix: our capture predates another process's publication."""
+
+
+def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard, seen):
     if embed and (dense is None or embedder is None):
         raise ValueError("embedding unavailable in local-only mode")
     if provider == "agy":
@@ -702,6 +716,13 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 if (receipt_authority_before[0] != "present"
                         or receipt_authority_before[2] != receipt_store.rows_digest(receipt_capture[0])):
                     raise ValueError("receipt authority changed during capture")
+        if cursor and cursor["path"] == str(path) and type(cursor["byte_offset"]) is int \
+                and cursor["byte_offset"] > observation.length:
+            # Never rewind a newer cursor from an older capture. Only a recapture that is still shorter than
+            # the cursor we already saw is a genuine truncation, which reindexes below as before.
+            if not seen or observation.length >= seen[-1]:
+                seen.append(cursor["byte_offset"])
+                raise _StaleObservation()
         parser_version = current_parser_version(provider)
         start = cursor["byte_offset"] if cursor else 0
         reindexed, reindex_reason = False, None
