@@ -5,6 +5,9 @@ import json
 import re
 from bisect import bisect_left, bisect_right
 
+from self_directing_mcp.audit.applicability import (
+    INVALID, UNMET, downgrade_unproven_inapplicability, not_applicable_reason, when_needs, when_state,
+)
 from self_directing_mcp.retrieve.checks import scope_matches
 from self_directing_mcp.schemas import AuditResult, Evidence, Finding
 from self_directing_mcp.security.mask import mask_secrets
@@ -80,7 +83,8 @@ def _key(value):
 def audit_needs(active, proposed):
     """What the history reader must keep text for: ``(scope, roles)`` pairs and whether call linkage is used."""
     rules = [r for r in active if r.regex and (r.type == "must" or proposed is None)]
-    return [(r.scope, tuple(r.roles)) for r in rules], any(r.requires_success for r in rules)
+    needs = [(r.scope, tuple(r.roles)) for r in rules] + when_needs(rules)
+    return needs, any(r.requires_success for r in rules)
 
 
 class _Presence:
@@ -130,10 +134,11 @@ class _Presence:
 def audit_contract(rule, *, session_id, store, retriever=None, provider=None, proposed=None, chunks=None):
     """Regex checks operate on events. Retrieval ranks are never verification evidence."""
     check_request()
-    def finding(verdict, reason, items=None, basis=None):
+    def finding(verdict, reason, items=None, basis=None, applicability="applicable"):
         check_request()
         return Finding(contract_id=rule.id, contract_revision=rule.revision, severity=rule.severity,
-                       verdict=verdict, reason=reason, evidence=items or [], basis=basis)
+                       verdict=verdict, reason=reason, evidence=items or [], basis=basis,
+                       applicability=applicability)
 
     if not rule.enabled:
         return finding("clean", "contract disabled")
@@ -153,6 +158,12 @@ def audit_contract(rule, *, session_id, store, retriever=None, provider=None, pr
         return finding("unknown", "invalid contract regex")
     start = ids[rule.applies_from_event_id] + 1 if rule.applies_from_event_id else 0
     active = chunks[start:]
+    condition = when_state(rule, active)
+    if condition == INVALID:
+        return finding("unknown", "invalid `when` regex", basis=f"{rule.id}.when failed to compile")
+    if condition == UNMET:
+        return finding("clean", not_applicable_reason(rule), basis=f"{rule.id}.when did not match any observed tool call",
+                       applicability="not_applicable")
     if rule.type == "must_not":
         inspected = [proposed] if proposed is not None else active
         hits = [c for c in _checked(inspected) if _eligible(c, rule) and regex.search(c.text)]
@@ -229,12 +240,16 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
                     item.verdict = "unknown"
                     item.reason = "incomplete evidence cannot prove a missing or failed obligation"
                     item.basis = (item.basis or "") + "; incomplete coverage prevents proving absence"
+            downgrade_unproven_inapplicability(findings)
         overall = "clean"
         for item in _checked(findings):
             overall = _worse(overall, item.verdict)
         if not active or not store.chunk_count(session_id, provider):
             overall = _worse(overall, "unknown")
             notes.append("No applicable enabled contracts or no indexed events.")
+        skipped = [item.contract_id for item in findings if item.applicability == "not_applicable"]
+        if skipped:
+            notes.append("not_applicable (`when` condition unmet, not dropped): " + ", ".join(skipped))
         if coverage and not coverage.get("complete"):
             if coverage.get("judged_prefix"):
                 # Pure append: the verdict is for the captured range; appended bytes are unreviewed.

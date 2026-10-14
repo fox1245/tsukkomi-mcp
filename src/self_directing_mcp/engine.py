@@ -241,6 +241,8 @@ class SelfDirectEngine:
         seed = Path(__file__).resolve().parent / "resources" / "examples.json"
         if s.seed_example_contracts:
             self.contracts.seed_from(seed)
+            # Disabled high-risk presets; the owner enables the ones they want.
+            self.contracts.seed_missing(seed.with_name("high_risk_presets.json"))
 
         if not s.local_only:
             self.retriever = HybridRetriever(
@@ -589,7 +591,7 @@ class SelfDirectEngine:
                             and (rule.requires_success or not payload["coverage"].get("judged_prefix"))}
                 for item in payload["findings"]:
                     if item["contract_id"] in gate_ids and item["verdict"] == "clean":
-                        item.update(verdict="unknown",
+                        item.update(verdict="unknown", applicability="applicable",
                                     reason="incomplete current history cannot establish the proposed action's prerequisite",
                                     basis=(item.get("basis") or "") + "; captured prerequisite evidence does not establish current compliance")
                 if gate_ids:
@@ -668,7 +670,7 @@ class SelfDirectEngine:
             else:
                 rules.append(ContractRule.model_validate(c))
         for rule in rules:
-            for pattern in (rule.regex, rule.before_regex):
+            for pattern in (rule.regex, rule.before_regex, rule.when.tool_call_regex if rule.when else None):
                 if pattern:
                     re.compile(pattern)
         with self._publication_guard():

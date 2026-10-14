@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "contracts": [
+    {
+      "id": "preset-no-recursive-delete",
+      "type": "must_not",
+      "scope": "tool_call",
+      "severity": "critical",
+      "risk": "high",
+      "description": "Forbid recursive deletion (rm -r, Remove-Item -Recurse, rmdir /s, shutil.rmtree, find -delete). Example preset, disabled until enabled by the owner.",
+      "regex": "(?<![\\w./-])(?<!git )rm\\s+(?:-\\S+\\s+)*(?:-[a-z]*r[a-z]*|--recursive)\\b|\\bRemove-Item\\b[^\\n]*-Recurse|\\b(?:rmdir|rd)\\s+/s\\b|\\bdel\\s+/s\\b|\\bshutil\\.rmtree\\b|\\bfind\\b[^\\n]*\\s-delete\\b",
+      "enabled": false
+    },
+    {
+      "id": "preset-no-write-outside-workspace",
+      "type": "must_not",
+      "scope": "tool_call",
+      "severity": "critical",
+      "risk": "high",
+      "description": "Forbid writes to system or home-config locations and parent-directory targets (redirects, tee, cp, mv, install, dd, sed -i, a TargetFile argument). This is a path-pattern approximation: replace it with your own workspace boundary regex. Example preset, disabled until enabled by the owner.",
+      "regex": "(?:>>?|\\btee\\b|\\bcp\\b|\\bmv\\b|\\binstall\\b|\\bdd\\b|\\bsed\\s+-i\\S*|\"?TargetFile\"?\\W+)[^\\n;|&]*?(?:\\.\\./|(?<![\\w.])/(?:etc|usr|bin|sbin|boot|root|var|opt|sys|proc)/|~/|\\$HOME/|[a-z]:\\\\{1,2}windows\\\\)",
+      "enabled": false
+    },
+    {
+      "id": "preset-no-force-push",
+      "type": "must_not",
+      "scope": "tool_call",
+      "severity": "critical",
+      "risk": "high",
+      "description": "Forbid force pushes (--force, --force-with-lease, -f, +refspec). Example preset, disabled until enabled by the owner.",
+      "regex": "\\bgit\\s+push\\b[^\\n;|&]*?(?:\\s--force(?:-with-lease|-if-includes)?\\b|\\s-[a-z]*f[a-z]*\\b|\\s\\+[\\w./-]+)",
+      "enabled": false
+    },
+    {
+      "id": "preset-no-branch-delete",
+      "type": "must_not",
+      "scope": "tool_call",
+      "severity": "high",
+      "risk": "high",
+      "description": "Forbid deleting local or remote branches (git branch -d/-D/--delete, git push --delete, git push origin :branch). Example preset, disabled until enabled by the owner.",
+      "regex": "\\bgit\\s+branch\\b[^\\n;|&]*?\\s(?:-[a-z]*d[a-z]*|--delete)\\b|\\bgit\\s+push\\b[^\\n;|&]*?\\s(?:--delete\\b|:[\\w./-]+)",
+      "enabled": false
+    }
+  ]
+}

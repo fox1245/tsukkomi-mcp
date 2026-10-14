@@ -140,3 +140,19 @@ class ContractStore:
         self._doc = doc
         self.save()
         return len(doc.contracts)
+
+    def seed_missing(self, preset_path: Path) -> int:
+        """Add preset contracts whose ids are absent; never alter or re-enable an existing contract.
+
+        Presets are shipped disabled, so adding them changes no verdict until the owner enables one.
+        """
+        preset_path = Path(preset_path)
+        if not preset_path.exists():
+            return 0
+        presets = ContractsDocument.model_validate(json.loads(preset_path.read_text(encoding="utf-8"))).contracts
+        known = {rule.id for rule in self._doc.contracts}
+        added = [rule for rule in presets if rule.id not in known]
+        if added:
+            self._doc.contracts.extend(added)
+            self.save()
+        return len(added)
