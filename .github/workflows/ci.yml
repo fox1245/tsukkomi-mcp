@@ -38,6 +38,11 @@ jobs:
           tests/test_mcp_transport.py
           tests/test_workflow_jev.py
           tests/test_windows_session_paths.py
+          tests/test_zstd_stream.py
+          tests/test_codex_zstd_discovery.py
+          tests/test_codex_zstd.py
+          --deselect tests/test_codex_zstd.py::test_syncing_a_large_compressed_session_never_materializes_it
+          --deselect tests/test_codex_zstd.py::test_continuing_a_cursor_inside_a_large_compressed_source_streams_from_the_start
         env:
           SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
 
