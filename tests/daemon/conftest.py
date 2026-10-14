@@ -13,7 +13,24 @@ _RUNTIMES: list[support.Runtime] = []
 PORTABLE = {"test_daemon_protocol.py"}
 
 
+# Under the ASan and TSan profiles of scripts/verify_memory.py the interpreter runs with the sanitizer runtime
+# preloaded. The daemon, the relays and the hook scripts start in a clean environment on purpose (that is what keeps
+# credentials out of the daemon), so their child processes would load the instrumented NeoGraph extension without the
+# runtime and die at import; timings under a sanitizer mean nothing either. The tests that start real processes are
+# therefore skipped there; the in-process daemon tests (the daemon's own threads and sockets) still run.
+SANITIZED = any(name in os.environ.get("LD_PRELOAD", "") for name in ("libasan", "libtsan", "libubsan"))
+REAL_PROCESS_MODULES = {"test_daemon_hooks.py", "test_daemon_mcp.py"}
+
+
 def pytest_collection_modifyitems(config, items):
+    if SANITIZED:
+        skip_real = pytest.mark.skip(reason="starts real processes; the sanitizer runtime is not inherited by their "
+                                            "clean environment and timings are meaningless under a sanitizer")
+        for item in items:
+            names = set(getattr(item, "fixturenames", ()))
+            in_process_only = "inproc" in names and "world" not in names
+            if os.path.basename(str(item.fspath)) in REAL_PROCESS_MODULES and not in_process_only:
+                item.add_marker(skip_real)
     if sys.platform.startswith("linux"):
         return
     skip = pytest.mark.skip(reason="the resident daemon is Linux only")
