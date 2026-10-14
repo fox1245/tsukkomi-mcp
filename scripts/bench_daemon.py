@@ -49,6 +49,7 @@ spec.loader.exec_module(bench)
 TARGETS = {
     "hook_wall_p95_ms": ("New-process hook wall time through the daemon, p95", 40.0, "ms"),
     "daemon_side_p95_ms": ("Daemon-side processing time, p95", 15.0, "ms"),
+    "daemon_overhead_p95_ms": ("Daemon-side processing time without the judgement, p95", 15.0, "ms"),
     "daemon_rss_mb": ("Daemon RSS after use", 120.0, "MB"),
     "proxy_rss_mb": ("MCP relay RSS (each)", 15.0, "MB"),
     "total_rss_mb": ("12 relays + 1 daemon, total RSS", 300.0, "MB"),
@@ -158,11 +159,13 @@ def measure_hooks(lab: Lab, args, log=print) -> dict:
                     bag["failed"] += verdict["failed_open"] or result["returncode"] != 0
             side_ms = lab.daemon_log_ms(event)[-args.runs:]
             run_ms = lab.daemon_log_ms(event, "run_ms")[-args.runs:]
+            overhead_ms = [a - b for a, b in zip(side_ms, run_ms)]
             cell = {name: {"wall_ms": bench.summarize(bag["wall"]), "cpu_ms": bench.summarize(bag["cpu"]),
                            "peak_rss_mb": bench.summarize(bag["rss"], 1), "decisions": bag["labels"],
                            "failed_open": bag["failed"]} for name, bag in samples.items()}
             cell["daemon"]["daemon_side_ms"] = bench.summarize(side_ms, 2)
             cell["daemon"]["daemon_run_ms"] = bench.summarize(run_ms, 2)
+            cell["daemon"]["daemon_overhead_ms"] = bench.summarize(overhead_ms, 2)
             report[host][key] = cell
             log(f"  {host:6s} {key:22s} standalone wall p50/p95 {cell['standalone']['wall_ms']['p50']:7.1f}/"
                 f"{cell['standalone']['wall_ms']['p95']:7.1f} ms | daemon wall p50/p95 {cell['daemon']['wall_ms']['p50']:6.1f}/"
@@ -271,23 +274,29 @@ def measure_servers(lab: Lab, args, log=print) -> dict:
 def evaluate(report: dict) -> list[dict]:
     rows = []
 
-    def add(key, value, note=""):
+    def add(key, value, note="", label_suffix=""):
         label, target, unit = TARGETS[key]
+        label += label_suffix
         rows.append({"metric": label, "target": f"<= {target:g} {unit}", "measured": None if value is None else f"{value:g} {unit}",
                      "status": "n/a" if value is None else ("met" if value <= target else "NOT met"), "note": note})
 
     hooks = report.get("hooks", {})
-    for label, wanted in (("nothing appended", "(+0 B)"), ("after appending", None)):
-        pre = [cell["daemon"] for h in hooks for key, cell in hooks[h].items() if key.startswith("PreToolUse")
-               and ((wanted in key) if wanted else ("(+0 B)" not in key))]
-        if pre:
-            add("hook_wall_p95_ms", max(c["wall_ms"]["p95"] for c in pre), f"worst PreToolUse (Claude Code, AGY), {label}")
-            add("daemon_side_p95_ms", max(c["daemon_side_ms"]["p95"] for c in pre),
-                f"worst PreToolUse, {label}; includes the judgement itself")
+    names = {"claude": "Claude Code", "agy": "AGY"}
+    for host, events in hooks.items():
+        for key, cell in events.items():
+            if key.split(" ")[0] not in ("PreToolUse", "UserPromptSubmit"):
+                continue
+            d = cell["daemon"]
+            suffix = f" [{names[host]} {key}]"
+            add("hook_wall_p95_ms", d["wall_ms"]["p95"], "the whole new process, this machine", suffix)
+            add("daemon_side_p95_ms", d["daemon_side_ms"]["p95"], "from the daemon's log; includes the judgement", suffix)
+            add("daemon_overhead_p95_ms", d["daemon_overhead_ms"]["p95"], "request time minus the lane thread's time", suffix)
     servers = report.get("servers", {})
     proxied = servers.get("proxied")
+    if report.get("daemon_after_hooks"):
+        add("daemon_rss_mb", report["daemon_after_hooks"].get("rss"), "after the hook runs above (two engines)", " [after hooks]")
     if proxied:
-        add("daemon_rss_mb", proxied["daemon"].get("rss"), "after 12 sessions' first calls and the hooks")
+        add("daemon_rss_mb", proxied["daemon"].get("rss"), f"after {servers['count']} MCP sessions' first calls (one engine)", f" [{servers['count']} sessions]")
         add("proxy_rss_mb", proxied["rss_mb_max"], "largest of the relays after one call")
         add("total_rss_mb", proxied["total_with_daemon_rss_mb"], "RSS counts shared libraries once per process")
     return rows
@@ -308,10 +317,13 @@ def markdown(report: dict) -> str:
                          f"{d['peak_rss_mb']['max']} |")
     lines += ["", "Daemon-side time is the whole request in the daemon (queueing, settings, judgement); the judgement "
               "(`run_ms`, the engine's own work: ingest of appended bytes, audit) dominates it:", "",
-              "| host | event | run p50 | run p95 |", "|---|---|---|---|"]
+              "| host | event | judgement (run) p50 | run p95 | rest of the daemon's request p50 | p95 |",
+              "|---|---|---|---|---|---|"]
     for host, events in report.get("hooks", {}).items():
         for event, cell in events.items():
-            lines.append(f"| {host} | {event} | {cell['daemon']['daemon_run_ms']['p50']} | {cell['daemon']['daemon_run_ms']['p95']} |")
+            d = cell["daemon"]
+            lines.append(f"| {host} | {event} | {d['daemon_run_ms']['p50']} | {d['daemon_run_ms']['p95']} | "
+                         f"{d['daemon_overhead_ms']['p50']} | {d['daemon_overhead_ms']['p95']} |")
     servers = report.get("servers")
     if servers:
         lines += ["", f"## {servers['count']} idle MCP sessions", "", "| mode | total RSS (MB) | total PSS (MB) | largest process RSS (MB) |",
