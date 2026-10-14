@@ -40,7 +40,7 @@ def _completed_results(path: Path) -> dict[int, str]:
     for _line, _start, _end, raw in iter_raw_lines(path):
         record = json.loads(raw)
         if (record.get("type") == "GENERIC" and record.get("source") == "MODEL"
-                and record.get("status") in ("DONE", "ERROR", "CANCELED")
+                and record.get("status") in ("DONE", "ERROR", "INVALID", "CANCELED")
                 and type(record.get("step_index")) is int):
             step = record["step_index"]
             if step in results:

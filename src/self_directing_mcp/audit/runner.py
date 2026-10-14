@@ -5,6 +5,7 @@ import json
 import re
 from bisect import bisect_left, bisect_right
 
+from self_directing_mcp.agy import JUDGED_FIELDS
 from self_directing_mcp.audit.applicability import (
     INVALID, UNMET, downgrade_unproven_inapplicability, not_applicable_reason, when_needs, when_state,
 )
@@ -84,6 +85,8 @@ def audit_needs(active, proposed):
     """What the history reader must keep text for: ``(scope, roles)`` pairs and whether call linkage is used."""
     rules = [r for r in active if r.regex and (r.type == "must" or proposed is None)]
     needs = [(r.scope, tuple(r.roles)) for r in rules] + when_needs(rules)
+    if any(_wants_attempts(r) for r in rules):
+        needs.append(("attempt", ("runtime",)))  # host-logged model proposals, see agy_evidence_rules
     return needs, any(r.requires_success for r in rules)
 
 
@@ -232,6 +235,8 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
         nonlocal findings
         findings = [audit_contract(r, session_id=session_id, store=store, provider=provider,
                                    proposed=proposed, chunks=chunks) for r in _checked(active)]
+        if provider == "agy":
+            agy_evidence_rules(active, findings, chunks, proposed=proposed, coverage=coverage)
     def aggregate_findings():
         nonlocal overall
         if coverage and not coverage.get("complete"):
@@ -263,3 +268,222 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
     ])
     return AuditResult(session_id=session_id, verdict=overall, findings=findings, notes=notes,
                        coverage=coverage or {}, contracts_snapshot=snapshot, execution=execution)
+
+
+# --- AGY evidence classes -------------------------------------------------------------------------------
+# Truncated fields, pending (RUNNING) results and legacy (pre-receipt) results change what the evidence can
+# prove, never what it matched. Everything here post-processes findings and stays out of the contract logic:
+#   * a visible match still counts (violation or satisfaction as before);
+#   * a contract that would turn clean for lack of a match, or unmet for lack of evidence, while a field it
+#     depends on is cut, is unknown with reason ``truncated_<field>``;
+#   * a truncated USER_INPUT never grants a permission (exception, user-role satisfaction);
+#   * a still-RUNNING result is ``pending_running``; a result with no receipt before the conversation's first one
+#     is ``unsupported_legacy`` for obligations that need the executed call (never "unmet", never clean).
+
+_FINAL_STATUS = frozenset({"DONE", "ERROR", "INVALID", "CANCELED"})
+_TRUNCATED_CODE = {"content": "truncated_content", "tool_calls": "truncated_tool_calls"}
+
+
+def _meta(event) -> dict:
+    return getattr(event, "meta", None) or {}
+
+
+def _wants_attempts(rule) -> bool:
+    """Rules that also read the host-logged model proposals (the call side of the history)."""
+    if rule.type == "must_not":
+        return rule.scope in ("tool_call", "any") and "assistant" in rule.roles and "runtime" not in rule.roles
+    return rule.scope in ("tool_call", "any")  # a must may be met, or only attempted, by a call
+
+
+def _dependencies(rule) -> set:
+    """(step type, field) pairs this rule's verdict can depend on."""
+    roles, scope = set(rule.roles), rule.scope
+    deps = set()
+    if scope in ("message", "any"):
+        if "user" in roles:
+            deps.add(("USER_INPUT", "content"))
+        if "assistant" in roles:
+            deps.add(("PLANNER_RESPONSE", "content"))
+    if scope in ("tool_call", "any") and roles & {"assistant", "runtime"}:
+        deps.add(("PLANNER_RESPONSE", "tool_calls"))
+    if scope in ("tool_result", "any") and "tool" in roles:
+        deps.add(("GENERIC", "content"))
+    if rule.requires_success:
+        deps.add(("GENERIC", "content"))
+    return deps
+
+
+def _proposal_args(text: str) -> dict:
+    try:
+        value = json.loads(text.split("] ", 1)[1])
+    except (IndexError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _consistent(denied_args, args) -> bool:
+    """A blocked call matches a proposal when every argument they share is equal (and they share one)."""
+    if not isinstance(denied_args, dict) or not args:
+        return False
+    shared = set(denied_args) & set(args)
+    return bool(shared) and all(denied_args[key] == args[key] for key in shared)
+
+
+def _blocked_proposals(events) -> set:
+    """Positions of model proposals the Pre hook demonstrably blocked (non-execution); they are not attempts."""
+    waiting: dict = {}
+    blocked = set()
+    for index, event in enumerate(events):
+        meta = _meta(event)
+        if meta.get("evidence_origin") == "model_proposal":
+            waiting.setdefault(meta.get("tool_name"), []).append((index, _proposal_args(event.text)))
+        elif isinstance(meta.get("denied_action"), dict):
+            denied = meta["denied_action"]
+            queue = waiting.get(denied.get("name"), [])
+            for slot in range(len(queue) - 1, -1, -1):
+                if _consistent(denied.get("args"), queue[slot][1]):
+                    blocked.add(queue.pop(slot)[0])
+                    break
+    return blocked
+
+
+def _window(rule, events, ids, proposed):
+    """Events a rule judges: after its activation anchor, and before its last triggering action."""
+    start = ids[rule.applies_from_event_id] + 1 if rule.applies_from_event_id in ids else 0
+    end = len(events)
+    if rule.type == "must" and rule.before_regex and proposed is None:
+        try:
+            trigger = re.compile(rule.before_regex, re.IGNORECASE | re.MULTILINE)
+        except re.error:
+            return start, end
+        positions = [i for i in range(start, end) if _eligible(events[i], rule) and trigger.search(events[i].text)]
+        if positions:
+            end = positions[-1]
+    return start, end
+
+
+def _unknown(item, code, why) -> None:
+    item.verdict = "unknown"
+    item.reason = f"{code}: {why}"
+    item.basis = (item.basis or "") + f"; {code}"
+
+
+def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None) -> None:
+    """Apply the partial-observation, pending and legacy rules above to ``findings`` (mutated in place)."""
+    events = list(events)
+    check_request()
+    ids = {event.chunk_id: index for index, event in enumerate(events)}
+    last_final = {}
+    for index, event in enumerate(events):
+        meta = _meta(event)
+        if meta.get("event_type") == "GENERIC" and meta.get("status") in _FINAL_STATUS:
+            last_final[meta.get("step_index")] = index
+    history = proposed is None
+    blocked = _blocked_proposals(events) if history and any(_wants_attempts(r) for r in rules) else set()
+    for rule, item in zip(rules, findings):
+        check_request()
+        start, end = _window(rule, events, ids, proposed)
+        scan = events[start:end]
+        deps = _dependencies(rule)
+        cut = [(event, field) for event in scan for field in (_meta(event).get("truncated_fields") or ())
+               if (_meta(event).get("event_type"), field) in deps and (_meta(event).get("event_type"), field) in JUDGED_FIELDS]
+        if rule.type == "must_not":
+            if history and item.verdict != "unknown" and _wants_attempts(rule) and rule.regex:
+                _attempt_hits(rule, item, events, range(start, end), blocked)
+            if history and item.verdict == "clean" and cut:
+                _unknown(item, _TRUNCATED_CODE.get(cut[0][1], "truncated_" + cut[0][1]),
+                         f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{cut[0][1]} may hide a match")
+            if item.verdict == "suspicious" and rule.exception_regex and rule.source_event_id in ids:
+                source = _meta(events[ids[rule.source_event_id]])
+                if source.get("event_type") == "USER_INPUT" and "content" in (source.get("truncated_fields") or ()):
+                    item.verdict = "violation"
+                    item.reason = ("truncated_content: the exception comes from a truncated user message and "
+                                   "cannot waive the match; " + item.reason)
+            continue
+        # must
+        if item.verdict == "clean" and item.reason.startswith("no triggering action"):
+            if rule.before_regex and history:
+                code = _hidden_trigger(rule, events, range(start, end), cut, blocked)
+                if code:
+                    _unknown(item, *code)
+            continue
+        if item.verdict == "clean":
+            supporting = [e.chunk_id for e in item.evidence if e.detail != "triggering action"]
+            sources = [_meta(events[ids[c]]) for c in supporting if c in ids]
+            if sources and len(sources) == len(supporting) and all(
+                    s.get("event_type") == "USER_INPUT" and "content" in (s.get("truncated_fields") or ()) for s in sources):
+                _unknown(item, "truncated_content", "the only satisfying evidence is a truncated user message")
+            continue
+        absent = item.verdict == "violation" and "evidence missing" in item.reason
+        unresolved = item.verdict == "unknown" and "completion status" in item.reason
+        if not (absent or unresolved):
+            continue
+        if cut:
+            field = cut[0][1]
+            _unknown(item, _TRUNCATED_CODE.get(field, "truncated_" + field),
+                     f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{field} may hold the missing evidence")
+        elif absent and _wants_attempts(rule) and _attempted(rule, events, range(start, end), blocked):
+            # Call side: a matching call was proposed, so the obligation may have been met; whether it ran, and
+            # how it ended, is what the result side cannot show. A call never proposed is a real absence.
+            if any(_meta(e).get("pending") and last_final.get(_meta(e).get("step_index"), -1) < start + i
+                   for i, e in enumerate(scan)):
+                _unknown(item, "pending_running", "a tool result is still RUNNING, so its outcome is unknown")
+            elif any(_meta(e).get("linkage") == "legacy_unlinked" for e in scan):
+                _unknown(item, "unsupported_legacy",
+                         "results before this conversation's first host receipt cannot be linked to calls")
+    if coverage is not None:
+        unknown = [f for f in findings if f.verdict == "unknown"]
+        legacy = sum(1 for f in unknown if f.reason.startswith("unsupported_legacy"))
+        coverage["unknown_breakdown"] = {"current_session": len(unknown) - legacy, "unsupported_legacy": legacy}
+
+
+def _attempted(rule, events, positions, blocked) -> bool:
+    try:
+        regex = re.compile(rule.regex, re.IGNORECASE | re.MULTILINE)
+    except re.error:
+        return False
+    return any(_meta(events[i]).get("evidence_origin") == "model_proposal" and i not in blocked
+               and regex.search(events[i].text) for i in positions)
+
+
+def _attempt_hits(rule, item, events, positions, blocked) -> None:
+    """A forbidden call attempt is a violation whatever came back (ERROR, INVALID, no receipt): the host log
+    preserves the proposal and its arguments. Proposals the Pre hook blocked never ran and are not counted."""
+    try:
+        regex = re.compile(rule.regex, re.IGNORECASE | re.MULTILINE)
+        exception = re.compile(rule.exception_regex, re.IGNORECASE | re.MULTILINE) if rule.exception_regex else None
+    except re.error:
+        return
+    hits = [events[i] for i in positions if _meta(events[i]).get("evidence_origin") == "model_proposal"
+            and i not in blocked and regex.search(events[i].text)]
+    if not hits:
+        return
+    covered = exception is not None and exception.search(" ".join(h.text for h in hits)) is not None
+    verdict = "suspicious" if covered else "violation"
+    if _worse(item.verdict, verdict) == item.verdict:
+        return  # already at least this severe (it was matched on a receipt-linked call)
+    reason = f"forbidden regex matched {len(hits)} host-logged call attempt(s); execution is not proven"
+    if rule.source_quote:
+        reason += f"; user said: {rule.source_quote[:120]}"
+    item.verdict, item.reason = verdict, reason
+    item.basis = f"{rule.id}.regex '{rule.regex}' matched a proposed call; the attempt itself is the violation"
+    item.evidence = [evidence(hit, "forbidden call attempt (model proposal)") for hit in hits[:20]]
+
+
+def _hidden_trigger(rule, events, positions, cut, blocked):
+    """(code, why) when a clean "no triggering action" cannot be trusted: calls may be hidden or unlinked."""
+    if cut:
+        field = cut[0][1]
+        return (_TRUNCATED_CODE.get(field, "truncated_" + field),
+                f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{field} may hide the triggering call")
+    try:
+        trigger = re.compile(rule.before_regex, re.IGNORECASE | re.MULTILINE)
+    except re.error:
+        return None
+    window = [events[i] for i in positions]
+    if any(_meta(e).get("linkage") == "legacy_unlinked" for e in window):
+        if any(_meta(events[i]).get("evidence_origin") == "model_proposal" and i not in blocked
+               and trigger.search(events[i].text) for i in positions):
+            return ("unsupported_legacy",
+                    "a matching call was proposed but its execution cannot be linked to a legacy result")
+    return None
