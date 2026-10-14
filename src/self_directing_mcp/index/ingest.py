@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from self_directing_mcp.compressed_source import CompressedSourceError
 from self_directing_mcp.schemas import AuditEvent, Chunk
 from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request, publication, request_operation
@@ -255,9 +256,11 @@ def session_flight(key):
 class SessionStore:
     """v2 events preserve every occurrence; legacy tables remain untouched for recovery."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, max_decompressed_bytes: int | None = None):
         check_request()
         self.db_path = Path(db_path)
+        # Bound on the declared decompressed size of a .zst session source (None: compressed_source's default).
+        self.max_decompressed_bytes = max_decompressed_bytes
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -710,7 +713,7 @@ class SessionStore:
             record = self.cursor_record(session_id, provider)
             metrics = self.session_metrics(session_id, provider)
             stats = self.agy_evidence_stats(session_id) if provider == "agy" and record else None
-        coverage = coverage_from_capture(session_id, provider, record, metrics)
+        coverage = coverage_from_capture(session_id, provider, record, metrics, max_bytes=self.max_decompressed_bytes)
         if stats is not None:
             # No receipt capture here: the counts are exact, the first-receipt position is reported by sync/audit.
             coverage.update(legacy_unlinked_count=stats["legacy_unlinked_results"],
@@ -718,8 +721,11 @@ class SessionStore:
         return coverage
 
 
-def coverage_from_capture(session_id, provider, record, metrics, observation=None, *, alias=False):
-    """``alias``: ``observation`` is a verified copy or continuation of the indexed source, which lives at another path."""
+def coverage_from_capture(session_id, provider, record, metrics, observation=None, *, alias=False, max_bytes=None):
+    """``alias``: ``observation`` is a verified copy or continuation of the indexed source, which lives at another path.
+
+    ``max_bytes`` bounds the declared decompressed size when an indexed ``.zst`` source is observed again. An
+    unreadable compressed source is reported by its own code (``zstd_corrupt``, ``zstd_unavailable``, ...)."""
     count, errors, unsupported = metrics
     result = dict(record or {"provider": provider, "session_id": session_id, "path": None, "byte_offset": 0})
     result.update(chunk_count=count, parse_error_count=errors, unsupported_event_count=unsupported)
@@ -730,7 +736,8 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
         if record["parser_version"] != current_parser_version(provider):
             issues.append("parser_outdated")
         try:
-            observation = observation or capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],))
+            observation = observation or capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],),
+                                                        max_bytes=max_bytes)
             if alias:
                 result.update(indexed_path=record["path"], requested_path=str(observation.path))
             if (str(observation.path) != record["path"] and not alias) or not observation.validate_prefix():
@@ -744,6 +751,8 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
                 issues.append("source_changed")
         except RequestStopped:
             raise
+        except CompressedSourceError as exc:
+            issues.append(exc.code)
         except (OSError, ValueError):
             issues.append("source_unavailable_or_truncated")
     if errors:
@@ -840,7 +849,7 @@ def _mark_prefix_alias(info, requested):
     coverage["complete"] = False
 
 
-def _other_source(cursor, path, observation, session_id):
+def _other_source(cursor, path, observation, session_id, max_bytes=None):
     """Another file claims the session id whose cursor indexes ``cursor["path"]``. Streaming hashes only; no writes.
 
     "copy": this file starts with the indexed prefix and the indexed file still exists, "moved": the same but that
@@ -854,7 +863,7 @@ def _other_source(cursor, path, observation, session_id):
         return "copy" if present else "moved"
     if not present:
         return "replaced"
-    other = capture_source(indexed, checkpoints=(offset, observation.length))
+    other = capture_source(indexed, checkpoints=(offset, observation.length), max_bytes=max_bytes)
     if (other.length >= offset and other.prefix_digest(offset) == cursor["prefix_hash"]
             and observation.length < offset
             and other.prefix_digest(observation.length) == observation.prefix_digest(observation.length)):
@@ -902,7 +911,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 hint = (known["byte_offset"],) if known and type(known["byte_offset"]) is int else ()
             except (OSError, sqlite3.Error):
                 hint = ()
-        observation = capture_source(path, checkpoints=hint)
+        observation = capture_source(path, checkpoints=hint, max_bytes=store.max_decompressed_bytes)
     with source_scope(observation):
         sid = session_id or peek_session_id(path)
         if not sid:
@@ -940,7 +949,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         # reindexing on a path change; elsewhere a copy or continuation of the indexed prefix is not a new source.
         relation = None
         if cursor and provider != "agy" and cursor["path"] != str(path) and type(cursor["byte_offset"]) is int:
-            relation = _other_source(cursor, path, observation, sid)
+            relation = _other_source(cursor, path, observation, sid, store.max_decompressed_bytes)
         parser_version = current_parser_version(provider)
         start = cursor["byte_offset"] if cursor else 0
         reindexed, reindex_reason = False, None
@@ -1039,7 +1048,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         new_chunks = chunks.count
         chunks.close()
     alias = committed_cursor["path"] != str(path)  # an equal or shorter copy never moves the cursor
-    coverage = coverage_from_capture(sid, provider, committed_cursor, metrics, observation, alias=alias)
+    coverage = coverage_from_capture(sid, provider, committed_cursor, metrics, observation, alias=alias,
+                                     max_bytes=store.max_decompressed_bytes)
     if agy_stats is not None:
         agy_coverage(coverage, agy_stats, receipts)
     info = {"session_id": sid, "provider": provider, "path": str(path), "byte_offset": offset,

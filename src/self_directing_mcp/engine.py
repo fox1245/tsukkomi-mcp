@@ -13,6 +13,7 @@ import sqlite3
 import re
 import time
 
+from self_directing_mcp.compressed_source import CompressedSourceError
 from self_directing_mcp.session_events import as_text, make_chunk
 
 from self_directing_mcp.audit.contracts import (
@@ -232,7 +233,7 @@ class SelfDirectEngine:
                 index_dir / ("vectors-v2-" + self.embedder.cache_key[:16]), dim=s.embedding_dim,
                 backend=s.dense_backend, extension_path=s.sqlite_vector_path)
         self.sparse = SparseIndex(index_dir / "sparse.sqlite")
-        self.store = SessionStore(index_dir / "meta.sqlite")
+        self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes)
         self.contracts = ContractStore(s.resolve_contracts_path())
         self.checklists = ChecklistStore(index_dir)
         self.graph = GraphStore(index_dir / "graph.sqlite")
@@ -340,6 +341,8 @@ class SelfDirectEngine:
             return {"ok": False, "error": "path_traversal", "message": str(e)}
         except FileNotFoundError as e:
             return {"ok": False, "error": "not_found", "message": str(e)}
+        except CompressedSourceError as e:
+            return {"ok": False, "error": e.code, "message": str(e), "provider": resolved_provider}
         except ValueError as e:
             return {"ok": False, "error": "bad_request", "message": str(e)}
 
@@ -361,6 +364,11 @@ class SelfDirectEngine:
         except AmbiguousSessionSource as exc:
             return {"ok": False, "error": "ambiguous_session_source", "message": str(exc), "provider": resolved_provider,
                     "session_id": exc.session_id, "indexed_path": exc.indexed_path, "requested_path": exc.requested_path}
+        except CompressedSourceError as exc:
+            # An unreadable .zst source (missing module, corrupt or truncated frame, size mismatch, over the limit):
+            # visible, nothing indexed or published, coverage stays incomplete.
+            return {"ok": False, "error": exc.code, "message": str(exc), "provider": resolved_provider,
+                    "path": str(resolved)}
         info["ok"] = True
         info["dense_backend"] = self.dense_backend
         info["embedder"] = type(self.embedder).__name__ if self.embedder else None
@@ -478,7 +486,7 @@ class SelfDirectEngine:
             record = self.store.cursor_record(sid, provider)
             metrics = self.store.session_metrics(sid, provider)
             token = self.store.state_token(sid, provider)
-        coverage = coverage_from_capture(sid, provider, record, metrics)
+        coverage = coverage_from_capture(sid, provider, record, metrics, max_bytes=self.store.max_decompressed_bytes)
         coverage["complete"] = False
         coverage["issues"].append(failure)
         coverage.update({key: failed[key] for key in ("indexed_path", "requested_path") if key in failed})
@@ -867,12 +875,14 @@ class SelfDirectEngine:
             receipt_token = self._receipt_token(sid, resolved_provider)
             evidence = self.store.capture_evidence(sid, resolved_provider)
         try:
-            observation = capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],)) if record else None
+            observation = (capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],),
+                                          max_bytes=self.store.max_decompressed_bytes) if record else None)
         except RequestStopped:
             raise
         except (OSError, ValueError):
             observation = None
-        coverage = coverage_from_capture(sid, resolved_provider, record, metrics, observation)
+        coverage = coverage_from_capture(sid, resolved_provider, record, metrics, observation,
+                                         max_bytes=self.store.max_decompressed_bytes)
         if resolved_provider == "agy" and record and record.get("receipt_digest") != receipt_token[2]:
             coverage["complete"] = False
             coverage["issues"].append("receipts_not_indexed")
@@ -1122,7 +1132,8 @@ class SelfDirectEngine:
         status, raw_contracts, record, metrics, metadata_token, receipt_token = self._capture_status(sid, resolved)
         status["contract_count"] = len(ContractsDocument.model_validate_json(raw_contracts).contracts) if raw_contracts is not None else 0
         if sid:
-            status["session"] = coverage_from_capture(sid, resolved, record, metrics)
+            status["session"] = coverage_from_capture(sid, resolved, record, metrics,
+                                                      max_bytes=self.store.max_decompressed_bytes)
             if resolved == "agy" and record and record.get("receipt_digest") != receipt_token[2]:
                 status["session"]["complete"] = False
                 status["session"]["issues"].append("receipts_not_indexed")

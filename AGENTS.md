@@ -224,6 +224,16 @@ instructions or execution evidence. Among steering messages only attribution "us
 turn; agent-attributed user-role messages are runtime text, and partial steering metadata or an
 unknown attribution is rejected. Opaque payloads (image data, redacted reasoning) are never indexed.
 
+Compressed Codex rollouts (rollout-*.jsonl.zst, written by Codex CLI 0.156 for older sessions) are
+discovered and synced like plain ones. Their byte offsets, anchors and prefix hashes address the
+decompressed stream, so a plain rollout and its compressed twin are one session: compressing in place
+or decompressing and appending reparses nothing and keeps event ids and cached vectors. They stream
+through a bounded decoder (never materialized), must be a single zstd frame that declares its content
+size, and are immutable snapshots. Corrupt, truncated, wrong-size, oversized
+(SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES) or undecodable files (no zstd module) are explicit errors
+with a zstd_* code and incomplete coverage, never skipped. Plain .jsonl sessions never need the module.
+The Codex parser version stays 3 for them.
+
 Parser versions are recorded per session and per provider (see README for the current table).
 On sync, older parser versions trigger a lazy, per-session full local reparse even when the
 source file has not changed. Unchanged event IDs, anchors and vectors survive; changed events reuse matching model-specific cached

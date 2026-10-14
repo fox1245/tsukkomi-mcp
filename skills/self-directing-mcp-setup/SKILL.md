@@ -51,6 +51,7 @@ Key installed packages:
 - `pydantic>=2.0` & `pydantic-settings`
 - `numpy>=1.26`
 - `httpx` & `python-dotenv`
+- `zstandard>=0.23` on Python before 3.14 (reads compressed Codex sessions, `rollout-*.jsonl.zst`; 3.14+ uses `compression.zstd`)
 
 ### 3. Native `sqlite-vector` Extension Provisioning
 Dense vector search requires the official `sqliteai/sqlite-vector` v1.1.0 release library. Download and verify the AVX2 checksum-pinned binary:

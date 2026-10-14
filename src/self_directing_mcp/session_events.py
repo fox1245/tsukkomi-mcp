@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterator
 
+from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES, is_compressed, open_source
 from self_directing_mcp.schemas import Chunk
 from self_directing_mcp.request_control import check_request
 
@@ -47,10 +48,19 @@ class SourceObservation:
         self._checkpoints = checkpoints  # offset -> (sha256 state, newline count)
         self._tail_digest = tail_digest  # SHA-256 of the last <= _TAIL_WINDOW bytes of [0, length)
         self._prefix_ok = True  # A detected identity/size/content mismatch does not heal
+        # What validate_prefix() re-hashes in the file itself. A plain file may keep growing past it; see
+        # CompressedObservation for the immutable variant.
+        self._guard_length, self._guard_digest, self._tolerates_growth = length, full_digest, True
 
     @property
     def identity(self) -> tuple[int, int]:
         return self.stamp[0], self.stamp[1]
+
+    def _open(self):
+        return self.path.open("rb")
+
+    def _size_ok(self, size):
+        return size >= self._guard_length if self._tolerates_growth else size == self._guard_length
 
     def _checkpoint(self, offset):
         found = self._checkpoints.get(offset)
@@ -59,7 +69,7 @@ class SourceObservation:
         if offset < 0 or offset > self.length:
             raise ValueError("source truncated during read")
         digest, lines = hashlib.sha256(), 0
-        with self.path.open("rb") as stream:
+        with self._open() as stream:
             if not same_identity(_identity(os.fstat(stream.fileno())), self.identity):
                 raise ValueError("source replaced during read")
             remaining = offset
@@ -114,9 +124,9 @@ class SourceObservation:
         try:
             with self.path.open("rb") as stream:
                 before = os.fstat(stream.fileno())
-                if not same_identity(_identity(before), self.identity) or before.st_size < self.length:
+                if not same_identity(_identity(before), self.identity) or not self._size_ok(before.st_size):
                     return self._fail()
-                digest, remaining = hashlib.sha256(), self.length
+                digest, remaining = hashlib.sha256(), self._guard_length
                 buffer = bytearray(min(remaining, _BLOCK))  # one reused buffer: no per-block bytes objects
                 view = memoryview(buffer)
                 while remaining:
@@ -129,7 +139,8 @@ class SourceObservation:
                 after = os.fstat(stream.fileno())
         except OSError:
             return False
-        if digest.hexdigest() != self._full_digest or not same_identity(_identity(after), self.identity) or after.st_size < self.length:
+        if (digest.hexdigest() != self._guard_digest or not same_identity(_identity(after), self.identity)
+                or not self._size_ok(after.st_size)):
             return self._fail()
         return True
 
@@ -141,18 +152,42 @@ class SourceObservation:
         try:
             with self.path.open("rb") as stream:
                 before = os.fstat(stream.fileno())
-                if not same_identity(_identity(before), self.identity) or before.st_size < self.length:
+                if not same_identity(_identity(before), self.identity) or not self._size_ok(before.st_size):
                     return self._fail()
                 if self._tail_digest is None:
                     return False
-                window = min(self.length, _TAIL_WINDOW)
-                stream.seek(self.length - window)
+                window = min(self._guard_length, _TAIL_WINDOW)
+                stream.seek(self._guard_length - window)
                 tail = stream.read(window)
         except OSError:
             return False
         if len(tail) != window or hashlib.sha256(tail).hexdigest() != self._tail_digest:
             return self._fail()
         return True
+
+
+class CompressedObservation(SourceObservation):
+    """One captured ``.zst`` source: an immutable snapshot whose offsets address the decompressed stream.
+
+    ``length``, the line states and ``prefix_digest`` come from one streaming decode and are exactly what a
+    plain file with the same bytes yields, so cursors move between the two forms. Decoding is deterministic,
+    so the SHA-256 of the COMPRESSED bytes stands in for the decompressed content when the snapshot is
+    validated (no decoder pass); any growth, truncation or rewrite of the compressed file is a rewrite, never
+    pure growth. The decoded stream has no unread tail to wait for: ``current_size()`` is its fixed length.
+    """
+
+    def __init__(self, path, stamp, length, complete_end, full_digest, checkpoints, tail_digest, *,
+                 raw_size, raw_digest, max_bytes):
+        super().__init__(path, stamp, length, complete_end, full_digest, checkpoints, tail_digest)
+        self.raw_size, self.raw_digest, self.max_bytes = raw_size, raw_digest, max_bytes
+        self._guard_length, self._guard_digest, self._tolerates_growth = raw_size, raw_digest, False
+
+    def _open(self):
+        return open_source(self.path, max_bytes=self.max_bytes)
+
+    def current_size(self):
+        self.path.stat()  # a vanished file is an error here, as for a plain source
+        return self.length
 
 
 def _identity(stat) -> tuple[int, int]:
@@ -202,14 +237,39 @@ def _hash_prefix(stream, length, checkpoints):
     return digest.hexdigest(), boundary, states
 
 
-def capture_source(path: Path, *, checkpoints=()) -> SourceObservation:
+def _capture_compressed(path: Path, checkpoints, max_bytes) -> CompressedObservation:
+    """One streaming decode of a ``.zst`` source: stream digest, line states, record boundary and the digest of
+    the compressed bytes. A compressed file is immutable, so any change during the pass is a rewrite."""
+    limit = DEFAULT_MAX_DECOMPRESSED_BYTES if max_bytes is None else max_bytes
+    with open_source(path, max_bytes=limit, tap=True) as stream:
+        reader = stream.raw
+        before = os.fstat(stream.fileno())
+        length = reader.declared
+        full_digest, boundary, states = _hash_prefix(stream, length, checkpoints)
+        reader.verify_complete()  # exactly one frame, ending exactly at the declared size
+        reader.drain()
+        after = os.fstat(stream.fileno())
+        raw_size, raw_digest, tail = reader.tap.count, reader.tap.digest.hexdigest(), reader.tap.tail()
+    path_stamp = source_stamp(path)
+    if (_stamp(after) != _stamp(before) or after.st_size != raw_size or not same_identity(path_stamp[:2], _identity(after))
+            or path_stamp[2] != raw_size or path_stamp[3] != after.st_mtime_ns):
+        raise ValueError("source changed during preparation")
+    return CompressedObservation(path, path_stamp, length, boundary, full_digest, states,
+                                 hashlib.sha256(tail).hexdigest(), raw_size=raw_size, raw_digest=raw_digest,
+                                 max_bytes=limit)
+
+
+def capture_source(path: Path, *, checkpoints=(), max_bytes=None) -> SourceObservation:
     """Observe the first ``size`` bytes of a possibly growing source in one streaming pass.
 
     Bytes are hashed, not retained. Growth after the initial ``fstat`` is not an error; an overwrite,
-    truncation or replacement during the pass is.
+    truncation or replacement during the pass is. A ``.zst`` source is decoded as a stream and observed as an
+    immutable snapshot (``max_bytes`` bounds its declared decompressed size); see ``CompressedObservation``.
     """
     check_request()
     path = Path(path).resolve()
+    if is_compressed(path):
+        return _capture_compressed(path, checkpoints, max_bytes)
     with path.open("rb") as stream:
         before = os.fstat(stream.fileno())
         length = before.st_size
@@ -278,7 +338,10 @@ def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, in
     limit = observation.complete_end if observation else None
     if observation is not None and start_byte > observation.complete_end:
         raise ValueError("cursor is not on a complete record boundary")
-    with Path(path).open("rb") as stream:
+    size_limit = getattr(observation, "max_bytes", None)
+    # A compressed source is read through a seekable decoder: forward seeks decode and discard, backward seeks
+    # restart, so the cursor logic below is the same for both forms. A plain path opens as before.
+    with (open_source(path) if size_limit is None else open_source(path, max_bytes=size_limit)) as stream:
         if observation is not None and not same_identity(_identity(os.fstat(stream.fileno())), observation.identity):
             raise ValueError("source replaced during read")
         check_digest = None
