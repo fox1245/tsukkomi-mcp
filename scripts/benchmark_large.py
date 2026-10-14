@@ -15,6 +15,7 @@ import time
 
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
+from self_directing_mcp.journal import copy_index_dir
 
 SID = "11111111-2222-3333-4444-555555555555"
 SMALL = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -104,7 +105,7 @@ def run(root, events, baseline=None):
     assert warm < 8 and full < 10 and max(values) < 8, report
     if baseline:
         old_index = root / "baseline-index"
-        shutil.copytree(root / "index", old_index)
+        copy_index_dir(root / "index", old_index)    # backup API for the databases: a -wal is not left behind
         code = """import sys,time,json
 from pathlib import Path
 from self_directing_mcp.config import Settings

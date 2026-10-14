@@ -145,6 +145,14 @@ class Settings(SettingsAccessors, BaseSettings):
                     "read it from the process environment before importing anything else. SELF_DIRECT_DAEMON.",
     )
 
+    sqlite_journal: Literal["auto", "delete"] = Field(
+        default=settings_core.DEFAULT_SQLITE_JOURNAL,
+        description="Journal mode of the authority databases (meta.sqlite, agy-receipts.sqlite). 'auto': write-ahead "
+                    "logging on a verified local file system (ext2/3/4, xfs, btrfs, tmpfs, f2fs, zfs, a local overlay; a "
+                    "fixed Windows drive), the rollback journal everywhere else; 'delete': the rollback journal everywhere. "
+                    "Always synchronous=FULL. SELF_DIRECT_SQLITE_JOURNAL.",
+    )
+
     @classmethod
     def settings_customise_sources(
         cls,
