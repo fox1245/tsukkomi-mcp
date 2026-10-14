@@ -114,7 +114,8 @@ the repository and use a private index.
 
 The parser is grounded in isolated synthetic Antigravity CLI 1.2.9 runs:
 `USER_INPUT`, `PLANNER_RESPONSE`, `SYSTEM_SDK/EPHEMERAL_MESSAGE`, and `GENERIC`
-command results with an explicit runtime exit-code prefix. Display arguments
+command results with an explicit runtime exit-code prefix. Parser version 7 also
+reads the IDE's typed result steps (see [parser version 7](#parser-version-7-ide-result-steps-context-steps-and-host-padding)). Display arguments
 are JSON-encoded strings; full-log arguments are ordinary JSON values.
 Both log formats omit tool call IDs and result references. Therefore the hook
 stores separate host receipts in `SELF_DIRECT_INDEX_DIR/agy-receipts.sqlite`.
@@ -153,7 +154,7 @@ Other native record formats remain unsupported until observed and validated.
 
 The display log (`transcript.jsonl`) can cut a long field and list it in the record's `truncated_fields`. Parser version 6 handles that explicitly instead of treating the visible prefix as the whole value. Raising the parser version reparses each already-indexed AGY session once, on its next sync or audit.
 
-**Fallback to `transcript_full.jsonl`.** For `USER_INPUT.content`, `PLANNER_RESPONSE.content`, `PLANNER_RESPONSE.tool_calls` and `GENERIC.content`, the parser looks up the same `step_index` in the sibling `transcript_full.jsonl` in the same directory (a symlink or a file of another conversation is refused). The full log is indexed in one streaming pass that keeps, per complete line, only the step, its byte range and a short digest, so memory grows with the number of records, not the file size; nothing about the full log is persisted. A restore must pass these checks: the record at that step has the same type, source and status; the field is complete and longer than the visible text and starts with the same text (for `tool_calls`, with the same call names); and the file still has the identity and digest it was indexed with. When it passes, the field is restored within the same step: the chunk carries the full text, `restored_fields`, a `full_ref` (byte range and digest in the full log) and, when no other judged field of that record is still cut, `source: "full"`. The restored field has no truncation marker.
+**Fallback to `transcript_full.jsonl`.** For `USER_INPUT.content`, `PLANNER_RESPONSE.content`, `PLANNER_RESPONSE.tool_calls` and `GENERIC.content` (and `content` of the IDE's typed results), the parser looks up the same `step_index` in the sibling `transcript_full.jsonl` in the same directory (a symlink or a file of another conversation is refused). The full log is indexed in one streaming pass that keeps, per complete line, only the step, its byte range and a short digest, so memory grows with the number of records, not the file size; nothing about the full log is persisted. A restore must pass these checks: the record at that step has the same type, source and status; the field is complete and longer than the visible text and starts with the same text (for `tool_calls`, with the same call names); and the file still has the identity and digest it was indexed with. When it passes, the field is restored within the same step: the chunk carries the full text, `restored_fields`, a `full_ref` (byte range and digest in the full log) and, when no other judged field of that record is still cut, `source: "full"`. The restored field has no truncation marker.
 
 **When the fallback fails.** The chunk keeps its visible text, keeps the field in `truncated_fields`, has `source: "display"` and records `fallback: {reason, retryable, full_size}`. The reasons are `full_missing`, `full_unavailable`, `full_changed`, `full_missing_step`, `full_duplicate_step`, `full_step_mismatch`, `full_truncated`, `full_field_missing`, `full_field_invalid`, `full_prefix_mismatch`, `full_not_longer` and `source_is_full` (the log being parsed is itself `transcript_full.jsonl`, so there is no sibling). Only transient failures are retryable: the full log is missing, has not reached that step yet, changed or could not be read. A retryable failure is retried once for each change of the full log's size (`reindex_reason: truncated_fallback_retry`); a permanent failure is never retried on every growth.
 
@@ -168,7 +169,7 @@ The display log (`transcript.jsonl`) can cut a long field and list it in the rec
 
 `coverage.agy_evidence.truncation` counts `restored_from_full`, `unrestored` (judged fields still cut) and `ignored` fields by `<type>.<field>`.
 
-**Statuses and record types.** A `GENERIC` result has a `status` of `DONE`, `RUNNING`, `ERROR`, `INVALID` or `CANCELED`; a recorded status outside that set is an unsupported event (a missing status is accepted).
+**Statuses and record types.** A `GENERIC` result (or one of the IDE's typed results) has a `status` of `DONE`, `RUNNING`, `ERROR`, `INVALID` or `CANCELED`; a recorded status outside that set is an unsupported event (a missing status is accepted).
 
 | Record | Handling |
 | --- | --- |
@@ -178,7 +179,7 @@ The display log (`transcript.jsonl`) can cut a long field and list it in the rec
 | `ERROR_MESSAGE` | Runtime text (`[host_error_message]`), not part of the default judgement. |
 | Media on a result | One placeholder per item, `[media #N type=<mime> chars=<n> sha256=<12 hex>]`, and `media_count` in the metadata. The payload is never indexed; data URIs and long base64 runs elsewhere in text become `[blob omitted: N chars]`. |
 
-**Legacy results.** The native logs omit call ids, so a result is linked to its call only through a host receipt. A `GENERIC` result without a receipt that comes before the conversation's first receipt (or in a conversation that has none) is `legacy_unlinked`. It is a known limitation of that history, not a current-session defect: it does not make `coverage.complete` false. A result without a receipt after the first receipt stays an unsupported-event defect. Coverage reports:
+**Legacy results.** The native logs omit call ids, so a result is linked to its call only through a host receipt. A tool result (`GENERIC` or a typed IDE result) without a receipt that comes before the conversation's first receipt (or in a conversation that has none) is `legacy_unlinked`. It is a known limitation of that history, not a current-session defect: it does not make `coverage.complete` false. A result without a receipt after the first receipt stays an unsupported-event defect. Coverage reports:
 
 | Field | Meaning |
 | --- | --- |
@@ -186,12 +187,37 @@ The display log (`transcript.jsonl`) can cut a long field and list it in the rec
 | `legacy_unlinked_count` | Number of legacy results. |
 | `result_dependent_complete` | `false` while any result is legacy; evidence that depends on results is not complete. |
 | `unknown_breakdown` | Count of `unknown` findings split into `current_session` and `unsupported_legacy`. |
-| `agy_evidence` | Counts of legacy and running results, media placeholders and truncation by class. |
+| `agy_evidence` | Counts of legacy and running results, media placeholders, host-padded records (`host_padded_records`, parser version 7) and truncation by class. |
 
 In an audit, an obligation that needs the executed call or its result and can only rest on legacy results is `unknown` with the reason `unsupported_legacy`: never unmet and never clean. Judgement of the call side (a forbidden command proposed by the model) is unaffected. Hooks add receipts from the moment they are installed; they do not create them retroactively.
 
 For manual MCP calls pass `provider: "agy"`, the real `session_id`, and `path`
 on sync/check/audit operations. Codex remains the shared API default.
+
+### Parser version 7: IDE result steps, context steps and host padding
+
+Version 7 adds three things. Raising the parser version reparses each already-indexed AGY session once, on its next sync or audit; event ids, anchors and cached vectors of unchanged events survive, and `embed=false` calls no embedding API. A running MCP process or hook process only picks the new parser up after a restart.
+
+**IDE typed result steps.** The Antigravity IDE (`antigravity-ide` app data) writes the result of a tool call as a step whose type names the tool, where the CLI writes `GENERIC`. These five types are tool results with the same evidence rules as `GENERIC`:
+
+| Step type | Carries | Notes |
+| --- | --- | --- |
+| `RUN_COMMAND` | `content`, `exit_code` | The only typed result that can be success evidence (below). |
+| `VIEW_FILE` | `content`, `truncated_fields` | Output of reading a file. |
+| `CODE_ACTION` | `content` | Result of an edit. |
+| `MCP_TOOL` | `content` | Result of an MCP tool. |
+| `LIST_DIRECTORY` | `content` | Result of a directory listing. |
+
+- **Linkage.** No call ids exist, so a result is linked to its call only through a host receipt (`linkage: host_step_receipt`, with the call emitted as a `tool_call` event). A result without a receipt is `legacy_unlinked` when it comes before the conversation's first receipt (or in a conversation that has none) and a current-session defect (`native_log_omits_call_id`, an unsupported event) after it, exactly as for `GENERIC`. Hook receipts bind to a typed result the same way: a result that already existed when the Pre hook ran, or that was rewritten afterwards, cannot be linked. The chunk metadata keeps the step type as `result_type` (the `GENERIC` chunk is unchanged), and `result_type` is part of the slim event metadata audits see.
+- **Truncation.** `content` falls back to the same step of `transcript_full.jsonl` under the checks above; what stays cut is marked, counted in `coverage.agy_evidence.truncation` (`VIEW_FILE.content`, `RUN_COMMAND.content`, ...) and leaves a dependent verdict `unknown` with the reason `truncated_content`. A visible match still counts. A cut result that cannot carry success (`VIEW_FILE`, `CODE_ACTION`, `MCP_TOOL`, `LIST_DIRECTORY`) does not affect a success obligation.
+- **Status.** `RUNNING` is pending (`pending_running` until a final record for that step arrives; a command that is still running when the session ends stays `unknown`), `ERROR`, `INVALID` and `CANCELED` are never success, and an unrecognized status is an unsupported event.
+- **`RUN_COMMAND` exit codes.** `exit_code` is the host-recorded execution status, read from the structured field and never from output text, and not at all while the command is `RUNNING`. A `DONE` command with `exit_code` 0 that is linked to its call by a host receipt (a `run_command` call) is success evidence wherever a `GENERIC` success would be: it satisfies `requires_success` and checklist evidence. A nonzero `exit_code` is a failure (`success: false`, recorded as `exit_code` in the metadata) whether or not the result is linked; that can only make a verdict worse. An unlinked result is never success (`success_withheld: unlinked`). Success is also withheld, as for `GENERIC`, when the output is still cut (`truncated_content`) and is `false` when the Post hook reported an error. A linked `DONE` `RUN_COMMAND` without an `exit_code` is an unsupported event; a present `exit_code` that is not an integer is a parse error.
+- **Other typed results** can be linked to their call but are never proof that the tool met its objective: their `success` stays unset (a failed status gives `false`).
+- A typed result is accepted only from `source: "MODEL"`. A typed result from another source, or with a status outside the known set, stays an unsupported event.
+
+**Context steps.** `CONVERSATION_HISTORY` and `KNOWLEDGE_ARTIFACTS` (source `SYSTEM`, no content) record that the IDE loaded context. They are runtime metadata (`role: runtime`, `evidence_origin: conversation_history` or `knowledge_artifacts`): never a user instruction, never observed execution, and not unsupported. Any other unknown step type stays `unsupported_event`, as before.
+
+**Host padding.** One CLI transcript contained a line made of a contiguous run of NUL bytes immediately followed by a complete JSON record, between two consecutive steps. The parser strips a *leading* NUL run from a line; if the remainder parses as a valid record, the record is accepted and its chunks carry `host_padding_bytes` (the run length; the byte range and anchors still cover the host's own bytes). `coverage.agy_evidence.host_padded_records` counts padded lines once each. The same reader is used for `transcript_full.jsonl` (the fallback) and for hook-receipt anchoring. Nothing else changes: a line that is only NULs, NULs followed by something that is not a valid record, NULs after or inside a record, and a padding run that is not at the very start of the line all stay parse errors that make coverage incomplete. Neighbouring step indexes never excuse a bad line, so a missing step stays visible.
 
 ### Host verification checklist
 
