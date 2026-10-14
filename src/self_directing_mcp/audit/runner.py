@@ -29,14 +29,26 @@ REJECTED_LIMIT = 20
 
 
 def _host_denied(decision) -> bool:
-    """A permission decision the host recorded on a tool result as a refusal (``deny``; never an error text)."""
+    """A permission decision the host recorded on a tool result as a refusal; anything else is an attempt.
+
+    Claude Code 2.1.299 records ``{"decision": "reject", "source": "hook" | ..., "reasonType": ...}`` on the record of
+    the tool result of a refused call (checked with a synthetic probe: a PreToolUse hook answering ``deny``); a
+    ``reject`` is a refusal whatever its ``source``. The forms ``"deny"`` and ``{"behavior": "deny"}`` are kept. An
+    ``accept``/``allow``, an unknown or missing decision, or an error text is never a refusal.
+    """
     if isinstance(decision, str):
         return decision == "deny"
-    return isinstance(decision, dict) and decision.get("behavior") == "deny"
+    return isinstance(decision, dict) and (decision.get("decision") == "reject" or decision.get("behavior") == "deny")
+
+
+def _denial_source(decision):
+    """Who refused (``source`` of the host's decision) when it says so, else None."""
+    source = decision.get("source") if isinstance(decision, dict) else None
+    return source if isinstance(source, str) and source else None
 
 
 def rejected_calls(events) -> dict:
-    """Claude Code: ``{tool call chunk id: denying result chunk id}`` for calls the host recorded as refused.
+    """Claude Code: ``{tool call chunk id: (denying result chunk id, source)}`` for calls the host recorded as refused.
 
     A refused call is a rejected proposal, not an executed action. The only evidence is the host's own decision on the
     tool result linked by call id (``meta.permission_decision``, from the record's ``permissionDecision``); a result
@@ -53,7 +65,7 @@ def rejected_calls(events) -> dict:
         elif event.kind == "tool_result" and _host_denied(_meta(event).get("permission_decision")):
             ids = calls.get(_key(call_id), ())
             if len(ids) == 1:
-                found[ids[0]] = event.chunk_id
+                found[ids[0]] = (event.chunk_id, _denial_source(_meta(event).get("permission_decision")))
     return found
 
 
@@ -74,9 +86,15 @@ def _event_byte(event):
     return key[0] if key else getattr(event, "byte_start", None)
 
 
-def rejected_item(rule_id, event, denied_by) -> dict:
-    return {"contract_id": rule_id, "event_id": event.chunk_id, "call_id": _meta(event).get("call_id"),
-            "reason": REJECTED_REASON, "denied_by": denied_by, "at_byte": _event_byte(event)}
+def rejection_entry(rule_id, event_id, call_id, denial, at_byte) -> dict:
+    """One ``proposals_rejected`` entry. ``denial`` is ``(chunk id of the result carrying the decision, source)``;
+    ``denied_by`` is the decision's ``source`` (``hook``, ``user``, ...) and ``host`` when it names none."""
+    return {"contract_id": rule_id, "event_id": event_id, "call_id": call_id, "reason": REJECTED_REASON,
+            "denied_by": denial[1] or "host", "denial_event_id": denial[0], "at_byte": at_byte}
+
+
+def rejected_item(rule_id, event, denial) -> dict:
+    return rejection_entry(rule_id, event.chunk_id, _meta(event).get("call_id"), denial, _event_byte(event))
 
 
 REJECTED_PROPOSAL_REASON = "host_denied: the pre-tool hook denied this proposal, so it did not run"

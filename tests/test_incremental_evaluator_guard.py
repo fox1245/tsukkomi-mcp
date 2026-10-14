@@ -19,7 +19,7 @@ from self_directing_mcp import agy
 from self_directing_mcp.audit import applicability, patterns, runner, shellstatus
 from self_directing_mcp.retrieve import checks
 
-DIGEST = "ad659ba5c0c0f764"
+DIGEST = "193cab44fc0bfc51"
 
 MIRRORED = [
     runner.audit_contract, runner._Presence, runner._eligible, runner._worse, runner.evidence, runner._key,
@@ -37,7 +37,7 @@ MIRRORED = [
     # a contract anchored to something other than a user message is unknown (``anchor_not_user``)
     runner.is_user_event,
     # a call the host refused is a rejected proposal, never an executed match (Claude Code ``permission_decision``)
-    runner.rejected_calls, runner._host_denied, runner._wants_rejections, runner.rejections, runner.rejected_item,
+    runner.rejected_calls, runner._host_denied, runner._denial_source, runner.rejection_entry, runner._wants_rejections, runner.rejections, runner.rejected_item,
     runner.rejected_clean, runner._event_byte, runner.rejected_proposal_item,
 ]
 CONSTANTS = [sorted(agy.RESULT_TYPES), sorted(agy.SUCCESS_TYPES), sorted(map(list, agy.JUDGED_FIELDS)),

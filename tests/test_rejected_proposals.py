@@ -16,8 +16,8 @@ import pytest
 from self_directing_mcp.claude_hooks import run_hook
 from self_directing_mcp.audit import runner
 from semantic_support import (
-    SID, Claude, assistant, bash, call, denied_result, evaluate, event, finding, human, one, result, tool_result,
-    use, user_turn,
+    HOOK_REJECT, SID, Claude, assistant, bash, call, denied_result, evaluate, event, finding, hook_denied_result,
+    human, one, result, tool_result, use, user_turn,
 )
 
 RM = {"id": "no-rm", "type": "must_not", "scope": "tool_call", "regex": r"rm\s+-rf"}
@@ -39,7 +39,8 @@ def test_a_refused_call_is_clean_and_reported_as_a_rejected_proposal(decision):
     assert item.reason == runner.rejected_clean(1) and item.evidence == []
     (entry,) = item.proposals_rejected
     assert entry["contract_id"] == "no-rm" and entry["event_id"] == first.chunk_id and entry["call_id"] == "c1"
-    assert entry["denied_by"] == refusal.chunk_id and entry["reason"].startswith("host_denied:")
+    assert entry["denial_event_id"] == refusal.chunk_id and entry["reason"].startswith("host_denied:")
+    assert entry["denied_by"] == "host"                       # these forms name no source
     assert entry["at_byte"] == first.key[0]
 
 
@@ -245,6 +246,88 @@ def test_the_hook_still_denies_the_next_proposal_exactly_as_before(session):
     payload = {"session_id": SID, "transcript_path": str(session.path), "cwd": "/synthetic/project",
                "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rm -rf /again"}}
     assert run_hook("PreToolUse", payload, engine=session.engine)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---------------------------------------------------------------- the decision as Claude Code 2.1.299 really records it
+
+@pytest.mark.parametrize("decision,source", [
+    ({"decision": "reject", "source": "hook", "reasonType": "hook"}, "hook"),
+    ({"decision": "reject", "source": "user"}, "user"),
+    ({"decision": "reject", "source": "rule", "reasonType": "rule"}, "rule"),
+    ({"decision": "reject", "source": "anything-else"}, "anything-else"),
+    ({"decision": "reject"}, "host"),
+    ({"decision": "reject", "source": ""}, "host"),
+])
+def test_a_reject_decision_is_a_refusal_whatever_its_source(decision, source):
+    first = call("rm -rf /x", "c1")
+    refusal = result("c1", False, "blocked", permission_decision=decision)
+    item = one(RM, [user_turn(), first, refusal])
+    assert item.verdict == "clean" and item.reason == runner.rejected_clean(1)
+    (entry,) = item.proposals_rejected
+    assert entry["denied_by"] == source and entry["denial_event_id"] == refusal.chunk_id
+    assert entry["event_id"] == first.chunk_id and entry["call_id"] == "c1"
+
+
+@pytest.mark.parametrize("decision", [
+    {"decision": "accept"}, {"decision": "accept", "source": "user"}, {"decision": "allow"}, {"decision": "rejected"},
+    {"decision": "Reject"}, {"decision": ""}, {"decision": None}, {"decision": 1}, {"source": "hook"}, {},
+    "reject", "accept", "allow", "ask", "", None, 0, ["reject"],       # not the recorded dict form
+])
+def test_anything_but_a_recorded_refusal_stays_an_attempt(decision):
+    events = [user_turn(), call("rm -rf /x", "c1"), result("c1", False, "blocked", permission_decision=decision)]
+    item = one(RM, events)
+    assert item.verdict == "violation" and item.proposals_rejected == []
+
+
+def test_a_result_with_no_decision_at_all_is_an_attempt():
+    item = one(RM, [user_turn(), call("rm -rf /x", "c1"), result("c1", False, "PreToolUse:Bash hook error: no")])
+    assert item.verdict == "violation" and item.proposals_rejected == []
+
+
+def test_both_evaluators_agree_on_the_recorded_shapes_arriving_late():
+    events = [user_turn(), call("rm -rf /a", "c1"), call("rm -rf /b", "c2"), call("rm -rf /c", "c3"),
+              result("c1", False, "x", permission_decision=dict(HOOK_REJECT)),
+              result("c2", False, "x", permission_decision={"decision": "accept"}),
+              result("c3", False, "x", permission_decision={"decision": "reject", "source": "user"})]
+    findings = evaluate([RM, {**RM, "id": "exc", "exception_regex": "/b"}], events, chunk_sizes=(None, 1, 2, 3))
+    assert [f.verdict for f in findings] == ["violation", "suspicious"]
+    assert [[p["denied_by"] for p in f.proposals_rejected] for f in findings] == [["hook", "user"]] * 2
+
+
+def test_the_parser_reads_the_recorded_record_without_an_unsupported_event(session):
+    session.write(human("never rm -rf"), bash("t1", "rm -rf /x"), hook_denied_result("t1"))
+    info = session.sync()
+    assert info["coverage"]["complete"] is True and info["coverage"]["unsupported_event_count"] == 0
+    (outcome,) = [c for c in session.chunks() if c.kind == "tool_result"]
+    assert outcome.meta["permission_decision"] == {"decision": "reject", "source": "hook", "reasonType": "hook"}
+    assert outcome.meta["success"] is False and outcome.text.startswith("[tool_result] PreToolUse:Bash hook error")
+
+
+def test_end_to_end_a_hook_denied_rm_rf_then_stop_is_a_rejected_proposal(session):
+    session.write(human("never rm -rf"), bash("t1", "rm -rf /x"), hook_denied_result("t1"))
+    session.upsert(RM)
+    audit = session.audit()
+    item = finding(audit, "no-rm")
+    assert item["verdict"] == "clean" and audit["verdict"] == "clean"
+    (entry,) = item["proposals_rejected"]
+    assert entry["call_id"] == "t1" and entry["denied_by"] == "hook"
+    note = stop(session)["systemMessage"]
+    assert "Rejected by the host, not executed" in note and "forbidden regex matched" not in note
+    # The same session through the incremental state: a later executed call is a violation beside the refused one.
+    session.append(bash("t2", "rm -rf /y"), tool_result("t2", "removed"))
+    again = finding(session.audit(), "no-rm")
+    assert again["verdict"] == "violation" and [p["call_id"] for p in again["proposals_rejected"]] == ["t1"]
+
+
+@pytest.mark.parametrize("decision", [{"decision": "accept", "source": "user"}, {"decision": "allow"}, "accept", None])
+def test_end_to_end_an_accepted_or_undecided_error_is_still_an_executed_attempt(session, decision):
+    record = (hook_denied_result("t1", decision=decision) if decision is not None
+              else tool_result("t1", "PreToolUse:Bash hook error: x", is_error=True, toolDenialKind="permission-rule"))
+    session.write(human("never rm -rf"), bash("t1", "rm -rf /x"), record)
+    session.upsert(RM)
+    item = finding(session.audit(), "no-rm")
+    assert item["verdict"] == "violation" and "proposals_rejected" not in item
+    assert "forbidden regex matched" in stop(session)["systemMessage"]
 
 
 # ---------------------------------------------------------------- AGY: the Pre hook's own denial of a model proposal

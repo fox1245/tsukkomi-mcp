@@ -72,6 +72,20 @@ def denied_result(call_id, decision="deny", content="blocked by a hook"):
     return tool_result(call_id, content, is_error=True, permissionDecision=decision)
 
 
+# The record Claude Code 2.1.299 wrote when a PreToolUse hook answered ``deny`` for a Bash call (reproduced by hand from
+# a synthetic probe; the field names and values are the recorded ones, the text is invented).
+HOOK_REJECT = {"decision": "reject", "source": "hook", "reasonType": "hook"}
+
+
+def hook_denied_result(call_id, reason="never rm -rf", decision=None, kind="permission-rule"):
+    """The tool-result record of a call refused by a hook, as Claude Code 2.1.299 records it: the host's decision is a
+    top-level ``permissionDecision`` object beside ``toolDenialKind``, and the block is an error result."""
+    extra = {"permissionDecision": HOOK_REJECT if decision is None else decision}
+    if kind is not None:
+        extra["toolDenialKind"] = kind
+    return tool_result(call_id, f"PreToolUse:Bash hook error: {reason}", is_error=True, **extra)
+
+
 def write(path, *records, mode="w"):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

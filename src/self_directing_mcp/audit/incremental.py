@@ -45,7 +45,7 @@ from self_directing_mcp.security.mask import mask_secrets
 
 # Bump when the semantics of any evaluation changes (rules, evidence classes, evidence text); it invalidates every
 # stored state and re-enables contracts that a shadow mismatch disabled.
-EVALUATOR_VERSION = 6
+EVALUATOR_VERSION = 7
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
@@ -202,7 +202,7 @@ class ClaudeFacts(Facts):
     def __init__(self):
         self.targets, self.cut = [], []
         self._targets = set()
-        self.rejected = {}  # chunk id of a refused tool call -> chunk id of the result that carries the decision
+        self.rejected = {}  # chunk id of a refused tool call -> [chunk id of the result carrying the decision, source]
 
     def feed(self, event, pools):
         meta = event.meta
@@ -228,7 +228,7 @@ class ClaudeFacts(Facts):
                     if calls[0] not in self.rejected and len(self.rejected) >= REJECTED_MAX:
                         self.overflow = "refused call table is full"
                         return
-                    self.rejected[calls[0]] = event.chunk_id
+                    self.rejected[calls[0]] = [event.chunk_id, runner._denial_source(meta.get("permission_decision"))]
                     self.dirty = True
 
     def _cut(self, position, chunk_id):
@@ -639,8 +639,7 @@ class RuleMonitor:
                     if count and len(evidence) < min(EVIDENCE_LIMIT, count):
                         raise NeedFull("listed matches do not cover the refused calls")
                     texts = [t for t, chunk in zip(self.exc, self.exc_ids) if chunk not in gone]
-                    stopped = [{"contract_id": rule.id, "event_id": chunk, "call_id": call_id,
-                                "reason": runner.REJECTED_REASON, "denied_by": facts.rejected[chunk], "at_byte": byte}
+                    stopped = [runner.rejection_entry(rule.id, chunk, call_id, facts.rejected[chunk], byte)
                                for chunk, call_id, byte in refused[:runner.REJECTED_LIMIT]]
                 evidence, joined = evidence[:EVIDENCE_LIMIT], " ".join(texts)
             if not count:
