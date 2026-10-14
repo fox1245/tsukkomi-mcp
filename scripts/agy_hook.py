@@ -30,10 +30,38 @@ def _fail_open(root, event, payload, error_class):
         return _minimal_fail_open(event, reason)
 
 
+def _via_daemon(root, python):
+    """Resident-daemon mode (``SELF_DIRECT_DAEMON=on``, Linux): a thin client that imports only the standard library
+    and the daemon's client module. Returns False, having read nothing, when the daemon is not in use. With the
+    daemon in use the answer is the daemon's or a visible fail-open; there is no in-process fallback."""
+    try:
+        sys.path.insert(0, str(root / "src"))
+        from self_directing_mcp.daemon import client
+        if not client.use_daemon():
+            return False
+    except Exception:
+        return False        # the package is unusable: the standalone path below reports it, fail-open
+    event = next((a.split("=", 1)[1] if a.startswith("--event=") else a
+                  for a in sys.argv[1:] if a.startswith("--event=") or a in EVENTS), None)
+    try:
+        payload = json.load(sys.stdin)
+    except Exception as exc:
+        from self_directing_mcp import agy_hook_state as state
+        response = state.fail_open(event, None, type(exc).__name__, state.CHECK_FAILED)
+    else:
+        response, _served = client.serve_hook("agy", event, payload, sys.argv[1:],
+                                              python=str(python) if python.is_file() else None)
+    json.dump(response, sys.stdout)
+    sys.stdout.write("\n")
+    return True
+
+
 def main():
     root = Path(__file__).resolve().parent.parent
     venv = root / ".venv"
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if _via_daemon(root, python):
+        return
     try:
         if python.is_file() and Path(sys.prefix).resolve() != venv.resolve():
             os.execv(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]])

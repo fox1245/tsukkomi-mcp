@@ -253,6 +253,15 @@ class World:
         self.index.mkdir(parents=True)
         (self.index / "contracts.json").write_text(json.dumps({"contracts": self.contracts}), encoding="utf-8")
 
+    def new_index(self, name: str, contracts=None) -> Path:
+        """A fresh, separate index directory holding the same (or the given) contracts."""
+        path = self.root / f"index-{name}"
+        shutil.rmtree(path, ignore_errors=True)
+        path.mkdir(parents=True)
+        document = {"contracts": list(self.contracts if contracts is None else contracts)}
+        (path / "contracts.json").write_text(json.dumps(document), encoding="utf-8")
+        return path
+
     def env(self, flag: str | None, **extra) -> dict:
         env = {k: v for k, v in os.environ.items() if not k.startswith(ENV_PREFIXES)}
         env.update(self.runtime.environ())
@@ -263,7 +272,9 @@ class World:
         env.update(extra)
         return env
 
-    def payload(self, host: str, event: str, command: str | None = None, *, sid: str | None = None) -> dict:
+    def payload(self, host: str, event: str, command: str | None = None, *, sid: str | None = None,
+                step_offset: int = 0) -> dict:
+        """``step_offset`` gives parallel AGY calls of one conversation distinct step indexes, as a host does."""
         b = bench()
         if host == "claude":
             sid = sid or SID
@@ -274,24 +285,32 @@ class World:
             return body
         sid = sid or AGY_SID
         transcript = self.agy[sid]
-        body = b.agy_payload(event, sid, transcript.path, transcript.last_step + 1)
+        body = b.agy_payload(event, sid, transcript.path, transcript.last_step + 1 + step_offset)
         if event == "PreToolUse" and command is not None:
             body["toolCall"]["args"] = {"CommandLine": command}
         return body
 
-    def argv(self, host: str, event: str) -> list[str]:
+    def argv(self, host: str, event: str, index: Path | None = None) -> list[str]:
         if host == "claude":
             return [PY, str(SCRIPTS / "claude_hook.py"), f"--event={event}", "--local-only",
-                    f"--index-dir={self.index}"]
+                    f"--index-dir={index or self.index}"]
         return [PY, str(SCRIPTS / "agy_hook.py"), f"--event={event}"]
 
     def hook(self, host: str, event: str, command: str | None = None, *, flag: str | None = "on",
-             sid: str | None = None, timeout: float = 60.0, **extra_env) -> "HookRun":
-        body = self.payload(host, event, command, sid=sid)
+             sid: str | None = None, index: Path | None = None, timeout: float = 60.0, body: dict | None = None,
+             step_offset: int = 0, **extra_env) -> "HookRun":
+        body = body if body is not None else self.payload(host, event, command, sid=sid, step_offset=step_offset)
+        extra_env = dict(extra_env)
+        if index is not None:
+            extra_env["SELF_DIRECT_INDEX_DIR"] = str(index)       # the environment beats the config file
         started = time.perf_counter()
-        done = subprocess.run(self.argv(host, event), input=json.dumps(body), capture_output=True, text=True,
+        done = subprocess.run(self.argv(host, event, index), input=json.dumps(body), capture_output=True, text=True,
                               env=self.env(flag, **extra_env), timeout=timeout, cwd=self.root)
         return HookRun(done.stdout, done.stderr, (time.perf_counter() - started) * 1000, done.returncode)
+
+    def start_daemon(self) -> subprocess.Popen:
+        """Start a real daemon process (as a client would) and wait until it answers; it is stopped by the fixture."""
+        return start_daemon_process(self.runtime)
 
 
 class HookRun:
@@ -311,3 +330,52 @@ def daemon_log(runtime: Runtime) -> list[dict]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def start_daemon_process(runtime: Runtime, **extra_env) -> subprocess.Popen:
+    env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(ROOT / "src"), **runtime.environ(), **extra_env}
+    process = subprocess.Popen([PY, "-m", "self_directing_mcp.daemon"], env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                               cwd=str(runtime.root))
+    runtime.extra_pids.add(process.pid)
+    STARTED.add(process.pid)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise AssertionError(f"the daemon process exited with {process.returncode}")
+        try:
+            area = rundir.open_runtime_dir(runtime.environ(), create=False)
+        except rundir.RuntimeDirError:
+            time.sleep(0.02)
+            continue
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            try:
+                sock.connect(area.address())
+                return process
+            except OSError:
+                time.sleep(0.02)
+            finally:
+                sock.close()
+        finally:
+            area.close()
+    raise AssertionError("the daemon process did not start listening")
+
+
+def daemon_status(runtime: Runtime) -> dict:
+    from self_directing_mcp.daemon import core
+    area = rundir.open_runtime_dir(runtime.environ(), create=False)
+    try:
+        return core.query(area, {"op": P.OP_STATUS}) or {}
+    finally:
+        area.close()
+
+
+def make_stub(directory: Path, seconds: float = 3.0) -> Path:
+    """An executable that stands in for the daemon's interpreter and never starts a daemon: it ignores its
+    arguments and just stays alive for a while (so a test can observe the client not waiting for it)."""
+    path = directory / "tsukkomi-test-stub"
+    path.write_text(f"#!/bin/sh\nsleep {seconds}\n")
+    path.chmod(0o755)
+    return path
