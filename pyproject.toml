@@ -18,6 +18,8 @@ dependencies = [
   "python-dotenv>=1.0",
   "httpx>=0.27",
   "numpy>=1.26",
+  # zstd-compressed Codex sessions: Python 3.14+ uses the standard library compression.zstd.
+  "zstandard>=0.23; python_version < '3.14'",
 ]
 
 [project.optional-dependencies]
