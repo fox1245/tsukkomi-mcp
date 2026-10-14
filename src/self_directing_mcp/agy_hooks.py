@@ -11,24 +11,20 @@ in every mode and are tracked in ``hook_health``. PostToolUse is observational.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import sys
 from typing import Any, TYPE_CHECKING
 
 from self_directing_mcp import agy_hook_state as hook_state
+from self_directing_mcp import hook_policy
 from self_directing_mcp.agy_hook_state import AUDIT_UNAVAILABLE, CHECK_FAILED, HookState
+from self_directing_mcp.hook_policy import HookRuntimeError  # noqa: F401  (public name of this module)
 from self_directing_mcp.security.mask import mask_value
 
 if TYPE_CHECKING:
     from self_directing_mcp.engine import SelfDirectEngine
 
 EVENTS = hook_state.EVENTS
-
-
-class HookRuntimeError(RuntimeError):
-    """The audit itself cannot run (settings, engine or contracts unavailable); the cause is chained."""
-    kind = AUDIT_UNAVAILABLE
 
 
 def failure_response(event: str | None, payload: Any = None, *, reason: str = "Hook verification unavailable") -> dict:
@@ -40,40 +36,8 @@ def _mode(engine: SelfDirectEngine) -> str:
     return engine.settings.agy_enforcement
 
 
-def _short(text: Any, limit: int = 300) -> str:
-    from self_directing_mcp.security.mask import mask_secrets
-    return mask_secrets(str(text))[:limit]
-
-
-def _classify(audit: dict, mode: str, high_risk: frozenset | set = frozenset()) -> tuple[str, str | None, bool]:
-    """``(decision, reason, warn)``; ``warn`` marks an allow that rests on unverified evidence."""
-    ok = audit.get("ok") is True
-    verdict = audit.get("verdict", "unknown") if ok else "unknown"
-    if ok and audit.get("action_scope") == "not_applicable":
-        return "allow", "No triggering action contract; not a compliance verdict.", False
-    findings = audit.get("findings", [])
-    if (mode == "enforced" and verdict == "suspicious" and (
-            any(f.get("verdict") in ("unknown", "violation") for f in findings
-                if f.get("contract_id") in audit.get("action_contracts", []))
-            or (audit.get("requires_history") and not audit.get("coverage", {}).get("complete")))):
-        verdict = "unknown"  # Strict mode: confirming an exception cannot waive another prerequisite.
-    if verdict == "clean":
-        return "allow", None, False
-    reasons = [f"[{f.get('contract_id')}] {_short(f.get('reason', 'Verification unavailable'))}"
-               for f in findings if f.get("verdict") != "clean"]
-    reason = "; ".join(reasons[:4]) or "Contract verification incomplete; resolve missing evidence."
-    if mode == "advisory":
-        return "allow", "ADVISORY (not compliance): " + reason, False
-    if verdict == "violation":
-        return "deny", reason, False
-    if verdict == "suspicious":
-        return "force_ask", reason, False
-    if mode == "enforced":
-        return "deny", reason, False
-    risky = sorted(set(high_risk) & set(audit.get("action_contracts", [])))
-    if risky:
-        return "ask", f"High-risk contract [{', '.join(risky)}] could not be verified: " + reason, False
-    return "allow", "WARNING - unverified, not a compliance verdict: " + reason, True
+_short = hook_policy.short
+_classify = hook_policy.classify
 
 
 def _verdict_response(audit: dict, mode: str = "confirmed_only", high_risk: frozenset | set = frozenset()) -> dict:
@@ -82,10 +46,7 @@ def _verdict_response(audit: dict, mode: str = "confirmed_only", high_risk: froz
 
 
 def _obligations(engine: SelfDirectEngine, session_id: str, path: str | None) -> dict:
-    try:
-        return engine.hook_obligations(session_id, provider="agy", path=path)
-    except Exception as exc:
-        raise HookRuntimeError("contracts or checklist unavailable") from exc
+    return hook_policy.read_obligations(engine, "agy", session_id, path)
 
 
 def handle_pre_tool_use(engine: SelfDirectEngine, session_id: str, tool_call: dict[str, Any],
@@ -96,42 +57,25 @@ def handle_pre_tool_use(engine: SelfDirectEngine, session_id: str, tool_call: di
     workflow = guard_host_action(session_id, {"tool_name": tool_call["name"], "arguments": tool_call["args"]}, "agy")
     if workflow is not None:
         return {"decision": workflow["decision"], "reason": workflow["reason"]}
-    obligations = _obligations(engine, session_id, path)
-    if not obligations["contracts"]:
-        return {"decision": "allow", "reason": "No applicable action contracts; not a compliance verdict."}
-    audit = engine.check_action(session_id=session_id, provider="agy", path=path,
-                                action={"tool_name": tool_call["name"], "arguments": tool_call["args"]})
-    high_risk = frozenset(rule.id for rule in obligations["contracts"] if rule.risk == "high")
-    decision, reason, warn = _classify(audit, _mode(engine), high_risk)
-    if warn:
+    judged = hook_policy.judge_action(engine, "agy", session_id, path, tool_call["name"], tool_call["args"],
+                                      _mode(engine))
+    if judged is None:
+        return {"decision": "allow", "reason": hook_policy.NO_ACTION_CONTRACTS}
+    if judged.warn:
         # The next invocation shows it through the host's supported injection channel as well.
-        HookState(engine.settings.index_dir).queue_warning(session_id, "Unverified tool call allowed: " + reason)
-    return {"decision": decision, **({"reason": reason} if reason else {})}
+        HookState(engine.settings.index_dir).queue_warning(session_id, "Unverified tool call allowed: " + judged.reason)
+    return {"decision": judged.decision, **({"reason": judged.reason} if judged.reason else {})}
 
 
-def _reason_key(items: list[str]) -> str:
-    return hashlib.sha256("\n".join(sorted(items)).encode()).hexdigest()
-
-
-def _confirmed_misses(obligations: dict, audit: dict) -> list:
-    """Auto-continue obligations that are confirmed unmet on complete, current evidence; otherwise none."""
-    coverage = audit.get("coverage", {})
-    if audit.get("ok") is not True or coverage.get("complete") is not True or coverage.get("issues"):
-        return []
-    rules = {rule.id: rule for rule in obligations["contracts"]
-             if rule.auto_continue and rule.type == "must" and rule.enabled}
-    return [(rules[f["contract_id"]], f) for f in audit.get("findings", [])
-            if f.get("contract_id") in rules and f.get("verdict") == "violation"
-            and f.get("applicability", "applicable") == "applicable"
-            and f.get("contract_revision") == rules[f["contract_id"]].revision]
+_reason_key = hook_policy.reason_key
+_confirmed_misses = hook_policy.confirmed_misses
 
 
 def _spend_continue(engine: SelfDirectEngine, session_id: str, key: str) -> bool:
     return HookState(engine.settings.index_dir).claim_continue(session_id, key)
 
 
-BUDGET_NOTE = ("Automatic continuation is allowed once per conversation and is unavailable here "
-               "(budget spent, repeated reason, or counter unreadable); not continuing.")
+BUDGET_NOTE = hook_policy.budget_note("conversation")
 
 
 def handle_stop(engine: SelfDirectEngine, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -154,30 +98,13 @@ def handle_stop(engine: SelfDirectEngine, session_id: str, payload: dict[str, An
     path = payload["transcriptPath"]
     obligations = _obligations(engine, session_id, path)
     if not obligations["contracts"] and not obligations["has_checklist"]:
-        return {"decision": "allow", "reason": "No outstanding obligations; not a compliance verdict."}
-    synced = engine.sync_session(session_id=session_id, provider="agy", path=path, embed=False)
-    notes = []
-    coverage = synced.get("coverage", {})
-    # Records the host is still appending are judged next time; any other gap leaves completion unverified.
-    if not synced.get("ok") or not (coverage.get("complete") or set(coverage.get("issues", [])) == {"unread_bytes"}):
-        notes.append("AGY history is incomplete; completion cannot be verified.")
-    checklist = engine.get_checklist(session_id, provider="agy")
-    pending = [item for item in checklist["items"] if item["status"] not in ("done", "revoked")]
-    notes.extend(f"{item['text']} (status={item['status']}; missing verified completion evidence)"
-                 for item in pending[:4])
-    misses = []
-    if obligations["contracts"]:
-        audit = engine.audit_session(session_id, provider="agy", path=path)
-        if audit.get("ok") is not True or audit.get("verdict") != "clean":
-            notes.append("Contract checkpoint is " + str(audit.get("verdict", "unknown")) + ".")
-        notes.extend(f"[{f['contract_id']}] {_short(f.get('reason', ''))}" for f in audit.get("findings", [])
-                     if f.get("verdict") != "clean")
-        misses = _confirmed_misses(obligations, audit)
+        return {"decision": "allow", "reason": hook_policy.NO_OUTSTANDING}
+    notes, misses = hook_policy.checkpoint(engine, "agy", session_id, path, obligations, "AGY")
     if mode == "advisory":
         return {"decision": "allow", "reason": "ADVISORY (not compliance): " + " ".join(notes)} if notes else {"decision": "allow"}
     if misses:
-        summary = "; ".join(f"[{rule.id}] {_short(rule.description or rule.regex, 160)}" for rule, _f in misses)
-        key = _reason_key([f"{rule.id}@{rule.revision}" for rule, _f in misses])
+        summary = hook_policy.miss_summary(misses)
+        key = hook_policy.miss_key(misses)
         if _spend_continue(engine, session_id, key):
             return {"decision": "continue", "reason":
                     "A user-specified completion obligation is confirmed unmet: " + summary

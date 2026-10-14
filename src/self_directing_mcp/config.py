@@ -130,6 +130,7 @@ class Settings(BaseSettings):
         for name in ("antigravity", "antigravity-cli", "antigravity-ide")
     ])
     agy_enforcement: Literal["confirmed_only", "advisory", "enforced"] = "confirmed_only"
+    claude_enforcement: Literal["confirmed_only", "advisory", "enforced"] = "confirmed_only"
     session_provider: Literal["codex", "grokbot", "omp", "agy", "claude"] = "codex"
     index_dir: Path = Field(default_factory=_default_index_dir)
     contracts_path: Path | None = Field(

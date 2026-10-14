@@ -86,8 +86,10 @@ def resolve_contracts_path() -> Path:
 # --- persistent state -------------------------------------------------------------------------------------
 
 class HookState:
-    def __init__(self, index_dir) -> None:
-        self.path = Path(index_dir) / STATE_FILE
+    """Per-host state. ``state_file`` selects an isolated database with the same schema (Claude Code uses its own)."""
+
+    def __init__(self, index_dir, state_file: str | None = None) -> None:
+        self.path = Path(index_dir) / (state_file or STATE_FILE)
 
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -243,7 +245,7 @@ def _stamp(epoch: float) -> str:
 
 # --- user-selected high-risk policy without the runtime ----------------------------------------------------
 
-def high_risk_match(contracts_path, session_id, tool_call) -> str | None:
+def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy") -> str | None:
     """Id of an enabled ``risk: high`` contract that applies to this call, or None.
 
     Reads the contracts file with ``json`` only. An unreadable file means "unknown", never a guess. A
@@ -256,7 +258,7 @@ def high_risk_match(contracts_path, session_id, tool_call) -> str | None:
         sid = session_id.lower() if isinstance(session_id, str) else None
         for rule in document.get("contracts", []):
             if (not isinstance(rule, dict) or rule.get("enabled", True) is not True or rule.get("risk") != "high"
-                    or rule.get("provider") not in (None, "agy") or rule.get("session_id") not in (None, sid)
+                    or rule.get("provider") not in (None, provider) or rule.get("session_id") not in (None, sid)
                     or rule.get("scope", "any") not in ("tool_call", "any")
                     or "assistant" not in (rule.get("roles") or ["assistant"])):
                 continue
