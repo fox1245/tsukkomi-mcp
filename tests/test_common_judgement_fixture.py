@@ -198,7 +198,9 @@ def _omp_actionable():
     source = (ROOT / "extensions" / "tsukkomi-omp.ts").read_text(encoding="utf-8")
     declared = re.search(r"const actionable: Record<string, true> = \{([^}]*)\}", source)
     assert declared, "the OMP extension no longer declares its actionable verdicts"
-    assert re.search(r"if \(actionable\[result\.verdict\]\) return \{ block: true", source)
+    # The block is returned for actionable verdicts only (optionally after resetting the check notice).
+    assert re.search(r"if \(actionable\[result\.verdict\]\) (?:\{ lastNotice\.check = \"\"; )?return \{ block: true",
+                     source)
     return set(re.findall(r"(\w+): true", declared.group(1)))
 
 
