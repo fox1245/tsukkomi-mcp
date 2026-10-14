@@ -331,3 +331,31 @@ def test_engine_uses_toml_source_index_and_rule_paths(tmp_path, monkeypatch, pro
         assert "persisted-rule" in {rule["id"] for rule in json.loads(rules.read_text())["contracts"]}
     finally:
         engine.close()
+
+
+def test_key_file_is_read_not_loaded_into_the_process_environment(tmp_path, monkeypatch):
+    # The selected key file is authoritative for OPENROUTER_API_KEY only; its other variables must not
+    # leak into os.environ, where workflow subprocesses and native hosts would inherit them.
+    from self_directing_mcp.config import get_settings
+    key_file = tmp_path / "shared.env"
+    key_file.write_text("OPENROUTER_API_KEY=file-only-key\nUNRELATED_SHARED_SECRET=other-tool-secret\n"
+                        "SELF_DIRECT_LOCAL_ONLY=true\n", encoding="utf-8")
+    for name in ("OPENROUTER_API_KEY", "UNRELATED_SHARED_SECRET", "SELF_DIRECT_LOCAL_ONLY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SELF_DIRECT_OPENROUTER_API_KEY_FILE", str(key_file))
+    settings = get_settings(_env_file=None)
+    assert settings.resolve_api_key() == "file-only-key"
+    assert "OPENROUTER_API_KEY" not in os.environ and "UNRELATED_SHARED_SECRET" not in os.environ
+    assert "SELF_DIRECT_LOCAL_ONLY" not in os.environ and settings.local_only is False
+
+
+@pytest.mark.parametrize("directory", ["native", ".native"])
+def test_sqlite_vector_autodetect_includes_setup_script_default(tmp_path, monkeypatch, directory):
+    # scripts/setup_sqlite_vector.py writes to .native/ by default; older installs used native/.
+    from self_directing_mcp import config
+    library = tmp_path / directory / ("vector.dll" if os.name == "nt" else "vector.so")
+    library.parent.mkdir()
+    library.write_bytes(b"")
+    monkeypatch.delenv("SELF_DIRECT_SQLITE_VECTOR_PATH", raising=False)
+    monkeypatch.setattr(config, "_repo_root", lambda: tmp_path)
+    assert config._default_sqlite_vector_path() == library.resolve()

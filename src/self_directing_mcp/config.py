@@ -107,10 +107,12 @@ def _default_sqlite_vector_path() -> Path | None:
     if override:
         return Path(override).expanduser().resolve()
     repo = _repo_root()
-    for ext in ("vector.so", "vector.dll", "vector.dylib"):
-        cand = repo / "native" / ext
-        if cand.is_file():
-            return cand.resolve()
+    # scripts/setup_sqlite_vector.py defaults to .native/; older installs used native/.
+    for directory in ("native", ".native"):
+        for ext in ("vector.so", "vector.dll", "vector.dylib"):
+            cand = repo / directory / ext
+            if cand.is_file():
+                return cand.resolve()
     return None
 
 
@@ -220,8 +222,6 @@ class Settings(BaseSettings):
 
 
 def get_settings(**overrides) -> Settings:
-    key_file = os.environ.get("SELF_DIRECT_OPENROUTER_API_KEY_FILE")
-    if key_file and Path(key_file).is_file():
-        from dotenv import load_dotenv
-        load_dotenv(key_file)
+    # The key file is read by resolve_api_key() for OPENROUTER_API_KEY only. It is never loaded into
+    # os.environ, where subprocesses and native hosts would inherit every variable it holds.
     return Settings(**overrides)
