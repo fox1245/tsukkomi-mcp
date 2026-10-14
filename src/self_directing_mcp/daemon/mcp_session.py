@@ -45,6 +45,7 @@ class _Tracker:
         if key in self.pending:
             self.pending.discard(key)
             self.daemon.end_request(None)
+            self.daemon.after_request()            # the memory cap applies after an MCP request as after a hook
 
     def close(self) -> None:
         for key in list(self.pending):

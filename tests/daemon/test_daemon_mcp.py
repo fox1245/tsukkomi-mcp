@@ -550,3 +550,29 @@ def test_a_relay_whose_daemon_keeps_going_away_ends_instead_of_looping(world, ru
         assert "keeps going away" in relay_proc.proc.stderr.read().decode()
     finally:
         relay_proc.close()
+
+
+def test_the_memory_cap_applies_after_an_mcp_request_too(runtime, inproc, monkeypatch):
+    rss = {"value": 10.0}
+    monkeypatch.setattr(core, "read_rss_mb", lambda: rss["value"])
+    gate = threading.Event()
+    gate.set()
+    daemon = inproc(core.DaemonConfig(max_rss_mb=100), hook_runner=lambda *a: {},
+                    engine_factory=lambda settings: SlowEngine(settings, gate), mcp_server=mcp_session.McpHandler())
+    sock, _ = daemon.connect()
+    P.write_frame(sock, {"op": "mcp", "env": {"SELF_DIRECT_LOCAL_ONLY": "true",
+                                              "SELF_DIRECT_INDEX_DIR": str(runtime.root / "cap-index")},
+                         "cwd": str(runtime.root), "mode": "default"})
+    assert P.read_frame(sock)["ok"] is True
+    reader = sock.makefile("rb")
+    sock.sendall((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}) + "\n").encode())
+    assert json.loads(reader.readline())["id"] == 1
+    sock.sendall((json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n").encode())
+    rss["value"] = 500.0
+    sock.sendall((json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                              "params": {"name": "audit_status", "arguments": {}}}) + "\n").encode())
+    assert json.loads(reader.readline())["id"] == 2                       # the request that crossed the cap is answered
+    assert daemon.wait_exit(10)
+    assert daemon.daemon.drain_reason == "rss"
+    sock.close()

@@ -445,12 +445,12 @@ def test_the_log_carries_event_names_sizes_and_durations_but_never_request_text(
 
     daemon = inproc(hook_runner=runner)
     frame = hook_frame("sess-1", payload={"session_id": "sess-1", "tool_input": {"command": marker + " rm -rf"},
-                                          "transcript_path": "/home/someone/private/" + marker})
+                                          "transcript_path": "/srv/example/private/" + marker})
     frame["env"] = {"SELF_DIRECT_INDEX_DIR": "/private/" + marker}
     assert request(daemon, frame)[1]["ok"] is True
     daemon.stop()
     text = (daemon.runtime_area.dir / rundir.LOG_NAME).read_text()
-    assert marker not in text and "/private" not in text and "someone" not in text and "rm -rf" not in text
+    assert marker not in text and "/private" not in text and "example" not in text and "rm -rf" not in text
     records = [json.loads(line) for line in text.splitlines()]
     assert {r["ev"] for r in records} >= {"started", "hook", "stopped"}
     for record in records:

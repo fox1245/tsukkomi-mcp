@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""AGY command entry point; importing it never reads stdin or re-execs Python."""
+"""AGY command entry point; importing it never reads stdin or re-execs Python.
+
+With ``SELF_DIRECT_DAEMON=on`` (Linux; experimental, see README "Resident daemon") this script is a thin client of the
+resident daemon: it imports only the standard library and ``self_directing_mcp.daemon.client``, and the answer is the
+daemon's or a visible fail-open (``daemon_unavailable``), never an in-process judgement.
+"""
 import json
 import os
 import sys

@@ -3,6 +3,10 @@
 
 Always exits 0 with a JSON response (exit code 2 would block). If the package cannot be imported, a standard-
 library fallback answers fail-open with a visible warning and records ``hook_health``.
+
+With ``SELF_DIRECT_DAEMON=on`` (Linux; experimental, see README "Resident daemon") this script is a thin client of the
+resident daemon: it imports only the standard library and ``self_directing_mcp.daemon.client``, and the answer is the
+daemon's or a visible fail-open (``daemon_unavailable``), never an in-process judgement.
 """
 import json
 import os
