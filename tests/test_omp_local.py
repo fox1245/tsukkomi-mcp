@@ -440,3 +440,141 @@ def test_developer_message_requires_list_content(local_engine):
     engine, file = local_engine
     _append(file, {"type": "message", "message": {"role": "developer", "content": "plain"}})
     assert _check_read(engine, file)["coverage"]["complete"] is False
+
+
+# --- Parser v7: host runtime notices and image blocks -------------------------------------------
+_TS = "2026-01-01T00:00:00Z"
+_B64 = "QUJDREVGR0hJSktMTU5PUA=="
+_CM_TYPES = ["launch-completion", "todo-error-reminder", "image-attachment", "tool-roster-notice",
+             "resolve-reminder", "xdev-mount-notice", "goal-continuation"]
+
+
+def _cm(custom_type="launch-completion", **over):
+    rec = {"type": "custom_message", "id": "c1", "parentId": None, "timestamp": _TS,
+           "customType": custom_type, "attribution": "agent", "display": False,
+           "content": "zzforbidden notice", "details": {"k": 1}}
+    rec.update(over)
+    return {k: v for k, v in rec.items() if v is not ...}
+
+
+def _custom(custom_type, data):
+    return {"type": "custom", "id": "x1", "parentId": None, "timestamp": _TS,
+            "customType": custom_type, "data": data}
+
+
+_GOAL = {"objective": "o", "timeUsedSeconds": 3, "tokensUsed": 10}
+_VALID_V7 = [
+    _custom("user_todo_edit", {"phases": [{"name": "a"}]}),
+    _custom("system-prompt-digest", "abc123"),
+    _custom("goal-completed", _GOAL),
+    {"type": "mode_change", "id": "m1", "parentId": None, "timestamp": _TS, "mode": "plan"},
+    *[_cm(t) for t in _CM_TYPES],
+    _cm("image-attachment", details=...),
+    _cm("goal-continuation", details=...),
+    _cm("launch-completion", attribution="user"),
+]
+
+
+@pytest.mark.parametrize("record", _VALID_V7)
+def test_v7_host_notices_are_supported_runtime_meta(local_engine, record):
+    engine, file = local_engine
+    _append(file, record)
+    result = _check_read(engine, file)
+    assert result["coverage"]["complete"] is True and result["verdict"] == "clean"
+    chunk = engine.store.list_chunks("session-1", "omp")[-1]
+    assert chunk.kind == "meta" and chunk.meta["role"] == "runtime"
+    assert chunk.meta["unsupported_event"] is False and chunk.meta["evidence_origin"]
+
+
+@pytest.mark.parametrize("record", [
+    _custom("user_todo_edit", {}),
+    _custom("user_todo_edit", {"phases": [], "extra": 1}),
+    _custom("user_todo_edit", {"phases": "x"}),
+    _custom("system-prompt-digest", {"a": 1}),
+    _custom("goal-completed", {**_GOAL, "extra": 1}),
+    _custom("goal-completed", {**_GOAL, "tokensUsed": "10"}),
+    _custom("goal-completed", {**_GOAL, "objective": 5}),
+    _custom("goal-completed", {**_GOAL, "tokensUsed": True}),
+    _custom("goal-completed", "str"),
+    _custom("future-custom", {"phases": []}),
+    {**_custom("system-prompt-digest", "x"), "extra": 1},
+    {"type": "mode_change", "id": "m1", "mode": 5},
+    {"type": "mode_change", "id": "m1", "mode": "plan", "extra": 1},
+    _cm(customType="future-notice"),
+    _cm(extra=1),
+    _cm(content=5),
+    _cm(content=...),
+    _cm(display="no"),
+    _cm(display=...),
+    _cm(attribution=5),
+    _cm(attribution=...),
+    _cm(details=[1]),
+    _cm(details="x"),
+])
+def test_v7_malformed_host_notices_stay_unsupported(local_engine, record):
+    engine, file = local_engine
+    _append(file, record)
+    result = _check_read(engine, file)
+    assert result["verdict"] == "unknown" and "unsupported_events" in result["coverage"]["issues"]
+    assert result["coverage"]["unsupported_event_count"] == 1
+
+
+def _image(mime="image/png", **over):
+    block = {"type": "image", "data": _B64, "mimeType": mime}
+    block.update(over)
+    return {k: v for k, v in block.items() if v is not ...}
+
+
+def _tool_result(*blocks, **extra):
+    return {"type": "message", "message": {"role": "toolResult", "toolCallId": "t1", "toolName": "read",
+                                           "content": list(blocks), **extra}}
+
+
+def test_v7_images_in_tool_results_and_user_messages(local_engine):
+    engine, file = local_engine
+    _append(file, _tool_result(_image(), isError=False),
+            _tool_result({"type": "text", "text": "Exit code: 1"}, _image("image/jpeg")),
+            _tool_result(_image()),
+            _message("user", {"type": "text", "text": "see this"}, _image()))
+    result = _check_read(engine, file)
+    assert result["coverage"]["complete"] is True and result["verdict"] == "clean"
+    chunks = engine.store.list_chunks("session-1", "omp")
+    assert not any(_B64 in c.text or _B64 in str(c.meta) for c in chunks)
+    results = [c for c in chunks if c.kind == "tool_result"]
+    assert [c.meta["success"] for c in results] == [True, False, None]
+    assert "[image:image/png]" in results[0].text and "[image:image/jpeg]" in results[1].text
+    (img,) = [c for c in chunks if c.text.startswith("[image:")]
+    assert img.kind == "meta" and img.meta["role"] == "runtime" and img.meta["evidence_origin"] == "image"
+    assert [c.kind for c in chunks if c.text == "[message:user] see this"] == ["turn"]
+
+
+@pytest.mark.parametrize("block", [
+    _image("text/plain"), _image("image"), _image(5), _image(data=...), _image(data=5),
+    _image(mimeType=...), _image(extra=1),
+])
+@pytest.mark.parametrize("where", ["tool", "user"])
+def test_v7_malformed_images_stay_unsupported(local_engine, block, where):
+    engine, file = local_engine
+    _append(file, _tool_result(block) if where == "tool" else _message("user", block))
+    result = _check_read(engine, file)
+    assert result["verdict"] == "unknown" and result["coverage"]["complete"] is False
+
+
+def test_v7_notice_text_and_images_never_satisfy_or_trigger_user_contracts(local_engine):
+    engine, file = local_engine
+    engine.upsert_contracts([
+        {"id": "no-zz", "type": "must_not", "scope": "message", "regex": "zzforbidden",
+         "provider": "omp", "roles": ["user"]},
+        {"id": "no-zz-any", "type": "must_not", "scope": "any", "regex": "zzforbidden|image:image",
+         "provider": "omp", "roles": ["user"]},
+        {"id": "need-img", "type": "must", "scope": "message", "regex": r"\[image:image/png\]",
+         "provider": "omp", "roles": ["user"]},
+    ])
+    _append(file, *[_cm(t) for t in _CM_TYPES], _message("user", _image()))
+    audit = engine.audit_session("session-1", provider="omp", path=str(file))
+    assert audit["coverage"]["complete"] is True
+    found = {f["contract_id"]: f for f in audit["findings"]}
+    # must_not (user role) is not triggered by notice text / image placeholders;
+    # must (user role) is not satisfied by them either.
+    assert found["no-zz"]["verdict"] == found["no-zz-any"]["verdict"] == "clean"
+    assert found["need-img"]["verdict"] == "violation" and not found["need-img"]["evidence"]
