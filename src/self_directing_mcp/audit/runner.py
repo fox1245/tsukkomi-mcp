@@ -13,18 +13,129 @@ from self_directing_mcp.retrieve.checks import scope_matches
 from self_directing_mcp.schemas import AuditResult, Evidence, Finding
 from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.neograph_runtime import run_stages
-from self_directing_mcp.request_control import check_request, request_operation
+from self_directing_mcp.request_control import check_request, current_request, request_operation
 
+from self_directing_mcp.audit import shellstatus
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 
 REGEX_TIMEOUT = "regex_timeout: a contract pattern exceeded its time limit, so this contract could not be evaluated"
+SUCCESS_UNVERIFIABLE = "success_unverifiable"
+ANCHOR_NOT_USER = ("anchor_not_user: the contract's source_event_id is not a user message (a tool result, runtime or "
+                   "injected text cannot be the origin of a contract), so its findings for this session are unknown")
+
+
+REJECTED_REASON = "host_denied: the host recorded a deny decision for this call, so it did not run"
+REJECTED_LIMIT = 20
+
+
+def _host_denied(decision) -> bool:
+    """A permission decision the host recorded on a tool result as a refusal; anything else is an attempt.
+
+    Claude Code 2.1.299 records ``{"decision": "reject", "source": "hook" | ..., "reasonType": ...}`` on the record of
+    the tool result of a refused call (checked with a synthetic probe: a PreToolUse hook answering ``deny``); a
+    ``reject`` is a refusal whatever its ``source``. The forms ``"deny"`` and ``{"behavior": "deny"}`` are kept. An
+    ``accept``/``allow``, an unknown or missing decision, or an error text is never a refusal.
+    """
+    if isinstance(decision, str):
+        return decision == "deny"
+    return isinstance(decision, dict) and (decision.get("decision") == "reject" or decision.get("behavior") == "deny")
+
+
+def _denial_source(decision):
+    """Who refused (``source`` of the host's decision) when it says so, else None."""
+    source = decision.get("source") if isinstance(decision, dict) else None
+    return source if isinstance(source, str) and source else None
+
+
+def rejected_calls(events) -> dict:
+    """Claude Code: ``{tool call chunk id: (denying result chunk id, source)}`` for calls the host recorded as refused.
+
+    A refused call is a rejected proposal, not an executed action. The only evidence is the host's own decision on the
+    tool result linked by call id (``meta.permission_decision``, from the record's ``permissionDecision``); a result
+    that merely failed is still an attempt. The call must be the only one with that id before the result, so an id
+    that is shared never vouches for a call it may not belong to.
+    """
+    calls, found = {}, {}
+    for event in events:
+        call_id = _meta(event).get("call_id")
+        if call_id is None:
+            continue
+        if event.kind == "tool_call":
+            calls.setdefault(_key(call_id), []).append(event.chunk_id)
+        elif event.kind == "tool_result" and _host_denied(_meta(event).get("permission_decision")):
+            ids = calls.get(_key(call_id), ())
+            if len(ids) == 1:
+                found[ids[0]] = (event.chunk_id, _denial_source(_meta(event).get("permission_decision")))
+    return found
+
+
+def _wants_rejections(rule) -> bool:
+    """A prohibition over calls: the only rules a refused call can change."""
+    return rule.type == "must_not" and rule.scope in ("tool_call", "any")
+
+
+def rejections(provider, rules, events, proposed):
+    """The rejected calls of a history audit (``None`` when there are none or none can matter)."""
+    if provider != "claude" or proposed is not None or not any(_wants_rejections(rule) for rule in rules):
+        return None
+    return rejected_calls(events) or None
+
+
+def _event_byte(event):
+    key = getattr(event, "key", None)
+    return key[0] if key else getattr(event, "byte_start", None)
+
+
+def rejection_entry(rule_id, event_id, call_id, denial, at_byte) -> dict:
+    """One ``proposals_rejected`` entry. ``denial`` is ``(chunk id of the result carrying the decision, source)``;
+    ``denied_by`` is the decision's ``source`` (``hook``, ``user``, ...) and ``host`` when it names none."""
+    return {"contract_id": rule_id, "event_id": event_id, "call_id": call_id, "reason": REJECTED_REASON,
+            "denied_by": denial[1] or "host", "denial_event_id": denial[0], "at_byte": at_byte}
+
+
+def rejected_item(rule_id, event, denial) -> dict:
+    return rejection_entry(rule_id, event.chunk_id, _meta(event).get("call_id"), denial, _event_byte(event))
+
+
+REJECTED_PROPOSAL_REASON = "host_denied: the pre-tool hook denied this proposal, so it did not run"
+
+
+def rejected_proposal_item(rule_id, tool_name, at_byte, denied_at_byte) -> dict:
+    """AGY: a model proposal the Pre hook denied (``host_rejected_proposal``); the call was never executed."""
+    return {"contract_id": rule_id, "reason": REJECTED_PROPOSAL_REASON, "tool_name": tool_name, "at_byte": at_byte,
+            "denied_at_byte": denied_at_byte}
+
+
+def rejected_clean(count) -> str:
+    return f"no executed forbidden match in inspected events; {count} matching call(s) were rejected by the host before they ran"
+
+
+def is_user_event(event) -> bool:
+    """A user message: what the parser marked ``role == "user"`` (never runtime, injected or tool text)."""
+    return (getattr(event, "meta", None) or {}).get("role") == "user"
+
+
+def success_unverifiable(why) -> str:
+    """The reason of an obligation whose only success evidence cannot be attributed to the required command."""
+    return (f"{SUCCESS_UNVERIFIABLE}: the recorded success is not necessarily the required command's "
+            f"({shellstatus.REASONS.get(why, why)})")
 
 
 def _checked(items):
+    """``items``, with a cooperative stop check before each and one after the last.
+
+    The request in force is read once, when the iteration starts: nothing a loop body does between two items opens or
+    closes a request scope (every use is a comprehension or a plain loop over events), so each check still sees
+    exactly the control that ``check_request()`` would, without a context-variable lookup and a call for every event."""
+    control = current_request()
+    if control is None:
+        yield from items
+        return
+    check = control._check
     for item in items:
-        check_request()
+        check()
         yield item
-    check_request()
+    check()
 
 
 def _worse(a, b):
@@ -40,6 +151,16 @@ def evidence(chunk, detail="regex match"):
 def _eligible(chunk, rule):
     check_request()
     return scope_matches(chunk, rule.scope) and chunk.meta.get("role") in rule.roles
+
+
+_SCOPE_KINDS = {"tool_call": "tool_call", "tool_result": "tool_result", "message": "turn"}
+
+
+def _scope_test(rule):
+    """``(kind, roles)`` for the hot loops: an event is eligible for ``rule`` when ``kind`` is None (scope ``any``) or the
+    event's kind equals it, and the event's role is one of ``roles``. This is ``_eligible`` minus its cooperative stop
+    check; every loop that uses it already checks once per event through ``_checked``."""
+    return _SCOPE_KINDS.get(rule.scope), rule.roles
 
 
 def action_applies(rule, proposed) -> bool:
@@ -63,6 +184,30 @@ def action_applies(rule, proposed) -> bool:
 def prefix_note(coverage) -> str:
     return (f"Judged as of byte {coverage.get('judged_through_byte', 0)}; "
             f"{coverage.get('unread_bytes', 0)} appended byte(s) were not reviewed.")
+
+
+ABSENCE_UNPROVEN = "incomplete evidence cannot prove the absence of a forbidden match"
+TRIGGER_UNPROVEN = "incomplete evidence cannot prove that no triggering action occurred"
+
+
+def downgrade_unproven_clean(rules, findings) -> bool:
+    """Format drift: with incomplete coverage an absence proof of a history audit is unknown, not clean.
+
+    An unsupported, unparsed or unread record may hold the forbidden match (``must_not``) or the triggering action
+    of an order rule (``before_regex``). A ``clean`` that rests on observed positive evidence (a satisfied
+    prerequisite) is not touched, and neither is a confirmed violation found anywhere else.
+    """
+    changed = False
+    for rule, item in zip(rules, findings):
+        if item.verdict != "clean" or item.applicability != "applicable":
+            continue
+        why = (ABSENCE_UNPROVEN if rule.type == "must_not"
+               else TRIGGER_UNPROVEN if rule.before_regex and item.reason.startswith("no triggering action") else None)
+        if why:
+            item.verdict, item.reason = "unknown", why
+            item.basis = (item.basis or "") + "; incomplete coverage prevents proving absence"
+            changed = True
+    return changed
 
 
 def downgrade_unproven_absence(findings, rules) -> bool:
@@ -94,19 +239,42 @@ def audit_needs(active, proposed):
     return needs, any(r.requires_success for r in rules)
 
 
+def _link_calls(active):
+    """``(calls, outputs)``: the positions of the tool calls and of the tool results, by call id."""
+    calls, outputs = {}, {}
+    for index, chunk in enumerate(_checked(active)):
+        kind = chunk.kind
+        if kind == "tool_call":
+            calls.setdefault(_key(chunk.meta.get("call_id")), []).append(index)
+        elif kind == "tool_result":
+            outputs.setdefault(_key(chunk.meta.get("call_id")), []).append(index)
+    return calls, outputs
+
+
+def _linked(shared, start, active):
+    """``_link_calls`` of ``active`` (= the events from ``start`` on), computed once per evaluation for every rule that
+    needs it; ``None`` (compute it privately) when the caller keeps no such table."""
+    if shared is None:
+        return None
+    found = shared.get(start)
+    if found is None:
+        found = shared[start] = _link_calls(active)
+    return found
+
+
 class _Presence:
     """Index prerequisites once; each checkpoint is a binary search plus a bounded evidence slice."""
 
-    def __init__(self, rule, regex, active):
-        self.rule, self.active = rule, active
-        self.hits, self.calls, self.outputs = [], {}, {}
+    def __init__(self, rule, regex, active, linked=None):
+        """``linked``: ``_link_calls(active)`` when the caller already has it (it does not depend on the rule)."""
+        self.rule, self.active, self.regex = rule, active, regex
+        self.calls, self.outputs = linked if linked is not None else _link_calls(active)
+        self.hits = hits = []
+        search = regex.search
+        scope_kind, roles = _scope_test(rule)
         for index, chunk in enumerate(_checked(active)):
-            if chunk.kind == "tool_call":
-                self.calls.setdefault(_key(chunk.meta.get("call_id")), []).append(index)
-            elif chunk.kind == "tool_result":
-                self.outputs.setdefault(_key(chunk.meta.get("call_id")), []).append(index)
-            if _eligible(chunk, rule) and regex.search(chunk.text):
-                self.hits.append(index)
+            if (scope_kind is None or chunk.kind == scope_kind) and chunk.meta.get("role") in roles and search(chunk.text):
+                hits.append(index)
 
     def before(self, position):
         """Verdict for a checkpoint whose prefix is ``active[:position]``."""
@@ -129,6 +297,12 @@ class _Presence:
             if end - start == 1 and active[outputs[start]].meta.get("success") is not None:
                 output = active[outputs[start]]
                 if output.meta["success"] is True:
+                    # A host records the status of the whole command line; `|| true`, a pipe without pipefail, a
+                    # following command or --collect-only make it someone else's status (audit/shellstatus.py).
+                    why = shellstatus.unverifiable(chunk.text, self.regex)
+                    if why:
+                        return "unknown", success_unverifiable(why), [
+                            evidence(chunk), evidence(output, "linked tool result (success not attributable)")]
                     return "clean", "required call has linked successful result", [
                         evidence(chunk), evidence(output, "linked successful tool result")]
                 unresolved = False
@@ -159,24 +333,31 @@ def audit_contract(rule, **kwargs):
             return _regex_timeout_finding(rule)
 
 
-def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, proposed=None, chunks=None):
-    """Regex checks operate on events. Retrieval ranks are never verification evidence."""
+def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, proposed=None, chunks=None,
+                    rejected=None, ids=None, linked=None):
+    """Regex checks operate on events. Retrieval ranks are never verification evidence.
+
+    ``rejected`` (Claude Code history audits): the calls the host refused, see ``rejected_calls``.
+    """
     check_request()
-    def finding(verdict, reason, items=None, basis=None, applicability="applicable"):
+    def finding(verdict, reason, items=None, basis=None, applicability="applicable", stopped=None):
         check_request()
         return Finding(contract_id=rule.id, contract_revision=rule.revision, severity=rule.severity,
                        verdict=verdict, reason=reason, evidence=items or [], basis=basis,
-                       applicability=applicability)
+                       applicability=applicability, proposals_rejected=stopped or [])
 
     if not rule.enabled:
         return finding("clean", "contract disabled")
     chunks = chunks if chunks is not None else store.list_chunks(session_id, provider)
     if (rule.provider and rule.provider != provider) or (rule.session_id and rule.session_id != session_id):
         return finding("clean", "contract outside this provider/session")
-    ids = {c.chunk_id: i for i, c in enumerate(_checked(chunks))}
+    if ids is None:
+        ids = {c.chunk_id: i for i, c in enumerate(_checked(chunks))}
     for anchor in (rule.source_event_id, rule.applies_from_event_id):
         if anchor and anchor not in ids:
             return finding("unknown", "contract source or activation event is not in this session")
+    if rule.source_event_id and not is_user_event(chunks[ids[rule.source_event_id]]):
+        return finding("unknown", ANCHOR_NOT_USER)
     if not rule.regex:
         return finding("unknown", "description-only contract needs a verifier; retrieval is not proof")
     try:
@@ -194,8 +375,19 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
                        applicability="not_applicable")
     if rule.type == "must_not":
         inspected = [proposed] if proposed is not None else active
-        hits = [c for c in _checked(inspected) if _eligible(c, rule) and regex.search(c.text)]
+        scope_kind, roles = _scope_test(rule)
+        hits = [c for c in _checked(inspected)
+                if (scope_kind is None or c.kind == scope_kind) and c.meta.get("role") in roles and regex.search(c.text)]
+        turned = [c for c in hits if rejected and c.chunk_id in rejected]
+        if turned:
+            # A call the host refused did not run: it is reported apart and never counts as an executed match.
+            hits = [c for c in hits if c.chunk_id not in rejected]
+        stopped = [rejected_item(rule.id, c, rejected[c.chunk_id]) for c in turned[:REJECTED_LIMIT]]
         if not hits:
+            if turned:
+                return finding("clean", rejected_clean(len(turned)),
+                               basis=f"{rule.id}.regex matched only host-rejected proposal(s), which did not run",
+                               stopped=stopped)
             return finding("clean", "no forbidden match in inspected events",
                            basis=f"{rule.id}.regex did not match any inspected event")
         exception = None
@@ -207,28 +399,33 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
                                basis=f"{rule.id}.exception_regex failed to compile")
         if exception is not None and exception.search(inspected[0].text if proposed is not None else " ".join(c.text for c in hits)):
             return finding("suspicious", "forbidden match is covered by the authorized exception; confirm scope before proceeding",
-                           basis=f"{rule.id}.exception_regex matched the same event(s); user-authorized exception requires confirmation")
+                           basis=f"{rule.id}.exception_regex matched the same event(s); user-authorized exception requires confirmation",
+                           stopped=stopped)
         reason = f"forbidden regex matched {len(hits)} event(s)"
         if rule.source_quote:
             reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
         return finding("violation", reason,
-                       basis=f"{rule.id}.regex '{rule.regex}' matched prohibited content", items=[evidence(c) for c in hits[:20]])
+                       basis=f"{rule.id}.regex '{rule.regex}' matched prohibited content", items=[evidence(c) for c in hits[:20]],
+                       stopped=stopped)
     if trigger:
         if proposed is not None:
             checkpoints = [(len(active), proposed)] if _eligible(proposed, rule) and trigger.search(proposed.text) else []
         else:
-            checkpoints = [(i, c) for i, c in enumerate(_checked(active)) if _eligible(c, rule) and trigger.search(c.text)]
+            scope_kind, roles = _scope_test(rule)
+            checkpoints = [(i, c) for i, c in enumerate(_checked(active))
+                           if (scope_kind is None or c.kind == scope_kind) and c.meta.get("role") in roles
+                           and trigger.search(c.text)]
         if not checkpoints:
             return finding("clean", "no triggering action in inspected events")
         overall, reasons, items = "clean", [], []
-        presence = _Presence(rule, regex, active)
+        presence = _Presence(rule, regex, active, _linked(linked, start, active))
         for position, checkpoint in _checked(checkpoints):
             verdict, reason, supporting = presence.before(position)
             overall = _worse(overall, verdict)
             reasons.append(reason)
             items.extend([evidence(checkpoint, "triggering action"), *supporting])
         return finding(overall, "; ".join(dict.fromkeys(reasons)), items[:20])
-    verdict, reason, supporting = _Presence(rule, regex, active).before(len(active))
+    verdict, reason, supporting = _Presence(rule, regex, active, _linked(linked, start, active)).before(len(active))
     return finding(verdict, reason, supporting)
 
 
@@ -257,8 +454,11 @@ def _post_process(evidence_rules, rules, findings, events, **kwargs) -> None:
 
 def full_findings(active, chunks, *, session_id, store, provider, proposed, coverage):
     """The reference evaluation: every rule over the whole event list, then the provider's evidence classes."""
-    findings = [audit_contract(r, session_id=session_id, store=store, provider=provider,
-                               proposed=proposed, chunks=chunks) for r in _checked(active)]
+    rejected = rejections(provider, active, chunks, proposed)
+    ids = {c.chunk_id: i for i, c in enumerate(_checked(chunks))}     # one position index for every rule
+    linked = {}                                                         # and one call/result table per activation point
+    findings = [audit_contract(r, session_id=session_id, store=store, provider=provider, proposed=proposed,
+                               chunks=chunks, rejected=rejected, ids=ids, linked=linked) for r in _checked(active)]
     # Provider-specific partial-observation passes post-process the findings; other providers have none.
     evidence_rules = _EVIDENCE_RULES.get(provider)
     if evidence_rules is not None:
@@ -312,6 +512,8 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
                     item.reason = "incomplete evidence cannot prove a missing or failed obligation"
                     item.basis = (item.basis or "") + "; incomplete coverage prevents proving absence"
             downgrade_unproven_inapplicability(findings)
+            if proposed is None and not coverage.get("judged_prefix"):
+                downgrade_unproven_clean(active, findings)
         overall = "clean"
         for item in _checked(findings):
             overall = _worse(overall, item.verdict)
@@ -400,10 +602,12 @@ def _consistent(denied_args, args) -> bool:
     return bool(shared) and all(denied_args[key] == args[key] for key in shared)
 
 
-def _blocked_proposals(events) -> set:
-    """Positions of model proposals the Pre hook demonstrably blocked (non-execution); they are not attempts."""
+def _blocked_proposals(events) -> dict:
+    """``{position of a model proposal the Pre hook demonstrably blocked: position of its denial}``.
+
+    A blocked proposal never ran (non-execution); it is not an attempt."""
     waiting: dict = {}
-    blocked = set()
+    blocked: dict = {}
     for index, event in enumerate(events):
         meta = _meta(event)
         if meta.get("evidence_origin") == "model_proposal":
@@ -413,7 +617,7 @@ def _blocked_proposals(events) -> set:
             queue = waiting.get(denied.get("name"), [])
             for slot in range(len(queue) - 1, -1, -1):
                 if _consistent(denied.get("args"), queue[slot][1]):
-                    blocked.add(queue.pop(slot)[0])
+                    blocked[queue.pop(slot)[0]] = index
                     break
     return blocked
 
@@ -427,7 +631,10 @@ def _window(rule, events, ids, proposed):
             trigger = compile_contract(rule.before_regex)
         except re.error:
             return start, end
-        positions = [i for i in range(start, end) if _eligible(events[i], rule) and trigger.search(events[i].text)]
+        scope_kind, roles = _scope_test(rule)
+        positions = [i for i in _checked(range(start, end))
+                     if (scope_kind is None or events[i].kind == scope_kind) and events[i].meta.get("role") in roles
+                     and trigger.search(events[i].text)]
         if positions:
             end = positions[-1]
     return start, end
@@ -459,28 +666,46 @@ def _cut_unknown(rule, item, code, why, *, history=True) -> bool:
     return unmet
 
 
+def _in_window(indices, start, end):
+    """The members of the sorted ``indices`` that lie in ``[start, end)`` (an empty window holds none)."""
+    return indices[bisect_left(indices, start):bisect_left(indices, end)]
+
+
 def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None) -> None:
     """Apply the partial-observation, pending and legacy rules above to ``findings`` (mutated in place)."""
     events = list(events)
     check_request()
     ids = {event.chunk_id: index for index, event in enumerate(events)}
     last_final = {}
+    # The classes of evidence the steps below look for are rare, and a rule needs only the ones inside its own window:
+    # find them once, in order, instead of scanning every rule's whole window for them.
+    truncated, truncated_at, proposals, legacy, pending = [], [], [], [], []
     for index, event in enumerate(events):
         meta = _meta(event)
         if meta.get("event_type") in RESULT_TYPES and meta.get("status") in _FINAL_STATUS:
             last_final[meta.get("step_index")] = index
+        fields = meta.get("truncated_fields")
+        if fields:
+            truncated.append((index, meta.get("event_type"), fields))
+            truncated_at.append(index)
+        if meta.get("evidence_origin") == "model_proposal":
+            proposals.append(index)
+        if meta.get("linkage") == "legacy_unlinked":
+            legacy.append(index)
+        if meta.get("pending"):
+            pending.append(index)
     history = proposed is None
-    blocked = _blocked_proposals(events) if history and any(_wants_attempts(r) for r in rules) else set()
+    blocked = _blocked_proposals(events) if history and any(_wants_attempts(r) for r in rules) else {}
     for rule, item in zip(rules, findings):
         check_request()
         start, end = _window(rule, events, ids, proposed)
-        scan = events[start:end]
         deps = _dependencies(rule)
-        cut = [(event, field) for event in scan for field in (_meta(event).get("truncated_fields") or ())
-               if (_meta(event).get("event_type"), field) in deps and (_meta(event).get("event_type"), field) in JUDGED_FIELDS]
+        low, high = bisect_left(truncated_at, start), bisect_left(truncated_at, end)
+        cut = [(events[index], field) for index, event_type, fields in truncated[low:high] for field in fields
+               if (event_type, field) in deps and (event_type, field) in JUDGED_FIELDS]
         if rule.type == "must_not":
             if history and item.verdict != "unknown" and _wants_attempts(rule) and rule.regex:
-                _attempt_hits(rule, item, events, range(start, end), blocked)
+                _attempt_hits(rule, item, events, _in_window(proposals, start, end), blocked)
             if cut:
                 _cut_unknown(rule, item, _TRUNCATED_CODE.get(cut[0][1], "truncated_" + cut[0][1]),
                              f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{cut[0][1]} may hide a match",
@@ -495,7 +720,8 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
         # must
         if item.verdict == "clean" and item.reason.startswith("no triggering action"):
             if rule.before_regex and history:
-                code = _hidden_trigger(rule, events, range(start, end), cut, blocked)
+                code = _hidden_trigger(rule, events, bool(_in_window(legacy, start, end)),
+                                       _in_window(proposals, start, end), cut, blocked)
                 if code:
                     _unknown(item, *code)
             continue
@@ -513,19 +739,19 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
             field = cut[0][1]
             _cut_unknown(rule, item, _TRUNCATED_CODE.get(field, "truncated_" + field),
                          f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{field} may hold the missing evidence")
-        elif absent and _wants_attempts(rule) and _attempted(rule, events, range(start, end), blocked):
+        elif absent and _wants_attempts(rule) and _attempted(rule, events, _in_window(proposals, start, end), blocked):
             # Call side: a matching call was proposed, so the obligation may have been met; whether it ran, and
             # how it ended, is what the result side cannot show. A call never proposed is a real absence.
-            if any(_meta(e).get("pending") and last_final.get(_meta(e).get("step_index"), -1) < start + i
-                   for i, e in enumerate(scan)):
+            if any(last_final.get(_meta(events[at]).get("step_index"), -1) < at for at in _in_window(pending, start, end)):
                 _unknown(item, "pending_running", "a tool result is still RUNNING, so its outcome is unknown")
-            elif any(_meta(e).get("linkage") == "legacy_unlinked" for e in scan):
+            elif _in_window(legacy, start, end):
                 _unknown(item, "unsupported_legacy",
                          "results before this conversation's first host receipt cannot be linked to calls")
     if coverage is not None:
         unknown = [f for f in findings if f.verdict == "unknown"]
-        legacy = sum(1 for f in unknown if f.reason.startswith("unsupported_legacy"))
-        coverage["unknown_breakdown"] = {"current_session": len(unknown) - legacy, "unsupported_legacy": legacy}
+        legacy_count = sum(1 for f in unknown if f.reason.startswith("unsupported_legacy"))
+        coverage["unknown_breakdown"] = {"current_session": len(unknown) - legacy_count,
+                                         "unsupported_legacy": legacy_count}
 
 
 # --- Claude Code evidence classes -----------------------------------------------------------------------
@@ -574,25 +800,31 @@ def claude_evidence_rules(rules, findings, events, *, proposed=None, coverage=No
 _EVIDENCE_RULES = {"agy": agy_evidence_rules, "claude": claude_evidence_rules}
 
 
-def _attempted(rule, events, positions, blocked) -> bool:
+def _attempted(rule, events, proposals, blocked) -> bool:
+    """Whether one of ``proposals`` (positions of the host-logged model proposals in the rule's window) that was not
+    blocked matches the rule's regex."""
     try:
         regex = compile_contract(rule.regex)
     except re.error:
         return False
-    return any(_meta(events[i]).get("evidence_origin") == "model_proposal" and i not in blocked
-               and regex.search(events[i].text) for i in positions)
+    return any(i not in blocked and regex.search(events[i].text) for i in proposals)
 
 
-def _attempt_hits(rule, item, events, positions, blocked) -> None:
+def _attempt_hits(rule, item, events, proposals, blocked) -> None:
     """A forbidden call attempt is a violation whatever came back (ERROR, INVALID, no receipt): the host log
-    preserves the proposal and its arguments. Proposals the Pre hook blocked never ran and are not counted."""
+    preserves the proposal and its arguments. Proposals the Pre hook blocked never ran and are not counted.
+    ``proposals``: the positions of the host-logged model proposals in the rule's window, in order."""
     try:
         regex = compile_contract(rule.regex)
         exception = compile_contract(rule.exception_regex) if rule.exception_regex else None
     except re.error:
         return
-    hits = [events[i] for i in positions if _meta(events[i]).get("evidence_origin") == "model_proposal"
-            and i not in blocked and regex.search(events[i].text)]
+    refused = [i for i in proposals if i in blocked and regex.search(events[i].text)]
+    if refused:   # reported apart, whatever the verdict ends up being
+        item.proposals_rejected = [
+            rejected_proposal_item(rule.id, _meta(events[i]).get("tool_name"), _event_byte(events[i]),
+                                   _event_byte(events[blocked[i]])) for i in refused[:REJECTED_LIMIT]]
+    hits = [events[i] for i in proposals if i not in blocked and regex.search(events[i].text)]
     if not hits:
         return
     covered = exception is not None and exception.search(" ".join(h.text for h in hits)) is not None
@@ -607,8 +839,10 @@ def _attempt_hits(rule, item, events, positions, blocked) -> None:
     item.evidence = [evidence(hit, "forbidden call attempt (model proposal)") for hit in hits[:20]]
 
 
-def _hidden_trigger(rule, events, positions, cut, blocked):
-    """(code, why) when a clean "no triggering action" cannot be trusted: calls may be hidden or unlinked."""
+def _hidden_trigger(rule, events, legacy_in_window, proposals, cut, blocked):
+    """(code, why) when a clean "no triggering action" cannot be trusted: calls may be hidden or unlinked.
+    ``legacy_in_window``: some result in the rule's window is a legacy (unlinked) one; ``proposals``: the positions of
+    the host-logged model proposals in the window."""
     if cut:
         field = cut[0][1]
         return (_TRUNCATED_CODE.get(field, "truncated_" + field),
@@ -617,10 +851,8 @@ def _hidden_trigger(rule, events, positions, cut, blocked):
         trigger = compile_contract(rule.before_regex)
     except re.error:
         return None
-    window = [events[i] for i in positions]
-    if any(_meta(e).get("linkage") == "legacy_unlinked" for e in window):
-        if any(_meta(events[i]).get("evidence_origin") == "model_proposal" and i not in blocked
-               and trigger.search(events[i].text) for i in positions):
+    if legacy_in_window:
+        if any(i not in blocked and trigger.search(events[i].text) for i in proposals):
             return ("unsupported_legacy",
                     "a matching call was proposed but its execution cannot be linked to a legacy result")
     return None

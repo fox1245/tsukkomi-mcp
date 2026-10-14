@@ -595,9 +595,11 @@ def test_typed_result_text_is_tool_role_evidence_for_result_rules(env):
                     lambda: code_action(1, "hunter2"), lambda: mcp_tool(1, "hunter2"), lambda: list_dir(1, "hunter2")):
         path = make(root, [user(0, "go"), builder()])
         assert finding(engine.audit_session(SID, provider="agy", path=str(path)), "no-secret")["verdict"] == "violation"
-        engine.upsert_contracts([{**SECRET_RULE, "roles": ["assistant"]}])
+        # Narrowing a rule to other roles weakens it, so it carries the user's message ("go") as its anchor.
+        anchor = next(c.chunk_id for c in engine.store.list_chunks(SID, "agy") if c.meta.get("role") == "user")
+        engine.upsert_contracts([{**SECRET_RULE, "roles": ["assistant"], "source_event_id": anchor}])
         assert finding(engine.audit_session(SID, provider="agy", path=str(path)), "no-secret")["verdict"] == "clean"
-        engine.upsert_contracts([SECRET_RULE])
+        engine.upsert_contracts([{**SECRET_RULE, "source_event_id": anchor}])   # swapping the roles back drops one too
 
 
 def test_the_result_type_reaches_audit_events(env):
@@ -621,7 +623,7 @@ def test_a_parser_bump_turns_unsupported_ide_steps_into_supported_ones(env, monk
         first = sync(engine, path)
     assert first["coverage"]["unsupported_event_count"] == 7 and first["parser_version"] == 6
     second = sync(engine, path)
-    assert second["reindexed"] and second["reindex_reason"] == "parser_updated" and second["parser_version"] == 7
+    assert second["reindexed"] and second["reindex_reason"] == "parser_updated" and second["parser_version"] == agy.PARSER_VERSION
     assert second["coverage"]["unsupported_event_count"] == 0 and second["coverage"]["complete"]
     assert not sync(engine, path)["reindexed"]
     persisted = second["coverage"]["agy_evidence"]

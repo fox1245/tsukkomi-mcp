@@ -29,6 +29,26 @@ class HookRuntimeError(RuntimeError):
     kind = AUDIT_UNAVAILABLE
 
 
+class InfoNote(str):
+    """A Stop note that reports something already settled (a refused call): information, not an unmet check."""
+
+
+def rejected_note(finding: dict) -> InfoNote:
+    """What a Stop checkpoint says about calls the host refused: rejected proposals, never executed violations."""
+    count = len(finding.get("proposals_rejected") or ())
+    return InfoNote(f"[{finding.get('contract_id')}] {count}{'+' if count >= 20 else ''} proposed call(s) matching this "
+                    "contract were rejected by the host and did not run (rejected proposals, not executed violations).")
+
+
+def with_notes(notes: list, lead: str) -> str:
+    """One user-facing line from Stop notes: ``lead`` introduces what is unverified, rejected proposals stand apart."""
+    plain = [note for note in notes if not isinstance(note, InfoNote)]
+    info = [note for note in notes if isinstance(note, InfoNote)]
+    parts = ([lead + " ".join(plain)] if plain else []) + (["Rejected by the host, not executed: " + " ".join(info)]
+                                                           if info else [])
+    return " ".join(parts)
+
+
 def short(text: Any, limit: int = 300) -> str:
     return mask_secrets(str(text))[:limit]
 
@@ -67,6 +87,15 @@ def classify(audit: dict, mode: str, high_risk: frozenset | set = frozenset()) -
     if risky:
         return "ask", f"High-risk contract [{', '.join(risky)}] could not be verified: " + reason, False
     return "allow", "WARNING - unverified, not a compliance verdict: " + reason, True
+
+
+def wants_derived_work(engine: SelfDirectEngine) -> bool:
+    """Whether a hook's history refresh should also maintain the search indexes.
+
+    A local-only engine (what command hooks run) has only the sparse index, which a search repairs on demand, so the
+    hook publishes just the canonical events its audit reads and skips the full-text writes (a synchronous commit of
+    their own). An engine with an embedder restores cached vectors during a sync, so it keeps doing that work."""
+    return not engine.settings.local_only
 
 
 def read_obligations(engine: SelfDirectEngine, provider: str, session_id: str, path: str | None) -> dict:
@@ -158,7 +187,8 @@ def miss_key(misses: list, prefix: str = "") -> str:
 def checkpoint(engine: SelfDirectEngine, provider: str, session_id: str, path: str, obligations: dict,
                label: str) -> tuple[list[str], list]:
     """Refresh history and gather ``(notes, confirmed_misses)`` for a Stop checkpoint. Notes never block."""
-    synced = engine.sync_session(session_id=session_id, provider=provider, path=path, embed=False)
+    synced = engine.sync_session(session_id=session_id, provider=provider, path=path, embed=False,
+                                 derived=wants_derived_work(engine))
     notes = []
     coverage = synced.get("coverage", {})
     # Records the host is still appending are judged next time; any other gap leaves completion unverified.
@@ -175,5 +205,6 @@ def checkpoint(engine: SelfDirectEngine, provider: str, session_id: str, path: s
             notes.append("Contract checkpoint is " + str(audit.get("verdict", "unknown")) + ".")
         notes.extend(f"[{f['contract_id']}] {short(f.get('reason', ''))}" for f in audit.get("findings", [])
                      if f.get("verdict") != "clean")
+        notes.extend(rejected_note(f) for f in audit.get("findings", []) if f.get("proposals_rejected"))
         misses = confirmed_misses(obligations, audit)
     return notes, misses

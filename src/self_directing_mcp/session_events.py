@@ -16,6 +16,7 @@ from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES,
 from self_directing_mcp.schemas import Chunk
 from self_directing_mcp.request_control import check_request
 from self_directing_mcp.source_blocks import BlockScan, FastFallback
+from self_directing_mcp.tool_payload import as_text  # noqa: F401  (shared with the hook-side text builders)
 
 
 def source_stamp(path: Path) -> tuple[int, ...]:
@@ -633,14 +634,18 @@ def source_scope(observation: SourceObservation):
         _source_observation.reset(token)
 
 
-def as_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# A byte that is not valid UTF-8 decodes (``errors="surrogateescape"``, see ``iter_raw_lines``) to a lone surrogate in
+# U+DC80..U+DCFF. One compiled scan in C replaces a Python generator that visited every character of every record.
+_ESCAPED_BYTE = re.compile("[\udc80-\udcff]")
+
+
+def has_invalid_utf8(raw: str) -> bool:
+    """True when ``raw`` (a record decoded with ``surrogateescape``) holds a byte that was not valid UTF-8."""
+    return _ESCAPED_BYTE.search(raw) is not None
 
 
 def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, int, int, str]]:

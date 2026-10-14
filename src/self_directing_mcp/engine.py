@@ -15,12 +15,17 @@ import re
 import time
 
 from self_directing_mcp.compressed_source import CompressedSourceError
-from self_directing_mcp.session_events import as_text, make_chunk
+from self_directing_mcp.session_events import make_chunk
+from self_directing_mcp.tool_payload import tool_call_parts
 
 from self_directing_mcp.audit.contracts import (
     GLOBAL_CONTRACT_MEANING,
+    MEMO_MAX_BYTES,
+    ContentMemo,
     ContractStore,
     contract_scope,
+    loosening_reasons,
+    parse_contracts,
     scope_counts,
     visible_contracts,
 )
@@ -49,7 +54,7 @@ from self_directing_mcp.index.vector import build_vector_index
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.retrieve.checks import regex_search
 from self_directing_mcp.retrieve.hybrid import HybridRetriever, hits_to_schema
-from self_directing_mcp.schemas import ContractRule, ContractsDocument, ProposedAction
+from self_directing_mcp.schemas import ContractRule, ContractsDocument, PendingChange, ProposedAction
 from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.timeseries import analyze_activity
 from self_directing_mcp.graphrag import GraphStore, validate_proposal
@@ -61,6 +66,9 @@ from self_directing_mcp.request_control import (
 
 if TYPE_CHECKING:       # the pydantic Settings model is imported lazily: command hooks pass a light settings object
     from self_directing_mcp.config import Settings
+
+
+_OBLIGATIONS = ContentMemo(16)
 
 
 def serialized(method):
@@ -154,6 +162,9 @@ def _fast_gate(payload, integrity):
 
 
 CHECKLIST_EVALUATION_ATTEMPTS = 3
+PENDING_NUDGE = ("NOT APPLIED: this change would weaken an active contract and no user message vouches for it "
+                 "(source_event_id missing or not found). The previous revision stays in force and the change is held "
+                 "as pending. Repeat it with source_event_id set to the user's own message that asked for it.")
 
 
 class ChecklistConflict(ValueError):
@@ -161,7 +172,10 @@ class ChecklistConflict(ValueError):
 
 
 class SelfDirectEngine:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, *, defer_derived: bool = False) -> None:
+        """``defer_derived``: a resident process (the daemon) holds the rows that carry no authority (monitor states,
+        verification stamps, the AGY indexed marker) in memory and writes them with the next authority commit, at idle
+        and at ``close`` instead of committing each synchronously; see ``index.deferred``. Off for every other use."""
         self._lock = RLock()
         self._lifetime = Condition(self._lock)
         self._active_operations = 0
@@ -176,6 +190,7 @@ class SelfDirectEngine:
             from self_directing_mcp.config import get_settings    # the server's pydantic settings; hooks pass their own
             settings = get_settings()
         self.settings = settings
+        self.defer_derived = defer_derived
         self.store: SessionStore | None = None
         self.sparse: SparseIndex | None = None
         self.dense = None
@@ -242,6 +257,27 @@ class SelfDirectEngine:
     def attach_integrity_worker(self, worker) -> None:
         self._integrity_worker = worker
 
+    def flush_derived(self) -> int:
+        """Write the derived rows a ``defer_derived`` engine is holding (the daemon calls it when idle). Cheap and lock-free
+        when nothing is held; never raises for a busy index or a stopped request (the rows stay held for the next call)."""
+        store = self.store
+        if store is None or not self._ready or not store.has_pending_derived():
+            return 0
+        try:
+            with self._publication_guard():
+                if self.store is not store or not self._ready:
+                    return 0                  # closed while this waited for the lease: close wrote what was held
+                from self_directing_mcp.agy_receipts import ReceiptStore
+                return (store.flush_derived()
+                        + ReceiptStore(Path(self.settings.index_dir), held=store.derived).flush_held())
+        except (IndexBusy, RequestStopped):
+            return 0
+
+    def _held_rows(self):
+        """The buffer a ``defer_derived`` engine holds its derived rows in, or None (nothing is deferred)."""
+        store = self.store
+        return store.derived if self.defer_derived and store is not None else None
+
     def accepts_background_work(self) -> bool:
         """False while closed or closing: a background worker must never reopen an engine that was shut down."""
         return self._ready and not self._closing
@@ -262,19 +298,33 @@ class SelfDirectEngine:
             agy.resolve_session_path(self.settings.resolve_agy_app_data_dirs(),
                                      session_id=sid, path=path, require_exists=False)
         path = self.settings.resolve_contracts_path()
-        doc = ContractsDocument.model_validate_json(path.read_bytes()) if path.exists() else ContractsDocument()
-        rules = [r for r in visible_contracts(doc.contracts, sid)
-                 if r.enabled and r.provider in (None, provider)]
+        raw = path.read_bytes() if path.exists() else None
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in sid)[:120]
         path = Path(self.settings.index_dir) / "checklists" / f"{safe}.json"
-        checklist = ChecklistDocument.model_validate_json(path.read_bytes()) if path.exists() else ChecklistDocument(session_id=sid)
-        pending = [item for item in checklist.items if item.status != "revoked"
-                   and (item.status != "done" or not item.verified or not item.evidence_chunk_ids)]
-        payload = {"contracts": [r.model_dump(mode="json") for r in rules],
-                   "pending": [i.model_dump(mode="json") for i in pending]}
-        return {"status": "applicable" if rules or pending else "not_applicable",
-                "contracts": rules, "pending": pending, "has_checklist": bool(checklist.items),
-                "snapshot": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}
+        checklist_raw = path.read_bytes() if path.exists() else None
+        # Everything below is a function of these four values, so they are the key: a changed contract file, a changed
+        # checklist, another session or provider is another entry, and an unchanged one costs no parsing, no
+        # serialization and no hashing (this runs on every hook).
+        key = (raw, checklist_raw, sid, provider)
+        memoize = len(raw or b"") + len(checklist_raw or b"") <= MEMO_MAX_BYTES
+        found = _OBLIGATIONS.get(key) if memoize else None
+        if found is None:
+            doc = parse_contracts(raw)
+            rules = [r for r in visible_contracts(doc.contracts, sid)
+                     if r.enabled and r.provider in (None, provider)]
+            checklist = (ChecklistDocument.model_validate_json(checklist_raw) if checklist_raw is not None
+                         else ChecklistDocument(session_id=sid))
+            pending = [item for item in checklist.items if item.status != "revoked"
+                       and (item.status != "done" or not item.verified or not item.evidence_chunk_ids)]
+            payload = {"contracts": [r.model_dump(mode="json") for r in rules],
+                       "pending": [i.model_dump(mode="json") for i in pending]}
+            found = {"status": "applicable" if rules or pending else "not_applicable",
+                     "contracts": rules, "pending": pending, "has_checklist": bool(checklist.items),
+                     "snapshot": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}
+            if memoize:
+                _OBLIGATIONS.put(key, found)
+        # A fresh dict with fresh lists each time; the rules and items inside are shared and read-only.
+        return {**found, "contracts": list(found["contracts"]), "pending": list(found["pending"])}
 
     @serialized
     def ensure_ready(self) -> None:
@@ -304,7 +354,8 @@ class SelfDirectEngine:
                 index_dir / ("vectors-v2-" + self.embedder.cache_key[:16]), dim=s.embedding_dim,
                 backend=s.dense_backend, extension_path=s.sqlite_vector_path)
         self.sparse = SparseIndex(index_dir / "sparse.sqlite")
-        self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes)
+        self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes,
+                                  defer_derived=self.defer_derived)
         self.contracts = ContractStore(s.resolve_contracts_path())
         self.checklists = ChecklistStore(index_dir)
         self.graph = GraphStore(index_dir / "graph.sqlite")
@@ -372,9 +423,13 @@ class SelfDirectEngine:
         provider: str | None = None,
         embed: bool = True,
         verify: str = "full",
+        derived: bool = True,
     ) -> dict[str, Any]:
+        """Index the appended events. ``derived=False`` publishes only the canonical events and the cursor (what every
+        audit reads); the sparse and dense search indexes are then left to the next ``derived`` sync or search, which
+        materialize whatever they lack (``_repair_sparse_for_search``). Host hooks use it: they judge, they do not search."""
         info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=embed,
-                                  verify=_check_verify(verify))
+                                  derived=derived, verify=_check_verify(verify))
         return {key: value for key, value in info.items() if not key.startswith("_")}
 
     @detached_operation
@@ -473,7 +528,7 @@ class SelfDirectEngine:
         path = agy.resolve_session_path(self.settings.resolve_agy_app_data_dirs(),
                                         session_id=sid, path=payload["transcriptPath"],
                                         require_exists=False)
-        ReceiptStore(Path(self.settings.index_dir)).record(
+        ReceiptStore(Path(self.settings.index_dir), held=self._held_rows()).record(
             sid, path, payload["stepIdx"], payload["toolCall"], event,
             error=payload.get("error", "") if event == "PostToolUse" else None,
             guard=self._publication_guard)
@@ -601,8 +656,7 @@ class SelfDirectEngine:
         with self._publication_guard():
             raw_contracts, contract_token = self.contracts.capture()
         try:
-            document = ContractsDocument.model_validate_json(raw_contracts) if raw_contracts is not None else ContractsDocument()
-            contracts = document.contracts
+            contracts = parse_contracts(raw_contracts).contracts   # shared and read-only: filtered below, never edited
         except ValueError:
             contracts = []
             coverage["complete"] = False
@@ -610,9 +664,11 @@ class SelfDirectEngine:
         planned = None
         if proposed is not None:
             action = ProposedAction.model_validate(proposed)
-            planned = make_chunk(provider, sid, "tool_call",
-                                 f"[tool_call:{action.tool_name}] {as_text(action.arguments)}",
-                                 {"role": "assistant", "tool_name": action.tool_name, "proposed": True},
+            # The same text builder as the parsers: a host's model-written prose field is not part of what the
+            # contracts match, in history and in the proposed action alike (see ``tool_payload``).
+            text, prose = tool_call_parts(provider, action.tool_name, action.arguments)
+            planned = make_chunk(provider, sid, "tool_call", text,
+                                 {"role": "assistant", "tool_name": action.tool_name, "proposed": True, **prose},
                                  0, coverage.get("byte_offset", 0), coverage.get("byte_offset", 0))
             planned.chunk_id = "proposed:" + planned.chunk_id
             # Preserve the public contracts_snapshot filtering/hash semantics.
@@ -869,9 +925,10 @@ class SelfDirectEngine:
         assert self.contracts
         with self._publication_guard():
             raw, _token = self.contracts.capture()
-        stored = (ContractsDocument.model_validate_json(raw).contracts if raw is not None else [])
+        document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
+        stored = document.contracts
         selected = visible_contracts(stored, session_id)
-        return {
+        result = {
             "ok": True,
             "session_id": session_id,
             "scope": contract_scope(session_id),
@@ -879,20 +936,76 @@ class SelfDirectEngine:
             "contracts": [c.model_dump(mode="json") for c in selected],
             "counts": scope_counts(selected, len(stored)),
         }
+        shown = [change for change in document.pending.values()
+                 if change.contract.session_id is None or change.contract.session_id == session_id]
+        if shown:
+            result["pending"] = [change.model_dump(mode="json") for change in shown]
+            result["counts"]["pending"] = len(shown)
+        return result
+
+    def _anchor_status(self, event_ids) -> dict[str, tuple[str, str]]:
+        """``{event id: (status, detail)}``: ``user`` (a user message), ``other`` or ``unresolved`` (not indexed here).
+
+        An anchor is the event a contract was derived from, so it must be the user's own message: a tool result,
+        runtime text or injected context cannot grant or revoke authority, whatever role the host rendered it with.
+        The parsers mark a user turn with ``meta.role == "user"`` (Claude Code: ``origin.kind == "human"``; AGY:
+        ``USER_INPUT`` from ``USER_EXPLICIT``; OMP: a user-role message not attributed to an agent). Codex records the
+        typed prompt and the model-facing copy (which may also carry injected context) both as user-role turns and
+        cannot tell them apart.
+        """
+        wanted = tuple(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        found: dict[str, tuple[str, str]] = {}
+        if not wanted:
+            return found
+        with self._publication_guard(), self.store._read_boundary():
+            for event_id in wanted:
+                check_request()
+                chunk = self.store.get_chunk(event_id)
+                if chunk is None:
+                    found[event_id] = ("unresolved", "not in the index")
+                elif chunk.meta.get("role") == "user":
+                    found[event_id] = ("user", "user message")
+                else:
+                    found[event_id] = ("other", f"a {chunk.kind} event with role {chunk.meta.get('role')!r}")
+        return found
+
+    @staticmethod
+    def _reject_non_user_anchors(label, anchors, event_id) -> None:
+        status, detail = anchors.get(event_id, ("unresolved", ""))
+        if status == "other":
+            raise ValueError(f"{label}: source_event_id {event_id!r} is {detail}, not a user message. A contract anchor "
+                             "must be the user's own message; a tool result, runtime or injected text cannot be one.")
 
     @detached_operation
-    def revoke_contract(self, contract_id: str) -> dict[str, Any]:
-        """Disable a rule while keeping its history and source quote for audit."""
+    def revoke_contract(self, contract_id: str, source_event_id: str | None = None) -> dict[str, Any]:
+        """Disable a rule while keeping its history and source quote for audit.
+
+        Disabling weakens enforcement, so it needs ``source_event_id``: a user message that asked for it. Without a
+        user anchor the request is parked as a pending change and the contract stays in force.
+        """
         assert self.contracts
+        anchors = self._anchor_status([source_event_id])
+        self._reject_non_user_anchors(f"revoke {contract_id!r}", anchors, source_event_id)
+        status = anchors.get(source_event_id, ("missing", ""))[0] if source_event_id else "missing"
         with self._publication_guard():
             raw, token = self.contracts.capture()
             document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
-            disabled = self.contracts.prepare_revoke(document, contract_id)
-            if disabled is None:
+            current = next((rule for rule in document.contracts if rule.id == contract_id), None)
+            if current is None:
                 return {"ok": False, "error": "not_found", "contract_id": contract_id}
+            if current.enabled and status != "user":
+                document.pending[contract_id] = PendingChange(
+                    contract=current.model_copy(update={"enabled": False}, deep=True), reasons=["disabled"],
+                    source_event_id=source_event_id, anchor_status="unresolved" if source_event_id else "missing",
+                    base_revision=current.revision)
+                self.contracts.publish_document(document, document.model_dump_json(indent=2), token)
+                return {"ok": True, "status": "pending", "contract": current.model_dump(mode="json"),
+                        "reasons": ["disabled"], "nudge": PENDING_NUDGE}
+            disabled = self.contracts.prepare_revoke(document, contract_id)
+            document.pending.pop(contract_id, None)
             payload = document.model_dump_json(indent=2)
             self.contracts.publish_document(document, payload, token)
-        return {"ok": True, "contract": disabled.model_dump(mode="json"),
+        return {"ok": True, "status": "disabled", "contract": disabled.model_dump(mode="json"),
                 "nudge": "Contract disabled. History retained; re-enable via upsert_contracts with the same id."}
 
     @detached_operation
@@ -914,13 +1027,41 @@ class SelfDirectEngine:
                 # (a denial when headless). A high-risk target must name the actions it covers.
                 raise ValueError(f"contract {rule.id!r}: a high-risk must_not needs a regex that names the actions it "
                                  "covers; without one it would ask on every tool call")
+        # An anchor that resolves to something other than a user message is rejected; one that cannot be resolved
+        # (the session is not indexed yet) is accepted and left to the audit (``anchor_not_user`` there).
+        anchors = self._anchor_status([rule.source_event_id for rule in rules])
+        for rule in rules:
+            self._reject_non_user_anchors(f"contract {rule.id!r}", anchors, rule.source_event_id)
         with self._publication_guard():
             raw, token = self.contracts.capture()
             document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
-            updated = self.contracts.prepare_upsert(document, rules)
+            active = {rule.id: rule for rule in document.contracts}
+            apply, held = [], []
+            for rule in rules:
+                previous = active.get(rule.id)
+                reasons = loosening_reasons(previous, rule) if previous is not None else []
+                if reasons and anchors.get(rule.source_event_id, ("", ""))[0] != "user":
+                    held.append((rule, reasons, previous))     # weakening needs a user anchor: not applied
+                    continue
+                apply.append(rule)
+                active[rule.id] = rule
+            updated = self.contracts.prepare_upsert(document, apply)
+            for rule in apply:
+                document.pending.pop(rule.id, None)
+            for rule, reasons, previous in held:
+                document.pending[rule.id] = PendingChange(
+                    contract=rule, reasons=reasons, source_event_id=rule.source_event_id,
+                    anchor_status="unresolved" if rule.source_event_id else "missing", base_revision=previous.revision)
             payload = document.model_dump_json(indent=2)
             self.contracts.publish_document(document, payload, token)
-        return {
+        try:
+            # Informational report of equivalent spellings the regexes miss. Imported here and nowhere else, so
+            # hook paths never load the variant library; it runs after the save and can only add this section.
+            from self_directing_mcp.audit.variants import fragility_report
+            fragility = fragility_report(updated)
+        except Exception as exc:
+            fragility = {"informational": True, "status": "unavailable", "error": type(exc).__name__}
+        result = {
             "ok": True,
             "returned": "upserted",
             "global_meaning": GLOBAL_CONTRACT_MEANING,
@@ -929,7 +1070,19 @@ class SelfDirectEngine:
                 "upserted": len(updated),
                 "store": len(document.contracts),
             },
+            "fragility": fragility,
         }
+        checks = [{"contract_id": rule.id, "source_event_id": rule.source_event_id,
+                   "anchor": anchors[rule.source_event_id][0]} for rule in rules if rule.source_event_id]
+        if checks:
+            result["anchor_checks"] = checks
+        if held:
+            result["pending"] = [{"contract_id": rule.id, "reasons": reasons, "active_revision": previous.revision,
+                                  "anchor": "unresolved" if rule.source_event_id else "missing"}
+                                 for rule, reasons, previous in held]
+            result["counts"]["pending"] = len(held)
+            result["nudge"] = PENDING_NUDGE
+        return result
 
     def _verified_checklist_evidence(self, evidence_ids, chunks, complete) -> bool:
         """Evidence IDs are claims until current, linked runtime results resolve."""
@@ -1091,6 +1244,11 @@ class SelfDirectEngine:
         resolved_provider = self._resolve_provider(provider)
         sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
         doc, _original = self._capture_checklist(sid)
+        if not any(item.status == RequirementStatus.DONE for item in doc.items):
+            # The evidence below can only ever demote a ``done`` item (to pending_verification); no other field of the
+            # reply depends on it. A checklist without a ``done`` item therefore needs neither the scan of every
+            # stored event (parsing each one) nor a second hash of the whole source, and the reply is the same.
+            return {"ok": True, "session_id": sid, "items": [i.model_dump(mode="json") for i in doc.items]}
         with self._publication_guard(), self.store._read_boundary():
             record = self.store.cursor_record(sid, resolved_provider)
             metrics = self.store.session_metrics(sid, resolved_provider)
@@ -1423,6 +1581,17 @@ class SelfDirectEngine:
             try:
                 while self._active_operations:
                     self._lifetime.wait()
+                if self.store is not None and self._ready and self.store.has_pending_derived():
+                    try:
+                        with self._publication_guard():
+                            from self_directing_mcp.agy_receipts import ReceiptStore
+                            self.store.flush_derived()
+                            ReceiptStore(Path(self.settings.index_dir), held=self.store.derived).flush_held()
+                    except Exception:
+                        pass    # held rows are a cache; closing must not fail because they could not be written
+                if self.defer_derived:
+                    from self_directing_mcp.agy_receipts import ReceiptStore
+                    ReceiptStore.release(Path(self.settings.index_dir))     # the persistent receipts reader, if any
                 for component in (self.store, self.sparse, self.dense, self.graph):
                     connection = getattr(component, "_conn", None)
                     if connection is not None:

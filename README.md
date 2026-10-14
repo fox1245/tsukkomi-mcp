@@ -61,8 +61,13 @@ Version 0.6.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly fixes memory growth, app
 ### 1. Invariant contracts (`upsert_contracts`)
 - **Prohibitions (`must_not`)** match a regex against proposed or recorded actions (`decision: deny` on hosts that enforce).
 - **Obligations (`must`)** require matching evidence before a gated action (`before_regex`) or at a completion checkpoint, optionally with a successful linked tool result (`requires_success: true`).
+- **A contract's origin must be a user message.** `source_event_id` names the history event a contract was derived from, and only the user can be the origin of one: a tool result, runtime text or injected context cannot. In an audit, a `source_event_id` that resolves to anything but a user-role event (`meta.role == "user"`) makes that contract's findings `unknown` with the reason `anchor_not_user` (reference evaluator and monitors alike); at upsert time such an anchor is rejected with an error when the event is already indexed, and accepted when it cannot be resolved yet (the session is not indexed), leaving the audit to decide. What counts as a user message is each parser's own classification: Claude Code `origin.kind == "human"` (plus a legacy prompt from before origin stamps), AGY `USER_INPUT` from `USER_EXPLICIT`, OMP a user-role message not attributed to an agent. Codex cannot tell a typed prompt from user-role context injected into the model's input, since it records both as user turns, so both are accepted. `applies_from_event_id` may still be any event. The upsert response reports each anchor check (`anchor_checks`); it is not stored on the contract.
+- **Weakening a contract needs a user anchor.** Disabling a contract, or replacing it with one that may enforce less (a different regex, an added or changed `exception_regex`, a different `before_regex`, a narrower scope, fewer roles, an added `when`, a narrower provider or session, dropping `requires_success`, lowering `risk`, dropping `auto_continue`), must carry a `source_event_id` that resolves to a user message. Without one the proposed revision is stored under `pending` in the contracts file and listed by `list_contracts`, the previous revision stays active (hooks and audits keep enforcing it), and the response says `NOT APPLIED`. Repeating the change with a user anchor applies it and clears the pending entry. Strictly tightening edits (a new verifier, an added role, a wider scope, removing an exception, enabling) need no anchor, and moving `applies_from_event_id` is not judged. The `pending` key is omitted from the file while empty.
+- **A call the host refused is a rejected proposal, not an executed violation.** When a hook or the user's permission prompt denies a tool call, the transcript still holds the call. Claude Code records its decision on the record of the linked tool result: a top-level `permissionDecision` object (kept as `meta.permission_decision`) beside `toolDenialKind`, with an error result. A decision of `{"decision": "reject", "source": "hook", ...}` (whatever its `source`: hook, user, rule, ...) marks its call as refused, provided that call is the only one with that id; the older forms `"deny"` and `{"behavior": "deny"}` are kept. This shape was verified against Claude Code 2.1.299 with a synthetic probe (a `PreToolUse` hook answering `deny` for `Bash`). Any other value (`accept`, `allow`, an unknown or missing decision) is an attempt. A `must_not` match in a refused call is not an executed match: it is reported separately in the finding's `proposals_rejected` (`contract_id`, `event_id`, `call_id`, `reason`, `denied_by` (the decision's `source`, or `host`), `denial_event_id`, `at_byte`; omitted while empty; at most 20), the verdict comes from the remaining evidence (`clean` with the reason `no executed forbidden match ...` when every match was refused), and an `exception_regex` is matched only against what ran. Only the host's own record counts: a result that merely says error, or a decision of `allow` or `ask`, is still an attempt. AGY already treated a model proposal that the Pre hook denied (`host_rejected_proposal`) as non-execution; it is now also listed in `proposals_rejected` (`tool_name`, `at_byte`, `denied_at_byte`). Codex, OMP and Cursor / Grok Bot have no host-recorded denial that their parsers can read reliably (Codex hooks never block; the OMP extension's block leaves no marker the parser knows), so a blocked call there stays an attempt. A `must` obligation and a rule that reads tool output (`scope` `tool_result`, or `any` with the `tool` role) are unchanged: a result that echoes the command still matches. The Claude Code and AGY `Stop` notes list rejected proposals on their own line ("Rejected by the host, not executed ..."), apart from "Not verified" and from any executed violation.
+- **`requires_success` needs a success that belongs to the required command.** A host records one exit status per command line. `pytest -q || true`, `|| :`, `pytest; exit 0` (any later command that replaces the status), a command sent to the background (`&`, or Claude Code's `run_in_background`), `pytest | tee log` without `set -o pipefail` earlier in the same line, and `pytest --collect-only` / `--co` all end in a recorded success without the tests having passed, so that success is not evidence: the finding is `unknown` with the reason `success_unverifiable` (never `clean`, and never a violation). A result recorded as failed is still a confirmed failure (`violation`), a call with no linked result keeps its `no unambiguous completion status` reason, and the command itself is never blocked. The check is a small quote-aware parse of the line (`audit/shellstatus.py`, also reading `bash -c '...'`, `( ... )` and `{ ...; }`): an operator inside quotes, `$( )` or a comment is not an operator, `set +e` alone changes nothing, `|| exit 1` and `; exit $?` keep a failure, and the last command the contract's regex matched is the one whose status counts. The latest matching call still decides, so a newer masked run supersedes an older clean one. Both evaluators call the same function.
 - AGY returns `force_ask` for suspicious exceptions so a cached Always Allow grant does not replace confirmation; Claude Code, which has no force-ask, returns `ask`.
 - Contracts are global or scoped to one session. A description-only contract stays `unknown`, and search rankings are never violation evidence.
+- **A tool-call contract matches the payload, not the model's commentary.** Some hosts let the model write a free-text field about a call: Claude Code's `description` on `Bash` (and on the other built-in tools that take one), AGY's `toolAction` and `toolSummary`. That prose is excluded from the call text a contract is matched against, in indexed history and in the proposed action a hook asks about alike (one builder, `tool_payload.py`), so `ls -l data/app.sqlite3` is no longer a `sqlite3` violation because its description says "without connecting to it with sqlite3". Only confirmed prose fields are excluded and only when their value is a string; every other field stays payload, an MCP tool's own `description` argument included, and a violation inside `command` is caught whatever the description says. The prose is kept in the event's `meta.tool_prose`. Matching it with an explicit `scope: "prose"` (at most `suspicious`) is not implemented yet. Fields suspected but not confirmed (AGY `Description`/`Instruction`, Codex `justification`, OMP `_i`) are deliberately not excluded.
 
 #### Contract fields: `risk`, `auto_continue` and `when`
 
@@ -79,6 +84,31 @@ A high-risk `must_not` must have a `regex` naming the actions it covers: a descr
 Contract regexes (`regex`, `before_regex`, `exception_regex`, `when.tool_call_regex`) and `search_history` regex queries run on the `regex` engine with a time limit: 0.25 s per search and 2 s per contract per evaluation. A pattern that exceeds it makes only that contract `unknown` (`regex_timeout`), never clean or a violation, so a pathological pattern cannot stall a hook past the host's timeout. The syntax is still Python `re` syntax.
 
 Set these only when the user asked for them. The high-risk presets in [`src/self_directing_mcp/resources/high_risk_presets.json`](src/self_directing_mcp/resources/high_risk_presets.json) are four example `must_not` contracts with `risk: "high"`: `preset-no-recursive-delete`, `preset-no-write-outside-workspace` (a path-pattern approximation to replace with your own boundary), `preset-no-force-push` and `preset-no-branch-delete`. They ship with `enabled: false` and exist in the contract store only when `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS=true`, where they are added if their id is missing and are never altered or re-enabled. The owner enables the ones they want.
+
+#### Contract fragility report (informational)
+
+A regex over command text is easy to bypass with an equivalent spelling (`rm -r -f` for `rm -rf`), channel (`python3 -c "shutil.rmtree(...)"`) or lexical trick (a backslash-newline, `busybox rm`, a GNU option abbreviation). The `upsert_contracts` response therefore ends with a `fragility` section that says which of those spellings the regex you just saved does **not** match.
+
+- **How it is chosen.** The server holds a versioned library of equivalent spellings ([`resources/contract_variants.json`](src/self_directing_mcp/resources/contract_variants.json)) in ten families: `recursive_delete`, `force_push`, `discard_worktree`, `world_writable`, `remote_script_exec`, `read_secret_file`, `stage_all`, `db_cli_access`, `skip_tests` and `tls_verify_off`. A family is reported only when the regex matches one of its canonical (standard) spellings; the section then lists that family's other spellings the regex misses, with their platform, technique and preconditions. Families the regex is not about are not mentioned. For a `must_not` contract the `regex` is analyzed; for a `must` it is the gated action (`before_regex`).
+- **Informational only.** It never blocks a registration, never edits or broadens a regex and never changes a verdict: findings still come from the saved regex alone. Use it as a prompt to widen the regex deliberately, if you want to. `exception_regex` and `when` are not analyzed.
+- **Unverified candidates.** Every library entry has `verified: false`: equivalence was not verified by execution, and the response says so (`"verified": false` and a note). A listed spelling may behave differently on your platform or tool version; read its preconditions.
+- **Deterministic and offline.** No model is involved. The report names the `library_version` that produced it. Each spelling is matched as plain command text with the contract regex engine (case-insensitive, multiline, the same time limits). A regex that exceeds them produces an explicit `"status": "regex_timeout"` entry for that contract, never a failure of the save.
+- **Bounded.** At most 8 spellings per family (`missed_total` counts all misses, `omitted` the unlisted ones; a capped list takes one spelling per technique in turn), 4 families per contract (`families_omitted`), 20 contracts per call (`contracts_not_analyzed`) and about 3 s per call (`skipped_time_budget`). A contract without such a pattern, or whose regex matches every listed spelling, is omitted.
+- **Hook paths never load it.** Only `upsert_contracts` imports the library, after the contracts are saved. If the library cannot be read, the response carries `"fragility": {"status": "unavailable", ...}` and the contracts are still saved.
+
+Abridged example for `{"id": "no-rm", "type": "must_not", "scope": "tool_call", "regex": "rm\\s+-rf"}`:
+
+```json
+"fragility": {
+  "library_version": "1.0.0", "informational": true, "verified": false, "analyzed": 1,
+  "contracts": [{"contract_id": "no-rm", "field": "regex", "status": "ok", "families_omitted": 0, "families": [{
+    "family": "recursive_delete", "matched_canonical": ["rm -rf build"], "missed_total": 19, "omitted": 11,
+    "missed_variants": [
+      {"id": "recursive_delete.split_flags", "text": "rm -r -f build", "platform": "posix",
+       "technique": "option_split", "verified": false},
+      {"id": "recursive_delete.python_rmtree", "text": "python3 -c \"import shutil; shutil.rmtree('build')\"",
+       "platform": "python", "technique": "interpreter", "verified": false, "preconditions": ["python3 on PATH"]}]}]}]}
+```
 
 ### 2. Checklist with evidence gating (`update_checklist`)
 - Track user requirements with provenance and completion criteria.
@@ -101,25 +131,27 @@ Set these only when the user asked for them. The high-risk presets in [`src/self
 
 | Host | Provider id | Evidence source | Lifecycle integration | Blocks actions? | Parser version |
 |---|---|---|---|---|---|
-| Google Antigravity (AGY) | `agy` | `brain/<conversation-id>/.system_generated/logs/transcript*.jsonl` plus hook receipts | Stdio hooks: `PreToolUse`, `PostToolUse`, `PreInvocation`, `Stop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`force_ask`); `unknown` passes with a warning, or asks for a `risk: "high"` contract. `advisory` and `enforced` are explicit. See [docs/agy-installation.md](docs/agy-installation.md) | 7 |
-| Claude Code | `claude` | `<projects>/<project>/<session-uuid>.jsonl` plus `<session-uuid>/subagents/agent-*.jsonl` | Opt-in command hooks from `scripts/install_claude_hooks.py`: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`ask`); never an explicit `allow`. A `Stop` blocks at most once per session for a confirmed `auto_continue` miss. `SubagentStop` never blocks. See [docs/claude-installation.md](docs/claude-installation.md) | 2 |
+| Google Antigravity (AGY) | `agy` | `brain/<conversation-id>/.system_generated/logs/transcript*.jsonl` plus hook receipts | Stdio hooks: `PreToolUse`, `PostToolUse`, `PreInvocation`, `Stop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`force_ask`); `unknown` passes with a warning, or asks for a `risk: "high"` contract. `advisory` and `enforced` are explicit. See [docs/agy-installation.md](docs/agy-installation.md) | 8 |
+| Claude Code | `claude` | `<projects>/<project>/<session-uuid>.jsonl` plus `<session-uuid>/subagents/agent-*.jsonl` | Opt-in command hooks from `scripts/install_claude_hooks.py`: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`ask`); never an explicit `allow`. A `Stop` blocks at most once per session for a confirmed `auto_continue` miss. `SubagentStop` never blocks. See [docs/claude-installation.md](docs/claude-installation.md) | 3 |
 | OpenAI Codex CLI | `codex` | Rollout JSONL in the Codex sessions directory, plain or zstd-compressed (`rollout-*.jsonl.zst`) | Three `mcp_tool` hooks installed by `scripts/install_codex.py`: `UserPromptSubmit`, `PreToolUse`, `Stop` | No. Hooks are advisory | 3 |
 | OMP | `omp` | OMP session JSONL | Opt-in extension `extensions/tsukkomi-omp.ts` | Only confirmed `violation`/`suspicious` on model-issued tools. `unknown` and transport failures never block | 8 |
 | Cursor / Grok Bot | `grokbot` | `agent-transcripts` roots | None; call the MCP tools manually | No | 1 (unversioned) |
 
 A parser version is recorded per session. When a provider's version is raised, each already-indexed session is reparsed from byte 0 on its next sync or audit, one session at a time. Unchanged event ids, anchors and cached vectors survive, and no embedding API is called when `embed=false`. A running MCP process only picks up a new parser after it is restarted.
 
-### AGY parser (version 7)
+### AGY parser (version 8)
 
 Fields the host cut (`truncated_fields`) are restored from the same step of the sibling `transcript_full.jsonl` when it matches; otherwise the visible text is kept, marked as truncated, and any verdict that depends on the cut field is `unknown` with a `truncated_<field>` reason. A match that is visible still counts. `RUNNING` results are pending (`pending_running`), `ERROR`, `INVALID` and `CANCELED` results are never success, `CHECKPOINT` and `ERROR_MESSAGE` records are runtime context, and media payloads become placeholders. Results from before the conversation's first hook receipt are `legacy_unlinked` and leave dependent obligations `unknown` (`unsupported_legacy`); coverage reports `receipts_since`, `legacy_unlinked_count` and `result_dependent_complete`. Details are in [docs/agy-installation.md](docs/agy-installation.md#parser-version-6-truncated-fields-result-statuses-and-legacy-results).
+
+Version 8 keeps the model-written `toolAction` and `toolSummary` labels of a tool call (they sit beside `CommandLine` in the recorded fixtures) out of the call text, for hook receipts and for model proposals, and records them in `meta.tool_prose`; every other argument stays payload.
 
 Version 7 reads two more shapes. The IDE writes a tool result as a step of its own type, `RUN_COMMAND`, `VIEW_FILE`, `CODE_ACTION`, `MCP_TOOL` or `LIST_DIRECTORY`, and the parser treats it exactly like the CLI's `GENERIC` result: it is linked to its call only through a host receipt, truncated content falls back to `transcript_full.jsonl` or leaves dependent verdicts `unknown`, and `RUNNING` is pending. A linked `RUN_COMMAND` with status `DONE` and host `exit_code` 0 is success evidence, a nonzero `exit_code` is a failure, and an unlinked result is never success. `CONVERSATION_HISTORY` and `KNOWLEDGE_ARTIFACTS` are runtime metadata. A contiguous run of NUL bytes at the start of a line is stripped when the rest is a valid record (`host_padding_bytes`, counted in `agy_evidence.host_padded_records`); any other NUL use, and any other unknown step type, stays a parse error or an unsupported event. See [docs/agy-installation.md](docs/agy-installation.md#parser-version-7-ide-result-steps-context-steps-and-host-padding).
 
 Hook receipts cost what was appended, not the size of the transcript. A receipt hashes the file once and parses only the records after a prefix it has verified; a sync checks every receipt anchor in the pass that hashes the file; and a receipt reindexes the conversation only when it can change an event that is already indexed. On a synthetic 10 MB transcript with a linked receipt per result, one `PreToolUse` hook (receipt and contract check) fell from 20.5 s to 0.51 s and a `PostToolUse` hook (receipt and sync) from 20.4 s to 0.58 s, against 0.38 s and 0.36 s at 0.1 MB (whole hook processes, wall time). The mechanisms and what they fall back to are in [AGY hook cost](docs/agy-installation.md#hook-cost-what-a-hook-reads); `scripts/bench_agy_hooks.py` reproduces the table.
 
-### Claude Code parser (version 2)
+### Claude Code parser (version 3)
 
-Only a record the host stamped `origin.kind == "human"` (or, in a main transcript, a legacy prompt from before origin stamps, or a human `queued_command` prompt) is a user turn. Task notifications, peer and coordinator messages, injected meta messages, compaction summaries, attachments, hook output, tool results and a subagent's task prompt are runtime evidence. Unknown record, attachment, block and origin shapes are unsupported events that keep coverage incomplete. Opaque payloads (thinking, images, hook output) are placeholders. A subagent transcript is its own session, `<session-uuid>_agent-<agent-id>`. Version 2 accepts the `system` record `scheduled_task_fire` (a scheduled task fired) as runtime metadata: its `prompt` is automation text, not something the user said, so it is validated, never indexed, and cannot satisfy or violate a user-role contract; every other unknown system subtype stays unsupported. See [docs/claude-installation.md](docs/claude-installation.md#9-how-the-claude-parser-decides-who-is-the-user).
+Only a record the host stamped `origin.kind == "human"` (or, in a main transcript, a legacy prompt from before origin stamps, or a human `queued_command` prompt) is a user turn. Task notifications, peer and coordinator messages, injected meta messages, compaction summaries, attachments, hook output, tool results and a subagent's task prompt are runtime evidence. Unknown record, attachment, block and origin shapes are unsupported events that keep coverage incomplete. Opaque payloads (thinking, images, hook output) are placeholders. A subagent transcript is its own session, `<session-uuid>_agent-<agent-id>`. Version 3 keeps the model-written `description` of a built-in tool call (`Bash`, `Task`, `Monitor`, ...) out of the call text and records it in `meta.tool_prose`; the call text contains only the other input fields, exactly like the proposed action a `PreToolUse` hook asks about. An MCP tool's own `description` argument is payload. Version 2 accepts the `system` record `scheduled_task_fire` (a scheduled task fired) as runtime metadata: its `prompt` is automation text, not something the user said, so it is validated, never indexed, and cannot satisfy or violate a user-role contract; every other unknown system subtype stays unsupported. See [docs/claude-installation.md](docs/claude-installation.md#9-how-the-claude-parser-decides-who-is-the-user).
 
 ### OMP parser (version 8)
 
@@ -157,9 +189,9 @@ Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout
 
 | Category | Tool | Description |
 |---|---|---|
-| **Governance & Contracts** | `upsert_contracts` | Create or update explicit invariant rules (`must` / `must_not`). |
-| | `list_contracts` | Inspect active contracts for the current session and global scope. |
-| | `revoke_contract` | Disable a contract while preserving history. |
+| **Governance & Contracts** | `upsert_contracts` | Create or update explicit invariant rules (`must` / `must_not`). The response adds an informational [fragility report](#contract-fragility-report-informational): equivalent spellings the saved regexes miss. |
+| | `list_contracts` | Inspect active contracts for the current session and global scope, plus any `pending` weakening awaiting a user anchor. |
+| | `revoke_contract` | Disable a contract while preserving history. Takes `source_event_id` (the user's message that asked for it); without one the request is held as pending and the contract stays in force. |
 | | `check_action` | Pre-flight test of a proposed action against current contracts. `verify="fast"` selects the hook-time source verification; the result's `integrity` says what was compared. |
 | | `audit_session` | Audit executed session history against active contracts (always a full source verification). |
 | | `audit_status` | Health check: vector extension, index schema, degraded flags, per-session coverage. |
@@ -263,6 +295,7 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES` | `4294967296` | **New in 0.6.0.** Largest decompressed size a `.jsonl.zst` Codex session may declare; larger files are refused as `zstd_too_large`. |
 | `SELF_DIRECT_RETRIEVE_TOP_K`, `SELF_DIRECT_SEARCH_TOP_K`, `SELF_DIRECT_RRF_K` | `20`, `10`, `60` | Retrieval tuning. |
 | `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS` | `false` | Seed disabled demonstration contracts. |
+| `SELF_DIRECT_DAEMON` | `off` | **Experimental.** `on` makes hooks and the MCP entry point clients of the resident daemon (Linux only; read from the process environment by the entry points). See [Resident daemon](#resident-daemon-experimental-off-by-default), which also lists the daemon's own `SELF_DIRECT_DAEMON_*` limits. |
 
 #### Credentials
 
@@ -351,6 +384,15 @@ Set `SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR` (or `grokbot_transcripts_dir` in TOML)
 
 Audit and `check_action` results also carry `requires_attention`, which is `true` whenever the verdict is not `clean`.
 
+### Format drift: unsupported records
+
+A record the parser does not know (an unsupported record type or step, a parse error) is kept visible and makes `coverage.complete` false (`unsupported_events`, `parse_errors`). It may hold the forbidden call or the commit an order rule waits for, so a history audit does not vouch for the records it could not read:
+
+- A `must_not` with no match and a `before_regex` rule with no triggering action are `unknown` (reasons `incomplete evidence cannot prove the absence of a forbidden match` / `... that no triggering action occurred`), and so is the overall verdict.
+- A `must` obligation that rests on missing evidence is `unknown` (as before), and a proposed action's `before_regex` / `requires_success` prerequisite cannot be established by incomplete history.
+- A violation confirmed from the parsed evidence stays a violation, in the findings and overall; a proposed action that matches a prohibition is a violation whatever the history coverage; a `clean` that rests on positive evidence (a satisfied prerequisite) is not touched.
+- Appended, unread bytes are not drift: they keep the `judged_prefix` behaviour below.
+
 ### Growing sessions
 
 Agents append to their own session file while they work, so an audit usually sees a file that is still growing. The audit judges the bytes captured at the start and says so.
@@ -408,11 +450,11 @@ evaluation, which remains the reference. The audit still runs through the native
   unreadable or disagreeing row only means the contract is evaluated in full again.
 - **Per contract kind** the state holds: anchors and the activation point (`applies_from_event_id`); whether a
   `when` condition was seen; for `must_not` the match count, the first 20 matches and (with an `exception_regex`, which
-  is matched against the join of all matches) the match texts; for `must` the last three regex hits and, for
-  `requires_success`, a per-call tracker (how many calls share the latest hit's id, how many results followed and whether
-  the first succeeded); for `before_regex` the worst verdict, the distinct reasons, the first 20 evidence items and the
+  is matched against the join of all matches) the match texts and, for Claude Code, its matching tool calls (up to 64 evidence items and 512 call ids, so calls the host refused can be subtracted; over a cap the rule goes to the full evaluator); for `must` the last three regex hits and, for
+  `requires_success`, a per-call tracker (how many calls share the latest hit's id, how many results followed, whether
+  the first succeeded and whether that success is the required command's at all, see `success_unverifiable`); for `before_regex` the worst verdict, the distinct reasons, the first 20 evidence items and the
   last trigger position, because each triggering action is judged at its own position from the prefix alone. Provider
-  evidence classes keep Claude Code's cut results and AGY's truncated fields, still-`RUNNING` results, legacy results,
+  evidence classes keep Claude Code's cut results and refused calls and AGY's truncated fields, still-`RUNNING` results, legacy results,
   host-logged proposals and denied proposals.
 - **A normal append does not invalidate state.** A state is reused only if all of this holds, otherwise the contract is
   rebuilt by a full pass: same contract (revision **and** content), parser version, evaluator version and `needs` (which
@@ -441,9 +483,11 @@ evaluation, which remains the reference. The audit still runs through the native
   is evaluated in full and no state is kept (`incremental.mode: "full"`, `below_min_events`). Below that size one full
   evaluation costs less than storing states, rebuilding them and shadow-checking the rebuild; on the scripted evaluation
   harness (short sessions) keeping state roughly doubled the Codex `Stop` latency. `0` keeps state for every session.
+  A resident engine that holds its state writes no commit for it, which lowers the break-even to about 250
+  events; the default is unchanged (see [Warm judgement benchmark](#warm-judgement-benchmark)).
 - **Reporting.** Results carry an `incremental` object: `mode` (`delta` reads only appended events, `full` reads all),
   `events_read`, `rebuilt` (contract to reason), `fallback` (contracts on full evaluation and why), `shadow`,
-  `shadow_compared`, `incremental_mismatch`, `retry` and `state`. `SELF_DIRECT_AUDIT_INCREMENTAL=false` switches the whole feature off.
+  `shadow_compared`, `incremental_mismatch`, `retry` and `state` (`saved`; `unchanged`; `deferred` when a resident engine holds the write, see [Held writes](#lifecycle); or why it was not written). `SELF_DIRECT_AUDIT_INCREMENTAL=false` switches the whole feature off.
 - **With source verification.** A state describes the stored events, not how the source was verified: it is written
   before the fast-verification gate and is the same whether the request verified `fast` or `full`. If a later full
   verification finds a rewrite, the reindex starts a new generation and deletes the states. A cursor that migrates from a
@@ -536,6 +580,109 @@ Cheap signals only ever escalate to full: a different file identity (a new inode
 - The residual window of a request's later stages is the one described under [Source capture](#source-capture).
 
 **Compatibility.** The cursor's `prefix_hash` is a plain SHA-256 until a source gets a table: the first full request after this version migrates it in place, without a reindex (`full_reason: "migration"`). A process of an older version that meets a block cursor does not understand it, treats it as a changed source and reindexes once; restart every process that shares an index after upgrading (see [Upgrading to 0.6.0](#upgrading-to-060)). A plain rollout and its `.jsonl.zst` twin still share one cursor: the cursor's hash form follows the source form.
+
+---
+
+## Resident daemon (experimental, off by default)
+
+In production a coding agent's integrations add up to many processes: Claude Code and AGY start a fresh Python process for **every hook event**, each OMP session starts its own stdio MCP server, and AGY starts one per session (16 processes and about 1.3 GB in the case that prompted this, [#15](https://github.com/fox1245/tsukkomi-mcp/issues/15)). The resident daemon replaces them with **one process per user and OS environment**; hooks and MCP servers become thin clients of it. It is a stage-1 skeleton behind a flag: Linux (including WSL) only, off by default, and judged by the same code as the standalone processes.
+
+```
+Claude Code / AGY hook event ─ scripts/*_hook.py (stdlib client) ┐
+OMP / AGY MCP server ───────── self-directing-mcp (stdlib relay) ┼─ Unix socket ─ python -m self_directing_mcp.daemon
+                                                                 ┘                 ├─ hook lane: claude_hooks.run_hook / agy_hooks.run_hook
+                                                                                   ├─ heavy lane: the FastMCP tool functions of server.py
+                                                                                   └─ one SelfDirectEngine (+ integrity worker) per resolved-settings key
+```
+
+### Turning it on, and off
+
+Set `SELF_DIRECT_DAEMON=on` in the environment of the hook command (the installers' `env`) and of the MCP server entry. The entry points read it from the **process environment** before importing anything else (a `.env` or the TOML cannot switch it; `config.Settings` and the light hook reader validate the same two values, `off` and `on`, identically, and an invalid value is a settings error like any other). `off`, the default, is the explicit **standalone** mode: nothing about hooks or servers changes. On a platform other than Linux `on` behaves as `off` and says so once on stderr (a marker file in `~/.cache/tsukkomi/notices/` keeps later processes quiet).
+
+`self-directing-mcp` and `tsukkomi-mcp` now point at `self_directing_mcp.entry:main`, which decides before importing the MCP SDK. Installations whose console script still points at `server:main` get the relay too (`server.main` delegates), at the cost of the imports. `python -m self_directing_mcp.daemon --status` prints the running daemon's counters (no request content), `--stop` asks it to drain and exit.
+
+### Threat model
+
+The authentication boundary is **the operating-system user**, and nothing finer.
+
+- The runtime directory is `$XDG_RUNTIME_DIR/tsukkomi/` when that variable names a usable directory (yours, not group- or world-writable), else `~/.cache/tsukkomi/run/`. It is created mode 0700 and **verified on every use**: a real directory (never a symbolic link), owned by the current user, mode exactly 0700; otherwise the daemon and the clients refuse it with a clear error and nothing is created or reused. The verified directory is held open as a file descriptor, files are opened relative to it and a long path is reached through `/proc/self/fd/<n>/`, so the check and the use cannot be separated by a swapped path component.
+- The socket (mode 0600, no TCP of any kind) lives in that directory, and every accepted connection's `SO_PEERCRED` user id must equal the daemon's; another uid is closed without a word.
+- **Processes of the same user are not isolated from each other**: any of them can connect, run hooks and MCP sessions as that user, and drain the daemon. That is no weaker than their access to the index and the contracts file today, and no stronger.
+- No credential travels. A client forwards a whitelist of its environment (`SELF_DIRECT_*`, `TSUKKOMI_*`, `HOME`, `CODEX_SESSIONS_DIR`, `CLAUDE_CONFIG_DIR`), never `OPENROUTER_API_KEY` or any name that looks like a key, token, secret or password (the key-file *path* setting is fine); the daemon re-checks what it receives. The daemon reads a key file itself, exactly as a standalone process does, so use `SELF_DIRECT_OPENROUTER_API_KEY_FILE`: an `OPENROUTER_API_KEY` in a client's environment is not forwarded and is ignored by the daemon, which starts with a scrubbed environment and never uses an ambient key. For an MCP session the daemon also reads `.env` in the client's working directory, as the standalone server would.
+- `daemon.log` (mode 0600, rotated at 256 KiB) holds event names, sizes, durations and error classes. Request and response bodies, payloads, paths and exception messages are never logged, and a log field that is not a short identifier is dropped.
+- A frame is a 4-byte length plus UTF-8 JSON, at most 16 MiB; a zero or oversized length, a body that is not a JSON object, and a connection that stays silent after connecting are protocol errors that close that connection only.
+
+### Lifecycle
+
+- **Start.** The first client that finds no daemon takes a non-blocking lock, starts one detached (own session, stdio on `/dev/null`) and waits for its socket for a bounded time (`AVAILABILITY_FAST_SEC` 0.3 s for `PreToolUse`, `PostToolUse`, `UserPromptSubmit` and `PreInvocation`; `AVAILABILITY_SLOW_SEC` 3 s for `Stop`, `SubagentStop` and `SessionStart`; an MCP relay waits up to 15 s). The interpreter is the checkout's `.venv` Python, else the client's own; `SELF_DIRECT_DAEMON_PYTHON` overrides it. The daemon's environment carries no settings: every request brings its own.
+- **One instance.** A lock file (`flock`) is held for the daemon's lifetime; a second daemon exits at once, and a successor started while its predecessor drains waits up to 10 s for the lock. Never two writers.
+- **Leaving.** After `SELF_DIRECT_DAEMON_IDLE_EXIT_SEC` (900) with no connection and no request; after a request when its resident set exceeds `SELF_DIRECT_DAEMON_MAX_RSS_MB` (400): it stops accepting, finishes what is running and exits, and the next client starts a new one; on SIGTERM/SIGINT; and when a newer client asks (below). Each exit flushes its counters, closes its engines and removes the socket and the pid file.
+- **Judging.** Hook requests run on their own thread pool and MCP tool calls on another, so a long `sync_session` never queues a `PreToolUse`. Requests are bounded per session (`SELF_DIRECT_DAEMON_SESSION_BOUND`, 16) and in total (128); beyond the bound the answer is `unknown(queue_full)`. Each request's environment is a per-request view of `os.environ` (managed names come from the request alone), settings are resolved with `settings_core.load_hook_settings` (hooks) or `Settings` (MCP; `--omp-bridge` validation through the same `server.omp_bridge_settings`), and engines are created lazily, one per resolved-settings key and reused, each with one resident integrity worker. An engine serializes its own operations exactly as in a standalone process.
+- **Held writes.** A hook that appends events and judges them used to make up to five synchronous SQLite commits, an `fsync` each (10 to 25 ms on the benchmark machine; the CPU work of the whole judgement is 4 to 21 ms, and was 4 to 75 ms before the `Stop` hooks stopped reading every stored event for an empty checklist and writing the full-text index): the events and the cursor, the incremental monitor states, the "verified in full at T" stamp of the block table, and for AGY the receipt and the receipts-indexed marker. The daemon's engines (`SelfDirectEngine(defer_derived=True)`) keep the authority commits synchronous (the events and cursor, the AGY receipt) and **hold the three rows that carry no authority**: the monitor states, the verification stamp and the AGY indexed marker are validated against the commit log, the generation, the cursor and the block table whenever they are read, and a missing, stale or lost one only ever means "rebuild from the events" or "verify in full again", never `clean`. A held row is read back in the same process through the merge rule the database applies (the newer `(generation, byte_offset)` wins; a stamp applies only to the exact table, `synced_at` and `root`, it was made for) and is written in the transaction of the next authority commit of that database, after the daemon has been idle for 1 s, at shutdown, or when 2048 rows or 16 MiB are held. A rewrite or reindex of a session, a dropped or demoted monitor and a replaced block table remove the rows they invalidate at once; a row whose lineage moved on by flush time is dropped instead of written. Another process that shares the index (a standalone hook) sees only what was written, so it rebuilds, which is correct and costs only time. A crash loses a cache. `incremental.state` reports `deferred` for a held write. `SELF_DIRECT_DAEMON_DEFER_DERIVED=off` makes the daemon write everything synchronously, as a standalone process does. Shadow comparison, source verification and coverage are not touched: the whole test suite also passes with every engine deferring (`TSUKKOMI_TEST_DEFER_DERIVED=1 python -m pytest`).
+- **Receipts read once per change.** An AGY request read all the receipts of the conversation a dozen times (the authority tokens that detect a change between two phases, the capture of a sync, the checkpoint list). A daemon engine keeps one read-only connection to the receipts database and re-reads a conversation's receipts only after SQLite's own change witness (`PRAGMA data_version`, which differs exactly when another connection committed) moved; the file's identity is compared with the path on every use, so a deleted, replaced or recreated database is never served from the old connection. A write that bypasses SQLite moves no witness (the index store's row-count cache makes the same assumption).
+
+### Failure behaviour: never an in-process fallback
+
+With the flag on, a hook's whole answer comes from the daemon or from a visible fail-open. If the daemon cannot be reached or started the client **never imports the engine and never judges itself**; it answers through `claude_hook_state.fail_open` / `agy_hook_state.fail_open`: no deny, a visible warning with the reason, the failure recorded in `hook_health`, and **`ask` when a contract marked `risk: high` matches the proposed action** (the same policy as every other unavailability).
+
+| Situation | Reason in the warning |
+|---|---|
+| Daemon unreachable after the availability budget; the daemon died mid-request; the spawned interpreter exited | `daemon_unavailable` |
+| More than 3 daemon starts within 5 minutes (recorded in the runtime directory; a daemon that is still starting is waited for, not started twice) | `daemon_unavailable:crash-loop`, also a stderr warning |
+| The runtime directory is unsafe (symlink, wrong owner or mode) | `daemon_unavailable:runtime_dir`, reason on stderr |
+| No answer within the request budget (`SELF_DIRECT_REQUEST_TIMEOUT_SEC`, default 45 s, plus 5 s) | `daemon_timeout` |
+| A session beyond its bound | `queue_full` |
+| The daemon runs another version (see below) | `version_mismatch` |
+| A payload above the 16 MiB frame limit | `frame_too_large` |
+
+The availability budget is not the judgement deadline: once connected, a request has the normal hook budget. An MCP relay behaves the same way: a failure becomes a JSON-RPC error for the host's first request (`initialize`) plus a non-zero exit (2 for a configuration the daemon rejected, such as an `--omp-bridge` without its key file or native library; 1 otherwise), never a silent standalone server. If the daemon goes away while a session is running (memory cap, version switch, crash), the relay answers the requests that were in flight with a JSON-RPC error, reconnects (starting a successor), replays the host's `initialize` handshake and carries on; five recoveries within a minute end the process.
+
+### Versions
+
+`hello` reports `proto`, `package_version`, `index_schema`, `parser_versions`, `evaluator_version`, `features` and `pid`. A client whose package version or proto is **newer** than the daemon's asks it to drain (it stops accepting, finishes in-flight requests, closes its engines and exits) and starts the successor; **an older client never replaces the daemon**: it gets `unknown(version_mismatch)` and its hook fails open. During any switchover other hooks fail open (`daemon_unavailable`) rather than being judged twice. The version is the package version: two checkouts with the same number share one daemon, so after switching branches without a version bump run `python -m self_directing_mcp.daemon --stop`.
+
+### Observability
+
+MCP tool results the daemon served carry `served_by: "daemon"` (a standalone server's results are unchanged, so existing consumers see no new key). Host hook JSON gets **no** extra key; where a hook was served is recorded in the hook state database that already holds `hook_health` (`<index_dir>/claude-hook-state.sqlite`, `agy-hook-state.sqlite`), in a `served_by` table of counters per event, written at most every 30 s and at exit; a database without `daemon` rows was never served by it. Failures a client could not hand to the daemon are `hook_health` rows as usual.
+
+### Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SELF_DIRECT_DAEMON` | `off` | `on`: hooks and the MCP entry point are clients of the daemon (Linux). |
+| `SELF_DIRECT_DAEMON_IDLE_EXIT_SEC` | `900` | Daemon-side: leave after this long with no connection and no request. |
+| `SELF_DIRECT_DAEMON_MAX_RSS_MB` | `400` | Daemon-side: drain and exit after a request when the resident set exceeds this. |
+| `SELF_DIRECT_DAEMON_SESSION_BOUND` | `16` | Daemon-side: queued plus running hook requests per session before `queue_full`. |
+| `SELF_DIRECT_DAEMON_DEFER_DERIVED` | `on` | Daemon-side: hold the rows that carry no authority (monitor states, verification stamps, the AGY indexed marker) and write them with the next authority commit, when idle and at exit. `off`: write each synchronously, as a standalone process does. See "Held writes". |
+| `SELF_DIRECT_DAEMON_PYTHON` | the `.venv` Python, else the client's | Client-side: interpreter that starts the daemon. |
+
+The `SELF_DIRECT_DAEMON_*` limits are read from the daemon's own environment (clients pass them on when they start it); a malformed value stops the daemon with an error instead of using a default.
+
+### Limits of this stage
+
+Linux and WSL only; one daemon version at a time; the `.env`-in-working-directory behaviour of an MCP server depends on the client's directory; every client of a user must see the same `XDG_RUNTIME_DIR` (or all fall back to the cache directory), or they would start separate daemons (index locking keeps that safe, not efficient); a request that exceeds its budget leaves its worker thread running until its cooperative deadline; the judgement is the standalone judgement (same verdicts, same verification, same shadow comparison), made cheaper by what a resident process can keep (see [Held writes](#lifecycle)), and what is still slow is listed in the measurements below (one synchronous commit per appended request, the shadow comparison, and for AGY the receipts commit); a hook arriving while the daemon is restarting fails open instead of waiting for it. Daemon-side `served_by` for hooks is a counter, not a per-call record.
+
+### Measurements
+
+Measured with `scripts/bench_daemon.py --runs 30` on synthetic data (AMD Ryzen 7 5800X under WSL2, ext4, Python 3.12, other work running on the machine: load average 2.0 to 3.1 during the runs; 1 MB sessions, 10 contracts, local-only, 30 interleaved runs per cell after a discarded warm-up). The "daemon" columns are the real hook script as a fresh process talking to a warm daemon; the standalone columns are the same script with the flag unset on a separate, identically built index. A cell that shows `before → after` compares the daemon commit this warm-path work started from with the result of it, on the same machine and benchmark.
+
+| Event (new process, wall ms) | standalone p50 / p95 | through the daemon p50 / p95 | judgement inside the daemon p50 / p95 | rest of the daemon's request p50 / p95 |
+|---|---|---|---|---|
+| Claude Code `UserPromptSubmit` | 51 / 56 | **21 / 23** | 0.7 / 0.8 | 0.2 / 0.3 |
+| Claude Code `PreToolUse` (nothing appended) | 251 / 282 → 248 / 281 | 53 / 66 → **47 / 58** | 32 / 44 → **25 / 35** | 0.2 / 0.3 |
+| Claude Code `PreToolUse` (4 KB appended) | 248 / 285 → 255 / 278 | 56 / 86 → **45 / 66** | 35 / 65 → **24 / 45** | 0.2 / 0.3 |
+| Claude Code `Stop` (nothing appended) | 272 / 306 → 252 / 290 | 76 / 93 → **30 / 33** | 55 / 72 → **8.9 / 9.7** | 0.2 / 0.2 |
+| Claude Code `Stop` (4 KB appended) | 316 / 352 → 274 / 315 | 117 / 137 → **48 / 81** | 95 / 116 → **27 / 60** | 0.2 / 0.3 |
+| AGY `PreToolUse` (nothing appended) | 267 / 295 → 263 / 293 | 72 / 80 → **58 / 67** | 50 / 57 → **37 / 40** | 0.2 / 0.3 |
+| AGY `PreToolUse` (4 KB appended) | 294 / 326 → 300 / 324 | 97 / 106 → **79 / 90** | 76 / 83 → **59 / 68** | 0.2 / 0.3 |
+| AGY `Stop` (nothing appended) | 295 / 327 → 229 / 278 | 101 / 115 → **35 / 42** | 79 / 91 → **14 / 16** | 0.2 / 0.3 |
+| AGY `Stop` (4 KB appended) | 355 / 392 → 261 / 301 | 154 / 180 → **54 / 61** | 133 / 159 → **33 / 38** | 0.2 / 0.3 |
+
+What the daemon removes is the process cost: interpreter start, imports, settings, engine and index setup (about 190 ms of a 250 ms Claude Code `PreToolUse`). The thin client alone costs about 20 ms end to end (12.6 ms of it is the bare interpreter start; the client adds the standard-library imports and one socket round trip), its peak resident set is about 14 MB (a bare interpreter: 11 MB; a standalone judging hook: 68 to 77 MB), and the daemon's own handling beyond the judgement is about 0.25 ms. What is left is the judgement, and the warm-path work cut it from 32 to 133 ms to 9 to 59 ms by removing commits and repeated work, never checks. Profiled with `scripts/bench_warm.py` (below), what remains of a judgement is: one synchronous `fsync`-ed commit for every request that appends events (10 to 15 ms on this machine; AGY makes a second one for the host receipt, and a third when a result binds to its receipt), 4 to 21 ms of CPU, and the **shadow comparison**. `Claude Code PreToolUse (nothing appended)` is a request whose offset the deterministic 1-in-16 shadow sample selects; with nothing appended every request is at that offset, so this cell measures the comparison (a full evaluation of the same events) in every request: 25 ms, against 4 ms without it (`SELF_DIRECT_AUDIT_SHADOW_EVERY=0`). Because 1 in 16 is more than the 5% a p95 leaves out, the p95 of every cell with appended events is the cost of a request that was shadowed, which is a full evaluation more: with 10 contracts 17 ms on Claude Code `PreToolUse`, 42 ms on `Stop` and 64 ms on AGY `Stop` (its evidence classes make the full evaluation dearer); with 100 contracts 270 ms on Claude Code `Stop` and 360 ms on AGY `Stop`. Which of the 30 requests of a cell are shadowed is chance, so the p95 of those cells moves by 10 to 15 ms between two runs (a second run of this benchmark gave `Stop` with 4 KB appended 29 / 73 ms instead of 27 / 60). The sample rate is a safety setting and was not changed.
+
+Idle MCP sessions (12, one shared index, after the handshake and one tool call): twelve standalone servers use 971 MB resident (588 MB proportional); twelve relays plus one daemon use **251 MB** (119 MB proportional): each relay 13.7 to 14.4 MB, the daemon 83.5 MB. After the hook runs above the daemon, holding two engines, was at 99.9 MB. (Measured before the warm-path work; it holds a few more kilobytes per session and is not expected to change.)
+
+Against the roundtable's provisional targets: relay at most 15 MB, met (14.4 MB); daemon at most 120 MB, met (83.5 to 99.9 MB); 12 sessions at most 300 MB in total, met (251 MB); the new-process hook p95 of at most 40 ms is **met for events without a judgement** (`UserPromptSubmit`: 23 ms) and **not met** for the judging events (Claude Code `PreToolUse` 58 / 66 ms, `Stop` 33 / 81 ms; AGY 42 to 90 ms); the daemon-side processing p95 of at most 15 ms is **met for the daemon's own work** (0.3 ms beyond the judgement, 1 ms for `UserPromptSubmit`) and for a warm judgement that appends nothing and is not shadowed (Claude Code `PreToolUse` 4 ms, `Stop` 9.7 ms, AGY `Stop` 16 ms), and **not met** wherever a request appends events or is shadowed (one commit is 10 to 15 ms before any CPU; the shadow comparison is a full evaluation). A `Stop` with 100 contracts (`bench_warm.py --contracts 100`, 60 requests per cell) is 15 / 18 ms at p50 / p95 with nothing appended and 40 / 51 ms with 4 KB appended on Claude Code (112 / 136 ms before), 57 / 66 ms on AGY with the shadow sample off, against the target of 80 ms at p95, **met** except in a window that holds a shadowed request (310 ms on Claude Code and 420 ms on AGY with 100 contracts when every request is shadowed). Two things would still move these numbers and were deliberately not done here: write-ahead logging for `meta.sqlite` and the receipts database (a commit measured 4 ms instead of 10 on this machine, a durability-preserving but file-format-visible change) and a faster or rarer shadow comparison (a weaker check).
 
 ---
 
@@ -722,7 +869,12 @@ python -m pytest -q
 python -m build
 python scripts/benchmark.py
 python scripts/bench_hooks.py --out bench-hooks.json --markdown bench-hooks.md   # hook cost, see below
+python scripts/bench_daemon.py --out bench-daemon.json --markdown bench-daemon.md  # resident daemon, Linux (experimental)
+python scripts/bench_warm.py --defer --spans claude:Stop:4096                      # the warm judgement of one engine, in-process
+TSUKKOMI_TEST_DEFER_DERIVED=1 python -m pytest -q                                 # the whole suite with every engine holding its derived writes
 ```
+
+The resident daemon's tests live in `tests/daemon/` (Linux only; other platforms skip them): framing and directory checks, peer credentials, bounds, version switching, idle exit and the memory drain, byte-identical hook output through the daemon and standalone (Claude Code and AGY: deny, allow with a satisfied prerequisite, `Stop`), concurrency, every fail-open path, the client import budget, MCP parity through the relay, and a fixture that fails any test that leaves a daemon process running (and the session, if one survives).
 
 ### CI
 
@@ -835,6 +987,53 @@ Against the targets (`check_action` with nothing appended 100 ms, `audit_session
 
 Windows, reported separately (Windows 11, Python 3.13, the same machine, 12 interleaved runs per event, 10 contracts; before → after, median wall in ms): Claude Code `PostToolUse` 361 → 141, `UserPromptSubmit` 358 → 144, `SessionStart` 543 → 359, `PreToolUse` 625 → 473, `Stop` 716 → 552; AGY events 11 to 28 percent faster. Windows is slower in absolute terms (a hook's process start and imports cost about 1.3 to 2.7 times as much), so the events that are not gated can exceed their 1.5 times threshold there (`SessionStart` reaches 0.56 s CPU at p95); the gated `PostToolUse` and `UserPromptSubmit` stay at about 0.2 s p95 and pass with the default factor. Twelve idle local-only servers: 966 → 877 MB working set (80.6 → 73.3 MB each). A venv's `python.exe` is a launcher that starts the real interpreter, so the benchmark runs the process tree in a job object and reads the interpreter's own peak working set; Windows CPU times have the 15.6 ms resolution of the operating system clock. The roundtable measured the 314 MB session on Windows at commit `00cb90e` (local-only engine): server import 1.12 s, first `check_action` 44.8 s, `check_action` with nothing appended 1.50 to 1.58 s CPU, `audit_session` 4.22 s.
 
+### Warm judgement benchmark
+
+`scripts/bench_warm.py` measures what is left of a hook judgement once the process and its imports are gone (the daemon case): one `SelfDirectEngine` kept between requests, 1 MB synthetic Claude Code and AGY sessions, 10 contracts, `claude_hooks.run_hook` / `agy_hooks.run_hook` called repeatedly with nothing appended and with 4 KB appended before each request, under an isolated `HOME`, index and config file. Per cell it prints p50 / p95 / minimum wall time and the **durable SQLite commits per request** (counted through SQLite's statement trace: a commit that wrote something is an `fsync`, 10 to 25 ms on the benchmark machine and most of what a warm judgement costs once the CPU work is gone). `--defer` builds the engine as the daemon does; `--tmpdir /dev/shm/...` puts the index on a RAM disk, which removes the `fsync` and leaves the CPU cost; `--profile host:event:bytes` prints a `cProfile`; `--spans host:event:bytes` (or `all`) times the stages the judgement is made of, per request; `--exact-size` cuts the session to `--session-mb` at a record boundary (tens or hundreds of events); `--shadow-every N` and `--min-events N` set the incremental-audit settings. It runs against an older checkout too (`--defer` is then ignored), which is how the before/after below was made.
+
+```bash
+python scripts/bench_warm.py --defer --runs 50                                  # the daemon's engine
+python scripts/bench_warm.py --defer --tmpdir /dev/shm/warm --runs 50           # the same without the disk's fsync
+python scripts/bench_warm.py --defer --spans claude:Stop:4096 --only claude:Stop # where one cell's time goes
+```
+
+Median over three interleaved rounds of 50 requests (before = the commit this work started from; machine and conditions as in [Measurements](#measurements) above, load average 2.7 to 3.8; p50 / p95 ms and durable commits per request):
+
+| Cell | before | after, synchronous engine | after, daemon engine (`--defer`) |
+|---|---|---|---|
+| Claude Code `PreToolUse`, nothing appended | 23.9 / 34.0, 0 | 21.2 / 33.0, 0 | 21.3 / 31.3, 0 |
+| Claude Code `PreToolUse`, 4 KB appended | 35.8 / 56.0, 2.1 | 34.2 / 53.9, 2.1 | **22.2 / 42.6**, 1 |
+| Claude Code `Stop`, nothing appended | 59.5 / 69.5, 2 | 34.0 / 37.7, 2 | **9.4 / 12.0**, 0 |
+| Claude Code `Stop`, 4 KB appended | 101.6 / 119.2, 4 | 53.9 / 60.2, 3 | **28.1 / 32.7**, 1 |
+| AGY `PreToolUse`, nothing appended | 54.7 / 60.1, 3 | 48.4 / 53.0, 3 | **37.2 / 45.4**, 2 |
+| AGY `PreToolUse`, 4 KB appended | 87.7 / 97.3, 5 | 86.9 / 96.5, 5 | **60.7 / 68.1**, 3 |
+| AGY `Stop`, nothing appended | 83.8 / 100.7, 2 | 16.4 / 21.1, 0 | **14.9 / 20.6**, 0 |
+| AGY `Stop`, 4 KB appended | 146.9 / 252.6, 5 | 51.4 / 132.2, 2 | **35.5 / 117.8**, 1 |
+
+With the shadow comparison off (`--shadow-every 0`), which isolates the steady state, the same cells are 4 / 5, 34 / 49, 57 / 69, 98 / 110, 52 / 57, 81 / 90, 84 / 104 and 144 / 172 ms before and 3.7 / 4.3, 22 / 27, 9.5 / 12, 28 / 31, 35 / 41, 57 / 64, 15 / 19 and 35 / 42 ms after (daemon engine). Of what is left, the CPU work is 4 to 21 ms (measure it with `--tmpdir` on a RAM disk; it was 4 to 75 ms before) and the rest is the commits in the table: one for the events and cursor, and for AGY the host receipt and the binding of results to receipts. The p95 of the cells that append events is a shadowed request (see [Measurements](#measurements)). The first two cells' p50 is the shadow comparison too: that synthetic session's offset is one the deterministic sample selects, and with nothing appended every request is at it.
+
+Where the time went in the slowest cells (per-request inclusive spans of `--spans`, p50 ms; spans nest, so the commit is inside the sync):
+
+| Cell | total before → after | sync (capture, parse, commit) | of which events commit | derived writes (states, stamps, marker, FTS) | checklist read |
+|---|---|---|---|---|---|
+| Claude Code `Stop`, 4 KB | 100 → 29 | 65 → 26 | 16 → 17 | 40 → 0.2 | 20 → 0.2 |
+| Claude Code `Stop`, nothing appended | 57 → 9.3 | 38 → 6.9 | 0 | 23 → 0.1 | 18 → 0.2 |
+| AGY `Stop`, 4 KB | 132 → 35 | 84 → 30 | 17 → 17 | 47 → 0.9 | 33 → 0.2 |
+| AGY `PreToolUse`, 4 KB | 77 → 53 | 46 → 34 | 17 → 16 | 22 → 0.6 | 0 |
+
+AGY costs grow with the number of receipts in the conversation (every request read them all a dozen times). With 1,200 realistic receipts (4,800 events, RAM disk) an AGY `Stop` took 37.5 ms before the receipts reader and 21.4 ms after it, a `PreToolUse` 33 and 25 ms.
+
+**`SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS` (default 500) and resident engines.** The benchmark sessions hold 1,729 (Claude Code) and 3,265 (AGY) events, so every request of the tables above keeps state and is judged incrementally; `bench_warm.py` prints this for each cell. The default exists because on a one-shot hook the monitor state costs a commit and a rebuild plus its shadow comparison. A resident engine that holds the state pays no commit, so the break-even moves down, and measuring it (`--exact-size`, 512 bytes appended per request, state kept against none, 20 requests per cell, p50 ms, Claude Code, RAM disk / real disk) gives:
+
+| stored events | `PreToolUse` kept / none, resident | `Stop` kept / none, resident | `PreToolUse` kept / none, one-shot | `Stop` kept / none, one-shot |
+|---|---|---|---|---|
+| 31 | 6.2 / 4.5 RAM, 18.9 / 16.7 disk | 6.8 / 7.6, 20.5 / 20.0 | 4.4 / 5.0, 31.3 / 20.0 | 6.4 / 7.9, 44.9 / 35.2 |
+| 124 | 5.0 / 5.5, 18.3 / 18.9 | 6.8 / 9.9, 20.5 / 24.0 | 4.6 / 5.6, 32.1 / 20.5 | 6.7 / 10.3, 47.6 / 38.8 |
+| 496 | 5.3 / 8.8, 19.5 / 23.2 | 7.2 / 17.2, 22.1 / 32.0 | 4.8 / 9.1, 29.3 / 23.2 | 7.4 / 17.2, 41.9 / 42.7 |
+| 1,857 | 5.3 / 23.9, 20.4 / 37.1 | 8.9 / 48.4, 24.2 / 60.0 | 5.5 / 22.3, 31.7 / 36.5 | 9.3 / 49.0, 48.0 / 71.8 |
+
+For a resident engine keeping state costs the same as keeping none up to about 250 events (for `Stop` it is cheaper from the start) and is cheaper beyond; on a one-shot engine the extra commit makes it dearer until about 500 events (`Stop`) and 1,500 (`PreToolUse`). The default of 500 is therefore right for `Stop` on both, a little conservative for a resident engine between 250 and 500 events (a few milliseconds at most) and a little low for a one-shot `PreToolUse`; it was left unchanged.
+
 ### Memory verification
 
 tsukkomi is Python, but it runs native code: neograph-engine (the audit and GraphRAG graphs) and the sqlite-vector extension (dense search). After the 0.5.x memory incident the project checks both the native code and the long-running server, modelled on NeoGraph's sanitizer CI. `.github/workflows/memory.yml` runs three jobs:
@@ -864,6 +1063,8 @@ python scripts/memory_soak.py --check --dense-backend sqlite-vector --vector-pat
 ```
 
 Use a separate virtual environment per profile, because the sanitizer build replaces the release wheel. `TSUKKOMI_TEST_DENSE_BACKEND=sqlite-vector` with `SQLITE_VECTOR_TEST_PATH` runs any suite against a native vector library. Known limit: CPython 3.12 builds where interned strings are immortal (Ubuntu 24.04's 3.12.3, for example) keep each path component that `pathlib` interns, about 150 bytes per distinct session path. This is bounded by the number of sessions; newer 3.12 releases and 3.13 release them.
+
+Daemon tests under the sanitizers: the daemon, the relays and the hook scripts start in a clean environment on purpose (that keeps credentials out of the daemon), so a child process of a sanitizer run would load the instrumented NeoGraph extension without the preloaded runtime and die at import. `tests/daemon/test_daemon_hooks.py` and `test_daemon_mcp.py` therefore skip the tests that start real processes under the ASan and TSan profiles (60 of 161 daemon tests); the in-process daemon tests, which run the daemon's own threads, sockets and drain logic inside the sanitized interpreter, still run, and the ordinary Linux job runs all of them. The in-process daemon tests also never apply the production resident-memory cap to the pytest process itself.
 
 Known third-party exemption: sqlite-vector 1.1.0 computes `1 << 31` on an `int` in `cpu_supports_avx512()` (`src/distance-cpu.c`), which UBSan reports as `shift-base` on CPUs that reach that AVX-512 probe (GitHub runners do; a Zen 3 workstation does not). The ASan build of that one library is compiled with `-fno-sanitize=shift-base`; NeoGraph and the canaries keep the full `-fsanitize=undefined` set. The sanitizer suites run pytest without output capture (`-s`), so a native report reaches the job log.
 

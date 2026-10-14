@@ -19,6 +19,7 @@ from self_directing_mcp.request_control import (
     IndexBusy, RequestControl, RequestStopped, request_scope,
 )
 from test_reliability import SID, call, session as reliability_session, write
+from semantic_support import codex_user_anchor
 from test_omp_local import _append, _message, local_engine
 from test_agy_transcript import (
     SID as AGY_SID, _append_result, _deploy_check, _receipt_payload,
@@ -107,17 +108,18 @@ def test_paused_native_evaluation_allows_metadata_and_another_audit(session, mon
 
 @pytest.mark.parametrize("change", ["add", "upsert", "revoke", "missing", "corrupt"])
 def test_rule_document_change_never_publishes_stale_clean(session, monkeypatch, change):
-    engine, _ = session
+    engine, path = session
     policy(engine)
+    anchor = codex_user_anchor(engine, path, SID, "change the rule")   # weakening a rule carries the user's message
     with pause_first(monkeypatch, audit_runner, "audit_contract") as (pool, entered, release):
         audit = pool.submit(engine.check_action, SID, {"tool_name": "shell", "arguments": "echo safe"})
         assert entered.wait(5)
         if change == "add":
             engine.upsert_contracts([{"id": "new", "type": "must_not", "regex": "safe"}])
         elif change == "upsert":
-            engine.upsert_contracts([{"id": "no-delete", "type": "must_not", "regex": "safe"}])
+            engine.upsert_contracts([{"id": "no-delete", "type": "must_not", "regex": "safe", "source_event_id": anchor}])
         elif change == "revoke":
-            engine.revoke_contract("no-delete")
+            engine.revoke_contract("no-delete", source_event_id=anchor)
         elif change == "missing":
             engine.settings.resolve_contracts_path().unlink()
         else:
@@ -163,11 +165,12 @@ def test_stale_snapshot_retains_actual_violation_evidence(session, monkeypatch):
     engine, path = session
     write(path, [call("DELETE")], "a")
     policy(engine)
+    anchor = codex_user_anchor(engine, path, SID, "drop that rule")
     with pause_first(monkeypatch, audit_runner, "audit_contract") as (pool, entered, release):
         audit = pool.submit(engine.audit_session, SID)
         assert entered.wait(5)
         evidence_ids = engine.store.chunk_ids(SID)
-        engine.revoke_contract("no-delete")
+        engine.revoke_contract("no-delete", source_event_id=anchor)
         release.set()
         value = audit.result(5)
         incomplete(value)

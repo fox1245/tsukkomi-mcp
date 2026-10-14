@@ -105,7 +105,7 @@ def handle_stop(engine: SelfDirectEngine, session_id: str, payload: dict[str, An
         return {"decision": "allow", "reason": hook_policy.NO_OUTSTANDING}
     notes, misses = hook_policy.checkpoint(engine, "agy", session_id, path, obligations, "AGY")
     if mode == "advisory":
-        return {"decision": "allow", "reason": "ADVISORY (not compliance): " + " ".join(notes)} if notes else {"decision": "allow"}
+        return {"decision": "allow", "reason": hook_policy.with_notes(notes, "ADVISORY (not compliance): ")} if notes else {"decision": "allow"}
     if misses:
         summary = hook_policy.miss_summary(misses)
         key = hook_policy.miss_key(misses)
@@ -115,7 +115,7 @@ def handle_stop(engine: SelfDirectEngine, session_id: str, payload: dict[str, An
                     + ". This is the only automatic continuation for this conversation."}
         notes.append(BUDGET_NOTE)
     if notes:
-        return {"decision": "allow", "reason": "Not verified (does not block stopping): " + " ".join(notes)}
+        return {"decision": "allow", "reason": hook_policy.with_notes(notes, "Not verified (does not block stopping): ")}
     return {"decision": "allow"}
 
 
@@ -215,7 +215,8 @@ def _dispatch(payload: Any, event_name: str | None, engine: SelfDirectEngine | N
             return handle_stop(engine, sid, payload), None
         if event_name == "PreInvocation":
             return handle_pre_invocation(engine, sid, payload), None
-        result = engine.sync_session(session_id=sid, provider="agy", path=path, embed=False)
+        result = engine.sync_session(session_id=sid, provider="agy", path=path, embed=False,
+                                     derived=hook_policy.wants_derived_work(engine))
         if not result.get("ok"):
             print("Tsukkomi PostToolUse: history refresh unavailable", file=sys.stderr)
         return {}, None

@@ -40,10 +40,12 @@ API_KEY_ENV = "OPENROUTER_API_KEY"
 ENFORCEMENT_MODES = ("confirmed_only", "advisory", "enforced")
 SESSION_PROVIDERS = ("codex", "grokbot", "omp", "agy", "claude")
 DENSE_BACKENDS = ("sqlite-vector", "numpy")
+DAEMON_MODES = ("off", "on")
 
 DEFAULT_ENFORCEMENT = "confirmed_only"
 DEFAULT_SESSION_PROVIDER = "codex"
 DEFAULT_DENSE_BACKEND = "sqlite-vector"
+DEFAULT_DAEMON = "off"
 DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 DEFAULT_EMBEDDING_DIM = 1024
 DEFAULT_EMBEDDING_BASE_URL = "https://openrouter.ai/api/v1"
@@ -397,6 +399,7 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("rrf_k", lambda name, text: _to_int(name, text), _static(DEFAULT_RRF_K)),
     FieldSpec("retrieve_top_k", lambda name, text: _to_int(name, text), _static(DEFAULT_RETRIEVE_TOP_K)),
     FieldSpec("search_top_k", lambda name, text: _to_int(name, text), _static(DEFAULT_SEARCH_TOP_K)),
+    FieldSpec("daemon", _literal(DAEMON_MODES), _static(DEFAULT_DAEMON)),
 )
 FIELD_NAMES = tuple(spec.name for spec in FIELDS)
 

@@ -43,8 +43,8 @@ def parse_errors(chunks):
     return [c for c in chunks if c.meta.get("parse_error")]
 
 
-def test_parser_version_is_seven():
-    assert agy.PARSER_VERSION == 7
+def test_parser_version_has_reached_seven():
+    assert agy.PARSER_VERSION >= 7   # v8 moved model-written tool labels out of the call text
 
 
 def test_nul_padded_record_is_accepted_and_the_padding_is_recorded(tmp_path):
@@ -195,7 +195,7 @@ def test_a_parser_bump_turns_the_old_parse_error_into_the_record(env, monkeypatc
         first = sync(engine, path)
     assert first["coverage"]["parse_error_count"] == 1 and first["parser_version"] == 6
     second = sync(engine, path)
-    assert second["reindexed"] and second["reindex_reason"] == "parser_updated" and second["parser_version"] == 7
+    assert second["reindexed"] and second["reindex_reason"] == "parser_updated" and second["parser_version"] == agy.PARSER_VERSION
     assert second["coverage"]["parse_error_count"] == 0 and second["coverage"]["complete"]
     assert not sync(engine, path)["reindexed"]
 
@@ -228,7 +228,7 @@ def test_a_parser_bump_keeps_event_ids_anchors_and_cached_vectors(tmp_path, monk
         kept = {c.chunk_id for c in before if not c.meta.get("parse_error")}
         assert kept <= engine.dense.ids()
         updated = engine.sync_session(session_id=SID, provider="agy", path=str(path), embed=False)
-        assert updated["reindex_reason"] == "parser_updated" and updated["parser_version"] == 7
+        assert updated["reindex_reason"] == "parser_updated" and updated["parser_version"] == agy.PARSER_VERSION
         after = {c.chunk_id for c in chunks_of(engine)}
         assert kept <= after and error not in after  # unchanged events keep their ids (and so any anchors)
         assert kept <= engine.dense.ids() and error not in engine.dense.ids() | engine.sparse.ids()

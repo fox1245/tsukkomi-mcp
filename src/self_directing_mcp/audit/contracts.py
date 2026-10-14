@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import hashlib
 from pathlib import Path
+import threading
 
 from self_directing_mcp.schemas import ContractRule, ContractsDocument
 from self_directing_mcp.request_control import check_request, publication
@@ -30,6 +32,100 @@ def scope_counts(selected: list[ContractRule], store_count: int) -> dict[str, in
         "global": sum(1 for rule in selected if rule.session_id is None),
         "store": store_count,
     }
+
+
+def loosening_reasons(previous: ContractRule, new: ContractRule) -> list[str]:
+    """Why replacing the active ``previous`` by ``new`` may enforce less; ``[]`` when it cannot.
+
+    Whether a regex got narrower is undecidable here, so any change of what a contract matches counts, as does every
+    field that restricts where or when it applies (moving ``applies_from_event_id`` is not judged: it is how a new
+    revision says "from now on"). Only strictly tightening edits (a new verifier for a description-only
+    contract, an added role, widening the scope to ``any``, adding an obligation flag, removing an exception, enabling)
+    pass without a user anchor. A contract that is not enabled enforces nothing, so editing it weakens nothing.
+    """
+    if not previous.enabled:
+        return []
+    reasons = []
+    if not new.enabled:
+        reasons.append("disabled")
+    if new.type != previous.type:
+        reasons.append("type changed")
+    if previous.regex and new.regex != previous.regex:
+        reasons.append("regex changed")
+    if new.before_regex != previous.before_regex:
+        reasons.append("before_regex changed")
+    if new.exception_regex and new.exception_regex != previous.exception_regex:
+        reasons.append("exception added or changed")
+    if new.scope != previous.scope and new.scope != "any":
+        reasons.append("scope narrowed")
+    if set(previous.roles) - set(new.roles):
+        reasons.append("roles narrowed")
+    if new.when is not None and new.when != previous.when:
+        reasons.append("applicability condition (when) added or changed")
+    if new.provider is not None and new.provider != previous.provider:
+        reasons.append("narrowed to one provider")
+    if new.session_id is not None and new.session_id != previous.session_id:
+        reasons.append("narrowed to one session")
+    if previous.requires_success and not new.requires_success:
+        reasons.append("success requirement removed")
+    if previous.risk == "high" and new.risk != "high":
+        reasons.append("risk lowered")
+    if previous.auto_continue and not new.auto_continue:
+        reasons.append("auto_continue removed")
+    return reasons
+
+
+class ContentMemo:
+    """A small thread-safe LRU whose KEY IS THE CONTENT its values were computed from.
+
+    Used for derivations of a file's exact bytes (a validated contracts document, the obligations read out of one):
+    a changed byte is a different key, so a stale entry can never be returned, and nothing needs invalidating. Errors
+    are not cached (``put`` is only called with a finished value). Values are shared between callers and must be
+    treated as read-only; whoever edits a document validates a private copy of its own.
+    """
+
+    def __init__(self, size: int) -> None:
+        self._size, self._items, self._lock = size, OrderedDict(), threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            value = self._items.get(key)
+            if value is not None:
+                self._items.move_to_end(key)
+            return value
+
+    def put(self, key, value) -> None:
+        with self._lock:
+            self._items[key] = value
+            self._items.move_to_end(key)
+            while len(self._items) > self._size:
+                self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+MEMO_MAX_BYTES = 1024 * 1024   # a larger contracts file is validated every time rather than held (bounds what the memos keep)
+_DOCUMENTS = ContentMemo(8)
+
+
+def parse_contracts(raw: bytes | None) -> ContractsDocument:
+    """The validated contracts document of these exact bytes (an empty one for ``None``).
+
+    Read-only callers only: the document is shared by everyone who reads the same bytes, so a reader must not modify
+    it or hand its rules to code that does. ``ContractStore.load`` and the upsert/revoke paths, which edit, validate
+    their own copy. Invalid bytes raise ``ValueError`` on every call (failures are not remembered).
+    """
+    if raw is None:
+        return ContractsDocument()
+    memoize = len(raw) <= MEMO_MAX_BYTES
+    document = _DOCUMENTS.get(raw) if memoize else None
+    if document is None:
+        document = ContractsDocument.model_validate_json(raw)
+        if memoize:
+            _DOCUMENTS.put(raw, document)
+    return document
 
 
 class ContractStore:

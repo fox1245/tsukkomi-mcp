@@ -82,7 +82,8 @@ def test_literal_choices_match_the_model():
     for name, choices in (("agy_enforcement", settings_core.ENFORCEMENT_MODES),
                           ("claude_enforcement", settings_core.ENFORCEMENT_MODES),
                           ("session_provider", settings_core.SESSION_PROVIDERS),
-                          ("dense_backend", settings_core.DENSE_BACKENDS)):
+                          ("dense_backend", settings_core.DENSE_BACKENDS),
+                          ("daemon", settings_core.DAEMON_MODES)):
         assert typing.get_args(Settings.model_fields[name].annotation) == choices, name
 
 
@@ -142,7 +143,8 @@ STR_OR_LISTS = ["/a;/b", '["/a"]', '"quoted"', "[1]", "5", "true", "null", '{"a"
 CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Advisory", "", " advisory", "bogus", "ENFORCED"],
            "claude_enforcement": ["confirmed_only", "advisory", "enforced", "Enforced", "", "advisory ", "bogus"],
            "session_provider": ["codex", "grokbot", "omp", "agy", "claude", "Codex", "", "cursor", "claude "],
-           "dense_backend": ["sqlite-vector", "numpy", "NumPy", "", "sqlite_vector", "faiss"]}
+           "dense_backend": ["sqlite-vector", "numpy", "NumPy", "", "sqlite_vector", "faiss"],
+           "daemon": ["off", "on", "On", "ON", "", " on", "on ", "auto", "true", "1", "false", "Off"]}
 KIND_VALUES = {"bool": BOOLS, "int": INTS, "float": FLOATS, "path": PATHS, "list": LISTS, "mixed": STR_OR_LISTS}
 FIELD_KINDS = {
     "codex_sessions_dir": "path", "omp_sessions_dir": "path", "claude_projects_dir": "path", "index_dir": "path",

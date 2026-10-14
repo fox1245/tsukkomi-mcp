@@ -28,8 +28,8 @@ dependencies = [
 dev = ["pytest>=8.0", "build>=1.0"]
 
 [project.scripts]
-tsukkomi-mcp = "self_directing_mcp.server:main"
-self-directing-mcp = "self_directing_mcp.server:main"
+tsukkomi-mcp = "self_directing_mcp.entry:main"
+self-directing-mcp = "self_directing_mcp.entry:main"
 tsukkomi-install-codex = "self_directing_mcp.install_codex:main"
 self-directing-install-codex = "self_directing_mcp.install_codex:main"
 tsukkomi-workflow = "self_directing_mcp.workflow_cli:main"
