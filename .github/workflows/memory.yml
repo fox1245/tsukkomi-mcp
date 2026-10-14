@@ -2,7 +2,7 @@ name: Memory
 # Memory and thread-safety verification, after NeoGraph's sanitizer CI:
 #   asan  - ASan + UBSan + LSan. neograph-engine and sqlite-vector are rebuilt from pinned, digest-verified
 #           sources with sanitizers and the whole suite runs against them (scripts/verify_memory.py).
-#   tsan  - ThreadSanitizer over the same native code, with the concurrency-focused tests.
+#   tsan  - ThreadSanitizer over the same native code and the whole suite.
 #   soak  - a long-running server loop through the MCP tool entry points, with the official sqlite-vector
 #           release: retained heap, file descriptors and threads must plateau (scripts/memory_soak.py).
 # Canaries run first in each sanitizer job, so "no reports" is evidence that the sanitizer was live.

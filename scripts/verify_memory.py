@@ -50,11 +50,11 @@ PROFILES = {
     "tsan": {"flags": "-fsanitize=thread -fno-omit-frame-pointer -O1 -g",
              "link": "-fsanitize=thread", "runtime": ("libtsan.so",), "needed": "libtsan"},
 }
-# The suite runs whole under ASan. TSan is about native code running on several threads, and the
-# uninstrumented interpreter makes it several times slower, so it runs the concurrency-focused tests.
-TSAN_TESTS = ("tests/test_native_vector_stress.py", "tests/test_index_concurrency.py",
-              "tests/test_server_concurrency.py", "tests/test_singleflight.py", "tests/test_timeout_regression.py",
-              "tests/test_hook_gating.py", "tests/test_graphrag_update.py", "tests/test_mcp_transport.py")
+# Both profiles run the whole suite. Under TSan, /bin/sh (dash) itself crashes with the runtime preloaded (SIGSEGV
+# before it runs anything), so the tests that start hook commands through a shell are deselected there; Python
+# child processes are unaffected.
+TSAN_DESELECT = ("tests/test_claude_install.py::test_printed_commands_run_the_real_hook_and_fail_open_on_bad_input",
+                 "tests/test_claude_install.py::test_index_dir_is_baked_into_every_command_and_must_be_absolute")
 TSAN_EXIT = 66
 CANARY = r"""
 /* Sanitizer canaries: each function holds exactly one deliberate defect. */
@@ -299,7 +299,9 @@ def command_test(args) -> int:
     leak_result = logs / "lsan-result.txt"
     if args.profile == "asan":
         env["TSUKKOMI_LSAN_RESULT"] = str(leak_result)
-    tests = args.pytest_args or (list(TSAN_TESTS) if args.profile == "tsan" else [])
+    tests = list(args.pytest_args)
+    if args.profile == "tsan":
+        tests += [f"--deselect={test}" for test in TSAN_DESELECT]
     command = [*prefix, sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *tests]
     print("+", " ".join(command), flush=True)
     # UBSan writes to stderr even when ASan logs to files, so the run's output is kept and scanned too.
@@ -339,7 +341,7 @@ def main(argv=None) -> int:
         if name == "native":
             command.add_argument("--ccache", action="store_true")
         if name == "test":
-            command.add_argument("pytest_args", nargs="*", help="tests or pytest options (default per profile)")
+            command.add_argument("pytest_args", nargs="*", help="tests or pytest options after --")
     args = parser.parse_args(argv)
     if platform.system() != "Linux":
         raise SystemExit("sanitizer profiles need Linux and GCC")
