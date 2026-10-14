@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_serializer, model_validator
 
 
 SCHEMA_VERSION = "1.0"
@@ -12,6 +12,8 @@ ChunkKind = Literal["turn", "tool_call", "tool_result", "policy", "meta"]
 ContractRuleType = Literal["must", "must_not"]
 ContractScope = Literal["tool_call", "tool_result", "message", "any"]
 Severity = Literal["critical", "high", "medium", "low"]
+ContractRisk = Literal["normal", "high"]
+Applicability = Literal["applicable", "not_applicable"]
 Verdict = Literal["violation", "suspicious", "clean", "unknown"]
 SearchMode = Literal["hybrid", "regex", "sparse", "dense"]
 
@@ -40,6 +42,25 @@ class AuditEvent:
 
     def __init__(self, chunk_id, kind, text, meta):
         self.chunk_id, self.kind, self.text, self.meta = chunk_id, kind, text, meta
+
+
+class ContractWhen(BaseModel):
+    """Optional applicability condition for a ``must`` obligation.
+
+    The obligation applies only if some tool call observed earlier in the same session matches
+    ``tool_call_regex`` (case-insensitive, multiline). A contract whose condition is not met is reported
+    as ``not_applicable`` with this reason; it is never dropped. Without a condition nothing changes.
+    """
+    model_config = ConfigDict(extra="forbid")
+    tool_call_regex: str = Field(
+        min_length=1,
+        description="Regex over tool calls observed in this session; the obligation applies only after one matched.",
+    )
+
+
+# Fields added after 1.0. They are omitted from serialized contracts while at their default so files written
+# by this version stay loadable by older processes (extra="forbid") and snapshots of unchanged contracts hold.
+_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None}
 
 
 class ContractRule(BaseModel):
@@ -101,6 +122,29 @@ class ContractRule(BaseModel):
         default=None,
         description="User-authorized exception pattern for must_not rules; a match lowers violation to suspicious pending confirmation.",
     )
+    risk: ContractRisk = Field(
+        default="normal",
+        description="'high' declares that actions this contract applies to are high-risk. Hosts may ask the user "
+                    "instead of silently allowing when such an action cannot be verified.",
+    )
+    auto_continue: bool = Field(
+        default=False,
+        description="For must completion obligations only: a confirmed, fully observed miss may resume a stopping "
+                    "agent once per session. Unknown evidence never resumes.",
+    )
+    when: ContractWhen | None = Field(
+        default=None,
+        description="Optional applicability condition for must obligations; see ContractWhen. "
+                    "Unmet conditions report not_applicable with a reason.",
+    )
+
+    @model_serializer(mode="wrap")
+    def _omit_default_extensions(self, handler):
+        data = handler(self)
+        for name, default in _OPTIONAL_DEFAULTS.items():
+            if name in data and data[name] == default:
+                del data[name]
+        return data
 
     # https://docs.pydantic.dev/latest/concepts/validators/ (Pydantic 2)
     @model_validator(mode="after")
@@ -113,6 +157,10 @@ class ContractRule(BaseModel):
             raise ValueError("roles must explicitly name at least one role")
         if self.exception_regex and self.type != "must_not":
             raise ValueError("exception_regex applies only to must_not rules")
+        if self.auto_continue and (self.type != "must" or not self.regex or self.before_regex):
+            raise ValueError("auto_continue requires a must completion obligation with regex and no before_regex")
+        if self.when is not None and self.type != "must":
+            raise ValueError("when applies only to must rules")
         return self
 
 
@@ -148,6 +196,11 @@ class Finding(BaseModel):
     )
     evidence: list[Evidence] = Field(default_factory=list)
     contract_revision: int = 1
+    applicability: Applicability = Field(
+        default="applicable",
+        description="not_applicable: the contract's `when` condition is not met (verdict stays clean); "
+                    "the contract is reported, never dropped.",
+    )
 
 
 class AuditResult(BaseModel):
