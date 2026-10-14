@@ -149,17 +149,20 @@ def test_tampering_with_appended_session_is_still_rejected_for_cursor(session, m
 
 
 def test_audit_never_claims_records_appended_during_audit(session, monkeypatch):
+    """Growth is judged as of the captured offset; the late record is never claimed as reviewed."""
     engine, path = session
     write(path, [call("echo safe")], "a")
     policy(engine)
+    size = path.stat().st_size
     with pause_first(monkeypatch, audit_runner, "audit_contract") as (pool, entered, release):
         audit = pool.submit(engine.audit_session, SID)
         assert entered.wait(5)
         write(path, [call("DELETE", "late")], "a")
         release.set()
         value = audit.result(5)
-    incomplete(value)
-    assert value["verdict"] == "unknown"
+    assert value["verdict"] == "clean"
+    assert value["coverage"]["complete"] is False
+    assert value["coverage"]["judged_through_byte"] == size and value["coverage"]["unread_bytes"] > 0
     assert not any("DELETE" in e.get("snippet", "") for f in value["findings"] for e in f.get("evidence", []))
     # The next audit actually reviews the appended record.
     assert engine.audit_session(SID)["verdict"] == "violation"

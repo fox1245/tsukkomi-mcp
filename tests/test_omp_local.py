@@ -78,8 +78,10 @@ def test_unknown_incomplete_and_unsupported_history(local_engine):
     with file.open("ab") as stream:
         stream.write(b'{"type":"message","message":')
     result = engine.audit_session("session-1", provider="omp", path=str(file))
-    assert result["verdict"] == "unknown"
-    assert "unread_bytes" in result["coverage"]["issues"]
+    # A trailing unfinished record is unread growth: judged as of the last complete record, never reviewed.
+    assert result["verdict"] == "clean"
+    assert "unread_bytes" in result["coverage"]["issues"] and result["coverage"]["complete"] is False
+    assert result["coverage"]["unread_bytes"] == len(b'{"type":"message","message":')
     with file.open("rb+") as stream:
         stream.truncate(file.stat().st_size - len(b'{"type":"message","message":'))
     _append(file, {"type": "unknown_future_event", "value": "curl"})

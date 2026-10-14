@@ -51,6 +51,23 @@ def action_applies(rule, proposed) -> bool:
         return True
 
 
+def prefix_note(coverage) -> str:
+    return (f"Judged as of byte {coverage.get('judged_through_byte', 0)}; "
+            f"{coverage.get('unread_bytes', 0)} appended byte(s) were not reviewed.")
+
+
+def downgrade_unproven_absence(findings, rules) -> bool:
+    """Late growth: a missing/failed obligation cannot be proven when bytes are unread. Dict findings."""
+    kinds = {rule.id: rule.type for rule in rules}
+    changed = False
+    for item in findings:
+        if kinds.get(item["contract_id"]) == "must" and item["verdict"] == "violation":
+            item.update(verdict="unknown", reason="incomplete evidence cannot prove a missing or failed obligation",
+                        basis=(item.get("basis") or "") + "; unread appended bytes prevent proving absence")
+            changed = True
+    return changed
+
+
 def _presence(rule, matches, prefix):
     if not matches:
         return "violation", "required evidence missing before checkpoint", []
@@ -192,8 +209,12 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
             overall = _worse(overall, "unknown")
             notes.append("No applicable enabled contracts or no indexed events.")
         if coverage and not coverage.get("complete"):
-            overall = _worse(overall, "unknown")
-            notes.append("Audit coverage incomplete; inspect coverage.issues.")
+            if coverage.get("judged_prefix"):
+                # Pure append: the verdict is for the captured range; appended bytes are unreviewed.
+                notes.append(prefix_note(coverage))
+            else:
+                overall = _worse(overall, "unknown")
+                notes.append("Audit coverage incomplete; inspect coverage.issues.")
     execution = run_stages("contract_audit", [
         ("select_contracts", select_contracts), ("load_evidence", load_evidence),
         ("evaluate_contracts", evaluate_contracts), ("aggregate_findings", aggregate_findings),

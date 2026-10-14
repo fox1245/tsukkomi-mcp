@@ -22,7 +22,7 @@ from self_directing_mcp.audit.contracts import (
     scope_counts,
     visible_contracts,
 )
-from self_directing_mcp.audit.runner import action_applies, run_audit
+from self_directing_mcp.audit.runner import _worse, action_applies, downgrade_unproven_absence, prefix_note, run_audit
 from self_directing_mcp.checklist import (
     INCOMPLETE_NOTE,
     ChecklistStore,
@@ -79,6 +79,27 @@ def workflow_operation(method):
                 return method(self, *args, **kwargs)
     return wrapped
 
+
+
+def _mark_growth(coverage, observation) -> bool:
+    """Record the judged offset and unread bytes. ``judged_prefix`` means pure append is the only gap."""
+    judged = coverage.get("byte_offset")
+    if judged is None:
+        return False
+    unread = coverage.get("pending_bytes", 0)
+    if observation is not None:
+        try:
+            unread = max(unread, observation.current_size() - judged)
+        except OSError:
+            pass
+    unread = max(0, unread)
+    coverage["judged_through_byte"], coverage["unread_bytes"] = judged, unread
+    if unread:
+        if "unread_bytes" not in coverage["issues"]:
+            coverage["issues"].append("unread_bytes")
+        coverage["complete"] = False
+        coverage["judged_prefix"] = set(coverage["issues"]) == {"unread_bytes"}
+    return bool(unread)
 
 
 class SelfDirectEngine:
@@ -479,6 +500,8 @@ class SelfDirectEngine:
             if provider == "agy" and receipt_token != refreshed["_receipt_token"]:
                 coverage["complete"] = False
                 coverage["issues"].append("receipts_changed_before_capture")
+        observation = refreshed["_source_observation"]
+        _mark_growth(coverage, observation)
         # The actual native stages, model decoding and regex evaluation own no
         # engine lease, shared SQLite handle or open read transaction.
         result = run_audit(session_id=sid, contracts=contracts, store=evidence,
@@ -514,10 +537,23 @@ class SelfDirectEngine:
                     raise
                 except (OSError, ValueError, sqlite3.DatabaseError) as exc:
                     stale.append(label + "_authority_unavailable:" + type(exc).__name__)
-            observation = refreshed["_source_observation"]
-            if observation is not None and not observation.validate():
-                stale.append("source_changed_during_evaluation")
+            known = bool(payload["coverage"].get("judged_prefix"))
+            grown = False
+            if observation is not None:
+                # Pure growth is judged as of the captured offset; any rewrite, truncation, replacement or
+                # deletion fails the prefix check and stays unknown.
+                if not observation.validate_prefix():
+                    stale.append("source_changed_during_evaluation")
+                else:
+                    grown = _mark_growth(payload["coverage"], observation)
+            if grown and not known and payload["coverage"].get("judged_prefix") and not stale:
+                if downgrade_unproven_absence(payload["findings"], active):
+                    payload["verdict"] = "clean"
+                    for item in payload["findings"]:
+                        payload["verdict"] = _worse(payload["verdict"], item["verdict"])
+                payload["notes"].append(prefix_note(payload["coverage"]))
             if stale:
+                payload["coverage"].pop("judged_prefix", None)
                 payload["snapshot_verdict"] = payload["verdict"]
                 payload.update(verdict="unknown", requires_attention=True)
                 payload["coverage"]["complete"] = False
@@ -645,7 +681,7 @@ class SelfDirectEngine:
     def _evidence_current(self, sid, provider, refreshed):
         observation = refreshed.get("_source_observation")
         return (self.store.state_token(sid, provider) == refreshed["_metadata_token"]
-                and observation is not None and observation.validate()
+                and observation is not None and observation.validate_prefix()
                 and self._receipt_token(sid, provider) == refreshed.get("_receipt_token"))
 
     def _save_checklist(self, doc, original, provider, refreshed=None):

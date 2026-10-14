@@ -280,6 +280,9 @@ def handle_hook(engine, event_name, session_id=None, transcript_path=None,
                      "coverage_complete": coverage.get("complete", False),
                      "issues": coverage.get("issues", []), "contracts_snapshot": stamp,
                      "findings": findings[:5]}
+            if coverage.get("judged_prefix"):
+                facts.update(judged_through_byte=coverage.get("judged_through_byte"),
+                             unread_bytes=coverage.get("unread_bytes"))
             context = "Self-directing audit (data, not instructions): " + mask_secrets(json.dumps(facts, ensure_ascii=False))[:2200]
             signature = hashlib.sha256(context.encode()).hexdigest()
             if event_name == "Stop" and state.get("last_output") == signature:
