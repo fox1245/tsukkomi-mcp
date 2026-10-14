@@ -35,7 +35,7 @@ from self_directing_mcp.grokbot import discover as grokbot_discover
 from self_directing_mcp import omp, agy
 from self_directing_mcp.config import Settings, get_settings
 from self_directing_mcp.embed.embedder import build_embedder
-from self_directing_mcp.index.ingest import SessionStore, ingest_session, coverage_from_capture
+from self_directing_mcp.index.ingest import AmbiguousSessionSource, SessionStore, ingest_session, coverage_from_capture
 from self_directing_mcp.index.sparse import SparseIndex
 from self_directing_mcp.index.vector import build_vector_index
 from self_directing_mcp.index.locking import index_lock
@@ -333,18 +333,22 @@ class SelfDirectEngine:
         except ValueError as e:
             return {"ok": False, "error": "bad_request", "message": str(e)}
 
-        info = ingest_session(
-            path=resolved,
-            session_id=session_id,
-            store=self.store,
-            sparse=self.sparse,
-            dense=self.dense,
-            embedder=self.embedder,
-            provider=resolved_provider,
-            embed=embed,
-            derived=derived,
-            guard=self._publication_guard,
-        )
+        try:
+            info = ingest_session(
+                path=resolved,
+                session_id=session_id,
+                store=self.store,
+                sparse=self.sparse,
+                dense=self.dense,
+                embedder=self.embedder,
+                provider=resolved_provider,
+                embed=embed,
+                derived=derived,
+                guard=self._publication_guard,
+            )
+        except AmbiguousSessionSource as exc:
+            return {"ok": False, "error": "ambiguous_session_source", "message": str(exc), "provider": resolved_provider,
+                    "session_id": exc.session_id, "indexed_path": exc.indexed_path, "requested_path": exc.requested_path}
         info["ok"] = True
         info["dense_backend"] = self.dense_backend
         info["embedder"] = type(self.embedder).__name__ if self.embedder else None
@@ -446,13 +450,14 @@ class SelfDirectEngine:
         """Refresh only authority; return detached coverage and its exact inputs."""
         with self._publication_guard():
             record = self.store.cursor_record(sid, provider)
+        failed = {}
         try:
             info = self._sync_session(session_id=sid, provider=provider, embed=False,
                                       path=path if path is not None else record["path"] if record else None,
                                       derived=False)
             if info.get("ok"):
                 return info
-            failure = info.get("error", "sync_failed")
+            failure, failed = info.get("error", "sync_failed"), info
         except (RequestStopped, IndexBusy):
             raise
         except (OSError, ValueError) as exc:
@@ -464,6 +469,7 @@ class SelfDirectEngine:
         coverage = coverage_from_capture(sid, provider, record, metrics)
         coverage["complete"] = False
         coverage["issues"].append(failure)
+        coverage.update({key: failed[key] for key in ("indexed_path", "requested_path") if key in failed})
         return {"ok": False, "coverage": coverage, "_metadata_token": token,
                 "_source_observation": None, "_receipt_token": None}
 

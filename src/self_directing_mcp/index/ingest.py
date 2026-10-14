@@ -182,7 +182,7 @@ _flights, _flights_gate = {}, threading.Lock()
 
 @contextmanager
 def session_flight(key):
-    """Single-flight per (index, provider, source): at most one capture/parse/publish at a time.
+    """Single-flight per (index, provider, session): at most one capture/parse/publish at a time.
 
     Waiters poll with their own request control, so a waiter's deadline or cancellation raises for that waiter
     only, and a leader's failure just passes the baton: the next caller becomes leader and finds the cursor
@@ -610,7 +610,8 @@ class SessionStore:
         return coverage_from_capture(session_id, provider, record, metrics)
 
 
-def coverage_from_capture(session_id, provider, record, metrics, observation=None):
+def coverage_from_capture(session_id, provider, record, metrics, observation=None, *, alias=False):
+    """``alias``: ``observation`` is a verified copy or continuation of the indexed source, which lives at another path."""
     count, errors, unsupported = metrics
     result = dict(record or {"provider": provider, "session_id": session_id, "path": None, "byte_offset": 0})
     result.update(chunk_count=count, parse_error_count=errors, unsupported_event_count=unsupported)
@@ -622,7 +623,9 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
             issues.append("parser_outdated")
         try:
             observation = observation or capture_source(Path(record["path"]), checkpoints=(record["byte_offset"],))
-            if str(observation.path) != record["path"] or not observation.validate_prefix():
+            if alias:
+                result.update(indexed_path=record["path"], requested_path=str(observation.path))
+            if (str(observation.path) != record["path"] and not alias) or not observation.validate_prefix():
                 issues.append("source_changed")
             # Bytes appended after the observation are unread, never reviewed or lost.
             result["file_size"] = max(observation.length, observation.current_size())
@@ -646,20 +649,29 @@ def coverage_from_capture(session_id, provider, record, metrics, observation=Non
 @request_operation
 def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider="codex",
                    embed=True, derived=True, guard=nullcontext):
-    """Serialize per (index, provider, source). Later callers find the cursor current and skip the parse.
+    """Serialize per (index, provider, session). Later callers find the cursor current and skip the parse.
 
     A parser-version bump therefore reparses a session once per process no matter how many hooks race on it;
-    other sessions reparse lazily, each on its own first sync, never in a storm.
+    other sessions reparse lazily, each on its own first sync, never in a storm. Copies of one session id in
+    several folders share a flight; across processes the state token still decides who publishes.
     """
-    with session_flight((str(store.db_path), provider, str(Path(path).resolve()))):
-        seen = []
+    requested = Path(path).resolve()
+    with session_flight(_flight_key(store, provider, requested, session_id)):
+        seen, target, captured = [], requested, None
         for _ in range(_RECAPTURE_ATTEMPTS):
+            handed, captured = captured, None
             try:
-                return _ingest_session(path=path, session_id=session_id, store=store, sparse=sparse, dense=dense,
+                info = _ingest_session(path=target, session_id=session_id, store=store, sparse=sparse, dense=dense,
                                        embedder=embedder, provider=provider, embed=embed, derived=derived,
-                                       guard=guard, seen=seen)
+                                       guard=guard, seen=seen, observation=handed)
             except _StaleObservation:
                 continue  # another process published past our capture: observe the file again
+            except _IndexedElsewhere as elsewhere:
+                target, captured = elsewhere.path, elsewhere.observation  # a strict prefix: report the indexed source
+                continue
+            if target != requested:
+                _mark_prefix_alias(info, requested)
+            return info
         raise ValueError("source changed during preparation")
 
 
@@ -670,9 +682,66 @@ class _StaleObservation(Exception):
     """The committed cursor lies beyond the captured prefix: our capture predates another process's publication."""
 
 
-def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard, seen):
-    if embed and (dense is None or embedder is None):
-        raise ValueError("embedding unavailable in local-only mode")
+class _IndexedElsewhere(Exception):
+    """The requested file is a strict prefix of the indexed source: carry that source and its fresh observation."""
+
+    def __init__(self, path, observation):
+        super().__init__(str(path))
+        self.path, self.observation = path, observation
+
+
+class AmbiguousSessionSource(ValueError):
+    """Two files claim one session id and neither continues the other. The index and cursor are left as they are."""
+
+    def __init__(self, session_id, indexed_path, requested_path):
+        super().__init__(f"session {session_id} is indexed from {indexed_path}; {requested_path} claims the same id "
+                         "but neither file is a prefix of the other")
+        self.session_id, self.indexed_path, self.requested_path = session_id, str(indexed_path), str(requested_path)
+
+
+def _mark_prefix_alias(info, requested):
+    """The request was a strict prefix of the indexed source: the index holds events it does not contain."""
+    coverage = info["coverage"]
+    info.update(path=str(requested), alias_of=coverage["path"])
+    coverage.update(indexed_path=coverage["path"], requested_path=str(requested))
+    coverage["issues"].append("requested_source_is_prefix_of_indexed")
+    coverage["complete"] = False
+
+
+def _other_source(cursor, path, observation, session_id):
+    """Another file claims the session id whose cursor indexes ``cursor["path"]``. Streaming hashes only; no writes.
+
+    "copy": this file starts with the indexed prefix and the indexed file still exists, "moved": the same but that
+    file is gone, "replaced": it is gone and this file does not continue it (reindex, as before). A strict prefix of
+    the indexed file raises _IndexedElsewhere; two files that disagree raise AmbiguousSessionSource.
+    """
+    indexed, offset = Path(cursor["path"]), cursor["byte_offset"]
+    continues = observation.length >= offset and observation.prefix_digest(offset) == cursor["prefix_hash"]
+    present = indexed.is_file()
+    if continues:
+        return "copy" if present else "moved"
+    if not present:
+        return "replaced"
+    other = capture_source(indexed, checkpoints=(offset, observation.length))
+    if (other.length >= offset and other.prefix_digest(offset) == cursor["prefix_hash"]
+            and observation.length < offset
+            and other.prefix_digest(observation.length) == observation.prefix_digest(observation.length)):
+        raise _IndexedElsewhere(indexed, other)
+    raise AmbiguousSessionSource(session_id, indexed, path)
+
+
+def _flight_key(store, provider, path, session_id):
+    """One flight per session id when it is known cheaply, else per file."""
+    try:
+        sid = session_id or _provider_parser(provider)[1](path)
+    except (OSError, ValueError):
+        sid = None
+    if sid:
+        return (str(store.db_path), provider, "session", sid.lower() if provider in ("codex", "agy") else sid)
+    return (str(store.db_path), provider, "path", str(path))
+
+
+def _provider_parser(provider):
     if provider == "agy":
         from self_directing_mcp.agy import parse_session_chunks, peek_session_id
     elif provider == "omp":
@@ -681,16 +750,25 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         from self_directing_mcp.grokbot.parse import parse_session_chunks, peek_session_id
     else:
         from self_directing_mcp.codex.parse import parse_session_chunks, peek_session_id
+    return parse_session_chunks, peek_session_id
+
+
+def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard, seen,
+                    observation=None):
+    if embed and (dense is None or embedder is None):
+        raise ValueError("embedding unavailable in local-only mode")
+    parse_session_chunks, peek_session_id = _provider_parser(provider)
     path = Path(path).resolve()
-    hint = ()
-    if session_id:
-        try:
-            with guard(), store._read_boundary():
-                known = store.cursor_record(session_id.lower() if provider in ("codex", "agy") else session_id, provider)
-            hint = (known["byte_offset"],) if known and type(known["byte_offset"]) is int else ()
-        except (OSError, sqlite3.Error):
-            hint = ()
-    observation = capture_source(path, checkpoints=hint)
+    if observation is None:
+        hint = ()
+        if session_id:
+            try:
+                with guard(), store._read_boundary():
+                    known = store.cursor_record(session_id.lower() if provider in ("codex", "agy") else session_id, provider)
+                hint = (known["byte_offset"],) if known and type(known["byte_offset"]) is int else ()
+            except (OSError, sqlite3.Error):
+                hint = ()
+        observation = capture_source(path, checkpoints=hint)
     with source_scope(observation):
         sid = session_id or peek_session_id(path)
         if not sid:
@@ -723,12 +801,18 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             if not seen or observation.length >= seen[-1]:
                 seen.append(cursor["byte_offset"])
                 raise _StaleObservation()
+        # A file with another path but the same session id: AGY hook receipts bind to an exact path, so it keeps
+        # reindexing on a path change; elsewhere a copy or continuation of the indexed prefix is not a new source.
+        relation = None
+        if cursor and provider != "agy" and cursor["path"] != str(path) and type(cursor["byte_offset"]) is int:
+            relation = _other_source(cursor, path, observation, sid)
         parser_version = current_parser_version(provider)
         start = cursor["byte_offset"] if cursor else 0
         reindexed, reindex_reason = False, None
         if cursor:
             try:
-                changed = str(path) != cursor["path"] or observation.prefix_digest(start) != cursor["prefix_hash"]
+                changed = relation not in ("copy", "moved") and (
+                    str(path) != cursor["path"] or observation.prefix_digest(start) != cursor["prefix_hash"])
             except ValueError:
                 changed = True
             if changed:
@@ -798,7 +882,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                     if receipt_store.authority_token(sid) != receipt_authority_before:
                         raise ValueError("receipt authority changed during preparation")
                     receipt_store.publish_bindings(sid, receipt_capture, receipt_rows)
-                if chunks.count or reindexed or cursor is None or offset != cursor["byte_offset"]:
+                if chunks.count or reindexed or cursor is None or offset != cursor["byte_offset"] or relation == "moved":
                     store.commit_events((), session_id=sid, provider=provider, path=path, offset=offset,
                                         digest=digest, replace=reindexed, parser_version=parser_version,
                                         expected_token=expected_token, prepared_rows=chunks, receipt_digest=receipt_digest)
@@ -814,13 +898,16 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
     finally:
         new_chunks = chunks.count
         chunks.close()
-    coverage = coverage_from_capture(sid, provider, committed_cursor, metrics, observation)
+    alias = committed_cursor["path"] != str(path)  # an equal or shorter copy never moves the cursor
+    coverage = coverage_from_capture(sid, provider, committed_cursor, metrics, observation, alias=alias)
     info = {"session_id": sid, "provider": provider, "path": str(path), "byte_offset": offset,
             "new_chunks": new_chunks, "embedded": 0, "total_chunks": coverage["chunk_count"],
             "reindexed": reindexed, "parser_version": parser_version, "reindex_reason": reindex_reason,
             "dense_restored": 0, "embedding_pending": 0, "embedding_error": None,
             "sparse_updated": 0, "coverage": coverage,
             "_source_observation": observation, "_metadata_token": committed_token, "_receipt_token": receipt_authority}
+    if alias:
+        info["alias_of"] = committed_cursor["path"]
     if not derived:
         return info
 
