@@ -30,6 +30,10 @@ def stable(payload):
         out.pop(key, None)
     out["execution"] = {key: out["execution"].get(key) for key in ("executor", "graph", "nodes")}
     out["coverage"].pop("synced_at", None)  # the moment each twin wrote its own cursor
+    # Source verification facts that are per engine: when each twin last verified, and its own generations. The mode
+    # and the verified extent are the same for twins reading one file.
+    integrity = out.pop("integrity", None) or {}
+    out["integrity"] = {key: integrity.get(key) for key in ("mode", "full_verified_through_byte")}
     # AGY host receipts carry a random id per twin, which is part of an event id and of the receipt digest.
     out["coverage"].pop("receipt_digest", None)
     for finding in out["findings"]:
@@ -524,12 +528,12 @@ def test_a_pattern_timeout_is_no_verdict_and_no_state(codex, monkeypatch, where,
 
     def feed(self, event, pools):
         if self.rule.id == "no-deploy":
-            raise inc.RegexTimeout()
+            raise inc.ContractRegexTimeout("synthetic")
         return real_feed(self, event, pools)
 
     def finding(self, proposed, facts):
         if self.rule.id == "no-deploy":
-            raise inc.RegexTimeout()
+            raise inc.ContractRegexTimeout("synthetic")
         return real_finding(self, proposed, facts)
 
     monkeypatch.setattr(inc.RuleMonitor, "_feed_forbidden" if where == "feed" else "finding",
@@ -563,3 +567,54 @@ def test_a_capacity_limit_met_by_a_delta_run_is_answered_in_a_second_pass(codex,
     write(path, [call("echo alpha again", "again")], "a")
     fast, _ = twin.audit(SID)  # remembered: straight to the full evaluator, no retry
     assert "retry" not in fast["incremental"] and fast["incremental"]["fallback"]["ex"].startswith("overflow")
+
+
+def test_a_real_pathological_pattern_is_unknown_for_both_engines_and_leaves_no_state(codex, monkeypatch):
+    """The real time limits (patterns.SEARCH_TIMEOUT_SEC, as in tests/test_harness_findings.py): a contract whose pattern
+    cannot be evaluated is unknown on the incremental engine exactly as on the full one, never clean, and no state of
+    that contract survives."""
+    from self_directing_mcp.audit import patterns
+    from self_directing_mcp.audit.runner import REGEX_TIMEOUT
+    monkeypatch.setattr(patterns, "SEARCH_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(patterns, "CONTRACT_BUDGET_SEC", 0.3)
+    twin, path = codex
+    rng = random.Random(17)
+    numbered = []
+    write(path, codex_records(rng, 20, numbered), "a")
+    twin.upsert([*RULES, {"id": "slow", "type": "must_not", "scope": "any", "regex": r"(a|a)+$",
+                          "roles": ["assistant", "user", "tool", "runtime"]}])
+    fast, _ = twin.audit(SID)  # nothing slow in the history yet: a normal verdict from both
+    assert {f["contract_id"]: f["reason"] for f in fast["findings"]}["slow"] != REGEX_TIMEOUT
+    write(path, [message("a" * 30 + "!")], "a")
+    for _ in range(3):
+        fast, _ = twin.audit(SID)
+        assert {f["contract_id"]: f["reason"] for f in fast["findings"]}["slow"] == REGEX_TIMEOUT
+        stored = {row[0] for row in twin.fast.store._conn.execute("SELECT monitor_id FROM audit_monitor_state")}
+        assert "slow" not in stored and stored, stored
+        write(path, codex_records(rng, 2, numbered), "a")
+    twin.check(SID)
+
+
+def test_a_shadow_run_whose_full_evaluation_times_out_keeps_the_unknown_answer_without_a_mismatch(codex, monkeypatch):
+    """A time limit is not a result. The state was built when the pattern still finished; when the full evaluator can no
+    longer finish it, its (unknown) answer stands, the contract's state is dropped, and nothing is marked unhealthy."""
+    from self_directing_mcp.audit import patterns
+    from self_directing_mcp.audit.runner import REGEX_TIMEOUT
+    monkeypatch.setattr(patterns, "SEARCH_TIMEOUT_SEC", 5.0)
+    monkeypatch.setattr(patterns, "CONTRACT_BUDGET_SEC", 30.0)
+    twin, path = codex
+    write(path, [message("a" * 18 + "!"), call("echo ok", "c1"), result("c1")], "a")  # about 0.1 s for the slow pattern
+    slow = {"id": "slow", "type": "must_not", "scope": "message", "regex": r"(a|a)+$", "roles": ["assistant"]}
+    twin.upsert([slow, RULES[0]])
+    twin.fast.settings.audit_shadow_every = 1
+    first = twin.fast.audit_session(SID, provider="codex")
+    assert {f["contract_id"]: f["reason"] for f in first["findings"]}["slow"] != REGEX_TIMEOUT
+    monkeypatch.setattr(patterns, "SEARCH_TIMEOUT_SEC", 0.01)  # the same pattern no longer finishes in time
+    answer = twin.fast.audit_session(SID, provider="codex")
+    by_id = {f["contract_id"]: f for f in answer["findings"]}
+    assert by_id["slow"]["reason"] == REGEX_TIMEOUT and by_id["slow"]["verdict"] == "unknown"
+    assert answer["incremental"]["shadow_skipped"] == "reference_regex_timeout"
+    assert answer["incremental"]["regex_timeout"] == ["slow"] and "incremental_mismatch" not in answer["incremental"]
+    stored = {row[0] for row in twin.fast.store._conn.execute("SELECT monitor_id FROM audit_monitor_state")}
+    assert "slow" not in stored
+    assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_incremental_health").fetchone()[0] == 0

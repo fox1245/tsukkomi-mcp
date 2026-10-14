@@ -43,7 +43,7 @@ from self_directing_mcp.security.mask import mask_secrets
 
 # Bump when the semantics of any evaluation changes (rules, evidence classes, evidence text); it invalidates every
 # stored state and re-enables contracts that a shadow mismatch disabled.
-EVALUATOR_VERSION = 1
+EVALUATOR_VERSION = 2
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
@@ -1131,7 +1131,7 @@ class AuditPlan:
                                            proposed=proposed, chunks=chunks) for r in rules]
             evidence_rules = runner._EVIDENCE_RULES.get(self.provider)
             if evidence_rules is not None:
-                evidence_rules(rules, found, chunks, proposed=proposed, coverage=None)
+                runner._post_process(evidence_rules, rules, found, chunks, proposed=proposed, coverage=None)
             for index, item in zip(group, found):
                 findings[index] = item
         if self.provider == "agy" and coverage is not None:

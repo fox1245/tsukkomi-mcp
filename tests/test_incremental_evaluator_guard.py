@@ -16,10 +16,10 @@ import hashlib
 import inspect
 
 from self_directing_mcp import agy
-from self_directing_mcp.audit import applicability, runner
+from self_directing_mcp.audit import applicability, patterns, runner
 from self_directing_mcp.retrieve import checks
 
-DIGEST = "ce13195d48995a63"
+DIGEST = "affe2a708cf3fcde"
 
 MIRRORED = [
     runner.audit_contract, runner._Presence, runner._eligible, runner._worse, runner.evidence, runner._key,
@@ -29,9 +29,13 @@ MIRRORED = [
     runner._hidden_trigger, runner.claude_evidence_rules, runner._cut_results, runner.full_findings,
     applicability.when_state, applicability._is_call_evidence, applicability.not_applicable_reason,
     applicability.when_needs, checks.scope_matches,
+    # contract patterns run on the guarded ``regex`` engine; a timeout makes the contract unknown (never clean)
+    runner._audit_contract, runner._post_process, runner._regex_timeout_finding, runner._patterns,
+    patterns.compile_contract, patterns.GuardedPattern.search,
 ]
 CONSTANTS = [sorted(agy.RESULT_TYPES), sorted(agy.SUCCESS_TYPES), sorted(map(list, agy.JUDGED_FIELDS)),
-             sorted(runner._FINAL_STATUS), sorted(runner._TRUNCATED_CODE.items()), applicability.PROPOSED_CALL_PREFIX]
+             sorted(runner._FINAL_STATUS), sorted(runner._TRUNCATED_CODE.items()), applicability.PROPOSED_CALL_PREFIX,
+             runner.REGEX_TIMEOUT]
 
 
 def digest():

@@ -438,6 +438,16 @@ evaluation, which remains the reference. The audit still runs through the native
 - **Reporting.** Results carry an `incremental` object: `mode` (`delta` reads only appended events, `full` reads all),
   `events_read`, `rebuilt` (contract to reason), `fallback` (contracts on full evaluation and why), `shadow`,
   `shadow_compared`, `incremental_mismatch`, `retry` and `state`. `SELF_DIRECT_AUDIT_INCREMENTAL=false` switches the whole feature off.
+- **With source verification.** A state describes the stored events, not how the source was verified: it is written
+  before the fast-verification gate and is the same whether the request verified `fast` or `full`. If a later full
+  verification finds a rewrite, the reindex starts a new generation and deletes the states. A cursor that migrates from a
+  plain digest to block digests, or that an older process rewrote, no longer matches the commit log, so states keyed to
+  the old digest are rebuilt and never reused.
+- **With contract time limits.** Contract patterns run on the time-limited engine. A monitor whose pattern times out
+  takes no more events and is dropped for that run; its contract is judged (`unknown`, never `clean`) by the full
+  evaluator, its stored state is deleted and nothing is marked unhealthy. When a shadow run's full evaluation itself
+  times out for a contract, the full (`unknown`) answer is returned, the contract's state is dropped, and it is reported as
+  `incremental.shadow_skipped: "reference_regex_timeout"`, not as a mismatch.
 - **What it does not do.** It does not make an unknown clean and does not change coverage: unread bytes, parse errors,
   unsupported events and rewrites are judged by the unchanged ingestion and coverage code, and a state describes the index,
   not the source file. The source verification (hashing) that precedes every audit is a separate cost; see

@@ -451,12 +451,12 @@ class SessionStore:
         try:
             self._commit_rows(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
                               replace=replace, parser_version=parser_version, expected_token=expected_token,
-                              receipt_digest=receipt_digest)
+                              receipt_digest=receipt_digest, blocks=blocks)
         finally:
             self._counts.clear()  # a rolled-back write leaves no trace in total_changes
 
     def _commit_rows(self, spool, *, session_id, provider, path, offset, digest, replace, parser_version,
-                     expected_token, receipt_digest):
+                     expected_token, receipt_digest, blocks=None):
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             if expected_token is not None and self.state_token(session_id, provider) != expected_token:

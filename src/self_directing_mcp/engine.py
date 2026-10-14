@@ -26,7 +26,9 @@ from self_directing_mcp.audit.contracts import (
 )
 from self_directing_mcp.audit import incremental
 from self_directing_mcp.audit.patterns import compile_contract
-from self_directing_mcp.audit.runner import _worse, action_applies, audit_needs, downgrade_unproven_absence, prefix_note, run_audit
+from self_directing_mcp.audit.runner import (
+    REGEX_TIMEOUT, _worse, action_applies, audit_needs, downgrade_unproven_absence, prefix_note, run_audit,
+)
 from self_directing_mcp.checklist import (
     INCOMPLETE_NOTE,
     ChecklistStore,
@@ -693,7 +695,22 @@ class SelfDirectEngine:
             # Shadow: the full evaluator over the same events. It is the answer whenever the two differ.
             full = run_audit(session_id=sid, contracts=contracts, store=reference, provider=provider,
                              proposed=planned, coverage=reference_coverage)
-            mismatch = incremental.compare(result, full)
+            timed_out = sorted({item.contract_id for item in full.findings if item.reason == REGEX_TIMEOUT})
+            if timed_out:
+                # A time limit is not a result: the full evaluator could not finish these contracts in its budget, so
+                # its (unknown) answer stands and the incremental state of those contracts is not trusted either.
+                # This is not a mismatch of the incremental path and disables nothing.
+                result = full
+                report["shadow_skipped"] = "reference_regex_timeout"
+                report["regex_timeout"] = timed_out
+                for contract_id in timed_out:
+                    if contract_id in plan.monitors:
+                        plan.monitors[contract_id].timed_out = True
+                        plan.timeouts.add(contract_id)
+                report["shadow"] = False
+                reference = None
+            else:
+                mismatch = incremental.compare(result, full)
             if mismatch:
                 result = full
                 ids = sorted({item.contract_id for item in full.findings} & set(plan.monitors)
@@ -707,7 +724,8 @@ class SelfDirectEngine:
                             f"{plan.snapshot['offset']}")
                 except (sqlite3.Error, OSError):
                     pass
-            report["shadow_compared"] = True
+            if reference is not None:
+                report["shadow_compared"] = True
         payload = result.model_dump(mode="json")
         payload.update(ok=True, provider=provider, action_executed=False,
                        applicable_contracts=len(active), requires_attention=result.verdict != "clean")

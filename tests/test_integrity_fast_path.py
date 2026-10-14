@@ -280,7 +280,9 @@ ACTIONS = {"deploy": DEPLOY, "forbidden": FORBIDDEN, "safe": SAFE}
 
 
 def comparable(response):
-    out = {key: value for key, value in response.items() if key not in ("timings_ms", "integrity")}
+    # ``timings_ms`` and ``incremental`` describe how this request was evaluated (the second call reads the state the
+    # first one stored), not what it found.
+    out = {key: value for key, value in response.items() if key not in ("timings_ms", "integrity", "incremental")}
     out["findings"] = [{key: value for key, value in finding.items() if key != "verified_through"}
                        for finding in response["findings"]]
     out["execution"] = response["execution"]["nodes"]  # the run id differs per run
