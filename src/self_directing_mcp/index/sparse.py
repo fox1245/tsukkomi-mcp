@@ -79,6 +79,18 @@ class SparseIndex:
                 out.add(row[0])
         return out
 
+    @request_operation
+    def present(self, ids) -> set[str]:
+        """Subset of ``ids`` already indexed; queries only the given ids, in bounded batches."""
+        ids = list(ids)
+        out = set()
+        for start in range(0, len(ids), 500):
+            check_request()
+            batch = ids[start:start + 500]
+            out.update(row[0] for row in self._conn.execute(
+                "SELECT chunk_id FROM chunk_rows WHERE chunk_id IN (" + ",".join("?" * len(batch)) + ")", batch))
+        return out
+
     def upsert(self, chunk_id: str, session_id: str, kind: str, text: str) -> None:
         check_request()
         with self._conn:

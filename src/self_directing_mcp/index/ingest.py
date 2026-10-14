@@ -66,6 +66,15 @@ class AuditEvidenceSnapshot:
         return frames
 
 
+_BATCH = 2000
+
+
+def _batches(items, size=_BATCH):
+    for start in range(0, len(items), size):
+        check_request()
+        yield items[start:start + size]
+
+
 def current_parser_version(provider):
     if provider == "codex":
         from self_directing_mcp.codex.parse import PARSER_VERSION
@@ -270,6 +279,18 @@ class SessionStore:
             params.append(provider)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         return {row[0] for row in self._conn.execute("SELECT chunk_id FROM session_events" + where, params)}
+
+    def live_ids(self, session_id, provider, ids):
+        ids = list(ids)
+        out = set()
+        with self._read_boundary():
+            for start in range(0, len(ids), 500):
+                check_request()
+                batch = ids[start:start + 500]
+                out.update(row[0] for row in self._conn.execute(
+                    "SELECT chunk_id FROM session_events WHERE provider=? AND session_id=? AND chunk_id IN ("
+                    + ",".join("?" * len(batch)) + ")", [provider, session_id, *batch]))
+        return out
 
     def has_prior_tool_call(self, session_id, provider, call_id, name, before_byte):
         row = self._conn.execute(
@@ -633,58 +654,69 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
                 dense.delete_ids(stale)
         if pending:
             store.finish_deletions(sid, provider, pending)
-        missing_ids = store.chunk_ids(sid, provider) - sparse.ids()
-        sparse_snapshot = store.capture_evidence(sid, provider, history=False, anchors=missing_ids)
-    to_index = sparse_snapshot.list_chunks(sid, provider)
+        session_ids = sorted(store.chunk_ids(sid, provider))
+        indexed = sparse.present(session_ids)
+        missing_ids = [cid for cid in session_ids if cid not in indexed]
+    for batch in _batches(missing_ids):
+        with guard():
+            snapshot = store.capture_evidence(sid, provider, history=False, anchors=batch)
+        documents = snapshot.list_chunks(sid, provider)
+        with guard():
+            live = store.live_ids(sid, provider, [chunk.chunk_id for chunk in documents])
+            documents = [chunk for chunk in documents if chunk.chunk_id in live]
+            if documents:
+                sparse.upsert_many(documents)
+        info["sparse_updated"] += len(documents)
+    if embedder is None:
+        return finish()
     with guard():
-        live = store.chunk_ids(sid, provider)
-        to_index = [chunk for chunk in to_index if chunk.chunk_id in live]
-        if to_index:
-            sparse.upsert_many(to_index)
-        info["sparse_updated"] = len(to_index)
-        if embedder is None:
-            return finish()
         dense.refresh()
-        candidates_snapshot = store.capture_evidence(sid, provider, history=False,
-                                                     anchors=store.chunk_ids(sid, provider) - dense.ids())
-    candidates = candidates_snapshot.list_chunks(sid, provider)
-    text_by_hash, chunk_hashes = {}, {}
-    for chunk in candidates:
-        check_request()
-        sanitized = mask_secrets(chunk.text)
-        key = hashlib.sha256(sanitized.encode("utf-8")).hexdigest()
-        text_by_hash[key], chunk_hashes[chunk.chunk_id] = sanitized, key
+        session_ids = sorted(store.chunk_ids(sid, provider))
+        indexed = dense.present(session_ids)
+        candidate_ids = [cid for cid in session_ids if cid not in indexed]
     cache_key = embedder.cache_key
-    with guard():
-        vectors = {key: store.cached_vector(cache_key, key) for key in text_by_hash}
-    missing = [key for key, value in vectors.items() if value is None]
-    try:
-        for start_idx in range(0, len(missing) if embed else 0, 32):
+    embedding_failed = False
+    for batch in _batches(candidate_ids):
+        with guard():
+            snapshot = store.capture_evidence(sid, provider, history=False, anchors=batch)
+        candidates = snapshot.list_chunks(sid, provider)
+        text_by_hash, chunk_hashes = {}, {}
+        for chunk in candidates:
             check_request()
-            batch = missing[start_idx:start_idx + 32]
-            values = embedder.embed_documents([text_by_hash[key] for key in batch])
+            sanitized = mask_secrets(chunk.text)
+            key = hashlib.sha256(sanitized.encode("utf-8")).hexdigest()
+            text_by_hash[key], chunk_hashes[chunk.chunk_id] = sanitized, key
+        with guard():
+            vectors = {key: store.cached_vector(cache_key, key) for key in text_by_hash}
+        missing = [key for key, value in vectors.items() if value is None]
+        try:
+            for start_idx in range(0, len(missing) if embed and not embedding_failed else 0, 32):
+                check_request()
+                keys = missing[start_idx:start_idx + 32]
+                values = embedder.embed_documents([text_by_hash[key] for key in keys])
+                check_request()
+                if len(values) != len(keys):
+                    raise ValueError("embedding response count mismatch")
+                if any(np.asarray(v).shape != (embedder.dim,) or not np.isfinite(v).all() for v in values):
+                    raise ValueError("invalid embedding shape or values")
+                with guard():
+                    store.cache_vectors(cache_key, zip(keys, values))
+                vectors.update(zip(keys, (np.asarray(v, dtype=np.float32) for v in values)))
+                info["embedded"] += len(keys)
+        except (RequestStopped, IndexBusy):
+            raise
+        except Exception as exc:
+            info["embedding_error"] = type(exc).__name__
+            embedding_failed = True
+        restored = [(c.chunk_id, vectors[chunk_hashes[c.chunk_id]]) for c in candidates
+                    if vectors[chunk_hashes[c.chunk_id]] is not None]
+        with guard():
             check_request()
-            if len(values) != len(batch):
-                raise ValueError("embedding response count mismatch")
-            if any(np.asarray(v).shape != (embedder.dim,) or not np.isfinite(v).all() for v in values):
-                raise ValueError("invalid embedding shape or values")
-            with guard():
-                store.cache_vectors(cache_key, zip(batch, values))
-            vectors.update(zip(batch, values))
-            info["embedded"] += len(batch)
-    except (RequestStopped, IndexBusy):
-        raise
-    except Exception as exc:
-        info["embedding_error"] = type(exc).__name__
-    restored = [(c.chunk_id, vectors[chunk_hashes[c.chunk_id]]) for c in candidates
-                if vectors[chunk_hashes[c.chunk_id]] is not None]
-    with guard():
-        check_request()
-        live = store.chunk_ids(sid, provider)
-        restored = [pair for pair in restored if pair[0] in live]
-        if restored:
-            dense.refresh()
-            dense.upsert_many(restored)
-    info["dense_restored"] = len(restored)
-    info["embedding_pending"] = len(candidates) - len(restored)
+            live = store.live_ids(sid, provider, [cid for cid, _ in restored])
+            restored = [pair for pair in restored if pair[0] in live]
+            if restored:
+                dense.refresh()
+                dense.upsert_many(restored)
+        info["dense_restored"] += len(restored)
+        info["embedding_pending"] += len(candidates) - len(restored)
     return finish()
