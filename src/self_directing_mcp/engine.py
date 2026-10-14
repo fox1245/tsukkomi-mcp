@@ -574,6 +574,21 @@ class SelfDirectEngine:
                 payload["coverage"]["complete"] = False
                 payload["coverage"]["issues"].extend(stale)
                 payload["notes"].append("Authority changed or became unavailable; findings describe the captured snapshot, not current compliance.")
+            if planned is not None and payload["requires_history"] and not payload["coverage"].get("complete"):
+                # A retrospective audit may be clean as of its offset, but a proposed action runs now: unread
+                # records precede it. Pure append cannot erase an observed run, yet a newer failed or pending
+                # run can invalidate an older success; any other coverage gap invalidates both.
+                gate_ids = {rule.id for rule in action_rules if rule.type == "must"
+                            and (rule.requires_success or not payload["coverage"].get("judged_prefix"))}
+                for item in payload["findings"]:
+                    if item["contract_id"] in gate_ids and item["verdict"] == "clean":
+                        item.update(verdict="unknown",
+                                    reason="incomplete current history cannot establish the proposed action's prerequisite",
+                                    basis=(item.get("basis") or "") + "; captured prerequisite evidence does not establish current compliance")
+                if gate_ids:
+                    payload["verdict"] = _worse(payload["verdict"], "unknown")
+                    payload["notes"].append("Current action prerequisites remain unverified while their required evidence is incomplete.")
+            payload["requires_attention"] = payload["verdict"] != "clean"
             with publication():
                 return payload
 
