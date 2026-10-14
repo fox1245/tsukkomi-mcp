@@ -23,3 +23,16 @@ def test_sync_does_not_load_other_sessions_ids(session, monkeypatch):
     monkeypatch.setattr(NumpyVectorIndex, "ids", forbidden)
     info = engine.sync_session(session_id=SID, embed=True)
     assert info["ok"] and info["dense_restored"] >= 1 and info["sparse_updated"] >= 1
+
+
+def test_search_repair_does_not_load_other_sessions_ids(session, monkeypatch):
+    engine, path = session
+    write(path, [message("needle in the haystack")], "a")
+    engine.sync_session(session_id=SID, embed=False)
+
+    def forbidden(self):
+        raise AssertionError("whole-index id set loaded during search")
+
+    monkeypatch.setattr(SparseIndex, "ids", forbidden)
+    result = engine.search_history("needle", session_id=SID, mode="sparse")
+    assert result["hits"]
