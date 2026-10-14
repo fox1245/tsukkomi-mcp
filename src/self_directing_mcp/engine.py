@@ -23,6 +23,7 @@ from self_directing_mcp.audit.contracts import (
     scope_counts,
     visible_contracts,
 )
+from self_directing_mcp.audit.patterns import compile_contract
 from self_directing_mcp.audit.runner import _worse, action_applies, audit_needs, downgrade_unproven_absence, prefix_note, run_audit
 from self_directing_mcp.checklist import (
     INCOMPLETE_NOTE,
@@ -688,9 +689,15 @@ class SelfDirectEngine:
             else:
                 rules.append(ContractRule.model_validate(c))
         for rule in rules:
-            for pattern in (rule.regex, rule.before_regex, rule.when.tool_call_regex if rule.when else None):
+            for pattern in (rule.regex, rule.before_regex, rule.exception_regex,
+                            rule.when.tool_call_regex if rule.when else None):
                 if pattern:
-                    re.compile(pattern)
+                    compile_contract(pattern)   # the syntax gate of both engines (raises re.error)
+            if rule.risk == "high" and rule.type == "must_not" and not rule.regex:
+                # Applies to every action and can never be verified: every tool call would be unknown, hence asked
+                # (a denial when headless). A high-risk target must name the actions it covers.
+                raise ValueError(f"contract {rule.id!r}: a high-risk must_not needs a regex that names the actions it "
+                                 "covers; without one it would ask on every tool call")
         with self._publication_guard():
             raw, token = self.contracts.capture()
             document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()

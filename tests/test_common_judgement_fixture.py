@@ -244,7 +244,8 @@ NO_FORCE_PUSH = {"id": "no-force-push", "type": "must_not", "scope": "tool_call"
 NO_PROD = {"id": "no-prod-deploy", "type": "must_not", "scope": "tool_call", "regex": r"deploy prod",
            "exception_regex": r"--dry-run"}
 PROSE = {"id": "prose-rule", "type": "must_not", "description": "Do not do the thing no verifier can see."}
-PROSE_HIGH = dict(PROSE, id="prose-high", risk="high")
+# A high-risk target names the actions it covers (a regex); unknown here because its activation event is absent.
+PROSE_HIGH = dict(PROSE, id="prose-high", risk="high", regex="echo", applies_from_event_id="not-in-this-session")
 ACK = {"id": "ack", "type": "must", "scope": "message", "regex": "VERIFIED", "auto_continue": True}
 
 

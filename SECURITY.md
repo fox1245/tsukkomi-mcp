@@ -60,6 +60,7 @@ The index is a local evidence store, and the audit needs the truth, so what is s
 
 **What masking does not cover.**
 
+- Key/value pairs are masked by the name of the key: besides `password`, `token`, `secret`, `api_key`, `credentials` and the `*_access_key`/`*_private_key` family, any `*_PASS`, `*_PWD`, `PASSPHRASE`, `*_KEY` (including `*_KEY_ID`), `*_SALT`, `PEPPER` and `*_AUTH` name is masked in env, YAML, JSON and query-string form. A bare `PWD` (the working directory) stays readable. Over-masking a non-secret `*_KEY` value hides only output text; contracts always match the raw record.
 - It is pattern-based best effort. A secret in a format the patterns do not know, a password in prose with no recognizable key name, and personal data (names, e-mail addresses, paths, proprietary code) are not removed. Harmless text that looks like a secret may be masked.
 - Contract rule fields `regex`, `before_regex` and `exception_regex`, and the single-use workflow `grant`, are returned unmasked so that they round-trip exactly. Never put a secret in a rule regex. Other contract text (`description`, `source_quote`) is stored as typed and masked only on the way out.
 - Text a caller sends in (contracts, checklist items, tool arguments) is not masked before it is stored.

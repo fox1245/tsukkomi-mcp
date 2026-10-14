@@ -63,6 +63,10 @@ Merged in [PR #7](https://github.com/fox1245/tsukkomi-mcp/pull/7) and [PR #11](h
 
 ### Fixed
 
+- Contract regexes run with a time limit (`regex` engine, new dependency): 0.25 s per search, 2 s per contract per evaluation. A pathological pattern used to backtrack for minutes, past the audit deadline and a host's hook timeout, after which the host proceeded with the call. Such a contract is now `unknown` (`regex_timeout`); `search_history` regex queries report the limit instead of partial results.
+- Codex `PreToolUse` no longer reports an empty-findings `unknown` when no contract applies to the proposed action (`action_scope: not_applicable`), matching the AGY and Claude Code adapters.
+- Masking now covers common credential names it missed: `*_PASS`, `*_PWD`, `PASSPHRASE`, `*_KEY`, `*_KEY_ID`, `*_SALT`, `PEPPER`, `*_AUTH`.
+- `upsert_contracts` rejects a high-risk `must_not` without a regex (it would ask on every tool call) and validates `exception_regex`.
 - The allocator trim after heavy calls now counts the heavy work done since the last trim, not the length of one call. A server that mostly answers short hook checks never had a single call long enough to trim, so freed heap stayed resident; it now trims at most every 5 seconds once 0.5 seconds of heavy work has accumulated. In the soak, live native allocations stay flat as history grows; the remaining RSS growth is allocator-retained memory.
 - A local-only process sharing an index that has dense vectors (for example a lifecycle hook installed with `--local-only` next to a server with embeddings) now leaves the vector cleanup of obsolete chunk ids journalled instead of acknowledging it. Before, a reparse in that process removed the ids from the sparse index only, and their vectors stayed orphaned for good. The next sync by a process with the dense index removes them.
 - AGY hooks in `advisory` mode no longer deny or continue on an internal exception, in `agy_hooks.main` and in the fallback script.

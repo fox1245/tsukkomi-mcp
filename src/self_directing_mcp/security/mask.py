@@ -93,6 +93,14 @@ _STEMS = (
     (("passw",), r"passw(?:or)?d"),
     (("token",), r"token"),
     (("credential",), r"credentials?"),
+    # Common .env names the stems above miss: DB_PASS, MYSQL_PWD, PASSPHRASE, JWT_KEY, ACCESS_KEY_ID, *_SALT, REDIS_AUTH.
+    # ``_pwd``/``_auth``/``_key`` need a preceding name part, so a bare PWD (the working directory) stays readable.
+    # Over-masking a non-secret ``*_KEY`` value only hides text from output; contracts still match the raw record.
+    (("_pass", "-pass", "passphrase"), r"(?:(?<=[a-z0-9])[_-]pass(?:word|wd|phrase)?|passphrase)"),
+    (("_pwd", "-pwd"), r"(?<=[a-z0-9])[_-]pwd"),
+    (("_key", "-key"), r"(?<=[a-z0-9])[_-]key(?:[_-]?id)?"),
+    (("salt", "pepper"), r"(?:salt|pepper)"),
+    (("_auth", "-auth"), r"(?<=[a-z0-9])[_-]auth"),
 )
 # URL query strings end a value at ``&`` (and ``#``), so unrelated parameters stay readable.
 _QUERY = r"(?i)([?&;][\w.-]{0,40}(?:%s)=)[^&\s#\"'\\]*"
