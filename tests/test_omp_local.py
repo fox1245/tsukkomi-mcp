@@ -721,3 +721,81 @@ def test_v7b_steering_attribution_semantics(local_engine):
     assert found["no-zz"]["verdict"] == "violation" and found["need-ok"]["verdict"] != "violation"
     turn = _new_chunks(engine)[-1]
     assert turn.kind == "turn" and turn.meta["role"] == "user" and turn.text == "[message:user] zzforbidden zzsatisfy typed"
+
+
+# Issue #9: agent-attributed text never becomes user authority, and opaque payloads never reach the index.
+_SENTINEL = "U1lOVEhFVElDX09OTFlfT1BBUVVFX1BBWUxPQUQ="
+
+
+def _user_list(text, **extra):
+    return {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": text}], **extra}}
+
+
+def _only_user(engine):
+    engine.upsert_contracts([{"id": "only-user", "type": "must_not", "scope": "message",
+                              "regex": "forbiddenprobe", "roles": ["user"], "provider": "omp"}])
+    return lambda: engine.audit_session("session-1", provider="omp", path=str(engine._omp_test_file))
+
+
+def test_v8_parser_version():
+    assert omp.PARSER_VERSION == 8
+
+
+def test_v8_agent_attributed_user_message_without_steering_is_runtime_meta(local_engine):
+    engine, file = local_engine
+    engine._omp_test_file = file
+    audit = _only_user(engine)
+    _append(file, _user_list("forbiddenprobe synthetic text", attribution="agent", timestamp=1))
+    result = audit()
+    assert result["coverage"]["complete"] is True
+    assert {f["contract_id"]: f["verdict"] for f in result["findings"]}["only-user"] == "clean"
+    chunk = _new_chunks(engine)[-1]
+    assert chunk.kind == "meta" and chunk.meta["role"] == "runtime" and chunk.meta["evidence_origin"] == "agent_message"
+    assert "forbiddenprobe" in chunk.text  # still searchable, just not user authority
+
+
+@pytest.mark.parametrize("extra", [
+    {"attribution": "agent", "liveSteered": True},   # steering metadata without steering=True
+    {"attribution": "user", "liveSteered": True},
+    {"attribution": "system"},                       # unknown attribution value
+    {"attribution": None},
+], ids=["agent-live-no-steering", "user-live-no-steering", "unknown-attribution", "null-attribution"])
+def test_v8_incomplete_or_unknown_user_attribution_is_never_user_evidence(local_engine, extra):
+    engine, file = local_engine
+    engine._omp_test_file = file
+    audit = _only_user(engine)
+    _append(file, _user_list("forbiddenprobe synthetic text", **extra))
+    result = audit()
+    assert result["verdict"] == "unknown" and result["coverage"]["complete"] is False
+    assert {f["contract_id"]: f["verdict"] for f in result["findings"]}["only-user"] != "violation"
+
+
+@pytest.mark.parametrize("extra", [{"attribution": "user"}, {}], ids=["attributed-user", "no-attribution"])
+def test_v8_genuine_user_messages_keep_user_authority(local_engine, extra):
+    engine, file = local_engine
+    engine._omp_test_file = file
+    audit = _only_user(engine)
+    _append(file, _user_list("forbiddenprobe synthetic text", **extra))
+    result = audit()
+    assert result["coverage"]["complete"] is True
+    assert {f["contract_id"]: f["verdict"] for f in result["findings"]}["only-user"] == "violation"
+    chunk = _new_chunks(engine)[-1]
+    assert chunk.kind == "turn" and chunk.meta["role"] == "user"
+
+
+@pytest.mark.parametrize("role,block", [
+    ("user", {"type": "image", "data": _SENTINEL, "mimeType": "image/png", "unrecognizedFutureField": True}),
+    ("assistant", {"type": "redactedThinking", "data": _SENTINEL, "unrecognizedFutureField": True}),
+    ("assistant", {"type": "thinking", "thinking": {"text": _SENTINEL}}),  # non-text thinking falls back
+    ("assistant", {"type": "image", "data": _SENTINEL, "mimeType": "image/png"}),  # images are user/tool only
+    ("user", {"type": "futureBlob", "data": _SENTINEL}),
+], ids=["user-image-extra", "redacted-extra", "thinking-nontext", "assistant-image", "unknown-with-data"])
+def test_v8_unsupported_opaque_blocks_keep_diagnostics_without_payload(local_engine, role, block):
+    engine, file = local_engine
+    _append(file, _message(role, block))
+    synced = engine.sync_session(session_id="session-1", provider="omp", path=str(file), embed=False)
+    assert synced["coverage"]["complete"] is False and "unsupported_events" in synced["coverage"]["issues"]
+    chunks = engine.store.list_chunks("session-1", "omp")
+    flagged = [c for c in chunks if c.meta.get("unsupported_event")]
+    assert flagged and all(f"[unsupported_content:{block['type']}]" in c.text for c in flagged)
+    assert not any(_SENTINEL in c.text or _SENTINEL in json.dumps(c.meta) for c in chunks)

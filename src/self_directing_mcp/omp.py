@@ -11,7 +11,9 @@ from self_directing_mcp.session_events import as_text, iter_raw_lines, make_chun
 # session (index.ingest compares the recorded version); unchanged event ids, anchors and vectors survive.
 # v7: host runtime notices (custom/custom_message/mode_change shapes), strict image blocks, steering
 # user messages, session_init/model_usage/branch_summary records and redactedThinking blocks.
-PARSER_VERSION = 7
+# v8: every agent-attributed user-role message is runtime text, partial steering metadata is rejected,
+# and unsupported opaque blocks keep only their key names.
+PARSER_VERSION = 8
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _EVENT_FIELDS = {"id", "parentId", "timestamp", "type"}
 _ADMIN_FIELDS = {
@@ -54,6 +56,14 @@ _SESSION_INIT_TYPES = {"agent": str, "task": str, "tools": list, "spawns": str, 
 _MODEL_USAGE_TYPES = {"api": str, "model": str, "provider": str, "purpose": str, "stopReason": str, "usage": dict,
                       "role": str, "errorMessage": str}
 _STEERING_FIELDS = {"role", "content", "timestamp", "attribution", "steering", "liveSteered"}
+_OPAQUE_KINDS = {"image", "redactedThinking", "thinking"}
+
+
+def _unsupported_text(kind, block):
+    """Diagnostics for an unsupported block. Image, reasoning and other ``data`` payloads are never indexed."""
+    if isinstance(block, dict) and (kind in _OPAQUE_KINDS or "data" in block):
+        return "keys=" + ",".join(sorted(map(str, block)))
+    return as_text(block)
 
 
 def _typed_fields_ok(obj, allowed, required, types):
@@ -250,10 +260,13 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
             content = msg.get("content")
             timestamp = obj.get("timestamp") or msg.get("timestamp")
             timestamp = str(timestamp) if timestamp is not None else None
-            steering = role == "user" and "steering" in msg
+            if role == "user" and "attribution" in msg and msg["attribution"] not in ("agent", "user"):
+                raise ValueError("unsupported OMP user attribution")
+            # Any steering metadata takes the strict path, so a partial record is rejected, not trusted.
+            steering = role == "user" and ("steering" in msg or "liveSteered" in msg)
             if steering:
                 # Mid-run steering: only a user-attributed message is a user turn; agent-attributed is host text.
-                if (not set(msg) <= _STEERING_FIELDS or msg["steering"] is not True
+                if (not set(msg) <= _STEERING_FIELDS or msg.get("steering") is not True
                         or msg.get("attribution") not in ("agent", "user")
                         or ("liveSteered" in msg and msg["liveSteered"] is not True
                             and not isinstance(msg["liveSteered"], str))):
@@ -273,9 +286,11 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                                for block in content)):
                     raise ValueError("unsupported OMP developer message shape")
                 base.update(role="runtime", evidence_origin="developer", attribution=msg.get("attribution"))
-            agent_steering = steering and msg["attribution"] == "agent"
-            if agent_steering:
-                base.update(role="runtime", evidence_origin="agent_steering")
+            # A user-role message the host attributes to an agent (subagent tasks, agent steering) is never
+            # user authority, with or without steering metadata.
+            agent_said = role == "user" and msg.get("attribution") == "agent"
+            if agent_said:
+                base.update(role="runtime", evidence_origin="agent_steering" if steering else "agent_message")
             if role == "toolResult":
                 call_id = msg.get("toolCallId")
                 if not isinstance(call_id, str) or not call_id:
@@ -303,8 +318,9 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 kind = block.get("type")
                 meta = dict(base)
                 if kind == "text" and isinstance(block.get("text"), str):
-                    event_kind = "meta" if role == "developer" or agent_steering else "turn"
-                    text = f"[steering:agent] {block['text']}" if agent_steering else f"[message:{role}] {block['text']}"
+                    event_kind = "meta" if role == "developer" or agent_said else "turn"
+                    label = ("steering:agent" if steering else "message:agent") if agent_said else f"message:{role}"
+                    text = f"[{label}] {block['text']}"
                 elif kind == "image" and role == "user" and _image_ok(block):
                     # Attachments are not instructions: keep as runtime meta, never base64.
                     meta.update(role="runtime", evidence_origin=base.get("evidence_origin", "image"))
@@ -324,7 +340,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                     event_kind, text = "meta", "[redacted_thinking]"
                 else:
                     meta["unsupported_event"] = True
-                    event_kind, text = "meta", f"[unsupported_content:{kind}] {as_text(block)}"
+                    event_kind, text = "meta", f"[unsupported_content:{kind}] {_unsupported_text(kind, block)}"
                 chunks.append(make_chunk("omp", sid, event_kind, text, meta, line, start, end,
                                          sub=sub, timestamp=timestamp))
         except (ValueError, TypeError) as exc:
