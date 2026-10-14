@@ -24,6 +24,7 @@ def _stamp(stat) -> tuple[int, ...]:
 
 
 _BLOCK = 1024 * 1024
+_TAIL_WINDOW = 64 * 1024  # bytes before ``length`` re-hashed under the publication lock instead of the whole prefix
 
 
 class SourceObservation:
@@ -33,10 +34,11 @@ class SourceObservation:
     boundary inside them. No file bytes are retained: the observation keeps device/inode, a streaming
     SHA-256 state per requested checkpoint (with its line count) and the digest of the whole prefix.
     ``validate()`` is the strict "file untouched since capture" test; ``validate_prefix()`` accepts pure
-    growth after verifying the captured prefix still hashes identically.
+    growth after verifying the captured prefix still hashes identically. ``validate_prefix(locked=True)`` is the
+    bounded variant for use under the publication guard (see there).
     """
 
-    def __init__(self, path, stamp, length, complete_end, full_digest, checkpoints):
+    def __init__(self, path, stamp, length, complete_end, full_digest, checkpoints, tail_digest=None):
         self.path = path
         self.stamp = stamp
         self.length = length
@@ -44,6 +46,8 @@ class SourceObservation:
         self._full_digest = full_digest
         self._checkpoints = checkpoints  # offset -> (sha256 state, newline count)
         self._verified_stamp = stamp
+        self._tail_digest = tail_digest  # SHA-256 of the last <= _TAIL_WINDOW bytes of [0, length)
+        self._prefix_ok = True  # False once a full verification failed; the prefix does not heal
 
     @property
     def identity(self) -> tuple[int, int]:
@@ -92,14 +96,23 @@ class SourceObservation:
     def current_size(self) -> int:
         return self.path.stat().st_size
 
-    def validate_prefix(self) -> bool:
-        """Growth tolerant: same file, and the captured prefix is byte-for-byte what was hashed."""
+    def validate_prefix(self, *, locked: bool = False) -> bool:
+        """Growth tolerant: same file, and the captured prefix is byte-for-byte what was hashed.
+
+        The default re-reads and hashes the whole prefix; call it OUTSIDE the publication guard. With
+        ``locked=True`` (inside the guard) only identity, size >= captured length and the digest of a bounded
+        tail window are checked, and a failed earlier full check still fails. Residual risk: a rewrite
+        outside the tail window between the last full check and the lock is accepted at that moment; the next
+        sync compares the stored cursor ``prefix_hash`` and reindexes.
+        """
         check_request()
+        if locked:
+            return self._validate_tail()
         try:
             with self.path.open("rb") as stream:
                 before = os.fstat(stream.fileno())
                 if _identity(before) != self.identity or before.st_size < self.length:
-                    return False
+                    return self._fail()
                 if _stamp(before) == self._verified_stamp:
                     return True
                 digest, remaining = hashlib.sha256(), self.length
@@ -107,16 +120,41 @@ class SourceObservation:
                     check_request()
                     block = stream.read(min(remaining, _BLOCK))
                     if not block:
-                        return False
+                        return self._fail()
                     digest.update(block)
                     remaining -= len(block)
                 after = os.fstat(stream.fileno())
         except OSError:
             return False
         if digest.hexdigest() != self._full_digest or _identity(after) != self.identity or after.st_size < self.length:
-            return False
+            return self._fail()
         if _stamp(after) == _stamp(before):
             self._verified_stamp = _stamp(after)
+        return True
+
+    def _fail(self) -> bool:
+        self._prefix_ok = False
+        return False
+
+    def _validate_tail(self) -> bool:
+        if not self._prefix_ok:
+            return False
+        try:
+            with self.path.open("rb") as stream:
+                before = os.fstat(stream.fileno())
+                if _identity(before) != self.identity or before.st_size < self.length:
+                    return self._fail()
+                if _stamp(before) == self._verified_stamp:
+                    return True
+                if self._tail_digest is None:
+                    return False
+                window = min(self.length, _TAIL_WINDOW)
+                stream.seek(self.length - window)
+                tail = stream.read(window)
+        except OSError:
+            return False
+        if len(tail) != window or hashlib.sha256(tail).hexdigest() != self._tail_digest:
+            return self._fail()
         return True
 
 
@@ -172,6 +210,10 @@ def capture_source(path: Path, *, checkpoints=()) -> SourceObservation:
         before = os.fstat(stream.fileno())
         length = before.st_size
         full_digest, boundary, states = _hash_prefix(stream, length, checkpoints)
+        window = min(length, _TAIL_WINDOW)
+        stream.seek(length - window)
+        tail = stream.read(window)
+        tail_digest = hashlib.sha256(tail).hexdigest() if len(tail) == window else None
         after = os.fstat(stream.fileno())
     path_stamp = source_stamp(path)
     # Some runtimes (e.g. 9p/drvfs) give stat and fstat different ctime semantics. Compare full stamps
@@ -181,7 +223,7 @@ def capture_source(path: Path, *, checkpoints=()) -> SourceObservation:
             or path_stamp[:2] != _identity(after) or path_stamp[2] < after.st_size
             or (path_stamp[2] == after.st_size and path_stamp[3] != after.st_mtime_ns)):
         raise ValueError("source changed during preparation")
-    observation = SourceObservation(path, path_stamp, length, boundary, full_digest, states)
+    observation = SourceObservation(path, path_stamp, length, boundary, full_digest, states, tail_digest)
     observation._verified_stamp = _stamp(after)
     if after.st_size == length and path_stamp[2] == length:
         if _stamp(after) != _stamp(before):

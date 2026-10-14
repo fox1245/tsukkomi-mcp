@@ -761,7 +761,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             if parsed_sid != sid:
                 raise ValueError("session id changed while parsing")
             digest = observation.prefix_digest(offset)
-            # Large comparison stays outside the publication lock; the lock only re-checks the file stamp.
+            # The whole-prefix rehash stays outside the publication lock; the lock only re-checks identity, size and a
+            # bounded tail window (a rewrite elsewhere in that gap is caught by the next sync's cursor prefix_hash).
             if not observation.validate_prefix():
                 raise ValueError("source changed during preparation")
         except BaseException:
@@ -769,8 +770,10 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             raise
     try:
         check_request()
+        if not observation.validate_prefix():  # full rehash, off the shared lock
+            raise ValueError("source changed during preparation")
         with guard():
-            if not observation.validate_prefix():
+            if not observation.validate_prefix(locked=True):
                 raise ValueError("source changed during preparation")
             current = store.cursor_record(sid, provider)
             changed_token = store.state_token(sid, provider) != expected_token
@@ -822,11 +825,12 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         return info
 
     def finish():
+        source_ok = observation.validate_prefix()  # full rehash, off the shared lock
         with guard():
             issues = []
             if store.state_token(sid, provider) != committed_token:
                 issues.append("metadata_changed_during_derived_work")
-            if not observation.validate_prefix():
+            if not (source_ok and observation.validate_prefix(locked=True)):
                 issues.append("source_changed_during_derived_work")
             elif observation.current_size() > info["coverage"].get("file_size", 0) and "unread_bytes" not in info["coverage"]["issues"]:
                 info["coverage"]["pending_bytes"] = max(0, observation.current_size() - offset)

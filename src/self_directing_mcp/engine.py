@@ -534,6 +534,8 @@ class SelfDirectEngine:
             "clean is limited to the reported contracts and history snapshot, not execution authorization.")
         payload["global_meaning"] = GLOBAL_CONTRACT_MEANING
         payload["contract_scope"] = {"session_id": sid, "scope": contract_scope(sid)}
+        if observation is not None:
+            observation.validate_prefix()  # full rehash off the shared lock; the locked check inherits a failure
         with self._publication_guard():
             stale = []
             tokens = (
@@ -554,7 +556,7 @@ class SelfDirectEngine:
             if observation is not None:
                 # Pure growth is judged as of the captured offset; any rewrite, truncation, replacement or
                 # deletion fails the prefix check and stays unknown.
-                if not observation.validate_prefix():
+                if not observation.validate_prefix(locked=True):
                     stale.append("source_changed_during_evaluation")
                 else:
                     grown = _mark_growth(payload["coverage"], observation)
@@ -693,11 +695,13 @@ class SelfDirectEngine:
     def _evidence_current(self, sid, provider, refreshed):
         observation = refreshed.get("_source_observation")
         return (self.store.state_token(sid, provider) == refreshed["_metadata_token"]
-                and observation is not None and observation.validate_prefix()
+                and observation is not None and observation.validate_prefix(locked=True)
                 and self._receipt_token(sid, provider) == refreshed.get("_receipt_token"))
 
     def _save_checklist(self, doc, original, provider, refreshed=None):
         payload = doc.model_dump_json(indent=2)
+        if refreshed is not None and refreshed.get("_source_observation") is not None:
+            refreshed["_source_observation"].validate_prefix()  # full rehash off the shared lock
         with self._publication_guard():
             path = self.checklists._path(doc.session_id)
             try:
@@ -843,6 +847,8 @@ class SelfDirectEngine:
                                                                                coverage["complete"])):
                 item.status = RequirementStatus.PENDING_VERIFICATION
                 item.verified = False
+        if observation is not None:
+            observation.validate_prefix()  # full rehash off the shared lock
         with self._publication_guard():
             state = {"_metadata_token": metadata_token, "_source_observation": observation,
                      "_receipt_token": receipt_token}
@@ -887,6 +893,8 @@ class SelfDirectEngine:
             if not synced.get("ok") or not synced.get("coverage", {}).get("complete"):
                 return {"ok": False, "error": synced.get("error", "incomplete_history"), "nodes": [], "edges": []}
 
+        if path is not None and synced.get("_source_observation") is not None:
+            synced["_source_observation"].validate_prefix()  # full rehash off the shared lock
         with self._publication_guard():
             if path is not None and not self._evidence_current(sid, resolved_provider, synced):
                 return {"ok": False, "error": "incomplete_history", "nodes": [], "edges": []}
