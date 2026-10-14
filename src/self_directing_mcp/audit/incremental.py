@@ -45,7 +45,7 @@ from self_directing_mcp.security.mask import mask_secrets
 
 # Bump when the semantics of any evaluation changes (rules, evidence classes, evidence text); it invalidates every
 # stored state and re-enables contracts that a shadow mismatch disabled.
-EVALUATOR_VERSION = 4
+EVALUATOR_VERSION = 5
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
@@ -61,6 +61,9 @@ PENDING_MAX = 2048
 BLOCKED_MAX = 512
 TARGETS_MAX = 4096
 CUT_MAX = 2048
+REJECTED_MAX = 2048    # refused calls remembered per session
+REJ_HITS_MAX = 512     # a rule's matching calls remembered, to subtract the refused ones
+REJ_EVIDENCE = 64      # evidence kept for such a rule: enough to refill the 20 shown when refused calls drop out
 
 _SCOPE_KIND = {"tool_call": "tool_call", "tool_result": "tool_result", "message": "turn"}
 
@@ -191,13 +194,15 @@ class Facts:
 
 
 class ClaudeFacts(Facts):
-    """Tool results that a ``read_truncation_notice`` marks as cut, whatever order notice and result arrive in."""
+    """Tool results that a ``read_truncation_notice`` marks as cut, whatever order notice and result arrive in, and the
+    calls the host recorded as refused (a ``deny`` decision on the linked result; see ``runner.rejected_calls``)."""
 
     needed = True
 
     def __init__(self):
         self.targets, self.cut = [], []
         self._targets = set()
+        self.rejected = {}  # chunk id of a refused tool call -> chunk id of the result that carries the decision
 
     def feed(self, event, pools):
         meta = event.meta
@@ -217,6 +222,14 @@ class ClaudeFacts(Facts):
             call_id = meta.get("call_id")
             if isinstance(call_id, str) and call_id in self._targets:
                 self._cut(event.key, event.chunk_id)
+            if call_id is not None and runner._host_denied(meta.get("permission_decision")):
+                calls = [chunk for kind, _position, chunk in pools.call_events(call_id, event.key) if kind == "tool_call"]
+                if len(calls) == 1:   # an id shared by several calls vouches for none of them
+                    if calls[0] not in self.rejected and len(self.rejected) >= REJECTED_MAX:
+                        self.overflow = "refused call table is full"
+                        return
+                    self.rejected[calls[0]] = event.chunk_id
+                    self.dirty = True
 
     def _cut(self, position, chunk_id):
         if len(self.cut) >= CUT_MAX:
@@ -226,13 +239,15 @@ class ClaudeFacts(Facts):
         self.dirty = True
 
     def dump(self):
-        return {"overflow": self.overflow, "targets": self.targets, "cut": [[list(p), c] for p, c in self.cut]}
+        return {"overflow": self.overflow, "targets": self.targets, "cut": [[list(p), c] for p, c in self.cut],
+                "rejected": self.rejected}
 
     def load(self, data):
         self.overflow = data.get("overflow")
         self.targets = list(data.get("targets", ()))
         self._targets = set(self.targets)
         self.cut = [(tuple(p), c) for p, c in data.get("cut", ())]
+        self.rejected = dict(data.get("rejected", {}))
 
 
 class AgyFacts(Facts):
@@ -244,7 +259,7 @@ class AgyFacts(Facts):
         # ``resolve``: some rule reads host-logged proposals, so their text is loaded and denials can be matched.
         self.resolve = resolve
         self.unresolved = []  # (key, step_index), in order
-        self.blocked = {}     # key -> (tool name, proposal text)
+        self.blocked = {}     # key -> (tool name, proposal text, key of the denial)
         self.unsure = []      # denials whose proposal was not found in the look-back window: (key, tool name)
 
     def feed(self, event, pools):
@@ -273,7 +288,7 @@ class AgyFacts(Facts):
                 if len(self.blocked) >= BLOCKED_MAX:
                     self.overflow = "blocked proposal table is full"
                     return
-                self.blocked[position] = (name, text)
+                self.blocked[position] = (name, text, event.key)
                 self.dirty = True
                 return
         if not pools.proposals_complete(name):
@@ -287,13 +302,13 @@ class AgyFacts(Facts):
 
     def dump(self):
         return {"overflow": self.overflow, "unresolved": [[list(p), s] for p, s in self.unresolved],
-                "blocked": [[list(p), n, t] for p, (n, t) in self.blocked.items()],
+                "blocked": [[list(p), n, t, list(k)] for p, (n, t, k) in self.blocked.items()],
                 "unsure": [[list(p), n] for p, n in self.unsure]}
 
     def load(self, data):
         self.overflow = data.get("overflow")
         self.unresolved = [(tuple(p), s) for p, s in data.get("unresolved", ())]
-        self.blocked = {tuple(p): (n, t) for p, n, t in data.get("blocked", ())}
+        self.blocked = {tuple(p): (n, t, tuple(k)) for p, n, t, k in data.get("blocked", ())}
         self.unsure = [(tuple(p), n) for p, n in data.get("unsure", ())]
 
 
@@ -301,7 +316,8 @@ def make_facts(provider, needs=(), rules=()):
     """The shared summaries ``rules`` need for ``provider``'s evidence classes (a plain ``Facts`` when none)."""
     if provider == "agy":
         return AgyFacts(resolve=any(scope == "attempt" for scope, _roles in needs))
-    if provider == "claude" and any(runner._reads_results(r) or r.requires_success for r in rules):
+    if provider == "claude" and any(runner._reads_results(r) or r.requires_success or runner._wants_rejections(r)
+                                    for r in rules):
         return ClaudeFacts()
     return Facts()
 
@@ -337,6 +353,7 @@ class RuleMonitor:
         self.deps = runner._dependencies(rule) if self.agy else frozenset()
         self.wants_attempts = self.agy and runner._wants_attempts(rule) and self.regex is not None
         self.track_trigger_proposals = self.agy and rule.type == "must" and self.trigger is not None
+        self.wants_rej = self.claude and runner._wants_rejections(rule) and self.regex is not None
         # state
         self.src = False
         self.src_user = False  # the source event was seen and is a user message
@@ -344,6 +361,8 @@ class RuleMonitor:
         self.from_key = None
         self.when_met = False
         self.hits, self.hit_ev, self.exc, self.exc_chars = 0, [], [], 0
+        self.exc_ids = []     # chunk id of each ``exc`` text, to drop the refused calls' texts
+        self.rej_hits, self.rej_over = [], False   # [chunk id, call id, byte] of the call hits; set when over the cap
         self.hit_n, self.last3, self.lh = 0, [], None
         self.trig_n, self.trig_worst, self.trig_reasons, self.trig_items, self.trig_last = 0, "clean", [], [], None
         self.cut = self.legacy = None
@@ -364,6 +383,7 @@ class RuleMonitor:
         return {
             "src": self.src, "src_user": self.src_user, "started": self.started, "from_key": self.from_key, "when": self.when_met,
             "hits": self.hits, "hit_ev": self.hit_ev, "exc": self.exc, "exc_chars": self.exc_chars,
+            "exc_ids": self.exc_ids, "rej_hits": self.rej_hits, "rej_over": self.rej_over,
             "hit_n": self.hit_n, "last3": self.last3, "lh": self.lh,
             "trig_n": self.trig_n, "trig_worst": self.trig_worst, "trig_reasons": self.trig_reasons,
             "trig_items": self.trig_items, "trig_last": self.trig_last,
@@ -377,6 +397,7 @@ class RuleMonitor:
         self.src_user = data["src_user"]
         self.from_key = _tuple(data["from_key"])
         self.hits, self.hit_ev, self.exc, self.exc_chars = data["hits"], data["hit_ev"], data["exc"], data["exc_chars"]
+        self.exc_ids, self.rej_hits, self.rej_over = data["exc_ids"], data["rej_hits"], data["rej_over"]
         self.hit_n, self.last3, self.lh = data["hit_n"], data["last3"], data["lh"]
         self.trig_n, self.trig_worst, self.trig_reasons = data["trig_n"], data["trig_worst"], data["trig_reasons"]
         self.trig_items, self.trig_last = data["trig_items"], _tuple(data["trig_last"])
@@ -448,13 +469,19 @@ class RuleMonitor:
 
     def _forbidden(self, event):
         self.hits += 1
-        if len(self.hit_ev) < EVIDENCE_LIMIT:
+        if len(self.hit_ev) < (REJ_EVIDENCE if self.wants_rej else EVIDENCE_LIMIT):
             self.hit_ev.append(_ev(event, flag=self.agy))
+        if self.wants_rej and event.kind == "tool_call" and event.meta.get("call_id") is not None:
+            if len(self.rej_hits) < REJ_HITS_MAX:
+                self.rej_hits.append([event.chunk_id, event.meta["call_id"], event.key[0] if event.key else None])
+            else:
+                self.rej_over = True
         if self.rule.exception_regex:
             if len(self.exc) >= EXCEPTION_MAX_HITS or self.exc_chars + len(event.text) > EXCEPTION_MAX_CHARS:
                 self.overflow, self.inert = "exception hit store is full", True
                 return
             self.exc.append(event.text)
+            self.exc_ids.append(event.chunk_id)
             self.exc_chars += len(event.text)
 
     def _checkpoint(self, event):
@@ -531,11 +558,11 @@ class RuleMonitor:
 
     # --- the finding ---
 
-    def _make(self, verdict, reason, items=None, basis=None, applicability="applicable"):
+    def _make(self, verdict, reason, items=None, basis=None, applicability="applicable", stopped=None):
         rule = self.rule
         return Finding(contract_id=rule.id, contract_revision=rule.revision, severity=rule.severity,
                        verdict=verdict, reason=reason, evidence=[_evidence(i) for i in items or ()], basis=basis,
-                       applicability=applicability)
+                       applicability=applicability, proposals_rejected=stopped or [])
 
     def _presence(self):
         """``_Presence.before`` for the end of the events fed so far."""
@@ -574,7 +601,7 @@ class RuleMonitor:
                 return self._make("clean", not_applicable_reason(rule),
                                   basis=f"{rule.id}.when did not match any observed tool call",
                                   applicability="not_applicable")
-        item, tu = self._typed(proposed)
+        item, tu = self._typed(proposed, facts)
         history = proposed is None
         if self.agy:
             self._post_agy(item, tu, history, facts)
@@ -582,8 +609,19 @@ class RuleMonitor:
             self._post_claude(item, history, facts)
         return item
 
-    def _typed(self, proposed):
+    def _refused(self, facts):
+        """This rule's matching calls that the host refused (empty unless it recorded some): ``[chunk, call, byte]``."""
+        if not (self.wants_rej and self.hits and facts.rejected):
+            return []
+        if facts.overflow:
+            raise NeedFull(facts.overflow)
+        if self.rej_over:
+            raise NeedFull("matching call table is full")
+        return [hit for hit in self.rej_hits if hit[0] in facts.rejected]
+
+    def _typed(self, proposed, facts):
         rule = self.rule
+        stopped, texts = [], None
         if self.is_must_not:
             if proposed is not None:
                 hit = self.eligible(proposed) and self.regex.search(proposed.text) is not None
@@ -591,8 +629,25 @@ class RuleMonitor:
             else:
                 if self.hits and rule.exception_regex and (self.hits > len(self.exc)):
                     raise NeedFull("exception hit store is incomplete")
-                count, evidence, joined = self.hits, self.hit_ev[:EVIDENCE_LIMIT], " ".join(self.exc)
+                count, texts = self.hits, self.exc
+                refused = self._refused(facts)
+                evidence = self.hit_ev
+                if refused:
+                    gone = {hit[0] for hit in refused}
+                    count -= len(refused)
+                    evidence = [item for item in evidence if item["i"] not in gone]
+                    if count and len(evidence) < min(EVIDENCE_LIMIT, count):
+                        raise NeedFull("listed matches do not cover the refused calls")
+                    texts = [t for t, chunk in zip(self.exc, self.exc_ids) if chunk not in gone]
+                    stopped = [{"contract_id": rule.id, "event_id": chunk, "call_id": call_id,
+                                "reason": runner.REJECTED_REASON, "denied_by": facts.rejected[chunk], "at_byte": byte}
+                               for chunk, call_id, byte in refused[:runner.REJECTED_LIMIT]]
+                evidence, joined = evidence[:EVIDENCE_LIMIT], " ".join(texts)
             if not count:
+                if stopped:
+                    return self._make("clean", runner.rejected_clean(len(refused)),
+                                      basis=f"{rule.id}.regex matched only host-rejected proposal(s), which did not run",
+                                      stopped=stopped), {}
                 return self._make("clean", "no forbidden match in inspected events",
                                   basis=f"{rule.id}.regex did not match any inspected event"), {}
             exception = None
@@ -607,12 +662,12 @@ class RuleMonitor:
                     "suspicious",
                     "forbidden match is covered by the authorized exception; confirm scope before proceeding",
                     basis=f"{rule.id}.exception_regex matched the same event(s); "
-                          "user-authorized exception requires confirmation"), {}
+                          "user-authorized exception requires confirmation", stopped=stopped), {}
             reason = f"forbidden regex matched {count} event(s)"
             if rule.source_quote:
                 reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
             return self._make("violation", reason, basis=f"{rule.id}.regex '{rule.regex}' matched prohibited content",
-                              items=evidence), {i["i"]: i.get("tu") for i in evidence}
+                              items=evidence, stopped=stopped), {i["i"]: i.get("tu") for i in evidence}
         if self.trigger is not None:
             if proposed is not None:
                 if not (self.eligible(proposed) and self.trigger.search(proposed.text)):
@@ -721,8 +776,12 @@ class RuleMonitor:
             exception = _compile(rule.exception_regex) if rule.exception_regex else None
         except re.error:
             return
-        gone = sum(1 for key, (_name, text) in blocked.items()
-                   if self._after_start(key) and self.regex.search(text))
+        refused = sorted((key, name, denied) for key, (name, text, denied) in blocked.items()
+                         if self._after_start(key) and self.regex.search(text))
+        if refused:   # reported apart, whatever the verdict ends up being
+            item.proposals_rejected = [runner.rejected_proposal_item(rule.id, name, key[0], denied[0])
+                                       for key, name, denied in refused[:runner.REJECTED_LIMIT]]
+        gone = len(refused)
         count = self.att_n - gone
         if count <= 0:
             return
@@ -781,8 +840,8 @@ def facts_fingerprint(provider, parser_version, digest) -> str:
 
 def wants_call_index(active, provider) -> bool:
     """Whether a run may look stored events up by call id (a requires_success tracker, Claude cut results)."""
-    return any(r.regex and (r.requires_success or (provider == "claude" and runner._reads_results(r)))
-               for r in active)
+    return any(r.regex and (r.requires_success or (provider == "claude" and (
+        runner._reads_results(r) or runner._wants_rejections(r)))) for r in active)
 
 
 class PlanRetry(Exception):
@@ -1050,6 +1109,9 @@ class AuditPlan:
                     target = event.meta.get("truncated_result_for")
                     if isinstance(facts, ClaudeFacts) and event.kind == "meta" and isinstance(target, str) and target:
                         wanted.add(target)
+                    if (isinstance(facts, ClaudeFacts) and event.kind == "tool_result" and call_id is not None
+                            and runner._host_denied(event.meta.get("permission_decision"))):
+                        wanted.add(call_id)   # the call a refusal belongs to may be older than this delta
                 pools.calls_prior = {_k(key): value for key, value in
                                      store.audit_call_events(session_id, provider, wanted, from_byte).items()}
             if pools.track_proposals:
@@ -1140,8 +1202,9 @@ class AuditPlan:
             if not group:
                 continue
             rules = [active[i] for i in group]
+            rejected = runner.rejections(self.provider, rules, chunks, proposed)
             found = [runner.audit_contract(r, session_id=self.session_id, store=None, provider=self.provider,
-                                           proposed=proposed, chunks=chunks) for r in rules]
+                                           proposed=proposed, chunks=chunks, rejected=rejected) for r in rules]
             evidence_rules = runner._EVIDENCE_RULES.get(self.provider)
             if evidence_rules is not None:
                 runner._post_process(evidence_rules, rules, found, chunks, proposed=proposed, coverage=None)

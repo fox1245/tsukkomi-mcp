@@ -228,6 +228,19 @@ class Finding(BaseModel):
         description="not_applicable: the contract's `when` condition is not met (verdict stays clean); "
                     "the contract is reported, never dropped.",
     )
+    proposals_rejected: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Calls matching a must_not contract that the host recorded as refused (a deny decision linked to "
+                    "the call): proposals, not executed actions. They never make the verdict a violation; omitted "
+                    "while empty.",
+    )
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_rejections(self, handler):
+        data = handler(self)
+        if not data.get("proposals_rejected"):
+            data.pop("proposals_rejected", None)
+        return data
 
 
 class AuditResult(BaseModel):

@@ -24,6 +24,74 @@ ANCHOR_NOT_USER = ("anchor_not_user: the contract's source_event_id is not a use
                    "injected text cannot be the origin of a contract), so its findings for this session are unknown")
 
 
+REJECTED_REASON = "host_denied: the host recorded a deny decision for this call, so it did not run"
+REJECTED_LIMIT = 20
+
+
+def _host_denied(decision) -> bool:
+    """A permission decision the host recorded on a tool result as a refusal (``deny``; never an error text)."""
+    if isinstance(decision, str):
+        return decision == "deny"
+    return isinstance(decision, dict) and decision.get("behavior") == "deny"
+
+
+def rejected_calls(events) -> dict:
+    """Claude Code: ``{tool call chunk id: denying result chunk id}`` for calls the host recorded as refused.
+
+    A refused call is a rejected proposal, not an executed action. The only evidence is the host's own decision on the
+    tool result linked by call id (``meta.permission_decision``, from the record's ``permissionDecision``); a result
+    that merely failed is still an attempt. The call must be the only one with that id before the result, so an id
+    that is shared never vouches for a call it may not belong to.
+    """
+    calls, found = {}, {}
+    for event in events:
+        call_id = _meta(event).get("call_id")
+        if call_id is None:
+            continue
+        if event.kind == "tool_call":
+            calls.setdefault(_key(call_id), []).append(event.chunk_id)
+        elif event.kind == "tool_result" and _host_denied(_meta(event).get("permission_decision")):
+            ids = calls.get(_key(call_id), ())
+            if len(ids) == 1:
+                found[ids[0]] = event.chunk_id
+    return found
+
+
+def _wants_rejections(rule) -> bool:
+    """A prohibition over calls: the only rules a refused call can change."""
+    return rule.type == "must_not" and rule.scope in ("tool_call", "any")
+
+
+def rejections(provider, rules, events, proposed):
+    """The rejected calls of a history audit (``None`` when there are none or none can matter)."""
+    if provider != "claude" or proposed is not None or not any(_wants_rejections(rule) for rule in rules):
+        return None
+    return rejected_calls(events) or None
+
+
+def _event_byte(event):
+    key = getattr(event, "key", None)
+    return key[0] if key else getattr(event, "byte_start", None)
+
+
+def rejected_item(rule_id, event, denied_by) -> dict:
+    return {"contract_id": rule_id, "event_id": event.chunk_id, "call_id": _meta(event).get("call_id"),
+            "reason": REJECTED_REASON, "denied_by": denied_by, "at_byte": _event_byte(event)}
+
+
+REJECTED_PROPOSAL_REASON = "host_denied: the pre-tool hook denied this proposal, so it did not run"
+
+
+def rejected_proposal_item(rule_id, tool_name, at_byte, denied_at_byte) -> dict:
+    """AGY: a model proposal the Pre hook denied (``host_rejected_proposal``); the call was never executed."""
+    return {"contract_id": rule_id, "reason": REJECTED_PROPOSAL_REASON, "tool_name": tool_name, "at_byte": at_byte,
+            "denied_at_byte": denied_at_byte}
+
+
+def rejected_clean(count) -> str:
+    return f"no executed forbidden match in inspected events; {count} matching call(s) were rejected by the host before they ran"
+
+
 def is_user_event(event) -> bool:
     """A user message: what the parser marked ``role == "user"`` (never runtime, injected or tool text)."""
     return (getattr(event, "meta", None) or {}).get("role") == "user"
@@ -180,14 +248,18 @@ def audit_contract(rule, **kwargs):
             return _regex_timeout_finding(rule)
 
 
-def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, proposed=None, chunks=None):
-    """Regex checks operate on events. Retrieval ranks are never verification evidence."""
+def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, proposed=None, chunks=None,
+                    rejected=None):
+    """Regex checks operate on events. Retrieval ranks are never verification evidence.
+
+    ``rejected`` (Claude Code history audits): the calls the host refused, see ``rejected_calls``.
+    """
     check_request()
-    def finding(verdict, reason, items=None, basis=None, applicability="applicable"):
+    def finding(verdict, reason, items=None, basis=None, applicability="applicable", stopped=None):
         check_request()
         return Finding(contract_id=rule.id, contract_revision=rule.revision, severity=rule.severity,
                        verdict=verdict, reason=reason, evidence=items or [], basis=basis,
-                       applicability=applicability)
+                       applicability=applicability, proposals_rejected=stopped or [])
 
     if not rule.enabled:
         return finding("clean", "contract disabled")
@@ -218,7 +290,16 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
     if rule.type == "must_not":
         inspected = [proposed] if proposed is not None else active
         hits = [c for c in _checked(inspected) if _eligible(c, rule) and regex.search(c.text)]
+        turned = [c for c in hits if rejected and c.chunk_id in rejected]
+        if turned:
+            # A call the host refused did not run: it is reported apart and never counts as an executed match.
+            hits = [c for c in hits if c.chunk_id not in rejected]
+        stopped = [rejected_item(rule.id, c, rejected[c.chunk_id]) for c in turned[:REJECTED_LIMIT]]
         if not hits:
+            if turned:
+                return finding("clean", rejected_clean(len(turned)),
+                               basis=f"{rule.id}.regex matched only host-rejected proposal(s), which did not run",
+                               stopped=stopped)
             return finding("clean", "no forbidden match in inspected events",
                            basis=f"{rule.id}.regex did not match any inspected event")
         exception = None
@@ -230,12 +311,14 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
                                basis=f"{rule.id}.exception_regex failed to compile")
         if exception is not None and exception.search(inspected[0].text if proposed is not None else " ".join(c.text for c in hits)):
             return finding("suspicious", "forbidden match is covered by the authorized exception; confirm scope before proceeding",
-                           basis=f"{rule.id}.exception_regex matched the same event(s); user-authorized exception requires confirmation")
+                           basis=f"{rule.id}.exception_regex matched the same event(s); user-authorized exception requires confirmation",
+                           stopped=stopped)
         reason = f"forbidden regex matched {len(hits)} event(s)"
         if rule.source_quote:
             reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
         return finding("violation", reason,
-                       basis=f"{rule.id}.regex '{rule.regex}' matched prohibited content", items=[evidence(c) for c in hits[:20]])
+                       basis=f"{rule.id}.regex '{rule.regex}' matched prohibited content", items=[evidence(c) for c in hits[:20]],
+                       stopped=stopped)
     if trigger:
         if proposed is not None:
             checkpoints = [(len(active), proposed)] if _eligible(proposed, rule) and trigger.search(proposed.text) else []
@@ -280,8 +363,9 @@ def _post_process(evidence_rules, rules, findings, events, **kwargs) -> None:
 
 def full_findings(active, chunks, *, session_id, store, provider, proposed, coverage):
     """The reference evaluation: every rule over the whole event list, then the provider's evidence classes."""
+    rejected = rejections(provider, active, chunks, proposed)
     findings = [audit_contract(r, session_id=session_id, store=store, provider=provider,
-                               proposed=proposed, chunks=chunks) for r in _checked(active)]
+                               proposed=proposed, chunks=chunks, rejected=rejected) for r in _checked(active)]
     # Provider-specific partial-observation passes post-process the findings; other providers have none.
     evidence_rules = _EVIDENCE_RULES.get(provider)
     if evidence_rules is not None:
@@ -423,10 +507,12 @@ def _consistent(denied_args, args) -> bool:
     return bool(shared) and all(denied_args[key] == args[key] for key in shared)
 
 
-def _blocked_proposals(events) -> set:
-    """Positions of model proposals the Pre hook demonstrably blocked (non-execution); they are not attempts."""
+def _blocked_proposals(events) -> dict:
+    """``{position of a model proposal the Pre hook demonstrably blocked: position of its denial}``.
+
+    A blocked proposal never ran (non-execution); it is not an attempt."""
     waiting: dict = {}
-    blocked = set()
+    blocked: dict = {}
     for index, event in enumerate(events):
         meta = _meta(event)
         if meta.get("evidence_origin") == "model_proposal":
@@ -436,7 +522,7 @@ def _blocked_proposals(events) -> set:
             queue = waiting.get(denied.get("name"), [])
             for slot in range(len(queue) - 1, -1, -1):
                 if _consistent(denied.get("args"), queue[slot][1]):
-                    blocked.add(queue.pop(slot)[0])
+                    blocked[queue.pop(slot)[0]] = index
                     break
     return blocked
 
@@ -493,7 +579,7 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
         if meta.get("event_type") in RESULT_TYPES and meta.get("status") in _FINAL_STATUS:
             last_final[meta.get("step_index")] = index
     history = proposed is None
-    blocked = _blocked_proposals(events) if history and any(_wants_attempts(r) for r in rules) else set()
+    blocked = _blocked_proposals(events) if history and any(_wants_attempts(r) for r in rules) else {}
     for rule, item in zip(rules, findings):
         check_request()
         start, end = _window(rule, events, ids, proposed)
@@ -614,6 +700,12 @@ def _attempt_hits(rule, item, events, positions, blocked) -> None:
         exception = compile_contract(rule.exception_regex) if rule.exception_regex else None
     except re.error:
         return
+    refused = [i for i in positions if i in blocked and _meta(events[i]).get("evidence_origin") == "model_proposal"
+               and regex.search(events[i].text)]
+    if refused:   # reported apart, whatever the verdict ends up being
+        item.proposals_rejected = [
+            rejected_proposal_item(rule.id, _meta(events[i]).get("tool_name"), _event_byte(events[i]),
+                                   _event_byte(events[blocked[i]])) for i in refused[:REJECTED_LIMIT]]
     hits = [events[i] for i in positions if _meta(events[i]).get("evidence_origin") == "model_proposal"
             and i not in blocked and regex.search(events[i].text)]
     if not hits:

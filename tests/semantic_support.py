@@ -175,13 +175,22 @@ def evaluate(rules, events, provider="claude", *, proposed=None, chunk_sizes=(No
     return expected
 
 
-def _prior(previous):
-    calls = {}
+def _prior(previous, lookback=4096):
+    """What the store would prefetch for the events before a feed: calls by id and proposals by tool name."""
+    calls, proposals = {}, {}
     for item in previous:
         call_id = item.meta.get("call_id")
         if call_id is not None and item.kind in ("tool_call", "tool_result"):
             calls.setdefault(inc._k(call_id), []).append((item.kind, item.key, item.chunk_id))
-    return inc.Pools(track_calls=True, track_proposals=True, calls_prior=calls)
+        if item.meta.get("evidence_origin") == "model_proposal":
+            proposals.setdefault(item.meta.get("tool_name"), []).append((item.key, item.text))
+    pools = inc.Pools(track_calls=True, track_proposals=True, calls_prior=calls)
+    complete = len(previous) <= lookback
+    for name in proposals:
+        pools.proposals_prior[name] = ([(e.key, e.text) for e in reversed(previous[-lookback:])
+                                        if e.meta.get("evidence_origin") == "model_proposal"
+                                        and e.meta.get("tool_name") == name], complete)
+    return pools
 
 
 def _reload(monitors, facts, provider, rules, needs):

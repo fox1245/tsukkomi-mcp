@@ -29,6 +29,26 @@ class HookRuntimeError(RuntimeError):
     kind = AUDIT_UNAVAILABLE
 
 
+class InfoNote(str):
+    """A Stop note that reports something already settled (a refused call): information, not an unmet check."""
+
+
+def rejected_note(finding: dict) -> InfoNote:
+    """What a Stop checkpoint says about calls the host refused: rejected proposals, never executed violations."""
+    count = len(finding.get("proposals_rejected") or ())
+    return InfoNote(f"[{finding.get('contract_id')}] {count}{'+' if count >= 20 else ''} proposed call(s) matching this "
+                    "contract were rejected by the host and did not run (rejected proposals, not executed violations).")
+
+
+def with_notes(notes: list, lead: str) -> str:
+    """One user-facing line from Stop notes: ``lead`` introduces what is unverified, rejected proposals stand apart."""
+    plain = [note for note in notes if not isinstance(note, InfoNote)]
+    info = [note for note in notes if isinstance(note, InfoNote)]
+    parts = ([lead + " ".join(plain)] if plain else []) + (["Rejected by the host, not executed: " + " ".join(info)]
+                                                           if info else [])
+    return " ".join(parts)
+
+
 def short(text: Any, limit: int = 300) -> str:
     return mask_secrets(str(text))[:limit]
 
@@ -175,5 +195,6 @@ def checkpoint(engine: SelfDirectEngine, provider: str, session_id: str, path: s
             notes.append("Contract checkpoint is " + str(audit.get("verdict", "unknown")) + ".")
         notes.extend(f"[{f['contract_id']}] {short(f.get('reason', ''))}" for f in audit.get("findings", [])
                      if f.get("verdict") != "clean")
+        notes.extend(rejected_note(f) for f in audit.get("findings", []) if f.get("proposals_rejected"))
         misses = confirmed_misses(obligations, audit)
     return notes, misses

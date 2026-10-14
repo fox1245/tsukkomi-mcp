@@ -51,8 +51,9 @@ _SCOPE_KINDS = {"tool_call": "tool_call", "tool_result": "tool_result", "message
 # Meta keys the audit helper for AGY evidence classes needs on every slim event.
 _AGY_AUDIT_META = ("event_type", "step_index", "status", "pending", "linkage", "evidence_origin",
                    "tool_name", "truncated_fields", "denied_action", "result_type")
-# Claude Code: a truncation notice names the tool result (``call_id``) the host cut; see audit.runner.
-_AUDIT_META = {"agy": _AGY_AUDIT_META, "claude": ("truncated_result_for", "call_id")}
+# Claude Code: a truncation notice names the tool result (``call_id``) the host cut; a tool result carries the
+# permission decision the host recorded for its call (a refused call is a rejected proposal); see audit.runner.
+_AUDIT_META = {"agy": _AGY_AUDIT_META, "claude": ("truncated_result_for", "call_id", "permission_decision")}
 
 
 @dataclass(frozen=True)

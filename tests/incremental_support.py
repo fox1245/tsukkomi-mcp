@@ -75,8 +75,11 @@ class Session:
         elif choice < 0.86:
             call_id = rng.choice(self.call_ids) if self.call_ids and rng.random() < 0.9 else None
             success = rng.choice([True, True, False, None])
-            self._add("tool_result", f"[tool_result] {words(rng)}",
-                      {"role": "tool", "call_id": call_id, "success": success}, 0, start)
+            meta = {"role": "tool", "call_id": call_id, "success": success}
+            if self.provider == "claude" and rng.random() < 0.25:
+                # the host's own decision on the call (a deny means the call never ran)
+                meta["permission_decision"] = rng.choice(["deny", "deny", {"behavior": "deny"}, "allow", {"behavior": "ask"}])
+            self._add("tool_result", f"[tool_result] {words(rng)}", meta, 0, start)
         elif choice < 0.93:
             self._add("meta", f"[meta] {words(rng)}", {"role": "runtime"}, 0, start)
         elif self.provider == "claude" and self.call_ids:

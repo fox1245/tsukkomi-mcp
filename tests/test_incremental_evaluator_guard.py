@@ -19,7 +19,7 @@ from self_directing_mcp import agy
 from self_directing_mcp.audit import applicability, patterns, runner, shellstatus
 from self_directing_mcp.retrieve import checks
 
-DIGEST = "305bfdcaa9fe5370"
+DIGEST = "f325f6d4e3e85056"
 
 MIRRORED = [
     runner.audit_contract, runner._Presence, runner._eligible, runner._worse, runner.evidence, runner._key,
@@ -36,10 +36,14 @@ MIRRORED = [
     runner.success_unverifiable, shellstatus,
     # a contract anchored to something other than a user message is unknown (``anchor_not_user``)
     runner.is_user_event,
+    # a call the host refused is a rejected proposal, never an executed match (Claude Code ``permission_decision``)
+    runner.rejected_calls, runner._host_denied, runner._wants_rejections, runner.rejections, runner.rejected_item,
+    runner.rejected_clean, runner._event_byte, runner.rejected_proposal_item,
 ]
 CONSTANTS = [sorted(agy.RESULT_TYPES), sorted(agy.SUCCESS_TYPES), sorted(map(list, agy.JUDGED_FIELDS)),
              sorted(runner._FINAL_STATUS), sorted(runner._TRUNCATED_CODE.items()), applicability.PROPOSED_CALL_PREFIX,
-             runner.REGEX_TIMEOUT, runner.SUCCESS_UNVERIFIABLE, runner.ANCHOR_NOT_USER]
+             runner.REGEX_TIMEOUT, runner.SUCCESS_UNVERIFIABLE, runner.ANCHOR_NOT_USER,
+             runner.REJECTED_REASON, runner.REJECTED_LIMIT, runner.REJECTED_PROPOSAL_REASON]
 
 
 def digest():
