@@ -156,7 +156,8 @@ def test_explicit_then_environment_then_toml_then_dotenv(tmp_path, monkeypatch, 
     _select(monkeypatch, tmp_path / "settings.toml", **{name: value("toml")})
     env_name = "SELF_DIRECT_" + name.upper()
     dotenv_value = json.dumps(value("dotenv")) if name == "agy_app_data_dirs" else str(roots["dotenv"])
-    (tmp_path / ".env").write_text(f"{env_name}='{dotenv_value}'\n", encoding="utf-8")
+    # python-dotenv decodes \\ inside single quotes, so a JSON list of Windows paths is escaped once more.
+    (tmp_path / ".env").write_text(f"{env_name}='{dotenv_value.replace(chr(92), chr(92) * 2)}'\n", encoding="utf-8")
     env_value = json.dumps(value("environment")) if name == "agy_app_data_dirs" else str(roots["environment"])
     monkeypatch.setenv(env_name, env_value)
     explicit = Settings(**{name: value("explicit")})

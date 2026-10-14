@@ -111,7 +111,8 @@ def test_print_options_select_events_mode_python_and_local_only():
     assert list(document["hooks"]) == ["PreToolUse", "Stop"]
     assert document["env"] == {"SELF_DIRECT_CLAUDE_ENFORCEMENT": "advisory"}
     command = document["hooks"]["Stop"][0]["hooks"][0]["command"]
-    assert command.startswith("'/opt/py 3/python' ") and command.endswith("--event=Stop --local-only")
+    quoted = '"/opt/py 3/python" ' if os.name == "nt" else "'/opt/py 3/python' "
+    assert command.startswith(quoted) and command.endswith("--event=Stop --local-only")
     assert run_cli("--events", "Nope").returncode == 2
     assert run_cli("--mode", "bogus").returncode == 2
 

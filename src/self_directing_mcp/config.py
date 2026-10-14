@@ -226,6 +226,16 @@ class Settings(BaseSettings):
         return Path(self.index_dir) / "contracts.json"
 
 
+def hook_settings() -> Settings:
+    """Settings for lifecycle hooks: environment and the user TOML only, never a ``.env`` in the working directory.
+
+    Hosts run hooks in the project being worked on, so a ``.env`` there is content the audited agent can write.
+    Reading it would let that agent point the hook at an empty index or another mode and silence its own checks.
+    The hook state modules resolve the same keys from the same two sources.
+    """
+    return Settings(_env_file=None)
+
+
 def get_settings(**overrides) -> Settings:
     # The key file is read by resolve_api_key() for OPENROUTER_API_KEY only. It is never loaded into
     # os.environ, where subprocesses and native hosts would inherit every variable it holds.

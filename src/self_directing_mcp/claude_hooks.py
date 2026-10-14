@@ -298,17 +298,18 @@ def render(event: str, reply: dict[str, Any]) -> dict[str, Any]:
 # --- dispatch ----------------------------------------------------------------------------------------------
 
 def _new_settings():
-    from self_directing_mcp.config import Settings
+    from self_directing_mcp.config import hook_settings
     try:
-        return Settings()
+        return hook_settings()
     except Exception as exc:
         raise HookRuntimeError("settings unavailable") from exc
 
 
 def _new_engine():
+    from self_directing_mcp.config import hook_settings
     from self_directing_mcp.engine import SelfDirectEngine
     try:
-        return SelfDirectEngine()
+        return SelfDirectEngine(hook_settings())
     except Exception as exc:
         raise HookRuntimeError("settings or engine unavailable") from exc
 

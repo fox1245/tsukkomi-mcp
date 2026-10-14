@@ -176,9 +176,10 @@ def _validate_payload(payload: Any, event: str) -> tuple[str, str]:
 
 
 def _new_engine():
+    from self_directing_mcp.config import hook_settings
     from self_directing_mcp.engine import SelfDirectEngine
     try:
-        return SelfDirectEngine()
+        return SelfDirectEngine(hook_settings())
     except Exception as exc:
         raise HookRuntimeError("settings or engine unavailable") from exc
 
