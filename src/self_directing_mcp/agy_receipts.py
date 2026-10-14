@@ -94,10 +94,11 @@ class ReceiptStore:
                     if observed is not None:
                         row["result_hash"] = observed
         payload = json.dumps(row, sort_keys=True)
-        if observation is not None:
-            observation.validate_prefix()  # full rehash off the shared lock; the locked check inherits a failure
+        # A failed full read (even a transient one) is not repaired by a successful bounded tail check.
+        source_ok = observation is None or observation.validate_prefix()  # full rehash off the shared lock
         with guard(), closing(self._connect()) as conn, conn:
-            if (observation is not None and not observation.validate_prefix(locked=True)) or (observation is None and path.is_file()):
+            if (not source_ok or (observation is not None and not observation.validate_prefix(locked=True))
+                    or (observation is None and path.is_file())):
                 raise ValueError("source changed during receipt preparation")
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute("SELECT data FROM receipts WHERE session_id=? AND step=?", (session_id, step)).fetchone()

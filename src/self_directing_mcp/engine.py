@@ -535,8 +535,9 @@ class SelfDirectEngine:
             "clean is limited to the reported contracts and history snapshot, not execution authorization.")
         payload["global_meaning"] = GLOBAL_CONTRACT_MEANING
         payload["contract_scope"] = {"session_id": sid, "scope": contract_scope(sid)}
-        if observation is not None:
-            observation.validate_prefix()  # full rehash off the shared lock; the locked check inherits a failure
+        # Keep the full result: a transient read error does not latch a mismatch, so a later
+        # successful bounded tail check must not certify this read.
+        source_ok = observation is None or observation.validate_prefix()  # full rehash off the shared lock
         with self._publication_guard():
             stale = []
             tokens = (
@@ -557,7 +558,7 @@ class SelfDirectEngine:
             if observation is not None:
                 # Pure growth is judged as of the captured offset; any rewrite, truncation, replacement or
                 # deletion fails the prefix check and stays unknown.
-                if not observation.validate_prefix(locked=True):
+                if not source_ok or not observation.validate_prefix(locked=True):
                     stale.append("source_changed_during_evaluation")
                 else:
                     grown = _mark_growth(payload["coverage"], observation)
@@ -716,8 +717,9 @@ class SelfDirectEngine:
 
     def _save_checklist(self, doc, original, provider, refreshed=None):
         payload = doc.model_dump_json(indent=2)
+        source_ok = True
         if refreshed is not None and refreshed.get("_source_observation") is not None:
-            refreshed["_source_observation"].validate_prefix()  # full rehash off the shared lock
+            source_ok = refreshed["_source_observation"].validate_prefix()  # full rehash off the shared lock
         with self._publication_guard():
             path = self.checklists._path(doc.session_id)
             try:
@@ -726,13 +728,13 @@ class SelfDirectEngine:
                 current = None
             if current != original:
                 raise ChecklistConflict("stale checklist preparation")
-            if refreshed is not None and not self._evidence_current(doc.session_id, provider, refreshed):
+            if refreshed is not None and (not source_ok or not self._evidence_current(doc.session_id, provider, refreshed)):
                 raise ChecklistConflict("checklist evidence changed during evaluation")
             temporary = path.with_suffix(path.suffix + ".tmp")
             try:
                 temporary.write_text(payload, encoding="utf-8")
                 with publication():
-                    if refreshed is not None and not self._evidence_current(doc.session_id, provider, refreshed):
+                    if refreshed is not None and (not source_ok or not self._evidence_current(doc.session_id, provider, refreshed)):
                         raise ChecklistConflict("checklist evidence changed before publication")
                     check_request()
                     temporary.replace(path)
@@ -863,12 +865,11 @@ class SelfDirectEngine:
                                                                                coverage["complete"])):
                 item.status = RequirementStatus.PENDING_VERIFICATION
                 item.verified = False
-        if observation is not None:
-            observation.validate_prefix()  # full rehash off the shared lock
+        source_ok = observation is not None and observation.validate_prefix()  # full rehash off the shared lock
         with self._publication_guard():
             state = {"_metadata_token": metadata_token, "_source_observation": observation,
                      "_receipt_token": receipt_token}
-            if not self._evidence_current(sid, resolved_provider, state):
+            if not source_ok or not self._evidence_current(sid, resolved_provider, state):
                 for item in doc.items:
                     if item.status == RequirementStatus.DONE:
                         item.status, item.verified = RequirementStatus.PENDING_VERIFICATION, False
@@ -909,10 +910,11 @@ class SelfDirectEngine:
             if not synced.get("ok") or not synced.get("coverage", {}).get("complete"):
                 return {"ok": False, "error": synced.get("error", "incomplete_history"), "nodes": [], "edges": []}
 
+        source_ok = True
         if path is not None and synced.get("_source_observation") is not None:
-            synced["_source_observation"].validate_prefix()  # full rehash off the shared lock
+            source_ok = synced["_source_observation"].validate_prefix()  # full rehash off the shared lock
         with self._publication_guard():
-            if path is not None and not self._evidence_current(sid, resolved_provider, synced):
+            if path is not None and (not source_ok or not self._evidence_current(sid, resolved_provider, synced)):
                 return {"ok": False, "error": "incomplete_history", "nodes": [], "edges": []}
             cursor = self.graph.cursor(sid, resolved_provider)
             if node_id:
