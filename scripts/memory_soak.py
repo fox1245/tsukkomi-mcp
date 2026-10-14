@@ -259,21 +259,26 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.dense_backend == "sqlite-vector" and not args.vector_path:
         parser.error("--vector-path is required with --dense-backend sqlite-vector")
+    # The soak changes into its temporary directory, so caller-relative paths are resolved first.
+    report_path = args.report.resolve() if args.report else None
+    vector_path = str(Path(args.vector_path).resolve()) if args.vector_path else None
+    origin = os.getcwd()
     with tempfile.TemporaryDirectory(prefix="tsukkomi-soak-") as directory:
-        soak = Soak(Path(directory), args.dense_backend, args.vector_path)
+        soak = Soak(Path(directory), args.dense_backend, vector_path)
         baseline = sample()
         phases = [run_phase(soak, name, args.cycles, args.warmup) for name in args.phases.split(",")]
         final = sample()
         soak.loop.close()
         soak.server._engine.close()
+        os.chdir(origin)
     problems = [f"{p['phase']}: {problem}" for p in phases for problem in p["problems"]]
     if baseline["rss"] is not None and final["rss"] - baseline["rss"] > RSS_LIMIT:
         problems.append(f"RSS grew {(final['rss'] - baseline['rss']) / MIB:.0f} MiB over the run "
                         f"(limit {RSS_LIMIT / MIB:.0f})")
     report = {"python": sys.version.split()[0], "dense_backend": args.dense_backend, "baseline": baseline,
               "final": final, "phases": phases, "problems": problems}
-    if args.report:
-        args.report.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    if report_path:
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     for phase in phases:
         first_window, second_window = phase["window_growth"]
         print(f"{phase['phase']:>6}: {phase['cycles']} cycles in {phase['seconds']}s, retained "
