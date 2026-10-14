@@ -638,6 +638,16 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# A byte that is not valid UTF-8 decodes (``errors="surrogateescape"``, see ``iter_raw_lines``) to a lone surrogate in
+# U+DC80..U+DCFF. One compiled scan in C replaces a Python generator that visited every character of every record.
+_ESCAPED_BYTE = re.compile("[\udc80-\udcff]")
+
+
+def has_invalid_utf8(raw: str) -> bool:
+    """True when ``raw`` (a record decoded with ``surrogateescape``) holds a byte that was not valid UTF-8."""
+    return _ESCAPED_BYTE.search(raw) is not None
+
+
 def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, int, int, str]]:
     """Cursors point to the start of a record. Leave unfinished final records unread.
 

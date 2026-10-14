@@ -7,7 +7,7 @@ from pathlib import Path
 from self_directing_mcp.compressed_source import CompressedSourceError, is_compressed, open_source
 from self_directing_mcp.tool_payload import tool_call_text
 from self_directing_mcp.session_events import (
-    as_text, iter_raw_lines, make_chunk, parse_error, result_success,
+    as_text, has_invalid_utf8, iter_raw_lines, make_chunk, parse_error, result_success,
 )
 
 # Bumping this triggers a lazy per-session reparse on the next sync/audit of each already-indexed
@@ -244,7 +244,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
         if not raw.strip():
             continue
         try:
-            if any(0xDC80 <= ord(char) <= 0xDCFF for char in raw):
+            if has_invalid_utf8(raw):
                 raise ValueError("invalid UTF-8")
             obj = json.loads(raw)
             if not isinstance(obj, dict):

@@ -89,6 +89,15 @@ def classify(audit: dict, mode: str, high_risk: frozenset | set = frozenset()) -
     return "allow", "WARNING - unverified, not a compliance verdict: " + reason, True
 
 
+def wants_derived_work(engine: SelfDirectEngine) -> bool:
+    """Whether a hook's history refresh should also maintain the search indexes.
+
+    A local-only engine (what command hooks run) has only the sparse index, which a search repairs on demand, so the
+    hook publishes just the canonical events its audit reads and skips the full-text writes (a synchronous commit of
+    their own). An engine with an embedder restores cached vectors during a sync, so it keeps doing that work."""
+    return not engine.settings.local_only
+
+
 def read_obligations(engine: SelfDirectEngine, provider: str, session_id: str, path: str | None) -> dict:
     try:
         return engine.hook_obligations(session_id, provider=provider, path=path)
@@ -178,7 +187,8 @@ def miss_key(misses: list, prefix: str = "") -> str:
 def checkpoint(engine: SelfDirectEngine, provider: str, session_id: str, path: str, obligations: dict,
                label: str) -> tuple[list[str], list]:
     """Refresh history and gather ``(notes, confirmed_misses)`` for a Stop checkpoint. Notes never block."""
-    synced = engine.sync_session(session_id=session_id, provider=provider, path=path, embed=False)
+    synced = engine.sync_session(session_id=session_id, provider=provider, path=path, embed=False,
+                                 derived=wants_derived_work(engine))
     notes = []
     coverage = synced.get("coverage", {})
     # Records the host is still appending are judged next time; any other gap leaves completion unverified.

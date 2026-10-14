@@ -215,7 +215,8 @@ def _dispatch(payload: Any, event_name: str | None, engine: SelfDirectEngine | N
             return handle_stop(engine, sid, payload), None
         if event_name == "PreInvocation":
             return handle_pre_invocation(engine, sid, payload), None
-        result = engine.sync_session(session_id=sid, provider="agy", path=path, embed=False)
+        result = engine.sync_session(session_id=sid, provider="agy", path=path, embed=False,
+                                     derived=hook_policy.wants_derived_work(engine))
         if not result.get("ok"):
             print("Tsukkomi PostToolUse: history refresh unavailable", file=sys.stderr)
         return {}, None

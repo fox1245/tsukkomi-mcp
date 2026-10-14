@@ -10,12 +10,15 @@ see its docstring for why that cannot change what a receipt says.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import closing, nullcontext
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
+import threading
 from uuid import uuid4
 
 from self_directing_mcp.agy import RESULT_TYPES, load_line
@@ -248,9 +251,156 @@ def _is_bound(original: str) -> bool:
     return at >= 0 and original[at - 1:at] != "\\" and original[at + len(_BOUND_KEY):at + len(_BOUND_KEY) + 1] != '"'
 
 
+_MISS = object()
+
+
+class _Reader:
+    """A resident engine's persistent read-only connection to one receipts database, and what it last read from it.
+
+    Every request used to read all the receipts of a conversation (thousands of rows) a dozen times: the authority
+    tokens that detect a change between two phases, the capture of a sync, the checkpoint list. Here a value is read once
+    and served again until the database changes. The witness is SQLite's own: ``PRAGMA data_version`` differs between two
+    calls on one connection exactly when ANOTHER connection committed in between, and every writer of this database
+    (``record``, ``publish_bindings``, ``mark_indexed``, another process) is another connection. The version is read
+    BEFORE the value, so a commit that lands between the two only makes the next call read again. The file identity is
+    compared with the path on every use (``_reader_for``): a database that was deleted, replaced or recreated is a new
+    reader, never served from the old one's values. A write that bypasses SQLite (an editor on the file) moves no
+    version; the same assumption the index store's row-count cache already makes."""
+
+    def __init__(self, connection, identity) -> None:
+        self.connection, self.identity = connection, identity
+        self.lock = threading.Lock()
+        self.values: OrderedDict = OrderedDict()
+
+    def get(self, key, load):
+        with self.lock:
+            version = self.connection.execute("PRAGMA data_version").fetchone()[0]
+            held = self.values.get(key)
+            if held is not None and held[0] == version:
+                self.values.move_to_end(key)
+                return held[1]
+            value = load(self.connection)
+            self.values[key] = (version, value)
+            self.values.move_to_end(key)
+            while len(self.values) > _READER_VALUES:
+                self.values.popitem(last=False)
+            return value
+
+    def close(self) -> None:
+        with self.lock:
+            try:
+                self.connection.close()
+            except sqlite3.Error:
+                pass
+
+
+_READER_VALUES = 12     # (kind, session) values one reader keeps
+_READER_LIMIT = 4       # receipts databases kept open by one process
+_READERS: OrderedDict[str, _Reader] = OrderedDict()
+_READERS_LOCK = threading.Lock()
+
+
+def _reader_for(path: Path):
+    """The reader of this receipts database, opened on first use; None when it cannot be (no file, SQLite refuses)."""
+    key = str(path)
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    identity = (stat.st_dev, stat.st_ino)
+    with _READERS_LOCK:
+        reader = _READERS.get(key)
+        if reader is not None and reader.identity != identity:
+            _READERS.pop(key).close()               # the file at this path is not the one the reader holds open
+            reader = None
+        if reader is None:
+            try:
+                connection = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, check_same_thread=False)
+                again = os.stat(path)
+            except (sqlite3.Error, OSError):
+                return None
+            if (again.st_dev, again.st_ino) != identity:      # replaced while opening: the next call starts over
+                connection.close()
+                return None
+            reader = _READERS[key] = _Reader(connection, identity)
+            while len(_READERS) > _READER_LIMIT:
+                _READERS.popitem(last=False)[1].close()
+        else:
+            _READERS.move_to_end(key)
+        return reader
+
+
+def _drop_reader(path: Path, reader) -> None:
+    with _READERS_LOCK:
+        if _READERS.get(str(path)) is reader:
+            del _READERS[str(path)]
+    reader.close()
+
+
 class ReceiptStore:
-    def __init__(self, index_dir: Path):
+    def __init__(self, index_dir: Path, *, held=None):
+        """``held``: the ``index.deferred.DerivedBuffer`` of a resident engine, or None. The "indexed" marker (which receipts
+        digest the index was built on) is advisory, so such an engine holds it there and writes it with the next
+        receipt it records, at idle or at close, instead of committing it by itself; every read goes through
+        ``_indexed``, which sees the held value first."""
         self.path = Path(index_dir) / "agy-receipts.sqlite"
+        self.held = held
+
+    @staticmethod
+    def release(index_dir: Path) -> None:
+        """Close this process's persistent reader of the index directory's receipts database (engine close)."""
+        path = Path(index_dir) / "agy-receipts.sqlite"
+        with _READERS_LOCK:
+            reader = _READERS.pop(str(path), None)
+        if reader is not None:
+            reader.close()
+
+    def _cached(self, key, load):
+        """``load(connection)`` through a persistent reader (resident engines only, i.e. with ``held``), else ``_MISS``:
+        the caller then reads as it always did. Any SQLite trouble also means ``_MISS`` and drops the reader."""
+        if self.held is None:
+            return _MISS
+        reader = _reader_for(self.path)
+        if reader is None:
+            return _MISS
+        try:
+            return reader.get(key, load)
+        except sqlite3.Error:
+            _drop_reader(self.path, reader)
+            return _MISS
+
+    def _rows(self, session_id, connection=None):
+        """The ``(step, json)`` receipts of a conversation, ordered by step."""
+        def load(conn):
+            return tuple(conn.execute("SELECT step,data FROM receipts WHERE session_id=? ORDER BY step",
+                                      (session_id,)).fetchall())
+        rows = self._cached(("rows", session_id), load)
+        return rows if rows is not _MISS else load(connection)
+
+    def _indexed(self, conn, session_id):
+        """The receipts digest the index is marked to be built on: the value this process holds, else the stored one."""
+        held = self.held.marker_for(str(self.path), session_id) if self.held is not None else None
+        if held is not None:
+            return held
+        row = conn.execute("SELECT digest FROM indexed WHERE session_id=?", (session_id,)).fetchone()
+        return row[0] if row else None
+
+    def flush_held(self) -> int:
+        """Write the markers this process holds for this database (idle, close); a failure loses only markers."""
+        if self.held is None or not any(key[0] == str(self.path) for key in list(self.held.markers)):
+            return 0
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                return self._write_held(conn)
+        except sqlite3.Error:
+            return 0
+
+    def _write_held(self, conn) -> int:
+        taken = self.held.drain_markers(str(self.path)) if self.held is not None else []
+        for session_id, digest in taken:
+            conn.execute("INSERT OR REPLACE INTO indexed VALUES (?,?)", (session_id, digest))
+        return len(taken)
 
     def _connect(self):
         check_request()
@@ -316,6 +466,7 @@ class ReceiptStore:
             with publication():
                 conn.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?)", (session_id, step, payload))
                 ledger.persist(conn)
+                self._write_held(conn)    # rides this commit
                 check_request()
                 conn.commit()
 
@@ -326,9 +477,12 @@ class ReceiptStore:
             before = self.path.stat()
         except FileNotFoundError:
             return ("missing", None, None)
-        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
-            rows = tuple(conn.execute("SELECT step,data FROM receipts WHERE session_id=? ORDER BY step",
-                                      (session_id,)).fetchall())
+        rows = self._cached(("rows", session_id), lambda conn: tuple(conn.execute(
+            "SELECT step,data FROM receipts WHERE session_id=? ORDER BY step", (session_id,)).fetchall()))
+        if rows is _MISS:
+            with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+                rows = tuple(conn.execute("SELECT step,data FROM receipts WHERE session_id=? ORDER BY step",
+                                          (session_id,)).fetchall())
         try:
             after = self.path.stat()
         except FileNotFoundError:
@@ -352,18 +506,22 @@ class ReceiptStore:
         return digest
 
     def read_capture(self, session_id: str):
-        with closing(self._connect()) as conn:
-            rows = tuple(conn.execute("SELECT step,data FROM receipts WHERE session_id=? ORDER BY step", (session_id,)).fetchall())
-            indexed = conn.execute("SELECT digest FROM indexed WHERE session_id=?", (session_id,)).fetchone()
-        return rows, indexed[0] if indexed else None
+        with closing(self._connect()) as conn:        # also makes sure the tables exist before any reader asks
+            rows = self._rows(session_id, conn)
+            indexed = self._indexed(conn, session_id)
+        return rows, indexed
 
     def checkpoints(self, session_id: str, path: Path) -> tuple[int, ...]:
         """Offsets whose prefix digests a sync of ``path`` is going to ask for: every receipt's anchor, and the
         verified length of the ledger. A capture that hashes the file with a state at each of them makes those
         digests free; one that does not still gets them right, by re-reading."""
+        def load(conn):
+            return frozenset(row[0] for row in conn.execute(
+                "SELECT json_extract(data,'$.prefix_length') FROM receipts WHERE session_id=?", (session_id,)))
+
         with closing(self._connect()) as conn:
-            marks = {row[0] for row in conn.execute(
-                "SELECT json_extract(data,'$.prefix_length') FROM receipts WHERE session_id=?", (session_id,))}
+            cached = self._cached(("marks", session_id), load)
+            marks = set(cached if cached is not _MISS else load(conn))
             length = conn.execute("SELECT length FROM scan_state WHERE session_id=? AND path=?",
                                   (session_id, str(path))).fetchone()
         if length:
@@ -409,8 +567,7 @@ class ReceiptStore:
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = tuple(conn.execute("SELECT step,data FROM receipts WHERE session_id=? ORDER BY step", (session_id,)).fetchall())
-            indexed = conn.execute("SELECT digest FROM indexed WHERE session_id=?", (session_id,)).fetchone()
-            current = (rows, indexed[0] if indexed else None)
+            current = (rows, self._indexed(conn, session_id))
             if current != capture:
                 raise ValueError("stale hook receipt preparation")
             if rows != prepared_rows or (ledger is not None and ledger.update is not None):
@@ -431,11 +588,26 @@ class ReceiptStore:
         return receipts, digest, indexed
 
     def mark_indexed(self, session_id: str, digest: str):
+        if self.held is not None:
+            # Same check, but the marker is held and written with the next commit of this database (see ``__init__``).
+            with closing(self._connect()) as conn:
+                rows = self._rows(session_id, conn)
+                if self.rows_digest(rows) != digest:
+                    raise ValueError("hook receipts changed before indexed marker")
+                stored = conn.execute("SELECT digest FROM indexed WHERE session_id=?", (session_id,)).fetchone()
+            if stored is not None and stored[0] == digest:
+                self.held.drop_marker(str(self.path), session_id)
+            else:
+                self.held.hold_marker(str(self.path), session_id, digest)
+            return
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = tuple(conn.execute("SELECT step,data FROM receipts WHERE session_id=? ORDER BY step", (session_id,)).fetchall())
             if self.rows_digest(rows) != digest:
                 raise ValueError("hook receipts changed before indexed marker")
+            marked = conn.execute("SELECT digest FROM indexed WHERE session_id=?", (session_id,)).fetchone()
+            if marked is not None and marked[0] == digest:
+                return  # already this digest: rewriting the identical row would only cost a synchronous commit
             with publication():
                 conn.execute("INSERT OR REPLACE INTO indexed VALUES (?,?)", (session_id, digest))
                 check_request()

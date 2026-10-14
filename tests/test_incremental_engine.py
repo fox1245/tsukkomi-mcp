@@ -255,6 +255,7 @@ def test_an_untouched_session_is_answered_without_reading_events(codex):
 # --- shadow verification, mismatches and the health table -----------------------------------------------------
 
 def corrupt(engine, field, value):
+    engine.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows first
     connection = engine.store._conn
     with connection:
         for row_id, state in connection.execute("SELECT rowid, state FROM audit_monitor_state WHERE monitor_id != '#facts'"
@@ -283,6 +284,7 @@ def test_a_shadow_mismatch_returns_the_full_result_and_disables_that_contract(co
     assert answer["incremental"]["incremental_mismatch"] == ["no-deploy"] and answer["incremental"]["shadow_compared"]
     health = twin.fast.store._conn.execute("SELECT status FROM audit_incremental_health WHERE monitor_id='no-deploy'").fetchall()
     assert [row[0] for row in health] == ["incremental_mismatch"]
+    twin.fast.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows first
     assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_monitor_state WHERE monitor_id='no-deploy'").fetchone()[0] == 0
     # From now on that contract is evaluated in full, in this process and after a restart.
     twin.fast.settings.audit_shadow_every = 0
@@ -332,6 +334,7 @@ def test_incremental_audits_can_be_switched_off(codex):
     twin.fast.settings.audit_incremental = False
     payload = twin.fast.audit_session(SID, provider="codex")
     assert "incremental" not in payload
+    twin.fast.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows first
     assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_monitor_state").fetchone()[0] == 0
 
 
@@ -345,10 +348,12 @@ def test_a_session_below_the_minimum_size_is_evaluated_in_full_without_state(cod
     fast, _full = twin.audit(SID)
     assert fast["incremental"]["mode"] == "full" and fast["incremental"]["below_min_events"] == 10_000
     assert "shadow_compared" not in fast["incremental"]
+    twin.fast.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows first
     assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_monitor_state").fetchone()[0] == 0
     twin.fast.settings.audit_incremental_min_events = 1           # once the session is large enough: state is kept
     fast, _full = twin.audit(SID)
     assert "below_min_events" not in fast["incremental"]
+    twin.fast.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows first
     assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_monitor_state").fetchone()[0] > 0
 
 
@@ -568,6 +573,7 @@ def test_a_pattern_timeout_is_no_verdict_and_no_state(codex, monkeypatch, where,
                         feed if where == "feed" else finding)
     answer = twin.fast.audit_session(SID, provider="codex")
     assert stable(answer) == stable(twin.full.audit_session(SID, provider="codex"))
+    twin.fast.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows first
     stored = {row[0] for row in twin.fast.store._conn.execute("SELECT monitor_id FROM audit_monitor_state")}
     assert "no-deploy" not in stored and stored - {"#facts"}, stored
     assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_incremental_health").fetchone()[0] == 0
@@ -617,6 +623,7 @@ def test_a_real_pathological_pattern_is_unknown_for_both_engines_and_leaves_no_s
     for _ in range(3):
         fast, _ = twin.audit(SID)
         assert {f["contract_id"]: f["reason"] for f in fast["findings"]}["slow"] == REGEX_TIMEOUT
+        twin.fast.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows first
         stored = {row[0] for row in twin.fast.store._conn.execute("SELECT monitor_id FROM audit_monitor_state")}
         assert "slow" not in stored and stored, stored
         write(path, codex_records(rng, 2, numbered), "a")
@@ -643,6 +650,7 @@ def test_a_shadow_run_whose_full_evaluation_times_out_keeps_the_unknown_answer_w
     assert by_id["slow"]["reason"] == REGEX_TIMEOUT and by_id["slow"]["verdict"] == "unknown"
     assert answer["incremental"]["shadow_skipped"] == "reference_regex_timeout"
     assert answer["incremental"]["regex_timeout"] == ["slow"] and "incremental_mismatch" not in answer["incremental"]
+    twin.fast.flush_derived()   # a deferring engine (TSUKKOMI_TEST_DEFER_DERIVED) writes held rows first
     stored = {row[0] for row in twin.fast.store._conn.execute("SELECT monitor_id FROM audit_monitor_state")}
     assert "slow" not in stored
     assert twin.fast.store._conn.execute("SELECT COUNT(*) FROM audit_incremental_health").fetchone()[0] == 0

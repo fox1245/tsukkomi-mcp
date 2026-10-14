@@ -22,7 +22,7 @@ from pathlib import Path
 
 from self_directing_mcp.claude_ids import SUBAGENTS, STEM as _STEM, UUID as _UUID, session_parts, valid_id  # noqa: F401
 from self_directing_mcp.codex import discover as _codex_discover
-from self_directing_mcp.session_events import iter_raw_lines, make_chunk, parse_error, result_success
+from self_directing_mcp.session_events import has_invalid_utf8, iter_raw_lines, make_chunk, parse_error, result_success
 from self_directing_mcp.tool_payload import tool_call_parts
 
 # Bumping this triggers a lazy per-session reparse on the next sync/audit of each already-indexed session.
@@ -836,7 +836,7 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
         if not raw.strip():
             continue
         try:
-            if any(0xDC80 <= ord(char) <= 0xDCFF for char in raw):
+            if has_invalid_utf8(raw):
                 raise ValueError("invalid UTF-8")
             record = json.loads(raw)
             if not isinstance(record, dict):

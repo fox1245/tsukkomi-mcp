@@ -47,8 +47,11 @@ class RequestControl:
             raise RequestStopped("request_deadline")
 
     def check(self):
-        with self._gate:
-            self._check()
+        # No gate: this runs inside every hot loop of an evaluation (tens of thousands of times per audit) and only
+        # reads state that ``cancel`` publishes atomically under the gates. A check that races a cancellation sees the
+        # stop at the next call; after ``cancel`` returned every check raises. ``publication`` still takes the gates, so
+        # admission and cancellation stay ordered.
+        self._check()
 
     def _lineage(self):
         controls = []
@@ -90,9 +93,9 @@ def current_request() -> RequestControl | None:
 
 
 def check_request() -> None:
-    control = current_request()
+    control = _active.get()
     if control is not None:
-        control.check()
+        control._check()
 
 
 @contextmanager
