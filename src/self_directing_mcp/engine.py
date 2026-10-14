@@ -81,6 +81,13 @@ def workflow_operation(method):
 
 
 
+CHECKLIST_EVALUATION_ATTEMPTS = 3
+
+
+class ChecklistConflict(ValueError):
+    """Checklist file or evidence moved between capture and publication."""
+
+
 class SelfDirectEngine:
     def __init__(self, settings: Settings | None = None) -> None:
         self._lock = RLock()
@@ -657,15 +664,15 @@ class SelfDirectEngine:
             except FileNotFoundError:
                 current = None
             if current != original:
-                raise ValueError("stale checklist preparation")
+                raise ChecklistConflict("stale checklist preparation")
             if refreshed is not None and not self._evidence_current(doc.session_id, provider, refreshed):
-                raise ValueError("checklist evidence changed during evaluation")
+                raise ChecklistConflict("checklist evidence changed during evaluation")
             temporary = path.with_suffix(path.suffix + ".tmp")
             try:
                 temporary.write_text(payload, encoding="utf-8")
                 with publication():
                     if refreshed is not None and not self._evidence_current(doc.session_id, provider, refreshed):
-                        raise ValueError("checklist evidence changed before publication")
+                        raise ChecklistConflict("checklist evidence changed before publication")
                     check_request()
                     temporary.replace(path)
             finally:
@@ -688,16 +695,45 @@ class SelfDirectEngine:
         assert self.checklists
         resolved_provider = self._resolve_provider(provider)
         sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
-        doc, original = self._capture_checklist(sid)
-        refreshed, evidence_chunks = None, []
-        if any(change.get("status") == RequirementStatus.DONE.value or "evidence_chunk_ids" in change
-               for change in update or []):
-            refreshed = self._refresh_evidence(sid, resolved_provider)
-            with self._publication_guard(), self.store._read_boundary():
-                evidence = self.store.capture_evidence(sid, resolved_provider)
-                if self.store.state_token(sid, resolved_provider) != refreshed["_metadata_token"]:
-                    refreshed["coverage"]["complete"] = False
-            evidence_chunks = evidence.list_chunks(sid, resolved_provider)
+        needs_evidence = any(change.get("status") == RequirementStatus.DONE.value or "evidence_chunk_ids" in change
+                             for change in update or [])
+        if not needs_evidence:
+            with self._publication_guard():
+                doc, original = self._capture_checklist(sid)
+                added, updated = self._apply_checklist_changes(doc, add, update, None, [])
+                self._save_checklist(doc, original, resolved_provider)
+        else:
+            for _attempt in range(CHECKLIST_EVALUATION_ATTEMPTS):
+                doc, original = self._capture_checklist(sid)
+                refreshed = self._refresh_evidence(sid, resolved_provider)
+                with self._publication_guard(), self.store._read_boundary():
+                    evidence = self.store.capture_evidence(sid, resolved_provider)
+                    if self.store.state_token(sid, resolved_provider) != refreshed["_metadata_token"]:
+                        refreshed["coverage"]["complete"] = False
+                evidence_chunks = evidence.list_chunks(sid, resolved_provider)
+                added, updated = self._apply_checklist_changes(doc, add, update, refreshed, evidence_chunks)
+                proof = refreshed if any(item.get("verified") and item.get("status") == RequirementStatus.DONE
+                                         for item in updated) else None
+                try:
+                    self._save_checklist(doc, original, resolved_provider, proof)
+                    break
+                except ChecklistConflict:
+                    continue
+            else:
+                return {"ok": False, "status": "checklist_conflict", "action_executed": False,
+                        "attempts": CHECKLIST_EVALUATION_ATTEMPTS,
+                        "message": "Checklist or evidence changed during every evaluation attempt; nothing was saved. Retry."}
+        remaining = [i for i in doc.items
+                     if i.status not in (RequirementStatus.DONE, RequirementStatus.REVOKED)]
+        return {
+            "ok": True,
+            "added": added,
+            "updated": updated,
+            "remaining": [i.model_dump(mode="json") for i in remaining],
+            "nudge": INCOMPLETE_NOTE if remaining else None,
+        }
+
+    def _apply_checklist_changes(self, doc, add, update, refreshed, evidence_chunks):
         added = []
         for item in add or []:
             entry = RequirementItem(
@@ -734,18 +770,7 @@ class SelfDirectEngine:
             item.history.append({"change": "updated", "from": before, "to": item.status,
                                  "evidence": len(item.evidence_chunk_ids)})
             updated.append(item.model_dump(mode="json"))
-        proof = refreshed if any(item.get("verified") and item.get("status") == RequirementStatus.DONE
-                                 for item in updated) else None
-        self._save_checklist(doc, original, resolved_provider, proof)
-        remaining = [i for i in doc.items
-                     if i.status not in (RequirementStatus.DONE, RequirementStatus.REVOKED)]
-        return {
-            "ok": True,
-            "added": added,
-            "updated": updated,
-            "remaining": [i.model_dump(mode="json") for i in remaining],
-            "nudge": INCOMPLETE_NOTE if remaining else None,
-        }
+        return added, updated
 
     @detached_operation
     def get_checklist(self, session_id: str, provider: str | None = None) -> dict[str, Any]:

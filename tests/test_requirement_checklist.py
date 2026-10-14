@@ -124,3 +124,114 @@ def test_only_current_linked_successful_results_verify_checklist(engine, exit_co
         assert engine.get_checklist(SID)["items"][0]["verified"] is False
     finally:
         engine.close()
+
+
+def _second_engine(engine):
+    return SelfDirectEngine(settings=engine.settings)
+
+
+def test_concurrent_checklist_adds_do_not_lose_updates(engine):
+    """Issue #6: read-modify-write without evaluation must hold the guard."""
+    import threading
+    second = _second_engine(engine)
+    errors, done, threads = [], threading.Event(), []
+
+    def other():
+        try:
+            second.update_checklist(SID, add=[{"text": "second"}])
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+        finally:
+            done.set()
+
+    original = engine._capture_checklist
+
+    def interleaving(sid):
+        result = original(sid)
+        if not threads:
+            thread = threading.Thread(target=other)
+            threads.append(thread)
+            thread.start()
+            done.wait(0.5)
+        return result
+
+    engine._capture_checklist = interleaving
+    try:
+        engine.update_checklist(SID, add=[{"text": "first"}])
+        threads[0].join(10)
+        assert not errors, errors
+        texts = sorted(i["text"] for i in engine.get_checklist(SID)["items"])
+        assert texts == ["first", "second"]
+        ids = [i["item_id"] for i in engine.get_checklist(SID)["items"]]
+        assert len(set(ids)) == 2
+    finally:
+        second.close()
+        engine.close()
+
+
+def _evidence_session(engine):
+    root = engine.settings.resolve_sessions_dir()
+    root.mkdir(parents=True)
+    path = root / f"rollout-2026-10-01T00-00-00-{SID}.jsonl"
+    rows = [
+        {"type": "session_meta", "payload": {"id": SID}},
+        {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+          "call_id": "observed-test", "arguments": '{"cmd":"python -m pytest"}'}},
+        {"type": "response_item", "payload": {"type": "function_call_output",
+          "call_id": "observed-test", "output": "Exit code: 0\n"}}]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    engine.sync_session(session_id=SID, path=str(path), embed=False)
+    return next(c for c in engine.store.list_chunks(SID, "codex") if c.kind == "tool_result")
+
+
+def test_evaluated_update_recaptures_after_concurrent_write(engine):
+    """A write landing between capture and save forces a re-capture, not an exception or lost update."""
+    second = _second_engine(engine)
+    try:
+        evidence = _evidence_session(engine)
+        engine.update_checklist(SID, add=[{"text": "Run the behavior check"}])
+        original, fired = engine._capture_checklist, []
+
+        def interleaving(sid):
+            result = original(sid)
+            if not fired:
+                fired.append(True)
+                second.update_checklist(SID, add=[{"text": "late"}])
+            return result
+
+        engine._capture_checklist = interleaving
+        result = engine.update_checklist(SID, update=[
+            {"item_id": "req-001", "status": "done", "evidence_chunk_ids": [evidence.chunk_id]}])
+        assert result["ok"] is True and result["updated"][0]["verified"] is True
+        items = engine.get_checklist(SID)["items"]
+        assert [i["text"] for i in items] == ["Run the behavior check", "late"]
+        assert items[0]["status"] == "done"
+    finally:
+        second.close()
+        engine.close()
+
+
+def test_evaluated_update_returns_conflict_status_after_bounded_retries(engine):
+    second = _second_engine(engine)
+    try:
+        evidence = _evidence_session(engine)
+        engine.update_checklist(SID, add=[{"text": "Run the behavior check"}])
+        original, calls = engine._capture_checklist, []
+
+        def interleaving(sid):
+            result = original(sid)
+            calls.append(1)
+            second.update_checklist(SID, add=[{"text": f"w{len(calls)}"}])
+            return result
+
+        engine._capture_checklist = interleaving
+        result = engine.update_checklist(SID, update=[
+            {"item_id": "req-001", "status": "done", "evidence_chunk_ids": [evidence.chunk_id]}])
+        assert result["ok"] is False and result["status"] == "checklist_conflict"
+        assert "stale" not in json.dumps(result) and len(calls) == 3
+        items = engine.get_checklist(SID)["items"]
+        assert items[0]["status"] == "open" and items[0]["verified"] is False
+        assert len(items) == 4
+    finally:
+        second.close()
+        engine.close()
