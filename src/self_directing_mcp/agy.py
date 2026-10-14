@@ -11,9 +11,12 @@ from pathlib import Path
 from self_directing_mcp.request_control import check_request
 from self_directing_mcp.session_events import (
     _identity, as_text, iter_raw_lines, make_chunk, parse_error, same_identity)
+from self_directing_mcp.tool_payload import tool_call_parts
 
 # v7: host NUL padding in front of a record, and the IDE's typed result and context steps.
-PARSER_VERSION = 7
+# v8: a tool call's model-written ``toolAction`` / ``toolSummary`` labels are kept out of the call text
+#     (``tool_payload``) and recorded in ``meta.tool_prose``; contracts match the payload only.
+PARSER_VERSION = 8
 DISPLAY_NAME, FULL_NAME = "transcript.jsonl", "transcript_full.jsonl"
 KNOWN_STATUS = frozenset({"DONE", "RUNNING", "ERROR", "INVALID", "CANCELED"})
 # The result of a tool call. The CLI writes every result as GENERIC; the IDE writes one step type per tool. Both
@@ -509,14 +512,15 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 for sub, (name, decoded) in enumerate(calls, 1):
                     # A planner proposal may subsequently be denied or cancelled.
                     # Preserve it for retrieval, never as observed execution.
+                    text, prose = tool_call_parts("agy", name, decoded, label="proposed_tool_call")
                     meta = {**base, "role": "runtime", "tool_name": name, "call_id": None,
-                            "evidence_origin": "model_proposal"}
+                            "evidence_origin": "model_proposal", **prose}
                     if "tool_calls" in cut.restored:
                         meta["source"] = "full"
                         if sub == 1:
                             meta.update(restored_fields=["tool_calls"], full_ref=cut.ref)
-                    chunks.append(make_chunk("agy", sid, "meta", f"[proposed_tool_call:{name}] {as_text(decoded)}",
-                                             meta, line, start, end, sub=sub, timestamp=timestamp))
+                    chunks.append(make_chunk("agy", sid, "meta", text, meta, line, start, end, sub=sub,
+                                             timestamp=timestamp))
                 if "tool_calls" in cut.still:
                     # Calls may be hidden beyond the visible ones, so even zero visible calls leave a marker.
                     chunks.append(make_chunk("agy", sid, "meta", f"[truncated_tool_calls] {len(calls)} visible",
@@ -575,10 +579,10 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                                   "evidence_origin": "host_hook_and_native_transcript",
                                   "receipt_step_index": step,
                                   "receipt_prefix_hash": receipt["prefix_hash"]}
-                    chunks.append(make_chunk("agy", sid, "tool_call",
-                                             f"[tool_call:{name}] {as_text(action['args'])}",
+                    text, prose = tool_call_parts("agy", name, action["args"])
+                    chunks.append(make_chunk("agy", sid, "tool_call", text,
                                              {**base, **provenance, "role": "assistant",
-                                              "tool_name": name, "call_id": call_id},
+                                              "tool_name": name, "call_id": call_id, **prose},
                                              line, start, end, timestamp=timestamp))
                     if receipt.get("post_error"):
                         success = False

@@ -15,7 +15,8 @@ import re
 import time
 
 from self_directing_mcp.compressed_source import CompressedSourceError
-from self_directing_mcp.session_events import as_text, make_chunk
+from self_directing_mcp.session_events import make_chunk
+from self_directing_mcp.tool_payload import tool_call_parts
 
 from self_directing_mcp.audit.contracts import (
     GLOBAL_CONTRACT_MEANING,
@@ -605,9 +606,11 @@ class SelfDirectEngine:
         planned = None
         if proposed is not None:
             action = ProposedAction.model_validate(proposed)
-            planned = make_chunk(provider, sid, "tool_call",
-                                 f"[tool_call:{action.tool_name}] {as_text(action.arguments)}",
-                                 {"role": "assistant", "tool_name": action.tool_name, "proposed": True},
+            # The same text builder as the parsers: a host's model-written prose field is not part of what the
+            # contracts match, in history and in the proposed action alike (see ``tool_payload``).
+            text, prose = tool_call_parts(provider, action.tool_name, action.arguments)
+            planned = make_chunk(provider, sid, "tool_call", text,
+                                 {"role": "assistant", "tool_name": action.tool_name, "proposed": True, **prose},
                                  0, coverage.get("byte_offset", 0), coverage.get("byte_offset", 0))
             planned.chunk_id = "proposed:" + planned.chunk_id
             # Preserve the public contracts_snapshot filtering/hash semantics.

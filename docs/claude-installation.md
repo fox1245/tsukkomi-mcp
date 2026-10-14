@@ -8,7 +8,7 @@ This document explains how to connect `tsukkomi-mcp` to Claude Code: the MCP ser
 
 | Part | What it does |
 |---|---|
-| Provider `claude` (parser version 2) | Reads Claude Code session transcripts, `<projects>/<project>/<session-uuid>.jsonl`, and subagent transcripts, `<projects>/<project>/<session-uuid>/subagents/agent-<agent-id>.jsonl`, as evidence. See [section 9](#9-how-the-claude-parser-decides-who-is-the-user). |
+| Provider `claude` (parser version 3) | Reads Claude Code session transcripts, `<projects>/<project>/<session-uuid>.jsonl`, and subagent transcripts, `<projects>/<project>/<session-uuid>/subagents/agent-<agent-id>.jsonl`, as evidence. See [section 9](#9-how-the-claude-parser-decides-who-is-the-user). |
 | MCP server | The same `python -m self_directing_mcp` server used for every host. The agent calls it with `provider: "claude"`. See [section 2](#2-register-the-mcp-server). |
 | Command hooks (opt-in) | `scripts/claude_hook.py` is registered for seven Claude Code events by `scripts/install_claude_hooks.py`. It judges proposed tool calls and stop checkpoints with the same contracts. See [sections 3 and 4](#3-install-the-hooks). |
 
@@ -227,13 +227,15 @@ Fail-open also covers the cases the hooks cannot see: hosted tools that emit no 
 
 ## 9. How the Claude parser decides who is the user
 
-Parser version 2 (`src/self_directing_mcp/claude.py`) treats authority as something the host recorded, never something the text claims. A user turn is only:
+Parser version 3 (`src/self_directing_mcp/claude.py`) treats authority as something the host recorded, never something the text claims. A user turn is only:
 
 - a record the host stamped `origin.kind == "human"` that is not a meta, compaction or tool-result-carrying message;
 - in a main transcript only, a legacy prompt from before origin stamps existed (no `origin` at all), marked `attribution: "inferred_legacy"`;
 - a `queued_command` attachment that has `origin.kind == "human"`, `commandMode == "prompt"` and is not `isMeta`. A queued command with any other origin or mode is runtime evidence. A human origin on a meta or compaction record, or on a queued command that is not a prompt, is a contradiction and is reported as unsupported.
 
 Everything else is runtime evidence and can neither grant nor revoke a user permission: task notifications, peer and coordinator messages, injected meta messages, compaction summaries, transcript-only messages, text riding with tool results, attachments, hook output, tool results, synthetic or API-error assistant text, scheduled-task announcements, and a subagent's task prompt (the parent agent's instruction, not the human's).
+
+**Model-written tool prose (parser version 3).** Claude Code's `Bash` input (and that of the other built-in tools that take one) carries a `description`: a label the model writes about the call. It is not part of what the call does, so the parser removes it from the indexed call text (`[tool_call:Bash] {"command": "..."}`) and keeps it in `meta.tool_prose`. The `PreToolUse` hook's proposed action goes through the same builder, so a careful `ls -l data/app.sqlite3` is no longer matched by a `sqlite3` prohibition because its description mentions it, while `sqlite3 data/app.sqlite3` in `command` still is, whatever the description says. An MCP tool (`mcp__server__tool`) defines its own schema; its `description` argument may be real content and stays payload, like every field that is not a confirmed prose field. Raising the parser version from 2 to 3 reparses each indexed session once, on its next sync or audit.
 
 **Scheduled tasks (parser version 2).** When a scheduled task (a cron entry) fires, Claude Code writes a `system` record with `subtype: "scheduled_task_fire"`; its `prompt` is the scheduled automation text. The parser records it as runtime metadata (`evidence_origin: "scheduled_task_fire"`, `role: "runtime"`) and, like every other `system` payload, validates `prompt` and `content` as text and replaces them by a placeholder: the scheduled prompt is not indexed and is never a user turn, so it cannot satisfy or violate a user-role contract. Only short identifiers reach the index and the metadata (`task_id`, `task_kind`, `cron_kind` and a `cron` expression made of digits and cron punctuation); an odd identifier is dropped. A payload field that is not text, and every other system subtype (including look-alikes such as `scheduled_task_fired`), stays an unsupported event that keeps coverage incomplete. Raising the parser version from 1 to 2 reparses each indexed Claude Code session once, on its next sync or audit; event ids, anchors and cached vectors of unchanged events survive.
 

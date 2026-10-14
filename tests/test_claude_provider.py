@@ -392,7 +392,10 @@ def test_tool_use_and_result_are_linked_and_success_comes_from_is_error(root):
     results = [c for c in chunks if c.kind == "tool_result"]
     assert [c.meta["call_id"] for c in calls] == [c.meta["call_id"] for c in results] == [
         "toolu_ok", "toolu_bad", "toolu_text", "toolu_unknown"]
-    assert calls[0].text == '[tool_call:Bash] {"command": "npm test", "description": "run tests"}'
+    # The model-written ``description`` is prose about the call, not payload: it is kept in meta, out of the text
+    # that contracts match (see tests/test_tool_prose.py).
+    assert calls[0].text == '[tool_call:Bash] {"command": "npm test"}'
+    assert calls[0].meta["tool_prose"] == {"description": "run tests"}
     assert calls[0].meta["tool_name"] == "Bash" and calls[0].meta["role"] == "assistant"
     assert calls[0].meta["message_id"] == "msg_synthetic_1" and calls[0].meta["request_id"] == "req_synthetic_1"
     assert [c.meta["success"] for c in results] == [True, False, False, None]

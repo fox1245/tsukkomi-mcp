@@ -621,7 +621,7 @@ def test_a_parser_bump_turns_unsupported_ide_steps_into_supported_ones(env, monk
         first = sync(engine, path)
     assert first["coverage"]["unsupported_event_count"] == 7 and first["parser_version"] == 6
     second = sync(engine, path)
-    assert second["reindexed"] and second["reindex_reason"] == "parser_updated" and second["parser_version"] == 7
+    assert second["reindexed"] and second["reindex_reason"] == "parser_updated" and second["parser_version"] == agy.PARSER_VERSION
     assert second["coverage"]["unsupported_event_count"] == 0 and second["coverage"]["complete"]
     assert not sync(engine, path)["reindexed"]
     persisted = second["coverage"]["agy_evidence"]
