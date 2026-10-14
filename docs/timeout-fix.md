@@ -1,6 +1,6 @@
 # Shared-index concurrency and request deadlines
 
-Current correction: [issue #3](https://github.com/fox1245/tsukkomi-mcp/issues/3), investigated against production source `7618028`. All reproductions use synthetic sources, isolated indexes and the real local engine/native graph. No live model call is needed to verify these boundaries.
+Current correction: [issue #3](https://github.com/fox1245/tsukkomi-mcp/issues/3), investigated against production source `7618028` and shipped in 0.6.0. The 0.6.0 follow-ups ([#4](https://github.com/fox1245/tsukkomi-mcp/issues/4), [#5](https://github.com/fox1245/tsukkomi-mcp/issues/5), [#6](https://github.com/fox1245/tsukkomi-mcp/issues/6), [#8](https://github.com/fox1245/tsukkomi-mcp/issues/8), [#10](https://github.com/fox1245/tsukkomi-mcp/issues/10)) are summarized at the end of this page. All reproductions use synthetic sources, isolated indexes and the real local engine/native graph. No live model call is needed to verify these boundaries.
 
 ## Protected state and execution boundaries
 
@@ -21,7 +21,7 @@ Ordinary requests/hooks share an absolute monotonic deadline and cancellation co
 | Error | Meaning |
 | --- | --- |
 | `index_busy` | A live request exhausted the engine/file writer-lease wait |
-| `request_deadline` | The request's response/execution deadline expired |
+| `request_deadline` | The request's response/execution deadline expired, including while it waited for a heavy-call slot; a call that expired in that queue never started |
 | `request_cancelled` | Its cancellation state was observed |
 | `operation_timeout` | A worker raised a separate, unclassified timeout |
 
@@ -49,10 +49,21 @@ python scripts/poc_shared_index_queue.py run --neograph-root ../NeoGraph --worke
 python -m build
 ```
 
-These are local deep checks. CI remains only the explicit lightweight transport/JEV/session-path smoke files and distribution build; no performance, large-session, native compilation or paid-model gate is added.
+These are local deep checks. CI runs the lightweight transport/JEV/session-path smoke files with a distribution build and, since 0.6.0, a separate Linux `memory-audit-regressions` job of small offline tests (memory, prefix freshness, append capture, single-flight, concurrency and deadlines). No performance, large-session, native compilation or paid-model gate is added.
+
+## 0.6.0 follow-ups
+
+These build on the snapshot and request-control work above.
+
+- **Heavy-call gate ([#5](https://github.com/fox1245/tsukkomi-mcp/issues/5)).** Sync, search, audit, `check_action`, checklist, graph, activity and hook calls run in worker threads, at most `SELF_DIRECT_MAX_CONCURRENT_CALLS` (default 4) at a time. Waiting for a slot spends the request's own deadline. A slot is released when the worker thread really finishes, not when its caller gives up. `list_contracts`, `upsert_contracts`, `revoke_contract`, `get_chunk`, `audit_status` and `workflow_*` calls bypass the gate. After the last running heavy call that took at least 0.5 s (at most once every 5 s), glibc Linux processes call `malloc_trim(0)`.
+- **Single-flight and streaming.** Capture, parse and publication for one (index, provider, session id) run one at a time in a process, so parallel hooks no longer parse the same session repeatedly. Source capture hashes the file without retaining its bytes and tolerates appended records (`unread_bytes`). Reparses spool rows to disk and publish them in batches. Cross-process safety is still the metadata state-token compare-and-swap at publication, and a capture older than a cursor another process already published is retaken.
+- **Audit evaluation of growing sessions ([#4](https://github.com/fox1245/tsukkomi-mcp/issues/4), [#8](https://github.com/fox1245/tsukkomi-mcp/issues/8)).** The final source check re-hashes the captured prefix outside the lock and re-checks only identity, size and the last 64 KiB under it. Pure growth is judged as of the captured offset; any other change is `source_changed_during_evaluation` and `unknown`. See the README's "Coverage and verdicts".
+- **`audit_status`.** The sparse count reads the `chunk_rows` mirror table instead of scanning the FTS5 table under the shared lock. The status call itself bypasses the gate.
+- **Checklist conflicts ([#6](https://github.com/fox1245/tsukkomi-mcp/issues/6)).** Plain checklist edits run inside one publication guard. An update that needs evidence evaluation retries three times, then returns `checklist_conflict` without saving.
+- **Measured effect.** On a 100 MB synthetic OMP session with 8 concurrent threads, peak RSS fell from 2,304 MB to 193 MB and the first sync no longer hit `index_busy` (PR #7; table in the README).
 
 ## Deployment and historical measurements
 
-Every process sharing an index must use the updated code from its actual configured source/package and be restarted through its owner's normal deployment procedure. Updating a checkout or passing a temporary-index PoC does not update running servers. This work does not terminate deployment processes or rewrite their indexes.
+Every process sharing an index must use the updated code from its actual configured source/package and be restarted through its owner's normal deployment procedure. Updating a checkout or passing a temporary-index PoC does not update running servers. This work does not terminate deployment processes or rewrite their indexes. A parser-version bump (OMP 8, Codex 3) then reparses each session lazily on its next sync.
 
 Historical v0.3/v0.4 comparison: a synthetic 83,908,974-byte transcript reported a v0.4 warm action check of 0.336 s, full audit of 1.566 s and cold sync of 12.106 s. Those measurements were made before this snapshot/request-control correction and are not current performance guarantees or CI gates.

@@ -37,9 +37,11 @@ Register the server in `~/.gemini/config/mcp_config.json`:
   }
 }
 ```
-Use `~/.config/tsukkomi-mcp/config.toml` with a `[paths]` table, or set `SELF_DIRECT_CONFIG_FILE` in the server environment to select another file. See [config.example.toml](../config.example.toml) and the [path source contract](../README.md#user-path-configuration-toml). Relative TOML paths use the configuration file's directory; explicit arguments/environment override them.
+The `python` in the entry must be the interpreter of an environment where this package is installed. Its dependencies include the exact `neograph-engine==0.14.1`; a missing native NeoGraph runtime is an error, not a fallback.
 
-Without an override, the index remains `~/.self_direct_index`, not the installed package. Preserve an existing/managed index by selecting its absolute `index_dir` in TOML or `SELF_DIRECT_INDEX_DIR`. No stored evidence or rules are automatically migrated.
+Configure paths and credentials with explicit `SELF_DIRECT_*` variables in the server entry's `env`, or with `~/.config/tsukkomi-mcp/config.toml` and a `[paths]` table (set `SELF_DIRECT_CONFIG_FILE` in the server environment to select another file). A `.env` is read only from the server process's working directory, which the host chooses, so do not rely on it. See [config.example.toml](../config.example.toml) and the [path source contract](../README.md#user-path-configuration-toml). Relative TOML paths use the configuration file's directory; explicit arguments/environment override them.
+
+Without an override, the index is `~/.self_direct_index`, not a directory inside the installed package or checkout (older versions defaulted to one inside the checkout). Preserve an existing/managed index by selecting its absolute `index_dir` in TOML or `SELF_DIRECT_INDEX_DIR`. No stored evidence or rules are automatically migrated.
 
 Select `sqlite_vector_path` and `openrouter_api_key_file` in TOML or their `SELF_DIRECT_` environment equivalents. Only the authorized key file's path belongs in TOML, not the key value. Missing or keyless selected files still fail closed. Keep the TOML and credentials outside writable workflow workspaces.
 
