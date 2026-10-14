@@ -1435,6 +1435,11 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                     known = store.cursor_record(sid_hint.lower() if provider in ("codex", "agy") else sid_hint, provider)
                     record = store.source_block_record(known["session_id"], provider) if known else None
                 hint = (known["byte_offset"],) if known and type(known["byte_offset"]) is int else ()
+                if provider == "agy":
+                    # Every receipt anchors to a prefix digest and the ledger to a verified length: hash the capture
+                    # at those offsets and none of them costs a second read of the file.
+                    from self_directing_mcp.agy_receipts import ReceiptStore
+                    hint += ReceiptStore(store.db_path.parent).checkpoints(sid_hint.lower(), path)
             except (OSError, sqlite3.Error):
                 hint, known, record = (), None, None
         observation = _capture_observation(path, provider, known, record, hint, verify, policy,
@@ -1501,9 +1506,10 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 # A fallback that failed because the full log was missing or not yet at that step: it is retried
                 # once per change of the full log, and only for those transient failures.
                 start, reindexed, reindex_reason = 0, True, "truncated_fallback_retry"
-        receipt_digest = None
+        receipt_digest = receipt_ledger = None
         if receipt_store is not None:
-            receipt_rows, receipts, receipt_digest, indexed_digest = receipt_store.prepare_bindings(receipt_capture, path)
+            receipt_rows, receipts, receipt_digest, indexed_digest, receipt_ledger = receipt_store.prepare_bindings(
+                receipt_capture, path, session_id=sid, observation=observation)
             if cursor and (receipt_digest != indexed_digest or cursor.get("receipt_digest") != receipt_digest):
                 start, reindexed, reindex_reason = 0, True, "hook_receipts_changed"
         chunks = RowSpool()
@@ -1562,7 +1568,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 if receipt_store is not None:
                     if receipt_store.authority_token(sid) != receipt_authority_before:
                         raise ValueError("receipt authority changed during preparation")
-                    receipt_store.publish_bindings(sid, receipt_capture, receipt_rows)
+                    receipt_store.publish_bindings(sid, receipt_capture, receipt_rows, receipt_ledger)
                 # A cursor without a block table (written before this version, by an older process, or after a
                 # change of source form) is republished with one, even when nothing else changed.
                 own = draft is not None and cursor is not None and cursor["path"] == str(path) and relation is None

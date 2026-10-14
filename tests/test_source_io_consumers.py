@@ -238,15 +238,15 @@ def test_agy_receipt_preserves_prior_authority_after_failed_full_read(tmp_path, 
                                      "status": "DONE", "content": "The command exited with code 0."}) + "\n")
     before = receipts.read_capture(SID)
     fault = _ReadFault(monkeypatch, path)
-    completed = agy_receipts._completed_results
+    scan = agy_receipts._scan  # the one parse of the transcript a receipt makes (through the ledger)
 
     def arm_after_inspection(*args, **kwargs):
-        result = completed(*args, **kwargs)
+        result = scan(*args, **kwargs)
         _touch(path)
         fault.armed = True
         return result
 
-    monkeypatch.setattr(agy_receipts, "_completed_results", arm_after_inspection)
+    monkeypatch.setattr(agy_receipts, "_scan", arm_after_inspection)
     with pytest.raises(ValueError, match="source changed during receipt preparation"):
         receipts.record(SID, path, 1, tool, event, error="" if event == "PostToolUse" else None)
     assert fault.errors == 1
