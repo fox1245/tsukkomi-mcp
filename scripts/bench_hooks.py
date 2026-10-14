@@ -298,6 +298,76 @@ if IS_WINDOWS:
     def win_open(pid: int):
         return _k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, False, pid)
 
+    class _JobAccounting(ctypes.Structure):
+        _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                    ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                    ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+                    ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
+
+    class _JobPids(ctypes.Structure):
+        _fields_ = [("NumberOfAssignedProcesses", wintypes.DWORD), ("NumberOfProcessIdsInList", wintypes.DWORD),
+                    ("ProcessIdList", ctypes.c_size_t * 64)]
+
+    _ntdll = ctypes.WinDLL("ntdll")
+    _k32.CreateJobObjectW.restype = wintypes.HANDLE
+    _k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    _k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _k32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                               ctypes.POINTER(wintypes.DWORD)]
+    _ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    CREATE_SUSPENDED = 0x4
+
+    class WinJob:
+        """A venv's ``python.exe`` is a launcher that starts the real interpreter as a child, so the process Popen
+        returns is not the one to measure. The whole tree runs in a job object: CPU is the job's user+kernel time
+        (a few milliseconds of it is the launcher) and peak memory is that of the interpreter, found by sampling the
+        job's process list while it runs and reading ``GetProcessMemoryInfo`` through handles kept open."""
+
+        def __init__(self) -> None:
+            self.handle = _k32.CreateJobObjectW(None, None)
+            self.opened: dict[int, object] = {}
+
+        def start(self, argv, **kwargs) -> subprocess.Popen:
+            proc = subprocess.Popen(argv, creationflags=kwargs.pop("creationflags", 0) | CREATE_SUSPENDED, **kwargs)
+            process = wintypes.HANDLE(int(proc._handle))
+            _k32.AssignProcessToJobObject(self.handle, process)     # children inherit the job
+            _ntdll.NtResumeProcess(process)
+            return proc
+
+        def sample(self) -> None:
+            info = _JobPids()
+            if _k32.QueryInformationJobObject(self.handle, 3, ctypes.byref(info), ctypes.sizeof(info), None):
+                for pid in info.ProcessIdList[:info.NumberOfProcessIdsInList]:
+                    if pid not in self.opened:
+                        self.opened[pid] = win_open(pid)
+
+        def cpu(self) -> float:
+            info = _JobAccounting()
+            if not _k32.QueryInformationJobObject(self.handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
+                return float("nan")
+            return (info.TotalUserTime + info.TotalKernelTime) / 1e7
+
+        def memory(self) -> dict:
+            """Working set, peak working set and private bytes of the biggest process in the job."""
+            best: dict = {}
+            for handle in self.opened.values():
+                if handle:
+                    current = win_memory(handle)
+                    if current.get("peak_rss", 0) > best.get("peak_rss", -1):
+                        best = current
+            return best
+
+        def terminate(self) -> None:
+            _k32.TerminateJobObject(self.handle, 1)
+
+        def close(self) -> None:
+            for handle in self.opened.values():
+                if handle:
+                    _k32.CloseHandle(handle)
+            if self.handle:
+                _k32.CloseHandle(self.handle)
+
 
 def self_cpu() -> float:
     """CPU seconds (user+sys, all threads) used by this process so far."""
@@ -336,15 +406,10 @@ def proc_status(pid: int) -> dict:
     return out
 
 
-def process_memory(proc: subprocess.Popen) -> dict:
+def process_memory(proc: subprocess.Popen, job=None) -> dict:
     if IS_WINDOWS:
-        handle = win_open(proc.pid)
-        if not handle:
-            return {}
-        try:
-            return {**win_memory(handle), "cpu_s": win_cpu(handle)}
-        finally:
-            _k32.CloseHandle(handle)
+        job.sample()
+        return {**job.memory(), "cpu_s": job.cpu()}
     return proc_status(proc.pid)
 
 
@@ -480,15 +545,30 @@ def run_process(argv: list[str], stdin_bytes: bytes, env: dict, cwd: Path, timeo
         with (scratch / "in").open("rb") as fin, (scratch / "out").open("wb") as fout, \
                 (scratch / "err").open("wb") as ferr:
             start = time.perf_counter()
-            proc = subprocess.Popen(argv, stdin=fin, stdout=fout, stderr=ferr, env=env, cwd=str(cwd))
+            job = WinJob() if IS_WINDOWS else None
+            if job is not None:
+                proc = job.start(argv, stdin=fin, stdout=fout, stderr=ferr, env=env, cwd=str(cwd))
+            else:
+                proc = subprocess.Popen(argv, stdin=fin, stdout=fout, stderr=ferr, env=env, cwd=str(cwd))
             peak, cpu = None, None
             try:
-                if IS_WINDOWS:
-                    proc.wait(timeout=timeout)
-                    wall = time.perf_counter() - start
-                    handle = int(proc._handle)          # still open: Popen closes it with the object
-                    memory = win_memory(wintypes.HANDLE(handle))
-                    cpu, peak = win_cpu(wintypes.HANDLE(handle)), memory.get("peak_rss")
+                if job is not None:
+                    done = threading.Event()
+
+                    def watch() -> None:
+                        while not done.is_set():
+                            job.sample()
+                            time.sleep(0.003)
+                    sampler = threading.Thread(target=watch, daemon=True)
+                    sampler.start()
+                    try:
+                        proc.wait(timeout=timeout)
+                        wall = time.perf_counter() - start
+                    finally:
+                        done.set()
+                        sampler.join()
+                    cpu, peak = job.cpu(), job.memory().get("peak_rss")
+                    job.close()
                 else:
                     deadline = time.monotonic() + timeout
                     while True:
@@ -505,6 +585,8 @@ def run_process(argv: list[str], stdin_bytes: bytes, env: dict, cwd: Path, timeo
                     cpu = usage.ru_utime + usage.ru_stime
                     peak = usage.ru_maxrss if sys.platform == "darwin" else usage.ru_maxrss * 1024
             except subprocess.TimeoutExpired:
+                if job is not None:
+                    job.terminate()
                 proc.kill()
                 raise
         return {"wall_s": wall, "cpu_s": cpu, "peak_rss": peak, "returncode": proc.returncode,
@@ -819,9 +901,11 @@ class StdioServer:
         extra = {"SELF_DIRECT_LOCAL_ONLY": "true"} if profile == "local-only" else {
             "SELF_DIRECT_USE_FAKE_EMBEDDER": "true", "SELF_DIRECT_DENSE_BACKEND": "numpy"}
         self.number = number
-        self.proc = subprocess.Popen([sandbox.python, "-m", "self_directing_mcp"], stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(sandbox.root),
-                                     env=sandbox.env(config, **extra))
+        self.job = WinJob() if IS_WINDOWS else None
+        launch = self.job.start if self.job is not None else subprocess.Popen
+        self.proc = launch([sandbox.python, "-m", "self_directing_mcp"], stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(sandbox.root),
+                           env=sandbox.env(config, **extra))
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
         self.started = time.perf_counter()
@@ -861,7 +945,7 @@ class StdioServer:
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.wait_for(2)
-        self.start_cpu_s = process_memory(self.proc).get("cpu_s")
+        self.start_cpu_s = process_memory(self.proc, self.job).get("cpu_s")
 
     def use(self) -> None:
         self.send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -873,7 +957,11 @@ class StdioServer:
             self.proc.stdin.close()
             self.proc.wait(timeout=5)
         except Exception:
+            if self.job is not None:
+                self.job.terminate()
             self.proc.kill()
+        if self.job is not None:
+            self.job.close()
 
 
 def idle_servers(sandbox: Sandbox, count: int, profile: str, log=print) -> dict:
@@ -882,11 +970,11 @@ def idle_servers(sandbox: Sandbox, count: int, profile: str, log=print) -> dict:
         for server in servers:
             server.handshake()
         time.sleep(1.0)
-        after_init = [process_memory(s.proc) for s in servers]
+        after_init = [process_memory(s.proc, s.job) for s in servers]
         for server in servers:
             server.use()
         time.sleep(1.0)
-        after_use = [process_memory(s.proc) for s in servers]
+        after_use = [process_memory(s.proc, s.job) for s in servers]
     finally:
         for server in servers:
             server.stop()
