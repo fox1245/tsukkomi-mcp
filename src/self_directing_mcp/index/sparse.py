@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from self_directing_mcp.request_control import check_request, publication, request_operation
+from self_directing_mcp.security.mask import mask_secrets
 
 
 def _fts_query(raw: str) -> str:
@@ -99,7 +100,7 @@ class SparseIndex:
                 self._conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (row[0],))
             inserted = self._conn.execute(
                 "INSERT INTO chunks_fts(chunk_id,session_id,kind,text) VALUES (?,?,?,?)",
-                (chunk_id, session_id, kind, text))
+                (chunk_id, session_id, kind, mask_secrets(text)))
             self._conn.execute("INSERT OR REPLACE INTO chunk_rows VALUES (?,?)", (chunk_id, inserted.lastrowid))
             with publication():
                 self._conn.commit()
@@ -126,7 +127,7 @@ class SparseIndex:
                     self._conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (row[0],))
                 inserted = self._conn.execute(
                     "INSERT INTO chunks_fts(chunk_id,session_id,kind,text) VALUES (?,?,?,?)",
-                    (chunk.chunk_id, chunk.session_id, chunk.kind, chunk.text))
+                    (chunk.chunk_id, chunk.session_id, chunk.kind, mask_secrets(chunk.text)))
                 self._conn.execute("INSERT OR REPLACE INTO chunk_rows VALUES (?,?)",
                                    (chunk.chunk_id, inserted.lastrowid))
             with publication():

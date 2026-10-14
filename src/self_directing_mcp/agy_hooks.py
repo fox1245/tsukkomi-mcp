@@ -18,6 +18,7 @@ from typing import Any, TYPE_CHECKING
 
 from self_directing_mcp import agy_hook_state as hook_state
 from self_directing_mcp.agy_hook_state import AUDIT_UNAVAILABLE, CHECK_FAILED, HookState
+from self_directing_mcp.security.mask import mask_value
 
 if TYPE_CHECKING:
     from self_directing_mcp.engine import SelfDirectEngine
@@ -329,10 +330,11 @@ def main() -> None:
     try:
         payload = json.load(sys.stdin)
     except Exception as exc:
+        # Only the error class is reported; the raw stdin payload never reaches diagnostics.
         response = hook_state.fail_open(event, None, type(exc).__name__, CHECK_FAILED)
     else:
         response = run_hook(event, payload)
-    json.dump(response, sys.stdout)
+    json.dump(mask_value(response), sys.stdout)  # contract text, graph context and reasons may quote history
     sys.stdout.write("\n")
 
 

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from self_directing_mcp.security.mask import mask_secrets
+
 
 ANALYSIS_SCHEMA_VERSION = 1
 
@@ -53,7 +55,7 @@ def _repeated_errors(rows) -> list[dict[str, Any]]:
     errors = [r for r in rows if r["kind"] == "tool_result" and r["success"] is False]
     by_signature: dict[str, list[dict[str, Any]]] = {}
     for r in errors:
-        signature = (r["tool_name"] or "") + ":" + (r["error_text"] or "")[:120]
+        signature = (r["tool_name"] or "") + ":" + mask_secrets(r["error_text"] or "")[:120]
         by_signature.setdefault(signature, []).append(r)
     out = []
     for signature, group in by_signature.items():
@@ -109,7 +111,7 @@ def _stalled_requirements(store, session_id, provider) -> list[dict[str, Any]]:
             continue
         is_stalled = item.get("status") in ("open", "in_progress") and not item.get("evidence_chunk_ids")
         if is_stalled or item.get("status") == "blocked":
-            stalled_item = {"item_id": item["item_id"], "text": item["text"][:200],
+            stalled_item = {"item_id": item["item_id"], "text": mask_secrets(item["text"])[:200],
                             "status": item["status"]}
             if item.get("blocked_reason"):
                 stalled_item["blocked_reason"] = item["blocked_reason"]
@@ -127,7 +129,7 @@ def _around_instructions(rows) -> list[dict[str, Any]]:
             continue
         before = [rows[j]["chunk_id"] for j in range(max(0, i - 3), i)]
         after = [rows[j]["chunk_id"] for j in range(i + 1, min(i + 4, len(rows)))]
-        out.append({"instruction_event": r["chunk_id"], "snippet": (r["text"] or "")[:160],
+        out.append({"instruction_event": r["chunk_id"], "snippet": mask_secrets(r["text"] or "")[:160],
                     "events_before": before, "events_after": after if (after := [rows[j]["chunk_id"] for j in range(i + 1, min(i + 4, len(rows)))]) else []})
     return out[:20]
 
@@ -158,7 +160,7 @@ def _fix_reverify(rows) -> list[dict[str, Any]]:
         after = rows[f + 1:f + 15]
         fix = next((r for r in after if r["kind"] == "tool_call"), None)
         reverify = next((r for r in after if r["kind"] == "tool_result" and r["success"] is True), None)
-        entry = {"failed_event": rows[f]["chunk_id"], "error": (rows[f]["error_text"] or "")[:120]}
+        entry = {"failed_event": rows[f]["chunk_id"], "error": mask_secrets(rows[f]["error_text"] or "")[:120]}
         if fix:
             entry["fix_attempt"] = fix["chunk_id"]
         if reverify:

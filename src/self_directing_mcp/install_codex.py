@@ -14,6 +14,7 @@ import tomllib
 import uuid
 
 from self_directing_mcp.codex_rpc import CodexRPC
+from self_directing_mcp.security.mask import mask_secrets
 
 SERVER = "self-directing-mcp"
 HOOK_TOOL = "codex_session_hook"
@@ -314,7 +315,7 @@ def main():
         print(json.dumps(result, indent=2, ensure_ascii=False))
     except Exception as exc:
         # Do not print config values, tokens, or remote server output.
-        print(json.dumps({"ok": False, "error": type(exc).__name__, "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps({"ok": False, "error": type(exc).__name__, "message": mask_secrets(str(exc))}, ensure_ascii=False), file=sys.stderr)
         raise SystemExit(1)
 
 

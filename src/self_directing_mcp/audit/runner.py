@@ -185,7 +185,7 @@ def audit_contract(rule, *, session_id, store, retriever=None, provider=None, pr
                            basis=f"{rule.id}.exception_regex matched the same event(s); user-authorized exception requires confirmation")
         reason = f"forbidden regex matched {len(hits)} event(s)"
         if rule.source_quote:
-            reason += f"; user said: {rule.source_quote[:120]}"
+            reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
         return finding("violation", reason,
                        basis=f"{rule.id}.regex '{rule.regex}' matched prohibited content", items=[evidence(c) for c in hits[:20]])
     if trigger:
@@ -464,7 +464,7 @@ def _attempt_hits(rule, item, events, positions, blocked) -> None:
         return  # already at least this severe (it was matched on a receipt-linked call)
     reason = f"forbidden regex matched {len(hits)} host-logged call attempt(s); execution is not proven"
     if rule.source_quote:
-        reason += f"; user said: {rule.source_quote[:120]}"
+        reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
     item.verdict, item.reason = verdict, reason
     item.basis = f"{rule.id}.regex '{rule.regex}' matched a proposed call; the attempt itself is the violation"
     item.evidence = [evidence(hit, "forbidden call attempt (model proposal)") for hit in hits[:20]]

@@ -62,7 +62,9 @@ def main() -> None:
                     result = controller.authorize(**common, classification_id=args.classification, action=action)
                 else:
                     result = controller.execute(**common, grant=args.grant, action=action)
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
+        from self_directing_mcp.security.mask import mask_value
+        # The single-use grant is the one credential this command must hand to its caller.
+        print(json.dumps(mask_value(result, skip_keys={"grant"}), ensure_ascii=False, sort_keys=True, allow_nan=False))
         if not result.get("ok"):
             raise SystemExit(1)
     except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
