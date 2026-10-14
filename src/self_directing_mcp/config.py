@@ -153,6 +153,12 @@ class Settings(BaseSettings):
         gt=0,
         description="Upper bound for client-provided timeout_ms on long-running tools.",
     )
+    max_concurrent_calls: int = Field(
+        default=4,
+        ge=1,
+        description="Max heavy tool calls (sync/search/audit/checklist/hooks) running at once; "
+                    "excess requests queue within their own deadline. SELF_DIRECT_MAX_CONCURRENT_CALLS.",
+    )
     rrf_k: int = 60
     retrieve_top_k: int = 20
     search_top_k: int = 10

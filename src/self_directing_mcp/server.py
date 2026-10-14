@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 import argparse
 import asyncio
+import ctypes
+import sys
 import time
 from threading import Event
 
@@ -73,12 +75,81 @@ def _collect_worker_exception(worker):
         worker.exception()
 
 
-async def _await_request(work, control, budget):
-    # Keep the actual thread task alive to collect its eventual exception.
-    worker = asyncio.create_task(asyncio.to_thread(work))
-    worker.add_done_callback(_collect_worker_exception)
+TRIM_MIN_CALL_SEC = 0.5
+TRIM_MIN_INTERVAL_SEC = 5.0
+_last_trim = 0.0
+
+
+def _libc():
     try:
-        done, _ = await asyncio.wait({worker}, timeout=budget)
+        return ctypes.CDLL("libc.so.6")
+    except OSError:
+        return None
+
+
+def _trim_heap():
+    """Return freed glibc heap to the OS; Linux/glibc only, failures ignored."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        trim = getattr(_libc(), "malloc_trim", None)
+        if trim is not None:
+            trim(0)
+    except Exception:
+        pass
+
+
+class _HeavyGate:
+    """Loop-local semaphore for heavy engine work. Slots are released only when the
+    worker thread really finishes, so abandoned (deadline-expired) workers still count."""
+
+    def __init__(self):
+        self._loop = self._limit = self._sem = None
+        self.running = 0
+
+    async def acquire(self, deadline):
+        loop, limit = asyncio.get_running_loop(), max(1, _engine.settings.max_concurrent_calls)
+        if self._sem is None or self._loop is not loop or self._limit != limit:
+            self._loop, self._limit, self._sem, self.running = loop, limit, asyncio.Semaphore(limit), 0
+        sem = self._sem
+        try:
+            await asyncio.wait_for(sem.acquire(), max(0.0, deadline - time.monotonic()))
+        except TimeoutError:
+            raise RequestStopped("request_deadline") from None
+        self.running += 1
+        return sem
+
+    def release(self, sem, started):
+        sem.release()
+        if sem is not self._sem:
+            return
+        self.running -= 1
+        global _last_trim
+        now = time.monotonic()
+        if (self.running == 0 and now - started >= TRIM_MIN_CALL_SEC
+                and now - _last_trim >= TRIM_MIN_INTERVAL_SEC):
+            _last_trim = now
+            self._loop.run_in_executor(None, _trim_heap)
+
+
+_gate = _HeavyGate()
+
+
+async def _await_request(work, control, budget, heavy=True):
+    # Keep the actual thread task alive to collect its eventual exception.
+    slot = await _gate.acquire(control.deadline) if heavy else None
+    started = time.monotonic()
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(work))
+    except BaseException:
+        if slot is not None:
+            _gate.release(slot, started)
+        raise
+    worker.add_done_callback(_collect_worker_exception)
+    if slot is not None:
+        worker.add_done_callback(lambda _w: _gate.release(slot, started))
+    try:
+        done, _ = await asyncio.wait({worker}, timeout=max(0.0, control.deadline - time.monotonic()))
         if not done:
             control.cancel("request_deadline")
             raise RequestStopped("request_deadline")
@@ -91,6 +162,7 @@ async def _await_request(work, control, budget):
 async def _dispatch(method, *args, audit=False, **kwargs):
     """Bound the response and share cooperative stop state with its worker."""
     budget = kwargs.pop("budget_override", None)
+    heavy = kwargs.pop("heavy", True)
     if budget is None:
         budget = _engine.settings.audit_timeout_sec if audit else _engine.settings.request_timeout_sec
     control = RequestControl(deadline=time.monotonic() + budget)
@@ -110,7 +182,7 @@ async def _dispatch(method, *args, audit=False, **kwargs):
             return result
 
     try:
-        return await _await_request(work, control, budget)
+        return await _await_request(work, control, budget, heavy)
     except (IndexBusy, RequestStopped) as exc:
         return _incomplete_response(exc.reason)
     except TimeoutError:
@@ -252,7 +324,7 @@ async def check_action(session_id: str, action: ProposedAction, provider: str | 
 @mcp.tool()
 async def get_chunk(chunk_id: str) -> dict[str, Any]:
     """Fetch a chunk by id. Secrets in text are masked (sk-, Bearer, api_key=)."""
-    return await _dispatch(_engine.get_chunk, chunk_id)
+    return await _dispatch(_engine.get_chunk, chunk_id, heavy=False)
 
 
 @mcp.tool()
@@ -264,13 +336,13 @@ async def list_contracts(session_id: str | None = None) -> dict[str, Any]:
     Other sessions' contracts are not returned. This is a view over the
     shared store, not a per-session store split.
     """
-    return await _dispatch(_engine.list_contracts, session_id=session_id)
+    return await _dispatch(_engine.list_contracts, heavy=False, session_id=session_id)
 
 
 @mcp.tool()
 async def revoke_contract(contract_id: str) -> dict[str, Any]:
     """Disable a contract by id. History and the user's source quote are retained."""
-    return await _dispatch(_engine.revoke_contract, contract_id)
+    return await _dispatch(_engine.revoke_contract, contract_id, heavy=False)
 
 
 @mcp.tool()
@@ -294,7 +366,7 @@ async def upsert_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
         validated = _contract_list_adapter.validate_python(contracts)
     except ValidationError as exc:
         raise ToolError(_format_contract_errors(contracts, exc))
-    return await _dispatch(_engine.upsert_contracts, validated)
+    return await _dispatch(_engine.upsert_contracts, validated, heavy=False)
 
 
 # Replace the auto-generated input schema with a typed one that exposes
@@ -317,7 +389,7 @@ async def audit_status(session_id: str | None = None, provider: str | None = Non
     Call when diagnosing sync gaps. Prefer sync_session + audit_session for the hook workflow.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=True)
-    return await _dispatch(_engine.audit_status, session_id=session_id, provider=provider, audit=True, budget_override=budget)
+    return await _dispatch(_engine.audit_status, heavy=False, session_id=session_id, provider=provider, audit=True, budget_override=budget)
 
 
 @mcp.tool()
