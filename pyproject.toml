@@ -20,6 +20,8 @@ dependencies = [
   "numpy>=1.26",
   # zstd-compressed Codex sessions: Python 3.14+ uses the standard library compression.zstd.
   "zstandard>=0.23; python_version < '3.14'",
+  # Contract regexes run with a time limit (audit/patterns.py); the standard re module cannot be interrupted.
+  "regex>=2024.11.6",
 ]
 
 [project.optional-dependencies]
