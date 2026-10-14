@@ -86,7 +86,7 @@ else:
 
 
 def run(command, **kwargs):
-    print("+", " ".join(str(part) for part in command), flush=True)
+    print("+", " ".join(str(part) for part in command), file=sys.stderr, flush=True)
     return subprocess.run([str(part) for part in command], check=kwargs.pop("check", True), **kwargs)
 
 
@@ -256,6 +256,12 @@ def require_instrumented(profile: str) -> None:
         raise SystemExit(f"{module.name} is not a {profile} build; install the wheel from 'native' first")
 
 
+def command_key(args) -> int:
+    """Cache key of a native build: changes only with the pins, flags, compiler and Python minor version."""
+    print(hashlib.sha256(json.dumps(manifest(args.profile), sort_keys=True).encode()).hexdigest()[:32])
+    return 0
+
+
 def command_canary(args) -> int:
     out, spec = args.out.resolve(), PROFILES[args.profile]
     work = out / "canary"
@@ -352,10 +358,11 @@ def command_test(args) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("native", "canary", "test"):
+    for name in ("key", "native", "canary", "test"):
         command = sub.add_parser(name)
         command.add_argument("--profile", choices=sorted(PROFILES), required=True)
-        command.add_argument("--out", type=Path, required=True, help="build and log directory for this profile")
+        if name != "key":
+            command.add_argument("--out", type=Path, required=True, help="build and log directory for this profile")
         if name == "native":
             command.add_argument("--ccache", action="store_true")
         if name == "test":
@@ -363,7 +370,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if platform.system() != "Linux":
         raise SystemExit("sanitizer profiles need Linux and GCC")
-    return {"native": command_native, "canary": command_canary, "test": command_test}[args.command](args)
+    return {"key": command_key, "native": command_native, "canary": command_canary,
+            "test": command_test}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,7 @@ Merged in [PR #7](https://github.com/fox1245/tsukkomi-mcp/pull/7) and [PR #11](h
 
 ### Fixed
 
+- The allocator trim after heavy calls now counts the heavy work done since the last trim, not the length of one call. A server that mostly answers short hook checks never had a single call long enough to trim, so freed heap stayed resident; it now trims at most every 5 seconds once 0.5 seconds of heavy work has accumulated. In the soak, live native allocations stay flat as history grows; the remaining RSS growth is allocator-retained memory.
 - A local-only process sharing an index that has dense vectors (for example a lifecycle hook installed with `--local-only` next to a server with embeddings) now leaves the vector cleanup of obsolete chunk ids journalled instead of acknowledging it. Before, a reparse in that process removed the ids from the sparse index only, and their vectors stayed orphaned for good. The next sync by a process with the dense index removes them.
 - AGY hooks in `advisory` mode no longer deny or continue on an internal exception, in `agy_hooks.main` and in the fallback script.
 - Sync no longer fails with `source changed during preparation` when records are appended during capture ([#4](https://github.com/fox1245/tsukkomi-mcp/issues/4)).

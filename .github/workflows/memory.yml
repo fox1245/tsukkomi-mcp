@@ -51,6 +51,11 @@ jobs:
           sudo apt-get install -y -qq build-essential cmake ninja-build libssl-dev libcurl4-openssl-dev \
             libpq-dev libsqlite3-dev binutils util-linux
 
+      # The key covers what the build depends on (pins, flags, gcc, Python minor), not the script's other code.
+      - name: Compute the native build key
+        id: key
+        run: echo "value=$(python scripts/verify_memory.py key --profile ${{ matrix.profile }})" >> "$GITHUB_OUTPUT"
+
       - name: Restore sanitizer builds
         id: restore
         uses: actions/cache/restore@v4
@@ -59,7 +64,7 @@ jobs:
             ${{ env.OUT }}/wheels
             ${{ env.OUT }}/vector.so
             ${{ env.OUT }}/manifest.json
-          key: memory-${{ matrix.profile }}-${{ runner.os }}-py3.12-${{ hashFiles('scripts/verify_memory.py', 'pyproject.toml') }}
+          key: memory-${{ matrix.profile }}-${{ runner.os }}-${{ steps.key.outputs.value }}
 
       - name: Build neograph-engine and sqlite-vector with ${{ matrix.profile }}
         id: native
@@ -76,7 +81,7 @@ jobs:
             ${{ env.OUT }}/wheels
             ${{ env.OUT }}/vector.so
             ${{ env.OUT }}/manifest.json
-          key: memory-${{ matrix.profile }}-${{ runner.os }}-py3.12-${{ hashFiles('scripts/verify_memory.py', 'pyproject.toml') }}
+          key: memory-${{ matrix.profile }}-${{ runner.os }}-${{ steps.key.outputs.value }}
 
       - name: Install the sanitizer build and the package
         run: |

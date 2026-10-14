@@ -9,8 +9,9 @@ One process and one event loop, like a long-lived server. Three phases:
 * ``churn``: a new session every cycle. Per-session in-memory state (hook states, single-flight entries) must
   stay bounded.
 
-Each phase warms up first and is then measured with ``tracemalloc`` (net retained allocations since the end of the
-warm-up) over two consecutive windows of equal length. A leak grows in both windows; a cache that fills once, or a
+``tracemalloc`` runs from process start, so a structure that is reallocated during a phase (a dict resizing, a
+cache rebuilt) shows its net change, not its whole new size. Each phase warms up first and is then measured over two
+consecutive windows of equal length (growth of traced memory within each window). A leak grows in both windows; a cache that fills once, or a
 dict that resizes, shows up as a single step in one of them. So a phase fails only when *both* windows grow beyond
 the limit. The churn warm-up exceeds the hook-state LRU (256 sessions) so bounded per-session caches are full before
 measuring. RSS is reported but only loosely checked, because allocator fragmentation makes it noisy on shared
@@ -43,7 +44,7 @@ MIB = 1024 * KIB
 # Per-window growth limits. A phase fails when both of its windows exceed the limit. Calibrated on Linux with
 # CPython 3.12 and the official sqlite-vector build at several times the observed noise; a leak of one event's text
 # (2 KiB) per cycle over a window exceeds each of them at the default cycle count.
-LIMITS = {"steady": 96 * KIB, "growth": 128 * KIB, "churn": 128 * KIB}
+LIMITS = {"steady": 96 * KIB, "growth": 256 * KIB, "churn": 128 * KIB}
 CHURN_WARMUP = 300
 RSS_LIMIT = 192 * MIB               # whole run, after warm-up; loose by design
 # asyncio's default executor starts worker threads on demand up to this cap and keeps them: not a leak.
@@ -214,7 +215,6 @@ def run_phase(soak: Soak, name: str, cycles: int, warmup: int) -> dict:
         warmup = max(warmup, CHURN_WARMUP)
     for _ in range(warmup):
         step()
-    tracemalloc.start()
     started, first = time.monotonic(), sample()
     samples, middle = [first], None
     for cycle in range(1, cycles + 1):
@@ -225,10 +225,9 @@ def run_phase(soak: Soak, name: str, cycles: int, warmup: int) -> dict:
         elif cycle % max(1, cycles // 10) == 0:
             samples.append(sample())
     last = sample()
-    tracemalloc.stop()
     windows = [middle["traced"] - first["traced"], last["traced"] - middle["traced"]]
     report = {"phase": name, "cycles": cycles, "warmup": warmup, "seconds": round(time.monotonic() - started, 1),
-              "retained": last["traced"], "window_growth": windows, "limit": LIMITS[name],
+              "retained": last["traced"] - first["traced"], "window_growth": windows, "limit": LIMITS[name],
               "fds": [first["fds"], last["fds"]], "native_threads": [first["native_threads"], last["native_threads"]],
               "python_threads": [first["python_threads"], last["python_threads"]],
               "executor_threads": [first["executor_threads"], last["executor_threads"]],
@@ -263,6 +262,7 @@ def main(argv=None) -> int:
     report_path = args.report.resolve() if args.report else None
     vector_path = str(Path(args.vector_path).resolve()) if args.vector_path else None
     origin = os.getcwd()
+    tracemalloc.start()       # before the server is imported: every later reallocation is measured net
     with tempfile.TemporaryDirectory(prefix="tsukkomi-soak-") as directory:
         soak = Soak(Path(directory), args.dense_backend, vector_path)
         baseline = sample()

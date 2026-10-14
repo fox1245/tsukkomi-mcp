@@ -120,9 +120,12 @@ def _collect_worker_exception(worker):
         worker.exception()
 
 
+# Heavy work since the last trim, summed over calls: many short calls (hook checks) fragment the heap as much as
+# one long call, so the threshold applies to the total, not to a single call.
 TRIM_MIN_CALL_SEC = 0.5
 TRIM_MIN_INTERVAL_SEC = 5.0
 _last_trim = 0.0
+_busy_since_trim = 0.0
 
 
 def _libc():
@@ -169,11 +172,12 @@ class _HeavyGate:
         if sem is not self._sem:
             return
         self.running -= 1
-        global _last_trim
+        global _last_trim, _busy_since_trim
         now = time.monotonic()
-        if (self.running == 0 and now - started >= TRIM_MIN_CALL_SEC
+        _busy_since_trim += now - started
+        if (self.running == 0 and _busy_since_trim >= TRIM_MIN_CALL_SEC
                 and now - _last_trim >= TRIM_MIN_INTERVAL_SEC):
-            _last_trim = now
+            _last_trim, _busy_since_trim = now, 0.0
             self._loop.run_in_executor(None, _trim_heap)
 
 
