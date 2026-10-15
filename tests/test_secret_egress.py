@@ -113,7 +113,28 @@ def contracts_for(tags, extra=()):
             for index, tag in enumerate(tags)] + list(extra)
 
 
-def run_common_tools(sc, capture, *, session_args, search_modes, chunk_ids):
+def host_batch_probe(sc, capture):
+    """Host-side extraction: the batch hands the agent masked events; a refused submit echoes caller input, masked.
+
+    Needs events the graph has not processed yet, and stores nothing (both submits are refused)."""
+    seeds, sid, provider = sc["seeds"], sc["sid"], sc["provider"]
+    batch = tool("graph_next_batch", session_id=sid, provider=provider)
+    capture.add("graph_next_batch", batch)
+    assert batch.get("batch_id"), batch
+    capture.add("graph_submit_batch", tool(
+        "graph_submit_batch", session_id=sid, provider=provider, batch_id=batch["batch_id"],
+        extractor=f"agent {sk(seeds.input_only('EXTRACTORZQ'))}",
+        proposal={"nodes": [{"node_id": "a", "kind": "task", "label": f"api_key={seeds.input_only('BATCHLABELZQ')}"}],
+                  "edges": [{"src": "a", "dst": "a", "relation": "DEPENDS_ON", "origin": "observed",
+                             "evidence_chunk_ids": [f"nope-{sk(seeds.input_only('BATCHEVIDZQ'))}"]}],
+                  "extraction_summary": f"password={seeds.input_only('BATCHSUMMARYZQ')}"}))
+    capture.add("graph_submit_batch-reason", tool(
+        "graph_submit_batch", session_id=sid, provider=provider, batch_id=batch["batch_id"],
+        proposal={"nodes": [], "edges": [], "extraction_summary": "x"},
+        no_graph_facts_reason="r" * 600 + sk(seeds.input_only("BATCHREASONZQ"))))
+
+
+def run_common_tools(sc, capture, *, session_args, search_modes, chunk_ids, host_probe=True):
     """Every provider-neutral MCP tool, with secrets in inputs as well as in stored history."""
     seeds, sid, provider = sc["seeds"], sc["sid"], sc["provider"]
     cs = lambda name, **kw: capture.add(name, tool(name, **kw))  # noqa: E731
@@ -145,6 +166,8 @@ def run_common_tools(sc, capture, *, session_args, search_modes, chunk_ids):
         {"item_id": "req-001", "status": "done",
          "evidence_chunk_ids": chunk_ids[:1] + [f"x-{sk(seeds.input_only('EVIDZQ'))}"]}])
     cs("get_checklist", session_id=sid, provider=provider)
+    if host_probe:
+        host_batch_probe(sc, capture)
     # Graph: model supplied proposals carry secrets in ids, labels and bad evidence ids.
     node = f"node-{sk(seeds.input_only('NODEIDZQ'))}"
     proposal = {"job_id": "job-1", "nodes": [{"node_id": node, "kind": "task",
@@ -385,10 +408,12 @@ def test_codex_remote_payloads_tools_hooks_and_errors_are_masked(codex_scenario,
     capture.add("sync_session", synced)
     assert synced["ok"] and synced.get("embedded", 0) > 0 and not synced.get("embedding_error")
     chunks = engine.store.list_chunks(sid, "codex")
-    # Remote graph extraction first: later graph commits advance the cursor past every event.
+    # Host-side batch and remote graph extraction first: later graph commits advance the cursor past every event.
+    host_batch_probe(sc, capture)
     capture.add("run_neograph_update", tool("run_neograph_update", session_id=sid, provider="codex"))
     run_common_tools(sc, capture, session_args={}, search_modes=("regex", "sparse", "hybrid", "dense"),
-                     chunk_ids=[c.chunk_id for c in chunks if any(tag in c.text for tag in sc["canonical"])])
+                     chunk_ids=[c.chunk_id for c in chunks if any(tag in c.text for tag in sc["canonical"])],
+                     host_probe=False)
     capture.add("get_chunk-all", [tool("get_chunk", chunk_id=c.chunk_id) for c in chunks])
     capture.add("get_graph_context-after-llm", tool("get_graph_context", session_id=sid, provider="codex"))
     assert prompts, "the graph extraction transport was not reached"

@@ -68,6 +68,13 @@ class Settings(SettingsAccessors, BaseSettings):
     request_timeout_sec: float = Field(default=settings_core.DEFAULT_REQUEST_TIMEOUT_SEC, gt=0)
     graph_update_timeout_sec: float = Field(default=settings_core.DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC, gt=0,
                                             allow_inf_nan=False)
+    graph_extractor: Literal["openrouter", "host"] = Field(
+        default=settings_core.DEFAULT_GRAPH_EXTRACTOR,
+        description="Who extracts for run_neograph_update: 'openrouter' (default) calls an OpenRouter model; 'host' "
+                    "disables that tool (error extractor_disabled, no key and no network touched) so that only the "
+                    "calling agent extracts, through graph_next_batch and graph_submit_batch, which work in both "
+                    "modes. SELF_DIRECT_GRAPH_EXTRACTOR.",
+    )
     max_tool_timeout_sec: float = Field(
         default=settings_core.DEFAULT_MAX_TOOL_TIMEOUT_SEC,
         gt=0,

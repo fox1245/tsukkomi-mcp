@@ -102,9 +102,26 @@ def test_literal_choices_match_the_model():
                           ("claude_enforcement", settings_core.ENFORCEMENT_MODES),
                           ("session_provider", settings_core.SESSION_PROVIDERS),
                           ("dense_backend", settings_core.DENSE_BACKENDS),
+                          ("graph_extractor", settings_core.GRAPH_EXTRACTORS),
                           ("daemon", settings_core.DAEMON_MODES),
                           ("sqlite_journal", settings_core.SQLITE_JOURNAL_MODES)):
         assert typing.get_args(Settings.model_fields[name].annotation) == choices, name
+
+
+def test_the_graph_extractor_setting_is_read_the_same_way_and_unknown_values_are_errors(world):
+    assert hook_settings().graph_extractor == load_hook_settings().graph_extractor == "openrouter"
+    put(world, SELF_DIRECT_GRAPH_EXTRACTOR="host")
+    assert hook_settings().graph_extractor == load_hook_settings().graph_extractor == "host"
+    world["monkeypatch"].delenv("SELF_DIRECT_GRAPH_EXTRACTOR")
+    put(world, self_direct_graph_extractor="host")                  # names are case-insensitive, like every other setting
+    assert hook_settings().graph_extractor == load_hook_settings().graph_extractor == "host"
+    world["monkeypatch"].delenv("self_direct_graph_extractor")
+    assert hook_settings().graph_extractor == load_hook_settings().graph_extractor == "openrouter"
+    for bad in ("hosted", "Host", "openrouter,host", ""):
+        put(world, SELF_DIRECT_GRAPH_EXTRACTOR=bad)
+        assert outcome(hook_settings)[0] == "error" and outcome(load_hook_settings)[0] == "error", bad
+        with pytest.raises(ValueError, match="openrouter.*host"):
+            Settings(_env_file=None)
 
 
 def test_the_hook_reader_never_reads_the_working_directory_env_file(world):
@@ -164,6 +181,8 @@ CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Adviso
            "claude_enforcement": ["confirmed_only", "advisory", "enforced", "Enforced", "", "advisory ", "bogus"],
            "session_provider": ["codex", "grokbot", "omp", "agy", "claude", "Codex", "", "cursor", "claude "],
            "dense_backend": ["sqlite-vector", "numpy", "NumPy", "", "sqlite_vector", "faiss"],
+           "graph_extractor": ["openrouter", "host", "Host", "HOST", "OpenRouter", "OPENROUTER", "", " host", "host ",
+                               "open_router", "open-router", "local", "none", "true", "1", "host\n"],
            "daemon": ["off", "on", "On", "ON", "", " on", "on ", "auto", "true", "1", "false", "Off"],
            "sqlite_journal": ["auto", "delete", "Auto", "DELETE", "", " auto", "delete ", "wal", "off", "true", "truncate"]}
 # SELF_DIRECT_AUDIT_SHADOW_EVERY: a non-negative integer, or "adaptive" in any case with surrounding whitespace.

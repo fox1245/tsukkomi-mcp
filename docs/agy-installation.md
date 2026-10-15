@@ -80,7 +80,7 @@ The default `SELF_DIRECT_AGY_ENFORCEMENT=confirmed_only` gates only confirmed fi
 | `Stop`, an incomplete owner-approved workflow | `continue`, sharing the same once-per-conversation budget; `allow` in `advisory` |
 | `Stop`, anything else on a normal stop (unknown evidence, an unmet obligation without `auto_continue`, pending checklist items, incomplete history, budget spent) | `allow`, with a note that completion was not verified |
 | `Stop`, cancellation, error, step limit, or active background work | `allow`; never restart cancellation |
-| `PreInvocation` | Ephemeral message with the health banner, queued warnings, workflow status, up to 8 contracts, up to 8 pending items and up to 8 graph relations (all marked as data). When it fails: an ephemeral warning, not a permission decision |
+| `PreInvocation` | Ephemeral message with the health banner, queued warnings, workflow status, up to 8 contracts, up to 8 pending items and up to 8 graph relations (all marked as data, each on one line of its own: a control, invisible or bidirectional character in a stored description, item or id is shown as a backslash escape with its code point, so stored text cannot start a line that reads like another rule). When it fails: an ephemeral warning, not a permission decision |
 | `PostToolUse` | `{}`; refreshes local history. Failures are diagnosed on stderr and queued as a warning, never fabricated as successful results |
 
 The stop policy is the same in `confirmed_only` and `enforced`; `advisory` never continues.

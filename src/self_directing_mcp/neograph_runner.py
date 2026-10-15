@@ -47,7 +47,9 @@ def _compile_guard():
         _compile_lock.release()
 
 
-EXTRACT_PROMPT = """You are a graph extractor. Read the session events and return
+# What the extractor is told, without the events. One definition for both extractors: the OpenRouter run below
+# (``EXTRACT_PROMPT``) and the host-side tool ``graph_next_batch``, which hands it to the calling agent verbatim.
+EXTRACT_INSTRUCTIONS = """You are a graph extractor. Read the session events and return
 nodes/edges with evidence. Allowed relations: IMPLEMENTS, DEPENDS_ON, MODIFIES,
 PRODUCES, CHECKS_VERSION, EVIDENCED_BY, SUPERSEDES.
 Rules:
@@ -60,10 +62,34 @@ Rules:
 - Include both endpoint nodes for each edge and preserve explicit entity identifiers.
 - Include extraction_summary describing what was extracted. If no relations can be
   extracted, explain the specific reason there; do not invent relations to fill arrays.
+- node_id, kind and label must be single-line plain text: no control characters (newline,
+  tab) and no bidirectional or other invisible formatting characters."""
+
+EXTRACT_PROMPT = EXTRACT_INSTRUCTIONS + """
 
 Session events:
 {events}
 """
+
+# The proposal an extractor returns (strict JSON schema). Shared by the OpenRouter request and ``graph_next_batch``.
+PROPOSAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "extraction_summary": {"type": "string"},
+        "nodes": {"type": "array", "items": {"type": "object", "properties": {
+            "node_id": {"type": "string"}, "kind": {"type": "string"},
+            "label": {"type": "string"},
+        }, "required": ["node_id", "kind", "label"], "additionalProperties": False}},
+        "edges": {"type": "array", "items": {"type": "object", "properties": {
+            "src": {"type": "string"}, "dst": {"type": "string"},
+            "relation": {"type": "string"}, "origin": {"type": "string"},
+            "evidence_chunk_ids": {"type": "array", "items": {"type": "string"}},
+        }, "required": ["src", "dst", "relation", "origin", "evidence_chunk_ids"],
+           "additionalProperties": False}},
+    },
+    "required": ["nodes", "edges", "extraction_summary"],
+    "additionalProperties": False,
+}
 
 
 class _Transport:
@@ -74,24 +100,7 @@ class _Transport:
         register_secret(api_key)
         self.model = model
         self.timeout_s = timeout_s
-        self.schema = {
-            "type": "object",
-            "properties": {
-                "extraction_summary": {"type": "string"},
-                "nodes": {"type": "array", "items": {"type": "object", "properties": {
-                    "node_id": {"type": "string"}, "kind": {"type": "string"},
-                    "label": {"type": "string"},
-                }, "required": ["node_id", "kind", "label"], "additionalProperties": False}},
-                "edges": {"type": "array", "items": {"type": "object", "properties": {
-                    "src": {"type": "string"}, "dst": {"type": "string"},
-                    "relation": {"type": "string"}, "origin": {"type": "string"},
-                    "evidence_chunk_ids": {"type": "array", "items": {"type": "string"}},
-                }, "required": ["src", "dst", "relation", "origin", "evidence_chunk_ids"],
-                   "additionalProperties": False}},
-            },
-            "required": ["nodes", "edges", "extraction_summary"],
-            "additionalProperties": False,
-        }
+        self.schema = PROPOSAL_SCHEMA
 
     def complete_json(self, prompt: str, schema: dict[str, Any] | None = None,
                       max_tokens: int = 8000) -> tuple[dict[str, Any], int]:
