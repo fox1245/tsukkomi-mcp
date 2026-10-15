@@ -45,6 +45,7 @@ SQLITE_JOURNAL_MODES = ("auto", "delete")    # journal.py validates the same two
 GRAPH_EXTRACTORS = ("openrouter", "host")    # who extracts for run_neograph_update: an OpenRouter model, or only the host agent
 SYNC_SLICING_MODES = ("auto", "off")         # index.ingest.SlicePolicy takes the same two values
 SPARSE_FORMATS = ("auto", "legacy", "compact")   # index.sparse.open_sparse_index takes the same three values
+PROJECT_CONTRACT_MODES = ("candidates", "off")   # contract_bundles: discover the project bundle as candidates, or not at all
 
 DEFAULT_ENFORCEMENT = "confirmed_only"
 DEFAULT_SESSION_PROVIDER = "codex"
@@ -54,6 +55,7 @@ DEFAULT_GRAPH_EXTRACTOR = "openrouter"
 DEFAULT_SQLITE_JOURNAL = "delete"            # "auto" is opt-in until the commit benchmark says otherwise (README, "SQLite journal")
 DEFAULT_SYNC_SLICING = "auto"                # "off" is exactly the all-or-nothing sync of before slicing (README, "Large sessions and deadlines")
 DEFAULT_SPARSE_FORMAT = "auto"               # compact when this SQLite can, else the legacy file, visibly (README, "Sparse index formats")
+DEFAULT_PROJECT_CONTRACTS = "candidates"     # discovery only: nothing is enforced without adopt_contracts (README, "Sharing contracts across devices")
 DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 DEFAULT_EMBEDDING_DIM = 1024
 DEFAULT_EMBEDDING_BASE_URL = "https://openrouter.ai/api/v1"
@@ -79,7 +81,7 @@ AGY_APP_DATA_NAMES = ("antigravity", "antigravity-cli", "antigravity-ide")
 
 PATH_FIELDS = frozenset({
     "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
-    "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file",
+    "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file", "contract_bundle_paths",
 })
 
 
@@ -187,6 +189,10 @@ def toml_path_settings() -> dict[str, object]:
         elif name == "agy_app_data_dirs":
             if not isinstance(value, list):
                 raise ValueError("TOML AGY paths must be an array")
+            resolved[name] = [toml_path(item, source.parent) for item in value]
+        elif name == "contract_bundle_paths":
+            if not isinstance(value, list):
+                raise ValueError("TOML contract bundle paths must be an array")
             resolved[name] = [toml_path(item, source.parent) for item in value]
         else:
             resolved[name] = toml_path(value, source.parent)
@@ -340,6 +346,22 @@ def _path_list(name: str, text: str) -> list[Path] | None:
     return [Path(item) for item in value]
 
 
+def parse_bundle_paths(name: str, text: str) -> list[Path]:
+    """``SELF_DIRECT_CONTRACT_BUNDLE_PATHS``: absolute paths separated by ``os.pathsep`` (``:``; ``;`` on Windows).
+
+    Empty segments are ignored and ``~`` expands. A relative path is an error: it would name a different file for
+    every process that reads it, and bundle files are looked up only where the owner said they are."""
+    paths = []
+    for part in text.split(os.pathsep):
+        if not part:
+            continue
+        path = Path(part).expanduser()
+        if not path.is_absolute():
+            raise _bad(name, "absolute path")
+        paths.append(path)
+    return paths
+
+
 def _str_or_path_list(name: str, text: str):
     """``grokbot_transcripts_dir``: a plain string, or a JSON list of paths."""
     try:
@@ -426,6 +448,8 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("sync_slicing", _literal(SYNC_SLICING_MODES), _static(DEFAULT_SYNC_SLICING)),
     FieldSpec("sync_slice_bytes", lambda name, text: _to_int(name, text, 1), _static(DEFAULT_SYNC_SLICE_BYTES)),
     FieldSpec("sparse_format", _literal(SPARSE_FORMATS), _static(DEFAULT_SPARSE_FORMAT)),
+    FieldSpec("project_contracts", _literal(PROJECT_CONTRACT_MODES), _static(DEFAULT_PROJECT_CONTRACTS)),
+    FieldSpec("contract_bundle_paths", parse_bundle_paths, lambda: []),
 )
 FIELD_NAMES = tuple(spec.name for spec in FIELDS)
 

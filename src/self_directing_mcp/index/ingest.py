@@ -1340,6 +1340,36 @@ class SessionStore:
         row = self._conn.execute("SELECT data FROM session_events WHERE chunk_id=?", (chunk_id,)).fetchone()
         return Chunk.model_validate_json(row["data"]) if row else None
 
+    WORKING_DIR_SCAN = 50           # events at the start of a session that may name its working directory
+
+    def session_working_dir(self, session_id, provider):
+        """The working directory the session's own first records name, or ``None`` (never guessed).
+
+        Claude Code stamps ``cwd`` on its records; a Codex rollout names it in its ``session_meta`` record. Other
+        providers' parsers do not index one. Only the first few events are looked at, so a session that never names
+        a directory costs a bounded read.
+        """
+        if provider not in ("claude", "codex"):
+            return None
+        with self._read_boundary():
+            rows = self._conn.execute(
+                "SELECT json_extract(data,'$.meta.cwd') AS cwd, json_extract(data,'$.meta.evidence_origin') AS origin,"
+                " json_extract(data,'$.text') AS text FROM (SELECT data FROM session_events WHERE provider=? AND "
+                "session_id=? ORDER BY byte_start, sub_index LIMIT ?)", (provider, session_id, self.WORKING_DIR_SCAN))
+            for row in rows:
+                if provider == "claude":
+                    found = row["cwd"]
+                elif row["origin"] == "session_meta" and isinstance(row["text"], str):
+                    try:
+                        found = json.loads(row["text"].partition(" ")[2]).get("cwd")
+                    except (ValueError, AttributeError):
+                        found = None
+                else:
+                    continue
+                if isinstance(found, str) and 0 < len(found) <= 4096:
+                    return found
+        return None
+
     def list_chunks(self, session_id=None, provider=None):
         clauses, params = [], []
         if session_id is not None:

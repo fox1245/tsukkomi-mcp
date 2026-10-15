@@ -23,7 +23,9 @@ from self_directing_mcp.audit.contracts import (
     GLOBAL_CONTRACT_MEANING,
     MEMO_MAX_BYTES,
     ContentMemo,
+    ContractRepository,
     ContractStore,
+    check_rule_patterns,
     contract_scope,
     loosening_reasons,
     parse_contracts,
@@ -32,7 +34,6 @@ from self_directing_mcp.audit.contracts import (
 )
 from self_directing_mcp.audit import incremental
 from self_directing_mcp.audit import shadow as shadow_policy
-from self_directing_mcp.audit.patterns import compile_contract
 from self_directing_mcp import eval_cost
 from self_directing_mcp.eval_cost import COSTS
 from self_directing_mcp.slice_budget import Sizing, sizing_scope
@@ -59,7 +60,7 @@ from self_directing_mcp.index.vector import build_vector_index
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.retrieve.checks import regex_search
 from self_directing_mcp.retrieve.hybrid import HybridRetriever, hits_to_schema
-from self_directing_mcp.schemas import ContractRule, ContractsDocument, PendingChange, ProposedAction
+from self_directing_mcp.schemas import ContractOrigin, ContractRule, ContractsDocument, PendingChange, ProposedAction
 from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.timeseries import analyze_activity
 from self_directing_mcp import graph_batch
@@ -193,6 +194,7 @@ def _fast_gate(payload, integrity):
 
 
 CHECKLIST_EVALUATION_ATTEMPTS = 3
+ID_SHOWN = 80      # a contract id quoted back in an answer is cut to this many characters
 PENDING_NUDGE = ("NOT APPLIED: this change would weaken an active contract and no user message vouches for it "
                  "(source_event_id missing or not found). The previous revision stays in force and the change is held "
                  "as pending. Repeat it with source_event_id set to the user's own message that asked for it.")
@@ -232,7 +234,7 @@ class SelfDirectEngine:
         self.embedder = None
         self.embedder_degraded = False
         self.retriever: HybridRetriever | None = None
-        self.contracts: ContractStore | None = None
+        self.contracts: ContractRepository | None = None
         self.checklists: ChecklistStore | None = None
         self.graph: GraphStore | None = None
         self.neograph = None
@@ -1441,15 +1443,7 @@ class SelfDirectEngine:
             else:
                 rules.append(ContractRule.model_validate(c))
         for rule in rules:
-            for pattern in (rule.regex, rule.before_regex, rule.exception_regex,
-                            rule.when.tool_call_regex if rule.when else None):
-                if pattern:
-                    compile_contract(pattern)   # the syntax gate of both engines (raises re.error)
-            if rule.risk == "high" and rule.type == "must_not" and not rule.regex:
-                # Applies to every action and can never be verified: every tool call would be unknown, hence asked
-                # (a denial when headless). A high-risk target must name the actions it covers.
-                raise ValueError(f"contract {rule.id!r}: a high-risk must_not needs a regex that names the actions it "
-                                 "covers; without one it would ask on every tool call")
+            check_rule_patterns(rule)   # compiles every pattern; a high-risk must_not must name its actions
         # An anchor that resolves to something other than a user message is rejected; one that cannot be resolved
         # (the session is not indexed yet) is accepted and left to the audit (``anchor_not_user`` there).
         anchors = self._anchor_status([rule.source_event_id for rule in rules])
@@ -1459,6 +1453,11 @@ class SelfDirectEngine:
             raw, token = self.contracts.capture()
             document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
             active = {rule.id: rule for rule in document.contracts}
+            for rule in rules:
+                if rule.origin is not None and (active.get(rule.id) is None or active[rule.id].origin != rule.origin):
+                    # Where a contract came from is recorded by adopt_contracts alone; a caller cannot claim it.
+                    raise ValueError(f"contract {rule.id!r}: origin is set only by adopt_contracts and cannot be "
+                                     "supplied here (resend the stored contract's own origin unchanged, or omit it)")
             apply, held = [], []
             for rule in rules:
                 previous = active.get(rule.id)
@@ -1505,6 +1504,302 @@ class SelfDirectEngine:
                                  for rule, reasons, previous in held]
             result["counts"]["pending"] = len(held)
             result["nudge"] = PENDING_NUDGE
+        return result
+
+    # ------------------------------------------------------------------------------------------------ portable contracts
+    # Bundles are files that carry contracts between devices (``contract_bundles``). Finding one enforces nothing:
+    # ``adopt_contracts`` stores contracts from it, and only with a user message of THIS device as its anchor.
+
+    def _project_context(self, project_dir, session_id, provider):
+        """``(directory | None, source | None, notes)``: the project directory a request is about."""
+        if project_dir is not None:
+            return project_dir, "argument", []
+        if not session_id:
+            return None, None, []
+        resolved = self._resolve_provider(provider)
+        sid = session_id.lower() if resolved in ("codex", "agy") else session_id
+        with self._publication_guard():
+            directory = self.store.session_working_dir(sid, resolved)
+        if directory is None:
+            return None, None, ["this session's index does not name a working directory (only Codex and Claude Code "
+                                "sessions do); pass project_dir"]
+        return directory, "session_index", []
+
+    def _discover_bundles(self, directory):
+        from self_directing_mcp import contract_bundles
+        return contract_bundles.discover(
+            project_dir=directory, project_mode=getattr(self.settings, "project_contracts", "candidates"),
+            personal_paths=tuple(getattr(self.settings, "contract_bundle_paths", ()) or ()))
+
+    def _stored_contracts(self) -> dict[str, ContractRule]:
+        with self._publication_guard():
+            raw, _token = self.contracts.capture()
+        return {rule.id: rule for rule in parse_contracts(raw).contracts}      # shared and read-only: only read here
+
+    @detached_operation
+    def list_contract_candidates(self, project_dir: str | None = None, session_id: str | None = None,
+                                 provider: str | None = None) -> dict[str, Any]:
+        """Contract bundles this device can see, as candidates. Reads files; enforces and writes nothing."""
+        from self_directing_mcp import contract_bundles as cb
+        assert self.contracts
+        directory, source, notes = self._project_context(project_dir, session_id, provider)
+        found = self._discover_bundles(directory)
+        local = self._stored_contracts()
+        candidates, totals = [], dict.fromkeys(cb.STATUSES, 0)
+        for bundle in found.bundles:
+            entries = cb.compare(bundle, local)
+            for entry in entries:
+                totals[entry.status] += 1
+            candidates.append(cb.describe_bundle(bundle, entries, cb.missing_from_file(bundle, local)))
+        project: dict[str, Any] = {"mode": getattr(self.settings, "project_contracts", "candidates"),
+                                   "directory_source": source, "boundary": found.boundary}
+        result = {"ok": True, "notice": cb.NOTICE, "project": project, "candidates": candidates,
+                  "counts": {"candidates": len(candidates), **{name: count for name, count in totals.items() if count}},
+                  "refused": [{**item, "detail": cb.shown(item["detail"], 300)} for item in found.refused],
+                  "notes": [*notes, *found.notes]}
+        conflicts = cb.candidate_conflicts(found.bundles)
+        if conflicts:
+            result["candidate_conflicts"] = conflicts
+        if candidates:
+            result["next"] = ("To enforce a candidate, ask the user, then call adopt_contracts(bundle_id, "
+                              "source_event_id=<the user's own message id>); a changed or conflicting contract needs "
+                              "replace_ids. Nothing is enforced until then.")
+        return result
+
+    def _bundle_counts(self, session_id, provider) -> dict[str, Any]:
+        """The ``contract_bundles`` section of ``audit_status``: counts only, no paths and no contract text."""
+        from self_directing_mcp import contract_bundles as cb
+        directory, _source, _notes = self._project_context(None, session_id, provider)
+        found = self._discover_bundles(directory)
+        local = self._stored_contracts()
+        pending = changed = 0
+        conflicting = {item["id"] for item in cb.candidate_conflicts(found.bundles)}
+        for bundle in found.bundles:
+            entries = cb.compare(bundle, local)
+            pending += any(entry.status == "new" for entry in entries)
+            changed += sum(entry.status == "changed_since_adoption" for entry in entries)
+            conflicting |= {entry.contract.rule.id for entry in entries if entry.status == "differs"}
+        counts: dict[str, Any] = {"candidates": len(found.bundles), "pending_adoption": pending,
+                                  "changed_since_adoption": changed, "conflicts": len(conflicting),
+                                  "refused": len(found.refused), "project_directory_known": directory is not None}
+        if pending:
+            counts["nudge"] = (f"{pending} contract bundle(s) wait for adoption: list_contract_candidates shows them; "
+                               "nothing is enforced until the user adopts one.")
+        return counts
+
+    @staticmethod
+    def _adoption_refusal(error: str, reason: str, **extra) -> dict[str, Any]:
+        return {"ok": False, "status": "refused", "error": error, "reason": reason, "adopted": [], "replaced": [],
+                "nothing_adopted": True, **extra}
+
+    @detached_operation
+    def adopt_contracts(self, bundle_id: str, source_event_id: str | None, ids: list[str] | None = None,
+                        replace_ids: list[str] | None = None, project_dir: str | None = None) -> dict[str, Any]:
+        """Store the contracts of a candidate bundle as this device's own, anchored to a user message of this device.
+
+        ``source_event_id`` must resolve, through the same check as every contract anchor, to a USER message in this
+        device's index; otherwise nothing is adopted (an error, not a pending change). The bundle is read again and its
+        SHA-256 must still be ``bundle_id``: a file that changed since it was listed is refused. A contract whose id
+        exists here with other content is a conflict and is not adopted unless its id is in ``replace_ids``.
+        """
+        from self_directing_mcp import contract_bundles as cb
+        assert self.contracts
+        if not isinstance(bundle_id, str) or not re.fullmatch(r"[0-9a-fA-F]{12,64}", bundle_id):
+            raise ValueError("bundle_id must be the bundle_id list_contract_candidates returned (12 to 64 hex characters)")
+        for name, values in (("ids", ids), ("replace_ids", replace_ids)):
+            if values is not None and (not isinstance(values, (list, tuple)) or len(values) > cb.MAX_BUNDLE_CONTRACTS
+                                       or not all(isinstance(v, str) for v in values)):
+                raise ValueError(f"{name} must be a list of at most {cb.MAX_BUNDLE_CONTRACTS} contract ids")
+        wanted = None if ids is None else list(dict.fromkeys(ids))
+        replace = set(replace_ids or ())
+        if not isinstance(source_event_id, str) or not source_event_id:
+            return self._adoption_refusal(
+                "anchor_required", "adoption needs source_event_id: the id of the user's own message on this device that "
+                "asked for it. Nothing was adopted.")
+        anchors = self._anchor_status([source_event_id])
+        status, detail = anchors.get(source_event_id, ("unresolved", "not in the index"))
+        if status != "user":
+            return self._adoption_refusal(
+                "anchor_not_user" if status == "other" else "anchor_unresolved",
+                f"source_event_id {cb.shown(source_event_id, 120)!r} is {detail}, not a user message of this device's index. A contract "
+                "enforced here needs one of this device's own user messages as its anchor; an event from another device, "
+                "a tool result or injected text cannot be. Nothing was adopted.")
+        directory = project_dir
+        if directory is None:
+            with self._publication_guard(), self.store._read_boundary():
+                anchor = self.store.get_chunk(source_event_id)
+                directory = self.store.session_working_dir(anchor.session_id, anchor.provider) if anchor else None
+        found = self._discover_bundles(directory)
+        prefix = bundle_id.lower()
+        matches = [bundle for bundle in found.bundles if bundle.sha256.startswith(prefix)]
+        if len(matches) != 1:
+            now = [{"bundle_id": bundle.bundle_id, "path_label": bundle.path_label} for bundle in found.bundles]
+            return self._adoption_refusal(
+                "bundle_not_found_or_changed" if not matches else "bundle_id_ambiguous",
+                "no candidate bundle has exactly this content: it changed or disappeared since it was listed, or it is "
+                "not in a place this request can see. Run list_contract_candidates again, read what it says now and "
+                "ask the user. Nothing was adopted." if not matches else "more than one candidate matches this bundle_id; "
+                "use a longer prefix. Nothing was adopted.", candidates_now=now,
+                refused=[{"source_kind": item["source_kind"], "path_label": item["path_label"], "reason": item["reason"]}
+                         for item in found.refused])
+        bundle = matches[0]
+        listed = {contract.rule.id: contract for contract in bundle.contracts}
+        selected = list(bundle.contracts) if wanted is None else [listed[i] for i in wanted if i in listed]
+        unknown = [i for i in (wanted or ()) if i not in listed]
+        if unknown:
+            return self._adoption_refusal("unknown_ids", "ids names contracts this bundle does not contain. Nothing was "
+                                          "adopted.", unknown_ids=[cb.shown(i, ID_SHOWN) for i in unknown[:20]])
+        chosen = {contract.rule.id for contract in selected}
+        if replace - chosen:
+            return self._adoption_refusal("replace_not_selected", "replace_ids names contracts that are not being "
+                                          "adopted in this call. Nothing was adopted.",
+                                          replace_ids=[cb.shown(i, ID_SHOWN) for i in sorted(replace - chosen)[:20]])
+        with self._publication_guard():
+            raw, token = self.contracts.capture()
+            document = ContractsDocument.model_validate_json(raw) if raw is not None else ContractsDocument()
+            stored = {rule.id: rule for rule in document.contracts}
+            to_save, added, replaced, conflicts, unchanged = [], [], [], [], []
+            for contract in selected:
+                current = stored.get(contract.rule.id)
+                origin = ContractOrigin(
+                    bundle_sha256=bundle.sha256, bundle_label=bundle.label, origin_kind=bundle.kind,
+                    bundle_path=bundle.path_label, adopted_by_event_id=source_event_id,
+                    claimed_origin_event_id=contract.claimed_origin_event_id, claimed_quote=contract.claimed_quote)
+                new = contract.rule.model_copy(update={"origin": origin}, deep=True)
+                if current is None:
+                    to_save.append(new)
+                    added.append(contract)
+                    continue
+                current_hash = cb.content_hash(cb.content_of(current))
+                if current_hash == contract.content_hash:
+                    unchanged.append(contract.rule.id)
+                    continue
+                if contract.rule.id in replace:
+                    reasons = loosening_reasons(current, new)
+                    to_save.append(new)
+                    replaced.append((contract, current, current_hash, reasons))
+                    continue
+                conflicts.append({
+                    "id": contract.rule.id, "status": "conflict", "adopted": False,
+                    "local": {"content_hash": current_hash[:cb.SHORT_HASH], "revision": current.revision,
+                              "enabled": current.enabled, "adopted_from_a_bundle": current.origin is not None},
+                    "candidate": {"content_hash": contract.content_hash[:cb.SHORT_HASH]},
+                    "differences": cb.differences(cb.content_of(current), contract.content),
+                    "resolution": "the local contract stays in force; to replace it with the candidate's version, call "
+                                  "adopt_contracts again with this id in replace_ids"})
+            saved = []
+            if to_save:
+                saved = self.contracts.prepare_upsert(document, to_save)
+                adopted_ids = {rule.id for rule in to_save}
+                # Adopted text is not the user's own wording: the field that holds it keeps meaning that.
+                document.contracts = [rule.model_copy(update={"source_quote": None}) if rule.id in adopted_ids else rule
+                                      for rule in document.contracts]
+                for rule in to_save:
+                    document.pending.pop(rule.id, None)
+                self.contracts.publish_document(document, document.model_dump_json(indent=2), token)
+        revisions = {rule.id: rule.revision for rule in saved}
+        weakened = [item for item in replaced if item[3]]
+        result: dict[str, Any] = {
+            "ok": True, "status": "adopted" if to_save else "nothing_to_adopt",
+            "bundle": {"bundle_id": bundle.bundle_id, "label": cb.shown(bundle.label, cb.LABEL_MAX),
+                       "source_kind": bundle.kind, "path_label": bundle.path_label},
+            "anchor": {"source_event_id": source_event_id, "anchor": "user"},
+            "adopted": [{"id": c.rule.id, "revision": revisions[c.rule.id], "content_hash": c.content_hash[:cb.SHORT_HASH]}
+                        for c in added],
+            "replaced": [{"id": c.rule.id, "revision": revisions[c.rule.id], "content_hash": c.content_hash[:cb.SHORT_HASH],
+                          "previous_content_hash": before[:cb.SHORT_HASH], "weakening": bool(reasons),
+                          "reasons": reasons} for c, _current, before, reasons in replaced],
+            "unchanged": unchanged, "conflicts": conflicts,
+            "counts": {"adopted": len(added), "replaced": len(replaced), "unchanged": len(unchanged),
+                       "conflicts": len(conflicts)},
+            "notice": cb.NOTICE}
+        if weakened:
+            result["weakened"] = [c.rule.id for c, *_rest in weakened]
+            result["nudge"] = ("A replacement may enforce less than the contract it replaced (see reasons). It was "
+                               "applied because this call is anchored to a user message of this device and names the id "
+                               "in replace_ids; the replaced revision is kept in the contract's history.")
+        elif conflicts:
+            result["nudge"] = "Conflicting contracts were NOT adopted; the local versions stay in force."
+        if to_save:
+            result.setdefault("nudge", "Adopted. These are ordinary contracts of this device now; the bundle file is no "
+                              "longer consulted for them, and a later change or deletion of it changes nothing.")
+        return result
+
+    @detached_operation
+    def export_contracts(self, path_label: str, ids: list[str] | None = None, include_disabled: bool = False,
+                         label: str | None = None, project_dir: str | None = None, session_id: str | None = None,
+                         provider: str | None = None) -> dict[str, Any]:
+        """Write this device's global contracts as a portable bundle, to the project or a configured personal file."""
+        from self_directing_mcp import contract_bundles as cb
+        assert self.contracts
+        directory, _source, _notes = self._project_context(project_dir, session_id, provider)
+        boundary = None
+        if directory is not None:
+            located = cb.locate_project(directory, cb.user_home())
+            boundary = None if isinstance(located, str) else located[1]
+        mode = getattr(self.settings, "project_contracts", "candidates")
+        try:
+            target = cb.resolve_export_target(path_label, boundary=boundary, project_allowed=mode != "off",
+                                              personal_paths=tuple(getattr(self.settings, "contract_bundle_paths", ())))
+        except ValueError as exc:
+            return {"ok": False, "status": "refused", "error": "path_refused", "reason": str(exc), "written": False}
+        with self._publication_guard():
+            raw, _token = self.contracts.capture()
+        stored = parse_contracts(raw).contracts
+        by_id = {rule.id: rule for rule in stored}
+        if ids is not None and (not isinstance(ids, (list, tuple)) or not all(isinstance(i, str) for i in ids)):
+            raise ValueError("ids must be a list of contract ids")
+        names = None if ids is None else list(dict.fromkeys(ids))
+        missing = [i for i in (names or ()) if i not in by_id]
+        if missing:
+            return {"ok": False, "status": "refused", "error": "unknown_ids", "written": False,
+                    "reason": "ids names contracts this device does not have",
+                    "unknown_ids": [cb.shown(i, ID_SHOWN) for i in missing[:20]]}
+        chosen = [by_id[i] for i in names] if names is not None else list(stored)
+        exported, skipped = [], []
+        for rule in chosen:
+            if rule.session_id is not None:
+                skipped.append({"id": cb.shown(rule.id, ID_SHOWN), "reason": "limited to one session: not portable"})
+            elif not rule.enabled and not include_disabled:
+                skipped.append({"id": cb.shown(rule.id, ID_SHOWN), "reason": "disabled (include_disabled=false)"})
+            else:
+                try:
+                    cb.parse_bundle(cb.serialize_bundle("check", [rule]), kind="personal", path_label="check")
+                except cb.BundleError as exc:
+                    skipped.append({"id": cb.shown(rule.id, ID_SHOWN), "reason": "not valid in a bundle: " + "; ".join(exc.problems)})
+                else:
+                    exported.append(rule)
+        if len(exported) > cb.MAX_BUNDLE_CONTRACTS:
+            return {"ok": False, "status": "refused", "error": "too_many_contracts", "written": False,
+                    "reason": f"a bundle holds at most {cb.MAX_BUNDLE_CONTRACTS} contracts; pass ids to choose"}
+        name = (label or "exported contracts").strip()
+        data = cb.serialize_bundle(name, exported)
+        try:
+            cb.parse_bundle(data, kind=target.kind, path_label=target.label)        # what is written must read back
+            cb.write_atomic(target, data)
+        except cb.BundleError as exc:
+            return {"ok": False, "status": "refused", "error": "label_invalid", "written": False,
+                    "reason": "; ".join(exc.problems)}
+        except ValueError as exc:
+            return {"ok": False, "status": "refused", "error": "target_refused", "reason": str(exc), "written": False}
+        except OSError as exc:
+            return {"ok": False, "status": "failed", "error": "write_failed", "written": False,
+                    "reason": cb.errno_name(exc)}
+        dropped = {field_name: sum(1 for rule in exported if getattr(rule, field_name) is not None)
+                   for field_name in ("source_event_id", "applies_from_event_id", "source_quote", "origin")}
+        sha = cb.digest(data)
+        result = {"ok": True, "status": "written", "written": True, "path_label": target.label,
+                  "source_kind": target.kind, "bundle_id": sha[:cb.SHORT_HASH], "sha256": sha,
+                  "mode": "0644" if target.kind == "project" else "0600", "label": cb.shown(name, cb.LABEL_MAX),
+                  "exported": [rule.id for rule in exported], "skipped": skipped,
+                  "dropped_fields": {key: count for key, count in dropped.items() if count},
+                  "next": "Commit the file with the project (or copy it to the other device), then on that device run "
+                          "list_contract_candidates and adopt_contracts with one of its own user messages as the "
+                          "anchor. Nothing is enforced there until it is adopted; deleting or editing the file later "
+                          "changes nothing that was adopted."}
+        if target.kind == "project" and not target.label.endswith(cb.PROJECT_BUNDLE_LABEL):
+            result["warning"] = (f"only {cb.PROJECT_BUNDLE_LABEL} files are found as project candidates; another device "
+                                 "would need this path in SELF_DIRECT_CONTRACT_BUNDLE_PATHS")
         return result
 
     def _verified_checklist_evidence(self, evidence_ids, chunks, complete) -> bool:
@@ -2198,6 +2493,12 @@ class SelfDirectEngine:
                     status["session"]["issues"].append("receipts_changed_during_status")
         status["incremental_verification"] = self._verification_status(sid, resolved)
         status["evaluation"] = self._evaluation_status(sid, resolved)
+        try:
+            status["contract_bundles"] = self._bundle_counts(sid, resolved)
+        except (IndexBusy, RequestStopped):
+            raise
+        except Exception as exc:        # candidate files are optional context: never fail a status call over them
+            status["contract_bundles"] = {"error": type(exc).__name__}
         return status
 
     def _evaluation_status(self, sid, provider) -> dict[str, Any]:

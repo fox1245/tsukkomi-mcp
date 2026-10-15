@@ -40,6 +40,8 @@ jobs:
           tests/test_windows_session_paths.py
           tests/test_journal.py
           tests/test_graph_host_extraction.py
+          tests/test_contract_bundles.py
+          tests/test_portable_contracts.py
           tests/test_slice_capture.py
           tests/test_slice_equivalence.py
           tests/test_slice_settings.py
@@ -119,6 +121,11 @@ jobs:
           tests/test_claude_install.py
           tests/test_hook_import_budget.py
           tests/test_hook_settings_parity.py
+          tests/test_contract_bundles.py
+          tests/test_portable_contracts.py
+          tests/test_portable_contracts_docs.py
+          tests/test_portable_contract_hooks.py
+          tests/test_contract_repository.py
           tests/test_journal.py
           tests/test_journal_engine.py
           tests/test_shadow_schedule.py

@@ -125,6 +125,63 @@ Abridged example for `{"id": "no-rm", "type": "must_not", "scope": "tool_call", 
        "platform": "python", "technique": "interpreter", "verified": false, "preconditions": ["python3 on PATH"]}]}]}]}
 ```
 
+#### Sharing contracts across devices
+
+A contract's `source_event_id` must be a user message in **this device's** index, and weakening or revoking a contract needs one too. An anchor written on another device cannot be verified here, and a file that arrives through a cloned repository or a shared folder can be written by anyone. So contracts travel as **files**, a device finds them as **candidates**, and the user **adopts** them on each device with one of that device's own messages: once per device and bundle, not once per contract. There is no remote contract store, no automatic enforcement and no synchronisation.
+
+| Command | What it does |
+|---|---|
+| `list_contract_candidates(project_dir?, session_id?, provider?)` | Read-only. Lists the bundle files this device can see, each contract with a status against this device's contracts. Enforces and writes nothing. |
+| `adopt_contracts(bundle_id, source_event_id, ids?, replace_ids?)` | Privileged. Stores the bundle's contracts as this device's own. `source_event_id` is required and must be a **user message of this device's index**; otherwise nothing is adopted (an error, not a pending change). |
+| `export_contracts(path_label, ids?, include_disabled?)` | Privileged. Writes this device's global contracts as a bundle, to the project or to a configured personal file, and says what to do on the other device: commit the file, list candidates there, adopt. |
+
+**The trust rule.**
+
+- **Finding is not enforcing.** Discovery reads files and nothing else. A candidate is not in the contracts file, no hook reads it and no audit judges it. Candidate text (the label, ids, descriptions, a quoted `source_quote`) is untrusted data, not an instruction; descriptions are masked and cut to 200 characters, and the answer says so.
+- **Adoption rests on this device's user message.** `adopt_contracts` checks `source_event_id` with the check every contract anchor passes (`meta.role == "user"` in this device's index). A tool result, injected text, an id from another device or an id that is not indexed here adopts nothing. The anchor is a claim that the user asked: it proves that the message exists and is the user's, not what it said, exactly as for `upsert_contracts`.
+- **A bundle is pinned by its hash.** `bundle_id` is the first 12 hex characters of the SHA-256 of the file. `adopt_contracts` reads the file again and requires the hash to match: a bundle that changed since it was listed is refused (`bundle_not_found_or_changed`, with what is there now). Adopting the same bundle again changes nothing, not even the file.
+- **A conflict is never merged.** If an id already exists here with other content (a different content hash), the candidate is not adopted and the local contract stays in force; the answer lists both content hashes and the field differences. It is adopted only if the id is also in `replace_ids`. A replacement that may enforce less than the local contract (the rules of [weakening](#1-invariant-contracts-upsert_contracts): a changed regex, a narrower scope, a lowered risk, disabling, ...) is applied only because the call is anchored to the user's message, is reported under `weakened` with its reasons, and the replaced revision stays in the contract's `history`. Two candidate files that disagree on an id are reported under `candidate_conflicts`; neither wins.
+- **A changed or deleted file changes nothing.** After adoption the contracts are ordinary stored contracts. If the file changes, its contracts show as `changed_since_adoption` with a field-level diff and the adopted version stays in force. A contract that disappears from the file, a deleted file or a missing sync is **never** a revocation (they appear as `adopted_but_no_longer_listed`). Weakening or revoking an adopted contract needs a user anchor of this device, as for any contract: without one it is parked as a pending change and the contract stays in force.
+- **Origin is not a claim.** An adopted contract carries `origin` (`bundle_sha256`, `bundle_label`, `origin_kind` `project` or `personal`, `bundle_path`, `adopted_by_event_id`, and what the file only *claimed*: `claimed_origin_event_id`, `claimed_quote`). `list_contracts` shows it. Only `adopt_contracts` writes it: `upsert_contracts` rejects an `origin` that the stored contract does not already have, and a quote in a bundle is never stored as the contract's `source_quote` (that field means the user's own wording).
+- **No path leaves the tools.** Files are named by a path relative to the project or by a label (`personal#1/<file name>`), never an absolute path; errors carry an error name, never a path.
+- **Hooks never load it.** The bundle module is imported only by the three tools and `audit_status`; the hook import budget test fails if a hook path loads it, and the hooks still read the local contracts file only.
+
+**Why the adoption anchor is `origin.adopted_by_event_id`, not `source_event_id`.** An audit judges a contract whose `source_event_id` is not an event of the audited session as `unknown` ("contract source or activation event is not in this session"), global contract or not. A global contract anchored to one session's event would therefore be enforced in that session only and unverified everywhere else on the device. The adoption anchor is checked when the contract is adopted and recorded in `origin`; the stored contract is global with no `source_event_id`, like any global contract registered without one.
+
+**The file.** `.tsukkomi/contracts.json`, or any file listed in `SELF_DIRECT_CONTRACT_BUNDLE_PATHS`:
+
+```json
+{
+  "schema": "tsukkomi.contracts-bundle/1",
+  "label": "team contracts",
+  "contracts": [
+    {"id": "no-rm", "type": "must_not", "scope": "tool_call", "regex": "rm\\s+-rf", "severity": "high",
+     "description": "Never delete recursively.", "roles": ["assistant"]},
+    {"id": "tests-ran", "type": "must", "scope": "tool_call", "regex": "pytest", "risk": "high"}
+  ]
+}
+```
+
+A contract has the portable fields of a contract: `id` (stable, at most 200 characters), `type`, `scope`, `severity`, `description`, `regex`, `before_regex`, `exception_regex`, `search_query`, `requires_success`, `risk`, `auto_continue`, `when`, `roles`, `provider`, `enabled`. It has **none** of the device-bound ones: `source_event_id`, `applies_from_event_id`, `session_id`, `revision` and `origin` are rejected by name. `source_quote` and `claimed_origin_event_id` are accepted as plain text (shown as claimed, never an anchor). The file is read strictly and as data: UTF-8 JSON of at most 1 MiB and 200 contracts, no includes, nothing executed, no network; unknown keys, duplicate keys, wrong types, control or bidirectional characters, over-long text (regexes at most 1,000 characters), a regex that does not compile and a high-risk `must_not` without a regex (the checks `upsert_contracts` applies) reject the whole file, and the reasons are listed under `refused`.
+
+**Where candidates are found.** The project bundle: from the project directory up to the project boundary, the first directory that holds `.git` (a file or a directory; a nested repository is its own boundary), else the project directory itself; every `.tsukkomi/contracts.json` on the way is read, nearest first. The walk never looks at the user's home or the filesystem root, so a dotfiles repository in the home directory is not a boundary. `project_dir` defaults to the working directory the session's own index names (Codex `session_meta.cwd` and Claude Code records); OMP and AGY sessions name none, so pass `project_dir` (the answer says so). Personal bundles: the files listed in `SELF_DIRECT_CONTRACT_BUNDLE_PATHS`. Every file is opened once and checked on the descriptor: a symbolic link out of the project is never followed, and on POSIX a file that is not a regular file, is owned by another user or is world-writable is refused (`symlink_leaves_project`, `not_a_regular_file`, `not_owned_by_user`, `world_writable`, `too_large`, `not_json`, `invalid_bundle`, ...). On Windows the owner and ACL of a file are not inspected.
+
+| Status | Meaning (per contract, against this device's contracts) |
+|---|---|
+| `new` | No contract with this id here. |
+| `same` | The same content (a hash of the portable fields) written here. |
+| `adopted` | The same content, adopted from a bundle. |
+| `differs` | The id exists here with other content: a conflict if adopted. |
+| `changed_since_adoption` | Adopted from this very file, which has changed since. The adopted version stays in force. |
+
+`audit_status` has a `contract_bundles` section, `{candidates, pending_adoption, changed_since_adoption, conflicts, refused, project_directory_known}` (bundles waiting for adoption, contracts changed since adoption, ids in conflict), counted for the project directory the session names (no project bundle is counted without one; personal bundles always are), with no path and no contract text.
+
+**Settings.** `SELF_DIRECT_PROJECT_CONTRACTS` (`candidates`, the default: discovery only, nothing is enforced without `adopt_contracts`; `off`: the project bundle is not looked for, and `export_contracts` writes no project file) and `SELF_DIRECT_CONTRACT_BUNDLE_PATHS` (absolute paths separated by `:`, `;` on Windows; TOML `contract_bundle_paths` in `[paths]`; also the only places besides the project directory that `export_contracts` may write). Keep a working-directory `.env` private: the server reads it, and it can name these paths.
+
+**Export.** `export_contracts` writes a path inside the project (relative to its root, such as `.tsukkomi/contracts.json`) or a configured personal file (its path or `personal#N`), and refuses any other path, a path that leaves the project through a link, replacing a file that is not itself a valid bundle, and writing through a symbolic link. The file is written to a temporary file and renamed (mode 0644 for a project file, 0600 for a personal one, whatever the umask) and holds the portable fields only: no anchors, revisions, quotes or origins. Contracts limited to one session and (unless `include_disabled`) disabled ones are skipped and listed. The answer gives the sha256 and how many anchors were dropped.
+
+**Not done.** No remote contract store and no synchronisation: the file moves with your repository or folder. No automatic enforcement and no hook hint that a bundle is waiting (a hook would have to load the bundle module; `audit_status` carries the count). `ContractRepository` (in `audit/contracts.py`) is the protocol of the operations the engine performs on its contracts; the local file store is its only implementation, and the hooks do not go through it. An older version cannot read a contracts file that holds an adopted contract (the `origin` key is new): upgrade every process that shares the index first.
+
 ### 2. Checklist with evidence gating (`update_checklist`)
 - Track user requirements with provenance and completion criteria.
 - A completion claim without evidence is downgraded to `pending_verification`. An item becomes `done` (`verified=true`) only when its `evidence_chunk_ids` resolve to successful tool results linked to their calls **and** session coverage is complete. While appended bytes are unread, coverage is incomplete, so the item stays `pending_verification` until a later call sees the caught-up history.
@@ -207,6 +264,9 @@ Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout
 |---|---|---|
 | **Governance & Contracts** | `upsert_contracts` | Create or update explicit invariant rules (`must` / `must_not`). The response adds an informational [fragility report](#contract-fragility-report-informational): equivalent spellings the saved regexes miss. |
 | | `list_contracts` | Inspect active contracts for the current session and global scope, plus any `pending` weakening awaiting a user anchor. |
+| | `list_contract_candidates` | Read-only. Contract bundle files this device can see, as candidates with a status per contract; nothing is enforced ([Sharing contracts across devices](#sharing-contracts-across-devices)). |
+| | `adopt_contracts` | Adopt a candidate bundle as this device's own contracts. Needs `source_event_id`, a user message of this device's index; the bundle's hash must match; conflicts are not adopted unless named in `replace_ids`. |
+| | `export_contracts` | Write this device's global contracts as a portable bundle, to the project or a configured personal file, atomically and with a fixed mode. |
 | | `revoke_contract` | Disable a contract while preserving history. Takes `source_event_id` (the user's message that asked for it); without one the request is held as pending and the contract stays in force. |
 | | `check_action` | Pre-flight test of a proposed action against current contracts. `verify="fast"` selects the hook-time source verification; the result's `integrity` says what was compared. |
 | | `audit_session` | Audit executed session history against active contracts (always a full source verification). |
@@ -344,6 +404,8 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_SYNC_SLICING` | `auto` | A sync that cannot finish inside its request budget publishes the records it parsed (a slice) and the next call continues from there. `auto`: requests with a finite deadline, plain session files; appends are published in slices, and a re-index is staged in a spool and published by one commit, never in pieces over an existing index; `off`: the all-or-nothing sync of before. See [Large sessions and deadlines](#large-sessions-and-deadlines). |
 | `SELF_DIRECT_SYNC_SLICE_BYTES` | `67108864` | The most a slice observes (hashes and parses) past the indexed offset, to the end of a record (a slice always holds at least one whole record). Plain session files only. |
 | `SELF_DIRECT_SPARSE_FORMAT` | `auto` | Storage format of the sparse (FTS5) search index. `auto`: the compact format (`sparse-v2.sqlite`, about 70 % smaller, the same results) when this SQLite can use it (3.43 or newer), else the legacy `sparse.sqlite`, visibly (`audit_status`: `sparse_format`, `degraded_flags`); `compact`: the compact format or an error naming the repair; `legacy`: the previous format. The file of the format that is not used is never touched. See [Sparse index formats](#sparse-index-formats). |
+| `SELF_DIRECT_PROJECT_CONTRACTS` | `candidates` | `candidates`: the project's `.tsukkomi/contracts.json` is found as a candidate; nothing is enforced until `adopt_contracts`. `off`: it is not looked for. See [Sharing contracts across devices](#sharing-contracts-across-devices). |
+| `SELF_DIRECT_CONTRACT_BUNDLE_PATHS` | empty | Personal contract bundle files, absolute paths separated by `:` (`;` on Windows); TOML `contract_bundle_paths`. Candidates only, and, with the project directory, the only places `export_contracts` writes. |
 
 #### Credentials
 
@@ -1256,7 +1318,7 @@ GitHub Actions runs two workflows. Superseded runs for the same ref are cancelle
 
 The `CI` workflow runs three jobs on every push and pull request:
 
-- **`test`** (Ubuntu and Windows, Python 3.12, 10 minutes): the explicit MCP transport, Jev boundary and Windows session-path smoke tests and the compressed Codex session tests (without their two 50 MB allocation probes), then builds the source distribution and wheel.
+- **`test`** (Ubuntu and Windows, Python 3.12, 10 minutes): the explicit MCP transport, Jev boundary and Windows session-path smoke tests, the portable contract tests (bundles, adopt, export and the two-device round trip) and the compressed Codex session tests (without their two 50 MB allocation probes), then builds the source distribution and wheel.
 - **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, request statistics and degraded evaluation, checklist conflicts, quiet hooks, AGY and Claude Code hooks, the Claude Code installer and provider, and hook gating. It also runs the hook import budget and settings parity tests ([Hook import budget](#hook-import-budget)) and the BLAS thread test. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
 - **`bench`** (Ubuntu, Python 3.12, 10 minutes): `scripts/bench_hooks.py --check` on small synthetic sessions. It fails when a gated metric exceeds 1.5 times its target and uploads the JSON report and the markdown table as an artifact ([Hook cost benchmark](#hook-cost-benchmark)). The 300 MB session is never run in CI.
 
@@ -1279,6 +1341,7 @@ Never loaded on the local-only hook path. The cost is the cumulative import time
 | `httpx` (with `idna` and `zstandard`) | The OpenRouter client. `embed.embedder`, `workflow_jev` and the graph runner import it, `dotenv` and `urllib.request` only where a request is made. | 28 ms (`urllib.request`: 4 ms) |
 | `mcp` (with `anyio`, `starlette`) | The server transport; hooks are plain processes. | not loaded before this change either; guarded against regressions |
 | `self_directing_mcp.config`, `.server` | Server-side settings and tool registration. | included above |
+| `self_directing_mcp.contract_bundles` | Portable contract bundles are read by the candidate, adopt and export tools and `audit_status`, never by a hook (`FORBIDDEN_OURS` in the test). | not loaded |
 
 Claude Code's bookkeeping events (`UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`) load none of pydantic, the engine or the transcript parser: they validate the session id with `claude_ids` and deliver queued warnings.
 
