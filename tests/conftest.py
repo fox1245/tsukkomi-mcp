@@ -154,6 +154,39 @@ def strict_incremental(monkeypatch, request):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "allow_incremental_mismatch: the test provokes an incremental/full mismatch")
+    config.addinivalue_line("markers", "pgvector: needs a real pgvector server (a throwaway container, or the server of "
+                                       "TSUKKOMI_PGVECTOR_TEST_DSN_FILE); skipped without one, a failure when "
+                                       "TSUKKOMI_REQUIRE_PGVECTOR=1")
+
+
+@pytest.fixture(scope="session")
+def pgvector_server():
+    """One throwaway pgvector server for the whole session (tests/pgvector_support.py), always removed at the end."""
+    import pgvector_support as support
+    try:
+        server = support.require_server()
+    except support.ServerUnavailable as exc:
+        if os.environ.get("TSUKKOMI_REQUIRE_PGVECTOR") == "1":
+            pytest.fail(f"TSUKKOMI_REQUIRE_PGVECTOR=1 but no pgvector server could be had: {exc}", pytrace=False)
+        pytest.skip(f"no pgvector server: {exc}")
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+@pytest.fixture
+def pg_schema(pgvector_server):
+    """A schema name used by one test only, dropped afterwards."""
+    import secrets
+    name = "t_" + secrets.token_hex(5)
+    try:
+        yield name
+    finally:
+        try:
+            pgvector_server.drop_schema(name)
+        except Exception:
+            pass
 
 
 def pytest_sessionfinish(session, exitstatus):

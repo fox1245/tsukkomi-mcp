@@ -45,10 +45,30 @@ class PgServer:
     """A PostgreSQL server with the ``vector`` extension created in ``dbname``."""
 
     def __init__(self, *, host: str, port: int, user: str, password: str, dbname: str, container: str | None = None,
-                 extra: str = "") -> None:
+                 extra: str = "", options: dict | None = None) -> None:
         self.host, self.port, self.user, self.password, self.dbname = host, port, user, password, dbname
         self.container = container          # None for an external server
         self.extra = extra                  # further libpq keywords of an external server (sslmode ...)
+        self.options = options or {}        # what start_container was called with, for restart()
+        self.stopped = False
+
+    @property
+    def managed(self) -> bool:
+        """Whether this module started the server (so it can stop and restart it)."""
+        return bool(self.options) or self.container is not None
+
+    def restart(self) -> None:
+        """Start a fresh container after ``stop()`` (the data directory is a tmpfs: the database is new, with the
+        extension created). Host, port and password change; the object is updated in place."""
+        if not self.options and self.container is None:
+            raise ServerUnavailable("restart needs the container this module started")
+        self.stop()
+        fresh = start_container(**self.options)
+        _RUNNING.remove(fresh)
+        self.host, self.port, self.user, self.password, self.dbname = (fresh.host, fresh.port, fresh.user, fresh.password,
+                                                                       fresh.dbname)
+        self.container = fresh.container
+        _RUNNING.append(self)
 
     def conninfo(self, dbname: str | None = None, **keywords) -> str:
         parts = {"host": self.host, "port": self.port, "dbname": dbname or self.dbname, "user": self.user,
@@ -82,16 +102,6 @@ class PgServer:
     def drop_schema(self, schema: str) -> None:
         self.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
-    def pause(self) -> None:
-        """Freeze the server process (the connection hangs instead of failing). Docker-managed servers only."""
-        if self.container is None:
-            raise ServerUnavailable("pause needs the container this module started")
-        _docker("pause", self.container)
-
-    def unpause(self) -> None:
-        if self.container is not None:
-            _docker("unpause", self.container)
-
     def stop(self) -> None:
         """Stop and remove the container (a no-op for an external server)."""
         if self in _RUNNING:
@@ -99,6 +109,87 @@ class PgServer:
         if self.container is not None:
             _docker("rm", "-f", self.container, timeout=60)
             self.container = None
+            self.stopped = True
+
+
+class TcpProxy:
+    """A loopback TCP forwarder in front of a server: ``stop()`` is, for a client, a server that went away (open connections
+    reset, new ones refused); ``start()`` brings it back on the same port. Works for any server, container or not."""
+
+    def __init__(self, target_host: str, target_port: int) -> None:
+        import socket
+        import threading
+
+        self._socket_module, self._threading = socket, threading
+        self.target = (target_host, target_port)
+        self.port = 0
+        self._listener = None
+        self._connections: list = []
+        self._lock = threading.Lock()
+        self.start()
+
+    def start(self) -> None:
+        socket = self._socket_module
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", self.port))
+        listener.listen(16)
+        self.port = listener.getsockname()[1]
+        self._listener = listener
+        self._threading.Thread(target=self._accept, args=(listener,), daemon=True).start()
+
+    def _accept(self, listener) -> None:
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                upstream = self._socket_module.create_connection(self.target, timeout=10)
+            except OSError:
+                client.close()
+                continue
+            with self._lock:
+                self._connections.extend((client, upstream))
+            for source, sink in ((client, upstream), (upstream, client)):
+                self._threading.Thread(target=self._pump, args=(source, sink), daemon=True).start()
+
+    @staticmethod
+    def _pump(source, sink) -> None:
+        try:
+            while True:
+                data = source.recv(65536)
+                if not data:
+                    break
+                sink.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for end in (source, sink):
+                try:
+                    end.close()
+                except OSError:
+                    pass
+
+    def drop_connections(self) -> None:
+        with self._lock:
+            connections, self._connections = self._connections, []
+        for connection in connections:
+            try:
+                connection.shutdown(self._socket_module.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+
+    def stop(self) -> None:
+        if self._listener is not None:
+            try:
+                self._listener.shutdown(self._socket_module.SHUT_RDWR)      # wakes the accept() blocked in another thread
+            except OSError:
+                pass
+            self._listener.close()
+            self._listener = None
+        self.drop_connections()
 
 
 def _stop_all() -> None:
@@ -161,7 +252,9 @@ def start_container(*, shared_buffers: str = "512MB", tmpfs_size: str = "3g", sh
     if run.returncode != 0:
         _docker("rm", "-f", name, timeout=60)
         raise ServerUnavailable("docker run failed: " + " ".join(run.stderr.split())[:200].replace(password, "***"))
-    server = PgServer(host="127.0.0.1", port=0, user=USER, password=password, dbname=DATABASE, container=name)
+    server = PgServer(host="127.0.0.1", port=0, user=USER, password=password, dbname=DATABASE, container=name,
+                      options={"shared_buffers": shared_buffers, "tmpfs_size": tmpfs_size, "shm_size": shm_size,
+                               "settings": settings, "wait_sec": wait_sec})
     _RUNNING.append(server)
     try:
         mapped = _docker("port", name, "5432/tcp").stdout.split()

@@ -633,6 +633,9 @@ class PgVectorIndex(VectorIndex):
         endpoint = self._endpoint()
         if kind == "timeout":
             check_request()                                 # the request's own deadline or cancellation wins
+            remaining = self._remaining()
+            if remaining is not None and remaining < 0.1:   # the server's timer is the request's own, to within a clock tick
+                raise RequestStopped("request_deadline")
             return PgVectorError(f"A pgvector statement on {endpoint} exceeded its time limit: {detail}")
         if kind == "connection":
             return PgVectorUnavailable(
@@ -764,14 +767,10 @@ class PgVectorIndex(VectorIndex):
                                    (doomed[start:start + PRESENT_BATCH],))
         self._run(operation, write=True)
 
-    @request_operation
-    def search(self, query, top_k: int = 20, allowed_ids: set[str] | None = None) -> list[tuple[str, float]]:
-        check_request()
-        if top_k <= 0:
-            return []
+    def _plan(self, query, top_k: int, allowed_ids):
+        """The statement a search runs: ``(statement, params, before, approximate, allowed)``; ``allowed`` is the sanitized
+        filter (``None`` for no filter, an empty list when nothing can match)."""
         allowed = None if allowed_ids is None else self._lookup_ids(allowed_ids)
-        if allowed is not None and not allowed:
-            return []
         probe = self._driver.vector(self._pack(query))
         approximate = self.hnsw and allowed is None
         where = "" if allowed is None else "WHERE chunk_id = ANY(%(ids)b) "
@@ -783,20 +782,33 @@ class PgVectorIndex(VectorIndex):
         params = {"q": probe, "k": int(top_k)}
         if allowed is not None:
             params["ids"] = allowed
-
         before = []
         if approximate:
             before.append(("SELECT set_config('hnsw.ef_search', %s, false)", (str(min(1000, max(40, 2 * int(top_k)))),)))
+        return statement, params, before, approximate, allowed
+
+    def _scan_wanted(self, approximate: bool, allowed) -> bool:
+        """Whether the planner should scan the table (hashed filter) instead of looking the filter's ids up one by one.
+
+        The planner prices a lookup per id too low when the filter is a large part of the table: at 50 000 rows one scan
+        with a hashed filter took 0.57 times as long as the planner's id-by-id lookups for a filter of every row, and as
+        long for a third of them (README, "pgvector numbers"). The table's row count is the one the previous read noted
+        (none before the first ANALYZE: then the planner decides alone)."""
+        rows = self._table_rows
+        return bool(not approximate and allowed is not None and rows is not None
+                    and len(allowed) * SEQ_SCAN_ID_RATIO >= rows)
+
+    @request_operation
+    def search(self, query, top_k: int = 20, allowed_ids: set[str] | None = None) -> list[tuple[str, float]]:
+        check_request()
+        if top_k <= 0:
+            return []
+        statement, params, before, approximate, allowed = self._plan(query, top_k, allowed_ids)
+        if allowed is not None and not allowed:
+            return []
 
         def operation(connection):
-            # The planner prices a lookup per id too low when the filter is a large part of the table: at 50 000 rows
-            # one scan with a hashed filter took 0.57 times as long as the planner's id-by-id lookups for a filter of
-            # every row, and as long for a third of them (README, "pgvector numbers"). The table's row count is the
-            # one the previous read noted (none before the first ANALYZE: then the planner decides alone).
-            rows = self._table_rows
-            scan = (not approximate and allowed is not None and rows is not None
-                    and len(allowed) * SEQ_SCAN_ID_RATIO >= rows)
-            return self._read(connection, statement, params, scan=scan, before=before)
+            return self._read(connection, statement, params, scan=self._scan_wanted(approximate, allowed), before=before)
         rows = self._run(operation)
         out = []
         for item_id, score in rows:
@@ -804,6 +816,24 @@ class PgVectorIndex(VectorIndex):
             # A zero vector has no cosine (pgvector: NaN, ordered last); SqliteVectorIndex and NumpyVectorIndex score it 0.
             out.append((item_id, float(score) if score is not None and math.isfinite(score) else 0.0))
         return out
+
+    @request_operation
+    def explain(self, query, top_k: int = 20, allowed_ids: set[str] | None = None) -> list[str]:
+        """The server's plan (``EXPLAIN``, no execution) for the statement ``search`` would run: what an operator checks to
+        see whether the HNSW index, an index lookup of the filter or a scan serves a search."""
+        statement, params, before, approximate, allowed = self._plan(query, top_k, allowed_ids)
+
+        def operation(connection):
+            scan = self._scan_wanted(approximate, allowed)
+            statements = list(before) + [("EXPLAIN " + statement, params)]
+            with self._driver.pipeline(connection):
+                armed = connection.execute(self.ARM, self._arm_parameters(None, False, scan))
+                for sql, values in statements[:-1]:
+                    connection.execute(sql, values)
+                cursor = connection.execute(*statements[-1])
+            self._noted(armed.fetchone())
+            return [row[0] for row in cursor.fetchall()]
+        return self._run(operation)
 
     @request_operation
     def count(self) -> int:
