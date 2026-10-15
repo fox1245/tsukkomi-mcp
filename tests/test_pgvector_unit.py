@@ -643,3 +643,19 @@ def test_the_hnsw_search_width_follows_top_k_unless_it_is_set():
     for bad in (0, 1001, True, "40", 2.5):
         with pytest.raises(ValueError, match="hnsw_ef_search"):
             PgVectorIndex(DSN, dim=4, hnsw_ef_search=bad, driver=FakeDriver())
+
+
+def test_a_vanished_peer_is_detected_by_the_connection_parameters_unless_the_dsn_sets_them():
+    index, driver, _server = make()
+    index.count()
+    params = driver.connect_calls[0][1]
+    assert params["tcp_user_timeout"] == 30_000 and params["keepalives_idle"] == 30 and params["application_name"] == "tsukkomi-mcp"
+    assert 2 <= params["connect_timeout"] <= 10
+    index, driver, _server = make(dsn=DSN + " tcp_user_timeout=5000 keepalives_idle=7 connect_timeout=3 application_name=mine")
+    index.count()
+    params = driver.connect_calls[0][1]
+    assert not ({"tcp_user_timeout", "keepalives_idle", "connect_timeout", "application_name"} & set(params))
+    with request_scope(deadline=time.monotonic() + 3.0):
+        index, driver, _server = make()
+        index.count()
+    assert driver.connect_calls[0][1]["connect_timeout"] == 3                    # never longer than the request has left

@@ -138,7 +138,7 @@ Abridged example for `{"id": "no-rm", "type": "must_not", "scope": "tool_call", 
 - In Google Antigravity, active graph relationships are delivered into agent context before each tool invocation.
 
 ### 4. Hybrid history search
-- Dense cosine similarity (`sqlite-vector`, native), SQLite FTS5 BM25 and regex, fused with reciprocal-rank fusion.
+- Dense cosine similarity (`sqlite-vector`, native, by default; NumPy or PostgreSQL with pgvector when selected: see [Dense backends](#dense-backends)), SQLite FTS5 BM25 and regex, fused with reciprocal-rank fusion.
 - **Secret masking:** known credential patterns are masked before embedding, in sparse search text and in everything returned to the client. This is not a guarantee that arbitrary personal data or every secret format is removed; see the [masking contract](SECURITY.md#masking-contract).
 
 ---
@@ -263,6 +263,7 @@ A batch is never skipped silently. A proposal without edges is rejected (`empty_
 - Python 3.12+ and `uv` (recommended) or `venv`
 - The official `sqlite-vector` 1.1.0 native library (the setup script below downloads and verifies it)
 - An OpenRouter key for the default embedding and retrieval path; not needed in explicit local-only mode
+- Optional: `pip install 'tsukkomi-mcp[pgvector]'` and a PostgreSQL server with the pgvector extension, only to keep the dense index there ([Dense backends](#dense-backends))
 
 ### 1. Clone and install
 
@@ -321,7 +322,10 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_CLAUDE_ENFORCEMENT` | `confirmed_only` | Claude Code hook policy, same values, independent of the AGY setting. `scripts/install_claude_hooks.py` writes it into the Claude Code settings `env`. |
 | `SELF_DIRECT_USE_FAKE_EMBEDDER` | `false` | Offline/test embedder; never a silent fallback. |
 | `SELF_DIRECT_LOCAL_ONLY` | `false` | Explicit offline mode: no embedder or dense index; embedding, dense/hybrid search and LLM graph updates are rejected. |
-| `SELF_DIRECT_DENSE_BACKEND` | `sqlite-vector` | `sqlite-vector` or `numpy`. |
+| `SELF_DIRECT_DENSE_BACKEND` | `sqlite-vector` | `sqlite-vector`, `numpy` (explicit offline option) or `pgvector` (opt-in extra; the vectors go to a PostgreSQL server, see [Dense backends](#dense-backends)). Never substituted for one another. |
+| `SELF_DIRECT_PGVECTOR_DSN_FILE` | unset | `pgvector` only: a file (TOML `pgvector_dsn_file`) holding one libpq connection string, `host=... dbname=...` or a `postgresql://` URI. It is a secret: the file must not be readable by group or others (`chmod 600`), its content is never logged or echoed, and a connection string in an environment variable (`SELF_DIRECT_PGVECTOR_DSN`) is refused. Unset: only the standard libpq environment (`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGPASSFILE`, `PGSERVICE`, `PGSSLMODE`) selects the server. |
+| `SELF_DIRECT_PGVECTOR_SCHEMA` | `tsukkomi` | `pgvector` only: the PostgreSQL schema that holds `chunk_vectors` and `tsukkomi_meta`; ASCII letters, digits and underscore, at most 63, not `pg_*`. One schema per index directory. |
+| `SELF_DIRECT_PGVECTOR_HNSW` | `false` | `pgvector` only: also keep an approximate (HNSW) index. Off by default: the exact scan is the reference. See [HNSW](#hnsw-optional-approximate-search). |
 | `SELF_DIRECT_SQLITE_VECTOR_PATH` | `native/vector.*` in the checkout, if present | Native library path. |
 | `SELF_DIRECT_OPENROUTER_API_KEY_FILE` | unset | Authoritative dotenv file with `OPENROUTER_API_KEY`. |
 | `SELF_DIRECT_EMBEDDING_MODEL`, `SELF_DIRECT_EMBEDDING_DIM`, `SELF_DIRECT_EMBEDDING_BASE_URL` | `qwen/qwen3-embedding-8b`, `1024`, `https://openrouter.ai/api/v1` | Embedding model, dimension and endpoint. |
@@ -415,6 +419,76 @@ The extension also registers the read-only `tsukkomi_session_context` tool. Call
 ### Cursor / Grok Bot
 
 Set `SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR` (or `grokbot_transcripts_dir` in TOML) and pass `provider="grokbot"` to the MCP tools. There is no lifecycle hook for this host in this repository.
+
+## Dense backends
+
+The dense half of `search_history` sits behind one interface (`index/vector.py::VectorIndex`). The canonical event store, the sparse (FTS5) index, the contracts and the embedding cache are always local SQLite files; only the vectors can live somewhere else. A backend is chosen with `SELF_DIRECT_DENSE_BACKEND` and is **never replaced by another one**: when the selected backend cannot work, the call fails with an error that names the repair, and `audit_status` says so.
+
+| Backend | Select | What it is | Use it when |
+|---|---|---|---|
+| `sqlite-vector` (default) | `sqlite-vector` | The official sqlite-vector 1.1.0 native library: an exact cosine scan over a local file (`vectors-v2-*/dense.sqlite`). | Every normal install. Nothing to operate, nothing leaves the machine. |
+| `numpy` | `numpy` | An explicit offline and test option: a float64 matrix in memory, persisted as `dense_numpy.npz`. It scores a dot product, which is a cosine only for unit vectors (every embedder here returns unit vectors). | Tests, and machines that cannot load the native library. Not for large indexes: each write rewrites the file and each search copies the matrix. |
+| `pgvector` | `pgvector` | PostgreSQL with the [pgvector](https://github.com/pgvector/pgvector) extension: an exact cosine scan with the id filter pushed into SQL, and an optional HNSW index. An opt-in extra. | The vectors should live on a database server you operate: more vectors than you want in a laptop file, one place for them, session-scoped searches that must stay fast as the index grows. Not needed otherwise. |
+
+All three score `1 - cosine distance` (1 is identical, a zero vector scores 0), apply `allowed_ids` before the top-k, and break exact ties by id in byte order (NumPy: arbitrary inside a tie). `tests/test_dense_backend_parity.py` holds pgvector and sqlite-vector to NumPy's exact scan on the same seeded vectors, filters and write sequences: identical top-k except inside groups of exactly equal scores, scores within 1e-6 (float32 arithmetic; the largest difference seen was 2e-7).
+
+### pgvector
+
+```bash
+pip install 'tsukkomi-mcp[pgvector]'          # psycopg 3; imported at the first query, never by hooks or the default install
+# once, by a database administrator, in the target database (this process never installs it):
+#   CREATE EXTENSION vector;
+(umask 077; printf '%s\n' 'host=db.example.org port=5432 dbname=tsukkomi user=tsukkomi password=<password> sslmode=verify-full' > /absolute/path/pgvector.dsn)
+export SELF_DIRECT_DENSE_BACKEND=pgvector
+export SELF_DIRECT_PGVECTOR_DSN_FILE=/absolute/path/pgvector.dsn
+```
+
+- **The connection string** is read only from the file named by `SELF_DIRECT_PGVECTOR_DSN_FILE` (one line, `host=... dbname=...` or a `postgresql://` URI; on POSIX not readable or writable by group or others) and from the standard libpq environment (`PGHOST`, `PGPASSFILE`, `PGSERVICE`...). It is never accepted as a setting value, never logged, never echoed: errors show `host:port/database`, the server's primary message with any password removed (also URI-encoded), and nothing else. `audit_status` shows `host`, `port`, `database` and `schema`, never the user or any option.
+- **TLS.** A server that is not this machine (anything but `localhost`, a loopback address or a socket directory) is reached only with `sslmode=verify-full` and a root certificate that verifies its name; `disable`, `allow`, `prefer` (libpq's default), `require` and `verify-ca` are refused before a connection is opened, so no credential is sent in the clear. A connection that only names a `service` hides its host, so it is forced to `verify-full`. A loopback server (a local container, a socket) needs no TLS.
+- **What leaves the machine.** Chunk ids and embedding vectors (float32, `SELF_DIRECT_EMBEDDING_DIM` numbers per chunk). Never session text, contracts or the canonical store. Vectors are **not anonymous**: an embedding can be partly inverted to recover the text it stands for, so treat them like the text. Selecting `pgvector` is therefore an explicit opt-in to that data flow, and a real remote server needs the owner's approval before it is first used; try it with synthetic data and a local container (`tests/pgvector_support.py` starts one). `SELF_DIRECT_LOCAL_ONLY=true` still forbids any dense index.
+- **Never on the hook path.** Hooks and audits do not use the dense index at all; the command hooks publish the canonical events and leave the vectors to the next `sync_session` of the server, so a database outage cannot delay or hide an audit. Only `sync_session` (vector upkeep) and `search_history` (`dense` and `hybrid` modes) talk to the server.
+- **Failure is an error, never a fallback.** An unreachable server, bad credentials, a missing `vector` extension, a dimension or embedding-policy mismatch each raise an error that names the repair (the DSN file, reachability, `CREATE EXTENSION vector;`, another `SELF_DIRECT_PGVECTOR_SCHEMA`). `sync_session` and dense or hybrid `search_history` return `error: dense_backend_unavailable` (the canonical events of a sync were already published and the journal keeps the vector work it owes; the next sync resumes). `sparse` and `regex` searches and all audits keep working. `audit_status` reports `dense_backend: "pgvector"`, `dense_count` (`null` when the server cannot answer), `dense_error`, the degraded flag `dense_backend_unavailable`, and `dense_info`: `host`, `port`, `database`, `schema`, `dimension`, `extension_version`, `server_version`, `tls`, `loopback`.
+- **Time budget.** Every statement runs with `statement_timeout` and `lock_timeout` equal to the time the request has left, so a slow or blocked statement ends with the request's own `request_deadline`; a connection attempt takes at most 10 seconds or the time left. A peer that vanishes is noticed through TCP keepalives (idle, about a minute) and `tcp_user_timeout` (30 s with data in flight). One connection per index object, opened lazily, validated on connect, replaced once if it drops (every operation is idempotent), closed with the engine. A write call is one transaction that commits only if the request is still live, so a stopped request leaves nothing half-applied.
+- **The schema** (`SELF_DIRECT_PGVECTOR_SCHEMA`, default `tsukkomi`), created under an advisory lock on first use by a role that may `CREATE` in the database, or by an administrator beforehand: `chunk_vectors(chunk_id text COLLATE "C" PRIMARY KEY, embedding vector(N) NOT NULL)` and `tsukkomi_meta(key, value)`, which records `schema_version`, `dim` (the vector dimension) and `policy` (the prefix of the embedder's cache key, which names the model, dimension and encoding). A process whose dimension or policy differs gets an explicit error instead of mixed vectors. Use **one schema per index directory**: the table is keyed by chunk id only. Up to 1700 dimensions the vector column is stored inline (`SET STORAGE PLAIN`): about 46 % more disk than pgvector's default out-of-line storage for 2.4 times faster scans (50,000 x 1024: 392 MB and 58 ms against 268 MB and 141 ms); above that the default is kept.
+- **Migrating** is not an in-place conversion: change the setting, and the next `sync_session` refills the new index from the local embedding cache (`dense_restored`; no embedding call for text that is already cached). The old `vectors-v2-*` files stay untouched, and so does the PostgreSQL schema when you go back (reverting the setting is the whole downgrade).
+- **Versions.** Tested with PostgreSQL 17.11, pgvector 0.8.7 and psycopg 3.3 on Linux. Exact search needs only the `vector` type and `<=>`; HNSW needs pgvector 0.5.0 or newer. Other PostgreSQL and pgvector versions, a remote server, TLS to a real server and Windows are not verified (Windows needs only the optional extra; the default install does not).
+
+#### HNSW (optional approximate search)
+
+`SELF_DIRECT_PGVECTOR_HNSW=true` creates `chunk_vectors_embedding_hnsw` (cosine, pgvector's defaults `m=16`, `ef_construction=64`; at most 2000 dimensions) and serves searches **without** an id filter with `hnsw.ef_search = max(100, 4 x top_k)`. It is off by default because the exact scan is the reference and because of what it costs: the index is as large as the table, every write maintains it, and it is approximate. Searches with an id filter are always exact, and **`search_history` always passes one** (the session's ids, or every id of the provider), so with the current engine the index is built and kept but not used: turn it on only when calling the backend directly. A large table's index takes minutes to build; build it outside a request with `PgVectorIndex(...).build_hnsw_index(maintenance_work_mem='2GB', timeout_ms=0)` (a build inside a request that runs out of time says so and names this command). The recall trade-off below is measured on clustered synthetic vectors; vectors with no neighbourhood structure (uniform random in 1024 dimensions) are the worst case, with recall@20 of 0.04 at 100,000 vectors and `ef_search=40`.
+
+### pgvector numbers
+
+Synthetic unit float32 vectors of dimension 1024 (uniform random for the comparison, 500 Gaussian clusters for HNSW recall), top_k = 20, 30 searches per cell after 2 warm-ups, p50 / p95 in milliseconds, one client, one machine (16 logical CPUs, WSL2). pgvector: PostgreSQL 17.11 and pgvector 0.8.7 in a loopback container with a tmpfs data directory, `shared_buffers=512MB`, PostgreSQL's default of 2 parallel workers per scan, inline vector storage, batches of 2000 rows per call. sqlite-vector 1.1.0 on a local file; NumPy in memory (loaded by one call: every call re-stacks the whole matrix). The filters are 500 stored ids and 50,000 ids (ids that are not stored pad the set when N is below 50,000, so that row measures the filter, not the hits). `scripts/bench_pgvector.py` reproduces everything; the 300,000-vector runs needed a larger tmpfs (8 GB) and, for HNSW, `--shm 6g --maintenance-work-mem 4GB`.
+
+| N | backend | upsert rows/s | `present` of 500 | search, no filter | 500 ids | 50,000 ids | size |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1,000 | pgvector | 8,752 | 1.5 | 1.2 / 1.4 | 1.4 / 2.0 | 31 / 36 | 8 MB |
+| | sqlite-vector | 45,395 | 0.5 | 2.0 / 2.5 | 2.4 / 3.1 | 22 / 24 | 4 MB |
+| | NumPy | 208,552 | 0.04 | 4.0 / 7.6 | 4.0 / 4.8 | 4.0 / 6.2 | 8 MB |
+| 10,000 | pgvector | 8,792 | 1.6 | 8.2 / 11.9 | 1.9 / 2.6 | 42 / 52 | 78 MB |
+| | sqlite-vector | 48,242 | 0.4 | 18.7 / 22.6 | 19.8 / 24.1 | 41 / 50 | 44 MB |
+| | NumPy | 102,194 | 0.2 | 18.1 / 32.3 | 8.0 / 12.2 | 30 / 48 | 78 MB |
+| 100,000 | pgvector | 9,818 | 1.9 | 82 / 90 | 2.7 / 4.0 | 153 / 196 | 784 MB |
+| | sqlite-vector | 65,709 | 0.5 | 183 / 213 | 193 / 219 | 227 / 257 | 441 MB |
+| | NumPy | 97,732 | 0.8 | 136 / 165 | 17.7 / 30.9 | 90 / 119 | 781 MB |
+| 300,000 | pgvector | 9,174 | 3.0 | 185 / 203 | 2.3 / 3.0 | 110 / 128 | 2,353 MB |
+| | sqlite-vector | 39,573 | 0.5 | 584 / 628 | 586 / 635 | 629 / 678 | 1,324 MB |
+| | NumPy | 72,344 | 2.9 | 413 / 451 | 36 / 48 | 113 / 136 | 2,344 MB |
+
+Where pgvector is **slower**: writes (about 9,000 rows/s, a fifth of sqlite-vector's: one transaction per batch, and a 4 kB vector fills a whole 8 kB page), `present` (a round trip, 1.5 to 3 ms against 0.5), disk (784 MB against 441 MB at 100,000, because inline storage wastes half of each page; the default storage is 32 % smaller but scans 2.4 times slower), the first query of a process (a validation round trip), and everything for a small index: below about 10,000 vectors the local file backends answer first. Where it **wins**: the exact scan once the index is large (2.2 times faster than sqlite-vector at 100,000 vectors, 3.2 times at 300,000: pgvector's SIMD distance and parallel scan against a single-threaded scan; with `max_parallel_workers_per_gather=0` expect less), a session-scoped search (500 ids: 2 to 3 ms at every size, an index lookup per id, where sqlite-vector scans everything and filters afterwards, 190 to 586 ms, and NumPy copies the matrix, 18 to 36 ms), and concurrent readers and writers. A 50,000-id filter costs 12 ms to send (one text parameter; as a `text[]` it was 42 ms) and, below a third of the table, an index lookup per id.
+
+HNSW on clustered vectors (build with 2 parallel workers; `ef_search` is the search width; p50 latency at `ef_search=100`, the default here, against the exact scan):
+
+| N | build | index size | recall@20 at `ef_search` 40 / 100 / 200 / 400 | HNSW p50 | exact p50 |
+|---:|---:|---:|---|---:|---:|
+| 10,000 | 5.6 s | 78 MB | 0.989 / 0.995 / 0.999 / 1.000 | 2.2 ms | 8.1 ms |
+| 100,000 | 24 s | 781 MB | 0.938 / 0.998 / 0.998 / 0.998 | 1.6 ms | 69.5 ms |
+| 300,000 | 73 s | 2,344 MB | 0.825 / 0.952 / 0.955 / 0.972 | 1.7 ms | 176 ms |
+
+**A LAN adds round trips, not computation.** A search or `present` costs about two round trips; a write batch pipelines its rows. Measured through a loopback proxy that delays each direction (10,000 vectors, p50): 0.25 ms each way (a 0.5 ms round trip) adds about 1 ms to `present` and to a 500-id search and 6 ms to a 50,000-id search; 1 ms each way adds about 4.5 ms and 30 ms, and cuts bulk upserts from 6,800 to 4,700 rows/s (bandwidth was not limited: 4 kB per vector is 30,000 rows/s per gigabit). A 50,000-id filter is 1.6 MB, 13 ms on a gigabit link.
+
+These are one machine's numbers on synthetic data. They do not include concurrent load, a cold cache or a remote server, and loopback understates every network cost.
 
 ---
 

@@ -538,25 +538,26 @@ def test_another_process_writes_the_same_index_concurrently(make_index, pgvector
 # --- the approximate index -------------------------------------------------------------------------------------------------
 
 def test_hnsw_serves_unfiltered_searches_with_good_recall_and_filtered_searches_stay_exact(make_index, pgvector_server, pg_schema):
-    index = make_index(32, hnsw=True)
-    ids, matrix = fill(index, 3000, 32, seed=11)
+    count, dim = 20_000, 16                  # large enough for the planner to prefer the index to a scan of the table
+    index = make_index(dim, hnsw=True)
+    ids, matrix = fill(index, count, dim, seed=11)
     pgvector_server.execute(f"ANALYZE {table(pg_schema)}")
     assert pgvector_server.execute("SELECT count(*) FROM pg_indexes WHERE schemaname = %s AND indexname = 'chunk_vectors_embedding_hnsw'",
                                    (pg_schema,))[0][0] == 1
     recalls = []
     for seed in range(20):
-        query = normalized_vectors(1, 32, 500 + seed)[0]
+        query = normalized_vectors(1, dim, 500 + seed)[0]
         scores = exact_cosine(matrix, query)
         want = {ids[n] for n in np.argsort(-scores)[:10]}
         recalls.append(len(want & {cid for cid, _ in index.search(query, 10)}) / 10)
     assert np.mean(recalls) >= 0.85
-    plan = "\n".join(index.explain(normalized_vectors(1, 32, 1)[0], 10))
+    plan = "\n".join(index.explain(normalized_vectors(1, dim, 1)[0], 10))
     assert "chunk_vectors_embedding_hnsw" in plan, plan                   # the unfiltered search is served by the index
-    allowed_plan = "\n".join(index.explain(normalized_vectors(1, 32, 1)[0], 10, {ids[n] for n in range(0, 3000, 3)}))
+    allowed_plan = "\n".join(index.explain(normalized_vectors(1, dim, 1)[0], 10, {ids[n] for n in range(0, count, 3)}))
     assert "hnsw" not in allowed_plan, allowed_plan                       # a filtered search never uses it
-    query = normalized_vectors(1, 32, 999)[0]
+    query = normalized_vectors(1, dim, 999)[0]
     scores = exact_cosine(matrix, query)
-    allowed = {ids[n] for n in range(0, 3000, 3)}
+    allowed = {ids[n] for n in range(0, count, 3)}
     assert_same_topk(index.search(query, 15, allowed), ids, scores, 15, allowed=allowed, label="filtered, hnsw on")
     assert index.describe()["hnsw"] is True
 

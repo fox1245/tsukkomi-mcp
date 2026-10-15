@@ -391,7 +391,10 @@ class PgVectorIndex(VectorIndex):
             params["connect_timeout"] = max(2, int(budget))         # libpq's minimum is 2 seconds
         if "application_name" not in parsed and "PGAPPNAME" not in env:
             params["application_name"] = APPLICATION_NAME
-        for key, value in (("keepalives_idle", 30), ("keepalives_interval", 10), ("keepalives_count", 3)):
+        # A peer that vanishes (a cable pulled, a host that froze) must end the connection, not hold the one thread that
+        # waits on it: keepalives find an idle dead peer in about a minute, tcp_user_timeout one with data in flight in 30 s.
+        for key, value in (("keepalives_idle", 30), ("keepalives_interval", 10), ("keepalives_count", 3),
+                           ("tcp_user_timeout", 30_000)):
             if key not in parsed:
                 params[key] = value
         try:

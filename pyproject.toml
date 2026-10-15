@@ -26,6 +26,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "build>=1.0"]
+# The pgvector dense backend (SELF_DIRECT_DENSE_BACKEND=pgvector): PostgreSQL with the pgvector extension as the dense index.
+# Optional and imported only at the first query; the default install, the hooks and the smoke tests never need it.
+pgvector = ["psycopg[binary]>=3.2"]
 
 [project.scripts]
 tsukkomi-mcp = "self_directing_mcp.entry:main"

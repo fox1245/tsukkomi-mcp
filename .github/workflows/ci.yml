@@ -52,6 +52,8 @@ jobs:
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
           tests/test_codex_zstd.py
+          tests/test_pgvector_unit.py
+          tests/test_pgvector_config.py
           --deselect tests/test_codex_zstd.py::test_syncing_a_large_compressed_session_never_materializes_it
           --deselect tests/test_codex_zstd.py::test_continuing_a_cursor_inside_a_large_compressed_source_streams_from_the_start
         env:
@@ -133,7 +135,66 @@ jobs:
           tests/test_eval_reindex.py
           tests/test_bench_eval_converge.py
           tests/test_runtime_threads.py
+          tests/test_pgvector_unit.py
+          tests/test_pgvector_config.py
+          tests/test_dense_backend_parity.py
           --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file
+
+  pgvector:
+    # The optional pgvector dense backend against a real pgvector server: a service container of the image the tests were
+    # written against, and the official sqlite-vector library for the three-way parity tests. Linux only. A failure here
+    # fails the workflow (no continue-on-error); TSUKKOMI_REQUIRE_PGVECTOR makes a missing server a failure, never a skip.
+    # The password below belongs to this throwaway container on the runner and protects nothing.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-throwaway-service-password
+          POSTGRES_DB: tsukkomi_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tsukkomi_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
+      TSUKKOMI_REQUIRE_PGVECTOR: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package (dev and the pgvector extra)
+        run: python -m pip install -U pip && python -m pip install -e ".[dev,pgvector]"
+
+      - name: Provision sqlite-vector for the parity tests
+        run: |
+          python scripts/setup_sqlite_vector.py --output-dir "$RUNNER_TEMP/native"
+          echo "SQLITE_VECTOR_TEST_PATH=$RUNNER_TEMP/native/vector.so" >> "$GITHUB_ENV"
+
+      - name: Write the private connection-string file
+        run: |
+          umask 077
+          printf 'host=127.0.0.1 port=5432 dbname=tsukkomi_ci user=postgres password=%s\n' "ci-throwaway-service-password" > "$RUNNER_TEMP/pgvector-dsn.txt"
+          echo "TSUKKOMI_PGVECTOR_TEST_DSN_FILE=$RUNNER_TEMP/pgvector-dsn.txt" >> "$GITHUB_ENV"
+
+      - name: Run the pgvector tests
+        timeout-minutes: 15
+        run: >-
+          python -m pytest -q -rs
+          tests/test_pgvector_unit.py
+          tests/test_pgvector_config.py
+          tests/test_pgvector_integration.py
+          tests/test_pgvector_engine.py
+          tests/test_dense_backend_parity.py
 
   bench:
     # Hook cost on synthetic data (scripts/bench_hooks.py): cold command hooks, warm server calls and idle servers.

@@ -7,7 +7,8 @@ except for NumPy which holds them) the script measures, on the same data and mac
 * bulk upsert, rows per second (batches of ``--batch`` rows, one call, so one transaction, per batch);
 * ``present`` of 500 stored ids;
 * ``search`` (top_k = 20, exact) with no filter, with a 500-id ``allowed_ids`` and with a 50 000-id one (ids that are
-  not stored pad the set when N is below 50 000: what is measured is the filter, not the hits);
+  not stored pad the set when N is below 50 000: what is measured is the filter, not the hits; ids are 65 characters
+  long, like the engine's chunk ids);
 * pgvector only: table, primary-key index, total size; the HNSW index (build time, size, search latency, recall@20 against
   the exact scan at several ``hnsw.ef_search``).
 
@@ -41,6 +42,13 @@ import numpy as np                                                  # noqa: E402
 from dense_support import normalized_vectors                        # noqa: E402
 
 CLUSTERS = 500
+SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def chunk_id(n: int) -> str:
+    """An id shaped like the engine's chunk ids (``provider:session:offset:part:digest``, about 65 characters), so that the
+    size of a 50 000-id filter is realistic."""
+    return f"codex:{SESSION}:{n}:0:{(n * 0x9E3779B97F4A7C15) % 2 ** 64:016x}"
 
 
 def percentile(values, q):
@@ -74,7 +82,7 @@ class Data:
     def stream(self, count: int, batch: int):
         for number, start in enumerate(range(0, count, batch)):
             size = min(batch, count - start)
-            yield [f"c{n:07d}" for n in range(start, start + size)], self.batch(number, size)
+            yield [chunk_id(n) for n in range(start, start + size)], self.batch(number, size)
 
     def queries(self, count: int) -> np.ndarray:
         return self.batch(10 ** 6, count, seed_base=7)
@@ -110,12 +118,12 @@ def load(index, data: Data, n: int, batch: int, single_call: bool = False) -> fl
 
 
 def measure_index(index, data: Data, n: int, queries: np.ndarray, rng, *, repeats: int) -> dict:
-    ids = [f"c{k:07d}" for k in range(n)]
+    ids = [chunk_id(k) for k in range(n)]
     sample = [ids[k] for k in rng.choice(n, size=min(500, n), replace=False)]
     present = timed(lambda: index.present(sample), repeats)
     allowed500 = {ids[k] for k in rng.choice(n, size=min(500, n), replace=False)}
     real = [ids[k] for k in rng.choice(n, size=min(50_000, n), replace=False)]
-    allowed50k = set(real) | {f"ghost{k}" for k in range(50_000 - len(real))}
+    allowed50k = set(real) | {chunk_id(10 ** 9 + k) for k in range(50_000 - len(real))}
     out = {"present500": summary(present), "search": {}}
     for name, allowed in (("no_filter", None), ("ids_500", allowed500), ("ids_50k", allowed50k)):
         cycle = iter(range(10 ** 9))
