@@ -34,8 +34,8 @@ ROWS = [
     ("list_dir", {"target_directory": "."}, "LS", {"path": "."}, {}),
     ("web_search", {"query": "weather"}, "WebSearch", {"query": "weather"}, {}),
     ("web_fetch", {"url": "https://example.com/x"}, "WebFetch", {"url": "https://example.com/x"}, {}),
-    ("spawn_subagent", {"description": "look", "prompt": "find it"}, "Task",
-     {"description": "look", "prompt": "find it"}, {}),
+    ("spawn_subagent", {"prompt": "find it", "subagent_type": "explore"}, "Task",
+     {"prompt": "find it", "subagent_type": "explore"}, {}),
     ("linear__save_issue", {"title": "t"}, "mcp__linear__save_issue", {"title": "t"}, {}),
     ("my-server__do_it", {"x": 1}, "mcp__my-server__do_it", {"x": 1}, {}),
 ]
