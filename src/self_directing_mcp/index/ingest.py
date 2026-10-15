@@ -1484,7 +1484,7 @@ def _may_slice(slicing, path) -> tuple[bool, bool]:
 
 def _flight_wait(slicing, path):
     """Seconds a caller waits for the flight of its session (None: until the leader is done, as without slicing)."""
-    if not _may_slice(slicing, path)[0]:
+    if not _may_slice(slicing, path)[1]:
         return None
     return min(FLIGHT_WAIT_MAX_SEC, FLIGHT_WAIT_SHARE * max(0.0, current_request().deadline - time.monotonic()))
 

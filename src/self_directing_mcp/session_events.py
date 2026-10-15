@@ -124,6 +124,23 @@ class SourceObservation:
         self._checkpoints[offset] = (digest, lines)
         return digest, lines
 
+    def _read_into(self, digest, begin: int, end: int) -> None:
+        """Feed ``digest`` the file's bytes ``[begin, end)``: a second look at part of what the capture saw."""
+        if begin < 0 or end > self.length:
+            raise SourceChanged("source truncated during read")
+        with self._open() as stream:
+            if not same_identity(_identity(os.fstat(stream.fileno())), self.identity):
+                raise SourceChanged("source replaced during read")
+            stream.seek(begin)
+            remaining = end - begin
+            while remaining:
+                check_request()
+                block = stream.read(min(remaining, _BLOCK))
+                if not block:
+                    raise SourceChanged("source truncated during read")
+                digest.update(block)
+                remaining -= len(block)
+
     def prefix_digest(self, length: int) -> str:
         """Plain SHA-256 of ``[0, length)``. Free at a requested checkpoint; anywhere else a re-read."""
         if length < 0 or length > self.length:
@@ -432,7 +449,11 @@ def _hash_prefix(stream, length, checkpoints, *, sha=True, scan=None, start=0, m
 
 
 class _ShaGuard:
-    """Consumed bytes are hashed from the SHA-256 state at ``start``; the end must match the observed prefix."""
+    """Consumed bytes are hashed from the SHA-256 state at ``start``; the end must match the observed prefix.
+
+    A parse that stops where the capture did not (a slice) is compared with what the capture saw at its end: the consumed
+    bytes plus the rest of the capture, read from the file again, must hash to the capture's digest of its last record.
+    The offset is then a verified checkpoint of the observation, so its cursor hash costs nothing more."""
 
     def __init__(self, observation, start):
         self.observation = observation
@@ -440,10 +461,19 @@ class _ShaGuard:
 
     def update(self, raw):
         self._digest.update(raw)
+        self.lines += 1     # a record is one line
 
     def finish(self, position):
-        if self._digest.hexdigest() != self.observation.prefix_digest(position):
+        observation = self.observation
+        if position in observation._checkpoints:
+            if self._digest.hexdigest() != observation.prefix_digest(position):
+                raise SourceChanged("source changed during read")
+            return
+        rest = self._digest.copy()
+        observation._read_into(rest, position, observation.complete_end)
+        if rest.hexdigest() != observation.prefix_digest(observation.complete_end):
             raise SourceChanged("source changed during read")
+        observation._checkpoints[position] = (self._digest.copy(), self.lines)
 
 
 class _BlockGuard:
@@ -489,8 +519,29 @@ class _BlockGuard:
     def finish(self, position):
         if position != self.position:
             raise SourceChanged("source changed during read")
+        if position not in self.scan.marks:
+            self._compare_with_block(position)
         expected = self.observation.mark_at(position)[0]
         if expected is not None and self.hasher.digest() != expected:
+            raise SourceChanged("source changed during read")
+
+    def _compare_with_block(self, position):
+        """A parse that stopped inside a block (a slice): the capture recorded no digest of this partial block. The rest of
+        the block is read back and the whole block compared with the capture's digest of it (the capture's last block: with
+        its digest at the last record boundary), so what was consumed is verified against the capture, not against a
+        second read of itself."""
+        observation, scan = self.observation, self.scan
+        if position == self.index * self.size:
+            return    # block aligned: the block that ended here was compared as it completed
+        end = (self.index + 1) * self.size
+        want = scan.block_digest(self.index) if end <= observation.length else None
+        if want is None:
+            end, want = observation.complete_end, observation.mark_at(observation.complete_end)[0]
+        if want is None or end <= position:
+            return
+        rest = self.hasher.copy()
+        observation._read_into(rest, position, end)
+        if rest.digest() != want:
             raise SourceChanged("source changed during read")
 
 
