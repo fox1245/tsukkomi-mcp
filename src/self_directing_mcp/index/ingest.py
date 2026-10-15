@@ -148,6 +148,9 @@ def current_parser_version(provider):
     if provider == "claude":
         from self_directing_mcp.claude import PARSER_VERSION
         return PARSER_VERSION
+    if provider == "grok":
+        from self_directing_mcp.grok import PARSER_VERSION
+        return PARSER_VERSION
     return 1
 
 
@@ -2092,6 +2095,8 @@ def _provider_parser(provider):
         from self_directing_mcp.omp import parse_session_chunks, peek_session_id
     elif provider == "claude":
         from self_directing_mcp.claude import parse_session_chunks, peek_session_id
+    elif provider == "grok":
+        from self_directing_mcp.grok import parse_session_chunks, peek_session_id
     elif provider == "grokbot":
         from self_directing_mcp.grokbot.parse import parse_session_chunks, peek_session_id
     else:
