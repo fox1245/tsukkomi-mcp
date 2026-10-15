@@ -564,6 +564,10 @@ class SelfDirectEngine:
         except AmbiguousSessionSource as exc:
             return {"ok": False, "error": "ambiguous_session_source", "message": str(exc), "provider": resolved_provider,
                     "session_id": exc.session_id, "indexed_path": exc.indexed_path, "requested_path": exc.requested_path}
+        except DenseBackendError as exc:
+            # The selected dense backend (a database server) cannot answer. The canonical events were published before the
+            # dense step and the journal keeps what it still owes, so the next sync resumes; nothing is substituted.
+            return self._dense_backend_error(exc, resolved_provider)
         except CompressedSourceError as exc:
             # An unreadable .zst source (missing module, corrupt or truncated frame, size mismatch, over the limit):
             # visible, nothing indexed or published, coverage stays incomplete.
@@ -660,8 +664,11 @@ class SelfDirectEngine:
                     results = [RRFResult(chunk_id=cid, ranking_score=score, dense_rank=None,
                                          sparse_rank=rank, sparse_score=score) for cid, score, rank in rows]
                 else:
-                    results = self.retriever.retrieve(query, top_k=k, session_id=session_id, mode=mode,
-                                                      provider=provider, query_vector=prepared_query)
+                    try:
+                        results = self.retriever.retrieve(query, top_k=k, session_id=session_id, mode=mode,
+                                                          provider=provider, query_vector=prepared_query)
+                    except DenseBackendError as exc:
+                        return self._dense_backend_error(exc, provider)     # never a sparse-only answer in its place
                     snapshot = self.store.capture_evidence(session_id, provider, history=False,
                                                           anchors=(row.chunk_id for row in results))
             hits = hits_to_schema(results, snapshot.get_chunk)
@@ -677,6 +684,11 @@ class SelfDirectEngine:
                 "Call audit_session — contracts/regex are authoritative."
             ),
         }
+
+    def _dense_backend_error(self, exc: DenseBackendError, provider) -> dict[str, Any]:
+        """The answer of a call whose dense backend is selected but cannot work: the error, its repair, no substitute."""
+        return {"ok": False, "error": "dense_backend_unavailable", "dense_backend": self.dense_backend,
+                "message": str(exc), "provider": provider}
 
     def _repair_sparse_for_search(self, session_id, provider):
         """Materialize deferred canonical evidence before searching its derived view."""
@@ -2269,6 +2281,9 @@ class SelfDirectEngine:
                 if self.store is not None:
                     self.store.close()                  # checkpoints meta.sqlite's log (if any), then closes
                 for component in (self.sparse, self.dense, self.graph):
+                    if component is not None and getattr(component, "remote", False):
+                        component.close()               # a server connection is closed under the index's own lock
+                        continue
                     connection = getattr(component, "_conn", None)
                     if connection is not None:
                         connection.close()

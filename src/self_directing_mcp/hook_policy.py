@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import hashlib
 from typing import Any, Callable, TYPE_CHECKING
 
+from self_directing_mcp import settings_core
 from self_directing_mcp.agy_hook_state import AUDIT_UNAVAILABLE
 from self_directing_mcp.security.mask import mask_secrets
 
@@ -98,7 +99,7 @@ def wants_derived_work(engine: SelfDirectEngine) -> bool:
     for a dense index on a database server (``SELF_DIRECT_DENSE_BACKEND=pgvector``): a hook judges from the canonical
     events and never waits for, or fails on, a network round trip; the next ``sync_session`` of the server
     (a derived sync) materializes the vectors it lacks."""
-    return not engine.settings.local_only and engine.settings.dense_backend != "pgvector"
+    return not engine.settings.local_only and engine.settings.dense_backend not in settings_core.REMOTE_DENSE_BACKENDS
 
 
 def read_obligations(engine: SelfDirectEngine, provider: str, session_id: str, path: str | None) -> dict:

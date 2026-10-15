@@ -41,6 +41,7 @@ API_KEY_ENV = "OPENROUTER_API_KEY"
 ENFORCEMENT_MODES = ("confirmed_only", "advisory", "enforced")
 SESSION_PROVIDERS = ("codex", "grokbot", "omp", "agy", "claude")
 DENSE_BACKENDS = ("sqlite-vector", "numpy", "pgvector")
+REMOTE_DENSE_BACKENDS = ("pgvector",)        # a database server: never on the hook path (hook_policy.wants_derived_work)
 DAEMON_MODES = ("off", "on")
 SQLITE_JOURNAL_MODES = ("auto", "delete")    # journal.py validates the same two values
 GRAPH_EXTRACTORS = ("openrouter", "host")    # who extracts for run_neograph_update: an OpenRouter model, or only the host agent

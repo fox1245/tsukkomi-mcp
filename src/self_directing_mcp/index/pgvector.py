@@ -22,7 +22,13 @@ connection (and a deadlock or serialization failure) is retried once; every oper
 
 Credentials. The connection string is a secret and reaches this module only as the text of a private file or through the
 standard libpq environment. It is never logged, repr'd or put into an exception: messages carry host, port and database
-name from the parsed string and the server's own message with any password value removed.
+name from the parsed string and the server's own primary message with any password value removed.
+
+Transport. A server that is not this machine (anything but ``localhost``, a loopback address or a socket directory) is
+reached only with ``sslmode=verify-full``; ``disable``, ``allow``, ``prefer`` (libpq's default), ``require`` and
+``verify-ca`` are refused before a connection is opened, so no credential is sent in the clear and no certificate goes
+unchecked. A connection that names only a ``service`` hides its host, so it is connected with ``sslmode=verify-full``
+as well, and every new connection is checked once more against what libpq actually used.
 """
 from __future__ import annotations
 
@@ -48,13 +54,15 @@ META_TABLE = "tsukkomi_meta"
 HNSW_INDEX = "chunk_vectors_embedding_hnsw"
 MAX_DIM = 16000                 # the largest ``vector`` column
 HNSW_MAX_DIM = 2000             # the largest vector dimension an HNSW index accepts
-PLAIN_STORAGE_MAX_DIM = 1900    # up to here a row fits in one 8 kB page, so the column is stored inline (see _create)
-MAX_ID_CHARS = 256              # at most 1 kB of UTF-8: keeps a row inside one page next to a 1900-dim vector
+PLAIN_STORAGE_MAX_DIM = 1700    # up to here a row (vector, and an id of up to 1 kB) fits one 8 kB page: stored inline (_create)
+MAX_ID_CHARS = 256              # at most 1 kB of UTF-8: keeps a row inside one page next to a 1700-dim vector
 UPSERT_BATCH = 256              # rows per ``executemany`` round (all in the call's one transaction)
 PRESENT_BATCH = 2000            # ids per ``present`` / ``delete_ids`` statement
 NO_DEADLINE_TIMEOUT_MS = 300_000    # statement and lock timeout when the caller has no request deadline
 CONNECT_TIMEOUT_SEC = 10
-SEQ_SCAN_ID_RATIO = 6           # a filter of more than 1/6 of the table is scanned, not looked up id by id (see search)
+SEQ_SCAN_ID_RATIO = 3           # a filter of at least 1/3 of the table is scanned, not looked up id by id (see search)
+MIN_HNSW_EXTENSION = (0, 5, 0)  # the first pgvector release with HNSW indexes
+SECURE_SSLMODE = "verify-full"
 IDLE_IN_TRANSACTION_MS = 120_000    # the server drops a session this long idle inside a transaction
 APPLICATION_NAME = "tsukkomi-mcp"
 ENVIRONMENT_HINT = ("SELF_DIRECT_PGVECTOR_DSN_FILE (a private file with one libpq connection string) or the libpq "
@@ -101,8 +109,43 @@ def _is_loopback(host) -> bool:
     return True
 
 
+def _version_tuple(text) -> tuple[int, ...]:
+    """``'0.8.1'`` -> ``(0, 8, 1)``; anything unparseable sorts as the oldest version."""
+    parts = []
+    for piece in str(text).split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) or (0,)
+
+
 def _quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+def check_transport(parsed: dict, environ=None) -> dict:
+    """Apply the TLS rule to a parsed connection string and the libpq environment, before anything is connected.
+
+    Returns ``{"remote": bool, "unknown_host": bool, "sslmode": str | None}``: ``remote`` when any host named is not this
+    machine, ``unknown_host`` when only a ``service`` could say where the server is (the caller then forces
+    ``sslmode=verify-full`` on the connection). Raises ``PgVectorConfigError`` for a remote server whose sslmode is
+    anything but ``verify-full`` (libpq's default, ``prefer``, included). Only the mode name is ever put in a message."""
+    environ = os.environ if environ is None else environ
+    hosts = [parsed["host"] if "host" in parsed else environ.get("PGHOST", ""),
+             parsed["hostaddr"] if "hostaddr" in parsed else environ.get("PGHOSTADDR", "")]
+    named = [value for value in hosts if value]
+    service = parsed.get("service") or environ.get("PGSERVICE")
+    unknown_host = not named and bool(service)
+    remote = any(not _is_loopback(value) for value in named)
+    sslmode = parsed.get("sslmode") or environ.get("PGSSLMODE") or None
+    insecure = sslmode != SECURE_SSLMODE
+    if (remote and insecure) or (unknown_host and sslmode is not None and insecure):
+        shown = sslmode or "prefer (libpq's default)"
+        raise PgVectorConfigError(
+            f"The pgvector server is not on this machine and the connection uses sslmode={shown}. A remote server is "
+            f"reached only with sslmode={SECURE_SSLMODE} (and a root certificate that verifies its host name): set it in "
+            "the connection string of SELF_DIRECT_PGVECTOR_DSN_FILE or in PGSSLMODE. Vectors and chunk ids are sensitive "
+            "and are never sent over an unverified connection.")
+    return {"remote": remote, "unknown_host": unknown_host, "sslmode": sslmode}
 
 
 # --- the driver: the only place that touches psycopg ----------------------------------------------------------------
@@ -182,7 +225,9 @@ class PsycopgDriver:
         return "database"
 
     def message(self, exc: BaseException) -> str:
-        text = " ".join(str(exc).split())
+        """The server's primary message (never its DETAIL, which can echo a row, vector included), at most 300 characters."""
+        primary = getattr(getattr(exc, "diag", None), "message_primary", None)
+        text = " ".join((primary or str(exc)).split())
         state = getattr(exc, "sqlstate", None)
         return f"{text[:300]} [{state}]" if state else text[:300]
 
@@ -259,11 +304,15 @@ class PgVectorIndex(VectorIndex):
         return f"service {service}" if service else f"the default local socket, port {port}/{database or '?'}"
 
     def _scrub(self, text: str) -> str:
+        """``text`` with every secret value (and the whole connection string) replaced, also in its URI-encoded form."""
         if self._secrets is None:
-            values = [os.environ.get("PGPASSWORD", "")]
+            from urllib.parse import quote
+
+            values = [os.environ.get("PGPASSWORD", ""), self._dsn]
             with suppress(PgVectorConfigError):
                 parsed = self._parsed()
                 values += [parsed.get("password", ""), parsed.get("sslpassword", "")]
+            values += [quote(value, safe="") for value in tuple(values) if value]
             self._secrets = tuple(sorted({value for value in values if value}, key=len, reverse=True))
         for value in self._secrets:
             text = text.replace(value, "***")
@@ -324,6 +373,9 @@ class PgVectorIndex(VectorIndex):
         parsed = self._parsed()
         params: dict = {}
         env = os.environ
+        transport = check_transport(parsed, env)                    # before any socket is opened
+        if transport["unknown_host"]:
+            params["sslmode"] = SECURE_SSLMODE                      # a service file hides the host: never in the clear
         remaining = self._remaining()
         if "connect_timeout" not in parsed and "PGCONNECT_TIMEOUT" not in env:
             budget = CONNECT_TIMEOUT_SEC if remaining is None else min(CONNECT_TIMEOUT_SEC, math.ceil(remaining))
@@ -334,7 +386,7 @@ class PgVectorIndex(VectorIndex):
             if key not in parsed:
                 params[key] = value
         try:
-            return self._driver.connect(self._dsn, **params)
+            connection = self._driver.connect(self._dsn, **params)
         except PgVectorError:
             raise
         except Exception as exc:
@@ -345,6 +397,28 @@ class PgVectorIndex(VectorIndex):
                 f"Cannot connect to the pgvector server {self._endpoint()}: {self._scrub(self._driver.message(exc))}. "
                 "Check that the server is reachable, the credentials in " + ENVIRONMENT_HINT +
                 " are right, and (for a remote server) that sslmode=verify-full is set.") from None
+        try:
+            self._verify_transport(connection)
+        except BaseException:
+            with suppress(Exception):
+                connection.close()
+            raise
+        return connection
+
+    def _verify_transport(self, connection) -> None:
+        """What libpq actually connected to: a host that is not this machine must have been reached over verified TLS."""
+        info = getattr(connection, "info", None)
+        host = getattr(info, "host", None)
+        if not host or _is_loopback(host):
+            return
+        try:
+            sslmode = info.get_parameters().get("sslmode")
+        except Exception:
+            sslmode = None
+        if not getattr(info, "ssl_in_use", False) or sslmode != SECURE_SSLMODE:
+            raise PgVectorConfigError(
+                f"The connection to the pgvector server {self._endpoint()} is not a verified TLS connection (the host is "
+                f"not this machine). Set sslmode={SECURE_SSLMODE} in SELF_DIRECT_PGVECTOR_DSN_FILE (or PGSSLMODE).")
 
     def _connection(self):
         connection = self._conn
@@ -386,24 +460,30 @@ class PgVectorIndex(VectorIndex):
         self._arm(connection)
         row = connection.execute(
             "SELECT e.extversion, n.nspname, to_regtype('vector') IS NOT NULL, to_regnamespace(%s) IS NOT NULL, "
-            "to_regclass(%s) IS NOT NULL, to_regclass(%s) IS NOT NULL, current_setting('server_version'), "
+            "to_regclass(%s) IS NOT NULL, to_regclass(%s) IS NOT NULL, to_regclass(%s) IS NOT NULL, "
+            "current_setting('server_version'), "
             "CASE WHEN current_setting('idle_in_transaction_session_timeout') = '0' "
             "THEN set_config('idle_in_transaction_session_timeout', %s, false) END "
             "FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'",
-            (_quote(self.schema), self._meta, f"{_quote(self.schema)}.{_quote(HNSW_INDEX)}",
+            (_quote(self.schema), self._meta, self._table, f"{_quote(self.schema)}.{_quote(HNSW_INDEX)}",
              str(IDLE_IN_TRANSACTION_MS))).fetchone()
         if row is None:
             connection.rollback()
             raise PgVectorConfigError(
                 f"The pgvector extension is not installed in the database of {self._endpoint()}. Ask an administrator to "
                 "run CREATE EXTENSION vector; in that database (this process never installs it).")
-        extension_version, extension_schema, type_visible, has_schema, has_meta, has_index, server_version = row[:7]
+        extension_version, extension_schema, type_visible, has_schema, has_meta, has_table, has_index, server_version = row[:8]
+        if self.hnsw and _version_tuple(extension_version) < MIN_HNSW_EXTENSION:
+            connection.rollback()
+            raise PgVectorConfigError(
+                f"The pgvector extension {extension_version} of {self._endpoint()} has no HNSW index (0.5.0 or newer is "
+                "needed): upgrade it (ALTER EXTENSION vector UPDATE;) or unset SELF_DIRECT_PGVECTOR_HNSW.")
         if not type_visible:
             # An extension in another schema (for example "extensions"): make its type and operators resolvable.
             connection.execute("SELECT set_config('search_path', %s, false)",
                                (f"{_quote(extension_schema)}, pg_catalog, {_quote(self.schema)}",)).fetchall()
         self.extension_version, self.server_version = extension_version, server_version
-        if has_meta and (has_index or not self.hnsw):
+        if has_meta and has_table and (has_index or not self.hnsw):
             meta = dict(connection.execute(f"SELECT key, value FROM {self._meta}").fetchall())
             self._check_meta(meta)
             if self.policy is not None and "policy" not in meta:
@@ -442,11 +522,13 @@ class PgVectorIndex(VectorIndex):
         if not has_schema:
             connection.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote(self.schema)}")
         connection.execute(f"CREATE TABLE IF NOT EXISTS {self._meta} (key text PRIMARY KEY, value text NOT NULL)")
+        # COLLATE "C": byte order like SQLite's BINARY collation, whatever the database's locale (tie-breaks, parity).
         connection.execute(f"CREATE TABLE IF NOT EXISTS {self._table} "
-                           f"(chunk_id text PRIMARY KEY, embedding vector({self.dim}) NOT NULL)")
+                           f'(chunk_id text COLLATE "C" PRIMARY KEY, embedding vector({self.dim}) NOT NULL)')
         if self.dim <= PLAIN_STORAGE_MAX_DIM:
-            # Inline storage: a float32 vector is incompressible, and the default (out-of-line TOAST chunks) made an
-            # exact scan about four times slower at 50k x 1024 for 30 % less disk (README, "pgvector numbers").
+            # Inline storage. pgvector's own default for the type is EXTERNAL (out-of-line TOAST chunks, never
+            # compressed): about a third less disk, but every row of an exact scan costs a second lookup (README,
+            # "pgvector numbers"). The bound keeps a row of an id of at most 1 kB and the vector inside one page.
             connection.execute(f"ALTER TABLE {self._table} ALTER COLUMN embedding SET STORAGE PLAIN")
         stored = connection.execute(
             "SELECT atttypmod FROM pg_attribute WHERE attrelid = %s::regclass AND attname = 'embedding' "
@@ -561,16 +643,44 @@ class PgVectorIndex(VectorIndex):
         if kind == "undefined":
             return PgVectorError(f"The pgvector tables of schema {self.schema!r} on {endpoint} disappeared and could not "
                                  f"be re-created: {detail}")
-        return PgVectorError(f"A pgvector operation on {endpoint} failed: {detail}")
+        hint = ""
+        if getattr(exc, "sqlstate", None) == "42501":
+            hint = (f" The database role needs CREATE on the database to make schema {self.schema!r} (or an administrator "
+                    "creates the schema and tables once) and INSERT/DELETE/SELECT/TRUNCATE on the tables.")
+        return PgVectorError(f"A pgvector operation on {endpoint} failed: {detail}.{hint}")
 
     # -- validation ---------------------------------------------------------------------------------------------------
 
     @staticmethod
-    def _item_id(item_id) -> str:
-        if not isinstance(item_id, str) or not item_id or "\x00" in item_id or len(item_id) > MAX_ID_CHARS:
-            raise ValueError(f"A chunk id must be a nonempty string of at most {MAX_ID_CHARS} characters "
+    def _storable(item_id) -> bool:
+        """Whether ``item_id`` can be a stored id: a nonempty ``str`` of at most ``MAX_ID_CHARS`` characters, no NUL, valid UTF-8."""
+        if not isinstance(item_id, str) or not item_id or len(item_id) > MAX_ID_CHARS or "\x00" in item_id:
+            return False
+        try:
+            item_id.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        return True
+
+    @classmethod
+    def _item_id(cls, item_id) -> str:
+        """An id to be written: anything that cannot be stored is an error (the write never reaches SQL)."""
+        if not cls._storable(item_id):
+            raise ValueError(f"A chunk id must be a nonempty UTF-8 string of at most {MAX_ID_CHARS} characters "
                              "without NUL characters")
         return item_id
+
+    @classmethod
+    def _lookup_ids(cls, ids) -> list[str]:
+        """Ids to be looked up or deleted: the distinct ones that could be stored. An id that could not have been stored is
+        simply absent (as in the other backends), not an error."""
+        found: dict[str, None] = {}
+        for position, item_id in enumerate(ids):
+            if not position & 1023:
+                check_request()             # cooperative stop, without a check per id of a very large filter
+            if cls._storable(item_id):
+                found[item_id] = None
+        return list(found)
 
     def _pack(self, vector) -> bytes:
         array = np.asarray(vector, dtype=np.float32)
@@ -593,7 +703,7 @@ class PgVectorIndex(VectorIndex):
 
     @request_operation
     def present(self, ids) -> set[str]:
-        wanted = list(dict.fromkeys(ids))
+        wanted = self._lookup_ids(ids)
         if not wanted:
             return set()
 
@@ -634,17 +744,15 @@ class PgVectorIndex(VectorIndex):
                     check_request()
                     self._arm(connection)
                     cursor.executemany(
-                        f"INSERT INTO {self._table}(chunk_id, embedding) VALUES (%s, %b::vector) "
-                        "ON CONFLICT (chunk_id) DO UPDATE SET embedding = EXCLUDED.embedding",
+                        f"INSERT INTO {self._table} AS t(chunk_id, embedding) VALUES (%s, %b::vector) "
+                        "ON CONFLICT (chunk_id) DO UPDATE SET embedding = EXCLUDED.embedding "
+                        "WHERE t.embedding IS DISTINCT FROM EXCLUDED.embedding",     # an identical row is not rewritten
                         [(cid, make(payload)) for cid, payload in ordered[offset:offset + UPSERT_BATCH]])
         self._run(operation, write=True)
 
     def delete_ids(self, ids) -> None:
-        doomed = set()
-        for item_id in ids:
-            check_request()
-            doomed.add(self._item_id(item_id))
-        doomed = sorted(doomed)
+        check_request()
+        doomed = sorted(self._lookup_ids(ids))
         if not doomed:
             return
 
@@ -659,31 +767,35 @@ class PgVectorIndex(VectorIndex):
     @request_operation
     def search(self, query, top_k: int = 20, allowed_ids: set[str] | None = None) -> list[tuple[str, float]]:
         check_request()
-        if top_k <= 0 or (allowed_ids is not None and len(allowed_ids) == 0):
+        if top_k <= 0:
+            return []
+        allowed = None if allowed_ids is None else self._lookup_ids(allowed_ids)
+        if allowed is not None and not allowed:
             return []
         probe = self._driver.vector(self._pack(query))
-        approximate = self.hnsw and allowed_ids is None
-        where = "" if allowed_ids is None else "WHERE chunk_id = ANY(%(ids)b) "
+        approximate = self.hnsw and allowed is None
+        where = "" if allowed is None else "WHERE chunk_id = ANY(%(ids)b) "
         # ``ORDER BY distance, chunk_id`` is the exact scan with a deterministic tie-break (it cannot use an HNSW index);
         # ``ORDER BY distance`` alone is what the approximate index serves.
-        order = "embedding <=> %(q)b::vector" + ("" if approximate else ", chunk_id")
+        order = "embedding <=> %(q)b::vector" + ("" if approximate else ', chunk_id COLLATE "C"')
         statement = (f"SELECT chunk_id, 1.0 - (embedding <=> %(q)b::vector) AS score FROM {self._table} {where}"
                      f"ORDER BY {order} LIMIT %(k)s")
         params = {"q": probe, "k": int(top_k)}
-        if allowed_ids is not None:
-            params["ids"] = list(allowed_ids)
+        if allowed is not None:
+            params["ids"] = allowed
 
         before = []
         if approximate:
             before.append(("SELECT set_config('hnsw.ef_search', %s, false)", (str(min(1000, max(40, 2 * int(top_k)))),)))
 
         def operation(connection):
-            # The planner prices a lookup per id too low when the filter is a large part of the table; one scan with a
-            # hashed filter was 40 % faster at 50 000 of 100 000 rows (README, "pgvector numbers"). Its row count is
-            # the one the previous read noted (none before the first ANALYZE: then the planner decides alone).
+            # The planner prices a lookup per id too low when the filter is a large part of the table: at 50 000 rows
+            # one scan with a hashed filter took 0.57 times as long as the planner's id-by-id lookups for a filter of
+            # every row, and as long for a third of them (README, "pgvector numbers"). The table's row count is the
+            # one the previous read noted (none before the first ANALYZE: then the planner decides alone).
             rows = self._table_rows
-            scan = (not approximate and allowed_ids is not None and rows is not None
-                    and len(allowed_ids) * SEQ_SCAN_ID_RATIO >= rows)
+            scan = (not approximate and allowed is not None and rows is not None
+                    and len(allowed) * SEQ_SCAN_ID_RATIO >= rows)
             return self._read(connection, statement, params, scan=scan, before=before)
         rows = self._run(operation)
         out = []
