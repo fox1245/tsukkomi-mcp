@@ -49,6 +49,10 @@ jobs:
           tests/test_reindex_equivalence.py
           tests/test_reindex_staging.py
           tests/test_eval_cost.py
+          tests/test_sparse_compact.py
+          tests/test_sparse_compact_mutations.py
+          tests/test_sparse_formats.py
+          tests/test_sparse_settings.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
           tests/test_codex_zstd.py
@@ -90,6 +94,10 @@ jobs:
           tests/test_source_capture.py
           tests/test_source_io_consumers.py
           tests/test_sync_idsets.py
+          tests/test_sparse_compact.py
+          tests/test_sparse_compact_mutations.py
+          tests/test_sparse_formats.py
+          tests/test_sparse_settings.py
           tests/test_singleflight.py
           tests/test_index_concurrency.py
           tests/test_server_concurrency.py
