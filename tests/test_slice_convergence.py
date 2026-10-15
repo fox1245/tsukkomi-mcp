@@ -44,6 +44,35 @@ class Allowance(RequestControl):
         super()._check()
 
 
+class Tripwire(RequestControl):
+    """A request that is stopped (``request_deadline``) at the first cooperative check after ``arm()``: the way to interrupt
+    a reindex halfway through its parse without counting checks."""
+
+    def __init__(self):
+        super().__init__(deadline=time.monotonic() + BIG)
+        self.armed = False
+
+    def _check(self):
+        if self.armed:
+            raise RequestStopped("request_deadline")
+        super()._check()
+
+
+def watch_captures(monkeypatch, control):
+    """Record the ``window`` of every capture the sync takes; arm ``control`` once a capture was taken whole."""
+    windows, original = [], session_events.capture_source
+
+    def spy(*args, **kwargs):
+        windows.append(kwargs.get("window"))
+        observation = original(*args, **kwargs)
+        if kwargs.get("window") is None:
+            control.armed = True
+        return observation
+
+    monkeypatch.setattr("self_directing_mcp.index.ingest.capture_source", spy)
+    return windows
+
+
 def big_world(tmp_path, monkeypatch, **options):
     return World(tmp_path, monkeypatch, "codex", seed=3, count=42000, partial=False, **options)
 
@@ -315,14 +344,12 @@ def reindex_world(tmp_path, monkeypatch):
 def test_a_parser_update_is_never_sliced_and_an_interrupted_reindex_keeps_the_old_index(tmp_path, monkeypatch):
     world, engine, before = reindex_world(tmp_path, monkeypatch)
     try:
-        windows = []
-        original = session_events.capture_source
-        monkeypatch.setattr("self_directing_mcp.index.ingest.capture_source",
-                            lambda *a, **k: (windows.append(k.get("window")), original(*a, **k))[1])
+        control = Tripwire()
+        windows = watch_captures(monkeypatch, control)
         monkeypatch.setattr(codex_parser, "PARSER_VERSION", codex_parser.PARSER_VERSION + 1)
         engine.slice_policy = forced(5, cap_bytes=2000)
-        with pytest.raises(RequestStopped):                   # the reindex runs out of time halfway through the parse
-            with request_scope(Allowance(900)):
+        with pytest.raises(RequestStopped):                   # the reindex runs out of time right after its capture
+            with request_scope(control):
                 engine.sync_session(**world.sync_args(), derived=False)
         after = snapshot(engine, "codex", world.sid)
         assert windows == [None]                              # the stored parser version is known: no cut capture at all
@@ -341,13 +368,11 @@ def test_a_changed_source_found_after_a_cut_capture_is_reindexed_whole(tmp_path,
     try:
         data = world.path.read_bytes()
         world.path.write_bytes(data[:100] + b"X" + data[101:] + b'{"type":"event_msg","payload":{"type":"agent_message","message":"more"}}\n' * 600)
-        windows = []
-        original = session_events.capture_source
-        monkeypatch.setattr("self_directing_mcp.index.ingest.capture_source",
-                            lambda *a, **k: (windows.append(k.get("window")), original(*a, **k))[1])
+        control = Tripwire()
+        windows = watch_captures(monkeypatch, control)
         engine.slice_policy = forced(5, cap_bytes=2000)
         with pytest.raises(RequestStopped):
-            with request_scope(Allowance(2500)):
+            with request_scope(control):
                 engine.sync_session(**world.sync_args(), derived=False)
         assert windows[0] is not None and windows[1] is None  # cut, found changed, observed whole
         after = snapshot(engine, "codex", world.sid)
@@ -370,5 +395,41 @@ def test_an_append_to_an_indexed_session_may_be_sliced_and_keeps_the_events_it_h
         kept = snapshot(engine, "codex", world.sid)
         assert kept.events[:len(before.events)] == before.events and len(kept.events) == len(before.events) + 50
         assert kept.generation == before.generation          # still the same history: nothing was rewritten
+    finally:
+        world.close()
+
+
+def test_a_receipt_change_that_forces_a_reindex_is_never_sliced_either(tmp_path, monkeypatch):
+    """AGY: the reindex is decided after the capture (a changed hook receipt of an indexed result), so a cut capture is
+    discarded for a whole one, and an interrupted reindex leaves the old events in place."""
+    from self_directing_mcp.agy_receipts import ReceiptStore
+    world = World(tmp_path, monkeypatch, "agy", seed=6, count=90, partial=False)
+    try:
+        engine = world.engine("protected")
+        world.copy_receipts(world.builder, engine)
+        engine.sync_session(**world.sync_args(), derived=False)
+        before = snapshot(engine, "agy", world.sid)
+        top = max(json.loads(row[5])["meta"].get("step_index", -1) for row in before.events) + 1
+        with world.path.open("ab") as stream:                        # more to index, so that the next capture is cut
+            for step in range(top, top + 200):
+                stream.write(json.dumps({"step_index": step, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+                                         "status": "DONE", "created_at": "2026-10-01T00:00:00Z",
+                                         "content": "<USER_REQUEST>more</USER_REQUEST>"}).encode() + b"\n")
+        rows = {step: json.loads(data) for step, data in ReceiptStore(engine.settings.index_dir).read_capture(world.sid)[0]}
+        step, row = next((s, r) for s, r in sorted(rows.items()) if r.get("paired") and r.get("result_hash"))
+        engine.record_agy_hook({"conversationId": world.sid, "transcriptPath": str(world.path), "workspacePaths": ["/synthetic"],
+                                "stepIdx": step, "toolCall": json.loads(row["action"]), "error": "reported later"}, "PostToolUse")
+        control = Tripwire()
+        windows = watch_captures(monkeypatch, control)
+        engine.slice_policy = forced(5, cap_bytes=3000)
+        with pytest.raises(RequestStopped):
+            with request_scope(control):
+                engine.sync_session(**world.sync_args(), derived=False)
+        assert windows[0] is not None and windows[-1] is None            # cut, found to need a reindex, observed whole
+        after = snapshot(engine, "agy", world.sid)
+        assert (after.events, after.cursor, after.metrics, after.agy) == (before.events, before.cursor, before.metrics, before.agy)
+        info = engine.sync_session(**world.sync_args(), derived=False, _deadline=FAR())
+        assert info["reindexed"] is True and info["reindex_reason"] == "hook_receipts_changed"
+        assert info["sync"]["state"] == "complete"
     finally:
         world.close()
