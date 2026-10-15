@@ -219,6 +219,20 @@ prefix (sync_in_progress above); sync_deadline remains for one that cannot. audi
 statistics as ops (in memory, closed names, no session content; both reasons count as degraded), even when the engine
 is busy.
 
+A deadline-bound audit_session or check_action also judges what its sync publishes, so a slice is sized by what judging
+it costs as well as by that 60 % share (now only the upper bound): the parse ends once parsing, committing and judging
+its records would use more than 85 % of the request's time, less the judging of events no monitor state covers
+(eval_cost.COSTS, a moving average per contract set in this process: 60 microseconds an event before it was measured,
+more for many contracts, nothing when no contract needs history; sync.cost says the numbers and which limit ended the
+slice). The incremental answer comes before any comparison with the full evaluator: a planned comparison that cannot follow it
+in the time left is skipped (incremental.shadow_skipped: deadline, or deferred when a resident engine's idle comparison will
+make it) and one that does not finish is cut, so the answer stands unverified with its states saved. Which requests are
+compared, the rates and the warm-up count do not change. A session that is indexed but has no monitor state
+(audit_status.evaluation.session.events_without_state) and does not fit one request cannot be folded in slices, because
+there is no commit boundary inside it to save a state at: run audit_session once with a larger timeout_ms (up to
+SELF_DIRECT_MAX_TOOL_TIMEOUT_SEC), or let a resident server's idle comparison do it. Do not save a state at an offset the
+commit log does not hold.
+
 ## Codex event coverage and parser upgrades
 
 The Codex parser supports world_state, token_usage_record, compacted, and native
