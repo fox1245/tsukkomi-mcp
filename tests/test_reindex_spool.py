@@ -529,6 +529,67 @@ def test_a_writer_that_races_the_creation_is_refused(tmp_path):
     second.close()
 
 
+@pytest.mark.skipif(not POSIX, reason="the lock of Windows is not exercised here")
+def test_a_file_system_that_cannot_lock_does_not_stop_the_staging(tmp_path, monkeypatch):
+    import errno
+    import fcntl
+
+    def cannot(descriptor, operation):
+        raise OSError(errno.ENOSYS, "Function not implemented")
+
+    monkeypatch.setattr(fcntl, "flock", cannot)
+    spool = open_spool(tmp_path)
+    stage(spool, (0, 3, 30))
+    spool.close()
+    again = open_spool(tmp_path)
+    assert again.valid and again.staged_through == 30
+    again.close()
+    monkeypatch.setattr(fcntl, "flock", lambda descriptor, operation: (_ for _ in ()).throw(OSError(errno.EIO, "I/O error")))
+    with pytest.raises(OSError):
+        open_spool(tmp_path)                    # any other failure of the lock is still a failure
+
+
+HOLDER = """
+import json, sys
+from pathlib import Path
+sys.path[:0] = sys.argv[2:3]
+from self_directing_mcp import reindex_spool as rs
+spec = json.loads(Path(sys.argv[1]).read_text())
+spool = rs.ReindexSpool.open(spec["index"], rs.SpoolBinding(**spec["binding"]), source_length=5000,
+                             head_hash=lambda n: "head-hash", cursor_hash=lambda o: f"prefix-{o}")
+rows = [(f"c{n}", "codex", "session-1", n * 10, 0, "{}") for n in range(5)]
+spool.append_slice(rows, 50, "prefix-50", start_offset=0)
+print("staged", flush=True)
+sys.stdin.readline()                     # holds the spool until the test says so
+"""
+
+
+@pytest.mark.skipif(not POSIX, reason="the lock of Windows is not exercised here")
+def test_a_second_process_is_refused_while_the_first_holds_the_spool_and_then_resumes_what_it_staged(tmp_path):
+    import dataclasses
+    import subprocess
+    import sys
+    script = tmp_path / "holder.py"
+    script.write_text(HOLDER)
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({"index": str(tmp_path), "binding": dataclasses.asdict(binding())}))
+    root = Path(__file__).resolve().parents[1]
+    holder = subprocess.Popen([sys.executable, "-I", "-B", str(script), str(spec), str(root / "src")],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        assert holder.stdout.readline().strip() == b"staged", holder.stderr.read()
+        with pytest.raises(SpoolBusy):
+            open_spool(tmp_path)                                    # another PROCESS holds it: refused, not waited for
+        assert ReindexSpool.peek(tmp_path, "codex", "session-1", 4) == 50      # a hint can be read all the same
+    finally:
+        holder.stdin.write(b"\n")
+        holder.stdin.flush()
+        holder.wait(timeout=30)
+    resumed = open_spool(tmp_path)                                  # the lock went with the process; the slice is durable
+    assert resumed.valid and resumed.staged_through == 50 and resumed.rows == 5
+    resumed.close()
+
+
 def test_the_disk_guard_wants_twice_the_measured_ratio(tmp_path, monkeypatch):
     monkeypatch.setattr(rs, "free_space", lambda path: 9 * 1000 - 1)
     assert not rs.has_room(tmp_path, 1000)

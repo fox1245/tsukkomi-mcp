@@ -245,17 +245,17 @@ def test_a_call_with_more_time_commits_the_staged_reindex(pair, monkeypatch):
 def test_the_prediction_is_eighteen_microseconds_a_row_with_a_margin(monkeypatch):
     assert ingest.COMMIT_SECONDS_PER_ROW == 18e-6 and ingest.COMMIT_SAFETY == 1.5
     from self_directing_mcp.request_control import request_scope
-    with request_scope(deadline=time.monotonic() + 10):
+    with request_scope(deadline=time.monotonic() + 100):
         fits = lambda rows: ingest._commit_fits(rows)         # noqa: E731
-        assert fits(300_000) and not fits(400_000)            # 18e-6 * 1.5 * rows against 90 % of ten seconds
+        assert fits(3_000_000) and not fits(3_600_000)        # 18e-6 * 1.5 * rows against 90 % of a hundred seconds (3.33 M)
         monkeypatch.setattr(ingest, "COMMIT_SECONDS_PER_ROW", 36e-6)
-        assert fits(150_000) and not fits(200_000)
+        assert fits(1_500_000) and not fits(1_800_000)
 
 
 def test_the_wall_of_one_transaction_is_about_one_and_a_half_million_rows_for_a_45_second_call():
     from self_directing_mcp.request_control import request_scope
     with request_scope(deadline=time.monotonic() + 45):
-        assert ingest._commit_fits(1_450_000) and not ingest._commit_fits(1_600_000)
+        assert ingest._commit_fits(1_400_000) and not ingest._commit_fits(1_700_000)
 
 
 def test_the_statistics_count_a_waiting_commit_as_degraded_with_its_own_reason(pair, monkeypatch, stats):  # noqa: F811

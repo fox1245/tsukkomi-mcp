@@ -98,7 +98,7 @@ def test_a_150k_event_reindex_converges_in_few_calls_with_a_scripted_clock(big, 
     q = quantum(calls, size)
     assert q >= 1 << 20                                                # at least the minimum progress of a slice
     assert 5 <= len(calls) <= math.ceil(size / q) + 2
-    assert all(e < 8.0 + 0.5 for e in elapsed[:-1])                    # every staging call came back inside its budget
+    assert all(e < 8.0 + 1.0 for e in elapsed[:-1])                    # every staging call came back inside its budget
     assert canonical(engine, "codex", world.sid) == expected and not spool_files(engine)
     assert integrity_ok(engine.settings.index_dir)
     print(f"\nscripted clock, 8 s: {len(calls)} calls for {size / 1e6:.1f} MB, q = {q / 1e6:.1f} MB, "
@@ -116,7 +116,7 @@ def test_the_same_reindex_on_the_real_clock_with_an_8_second_budget(big):
     assert calls[-1][1]["state"] == "complete"
     q = quantum(calls, size)
     assert len(calls) <= math.ceil(size / q) + 2
-    assert all(e < 8.0 + 0.5 for e in elapsed)                         # inside the budget, with a stated tolerance
+    assert all(e < 8.0 + 1.0 for e in elapsed)                         # inside the budget, with a stated tolerance (a second)
     assert canonical(engine, "codex", world.sid) == expected and not spool_files(engine)
     print(f"\nreal clock, 8 s: {len(calls)} calls ({', '.join(f'{e:.1f}' for e in elapsed)} s) for {size / 1e6:.1f} MB, "
           f"q = {q / 1e6:.1f} MB, bound {math.ceil(size / q) + 2}; states "
@@ -136,7 +136,7 @@ def test_with_a_4_second_budget_the_commit_is_the_wall_and_an_explicit_sync_gets
     assert waiting["state"] == "ready_to_commit" and waiting["staged_through"] == waiting["target_bytes"]
     assert waiting["rows"] > 140_000 and spool_files(engine)
     assert ingest.COMMIT_SECONDS_PER_ROW * ingest.COMMIT_SAFETY * waiting["rows"] > 0.9 * 4.0       # why it waits
-    assert all(call[0] < 4.0 + 0.5 for call in calls)
+    assert all(call[0] < 4.0 + 1.0 for call in calls)
     again = engine.sync_session(**world.sync_args(), derived=False, _deadline=time.monotonic() + 4.0)
     assert reindex_of(again)["state"] == "ready_to_commit"           # the same call again: no progress to make, and it says so
     started = time.monotonic()

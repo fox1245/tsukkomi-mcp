@@ -42,7 +42,7 @@ Hosts run lifecycle hooks inside the project being edited, so anything in the wo
 
 The index is a local evidence store, and the audit needs the truth, so what is stored and what leaves are treated differently.
 
-**Stored raw.** The canonical event store (`meta.sqlite`), the original session files, the checklist and contract files keep text as the host or caller wrote it, so a regular expression audit can see a secret that a session contains. Anyone who can read the index directory can read those secrets. Keep the index private and outside agent-writable workspaces.
+**Stored raw.** The canonical event store (`meta.sqlite`), the original session files, the checklist and contract files keep text as the host or caller wrote it, so a regular expression audit can see a secret that a session contains. Anyone who can read the index directory can read those secrets. Keep the index private and outside agent-writable workspaces. While a re-index is staged, the same raw rows are also in `<index dir>/reindex/*.spool` (a 0600 file in a 0700 directory on POSIX; deleted when the re-index is published or discarded; see [Re-indexing](README.md#re-indexing)): it is part of the index directory for everything said here.
 
 **Masked on every way out.** Text passes through `security/mask.py` (`mask_secrets` for strings, `mask_value` for JSON-like values) before it leaves the evidence store:
 

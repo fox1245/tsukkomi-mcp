@@ -334,6 +334,11 @@ def _close_slice(scan: _Scan, pending: _Slice, trailer: dict | None, meta: bool)
 
 # --- the lock ---------------------------------------------------------------------------------------------------------
 
+# A file system that cannot lock at all (some network and FUSE mounts) is not a reason to give up staging: the header, the
+# trailers, the checksums and the binding validate a spool, and the per-session flight orders one process's threads.
+_CANNOT_LOCK = (errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL)
+
+
 def _lock(fd: int) -> None:
     """Take the writer lock of an open spool, or raise ``SpoolBusy``. Never waits."""
     if fcntl is not None:
@@ -342,7 +347,8 @@ def _lock(fd: int) -> None:
         except OSError as exc:
             if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
                 raise SpoolBusy("another process is writing this spool") from None
-            raise
+            if exc.errno not in _CANNOT_LOCK:
+                raise
     elif msvcrt is not None:
         try:
             os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
@@ -353,6 +359,17 @@ def _lock(fd: int) -> None:
             # Any other failure means this file system cannot lock: the header/trailer validation still holds.
         finally:
             os.lseek(fd, 0, os.SEEK_SET)
+
+
+def _unlock(fd: int) -> None:
+    """Windows frees the locks of a closed handle only "when resources allow"; the next opener would find the spool busy.
+    POSIX frees a ``flock`` when the descriptor closes."""
+    if msvcrt is not None:
+        try:
+            os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass                     # it was never locked (a file system that cannot)
 
 
 def _unlink(path) -> bool:
@@ -750,6 +767,7 @@ class ReindexSpool:
     def _release(self) -> None:
         fd, self._fd = self._fd, None
         if fd is not None:
+            _unlock(fd)
             try:
                 os.close(fd)        # releases the lock
             except OSError:
@@ -799,6 +817,8 @@ class StagedRows:
         if len(head) < _FRAME.size:
             raise SpoolError("the spool ends inside a frame")
         length, crc = _FRAME.unpack(head)
+        if offset + _FRAME.size + length > os.fstat(stream.fileno()).st_size:
+            raise SpoolError("a frame of the spool is longer than the spool")
         payload = stream.read(length)
         if len(payload) != length or _crc(length, payload) != crc:
             raise SpoolError("a frame of the spool does not verify")

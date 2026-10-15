@@ -17,7 +17,7 @@ parsed. This script measures, for sessions of 100,000 and 300,000 events and per
 
     python scripts/bench_slicing.py [--events 100000,300000] [--budgets 1,4,8] [--overhead-events 40000]
                                     [--overhead-runs 9] [--sweep-events 100000] [--json FILE] [--dir DIR]
-    python scripts/bench_slicing.py --reindex [--events 100000,300000,500000] [--budgets 8] [--json FILE] [--dir DIR]
+    python scripts/bench_slicing.py --reindex [--events 100000,300000,500000] [--reindex-budget 8] [--json FILE] [--dir DIR]
 
 ``--reindex`` measures the re-index of a session after a parser upgrade (``reindex_spool``) instead: for each size, the cold
 sync of the session and the first audit after it; the one-shot re-index (no deadline, one transaction) with its peak memory and
@@ -531,6 +531,7 @@ def main():
     parser.add_argument("--json", help="also write the results to this file (outside the repository)")
     parser.add_argument("--dir", help="parent of the temporary directory")
     parser.add_argument("--reindex", action="store_true", help="measure the re-index (reindex_spool) instead")
+    parser.add_argument("--reindex-budget", type=float, default=8.0, help="seconds each staged call of --reindex may take")
     parser.add_argument("--child", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.child:
@@ -551,7 +552,7 @@ def main():
         results["reindex"] = []
         try:
             for events in [int(x) for x in args.events.split(",")]:
-                item = reindex_one(base, events, float(args.budgets.split(",")[0]))
+                item = reindex_one(base, events, args.reindex_budget)
                 results["reindex"].append(item)
                 print_reindex(item)
         finally:

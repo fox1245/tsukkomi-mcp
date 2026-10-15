@@ -120,7 +120,8 @@ def run_faults(tmp_path, monkeypatch, provider, *, count, stride, seed=4, audit_
 
 
 def test_a_stop_at_every_check_leaves_the_old_index_or_the_published_one_codex(tmp_path, monkeypatch):
-    assert run_faults(tmp_path, monkeypatch, "codex", count=26, stride=2) > 150
+    """Every one of the cooperative checks of the staged sequence (about 570 of them, in 6 calls) is a stop point."""
+    assert run_faults(tmp_path, monkeypatch, "codex", count=16, stride=1) > 500
 
 
 @pytest.mark.parametrize("provider", [name for name in PROVIDERS if name not in ("codex", "grokbot")])
