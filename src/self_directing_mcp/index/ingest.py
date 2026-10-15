@@ -702,7 +702,7 @@ class SessionStore:
                 check_request()
                 batch = ids[start:start + 500]
                 out.update(row[0] for row in self._conn.execute(
-                    "SELECT chunk_id FROM session_events WHERE provider=? AND session_id=? AND chunk_id IN ("
+                    "SELECT chunk_id FROM session_events WHERE +provider=? AND +session_id=? AND chunk_id IN ("
                     + ",".join("?" * len(batch)) + ")", [provider, session_id, *batch]))
         return out
 
@@ -753,7 +753,9 @@ class SessionStore:
             for start in range(0, len(anchors), 256):
                 check_request()
                 batch = anchors[start:start + 256]
-                selected = clauses + ["chunk_id IN (" + ",".join("?" for _ in batch) + ")"]
+                # ``+`` keeps the planner on the primary key: without table statistics it prefers the two equalities
+                # (a scan of the whole session per batch) over the id list, which made a derived pass quadratic.
+                selected = ["+" + clause for clause in clauses] + ["chunk_id IN (" + ",".join("?" for _ in batch) + ")"]
                 rows.extend(tuple(row) for row in self._conn.execute(
                     "SELECT chunk_id,data FROM session_events WHERE " + " AND ".join(selected),
                     params + list(batch)).fetchall())
