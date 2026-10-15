@@ -17,7 +17,7 @@ Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions 
 
 ### Notes
 
-- Deleting leaves free pages in the file, which later writes reuse; the file does not shrink by itself (`VACUUM`, with every process stopped, returns the space). Measured on synthetic corpora (SQLite 3.53.1, `scripts/bench_sparse.py --stages orphans` and a 360,125-event engine): 0.7 to 0.9 s per 10,000 orphans when a tenth of a 30,000 to 100,000-document file goes, 1.2 to 1.6 s per 10,000 when a fifth of a 50,000 to 200,000-document file goes (44,000 of 200,000: 6.3 s), the longest transaction 0.15 to 0.6 s; about 12 s for 85,000 orphans. A global search repair without orphans took 660 ms before and 646 ms after (medians of 25 runs at 360,125 events), a 100-event session's 0.27 ms and 0.26 ms.
+- Deleting leaves free pages in the file, which later writes reuse; the file does not shrink by itself (`VACUUM`, with every process stopped, returns the space). Measured on synthetic corpora (SQLite 3.53.1, `scripts/bench_sparse.py --stages orphans` and a 360,125-event engine): 0.7 to 0.9 s per 10,000 orphans when a tenth of a 30,000 to 100,000-document file goes, 1.2 to 1.6 s per 10,000 when a fifth of a 50,000 to 200,000-document file goes (44,000 of 200,000: 6.3 s), the longest transaction 0.09 to 0.6 s; about 12 s for 85,000 orphans. A global search repair without orphans took 660 ms before and 646 ms after (medians of 25 runs at 360,125 events), a 100-event session's 0.27 ms and 0.26 ms.
 - Not addressed: a document whose id is still in the store but whose indexed text is stale (the contentless index cannot compare texts) is neither detected nor rewritten.
 
 ## 0.8.0 - 2026-10-16
