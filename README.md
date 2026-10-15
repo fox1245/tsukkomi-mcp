@@ -194,7 +194,7 @@ Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout
 | | `revoke_contract` | Disable a contract while preserving history. Takes `source_event_id` (the user's message that asked for it); without one the request is held as pending and the contract stays in force. |
 | | `check_action` | Pre-flight test of a proposed action against current contracts. `verify="fast"` selects the hook-time source verification; the result's `integrity` says what was compared. |
 | | `audit_session` | Audit executed session history against active contracts (always a full source verification). |
-| | `audit_status` | Health check: vector extension, index schema, degraded flags, per-session coverage. |
+| | `audit_status` | Health check: vector extension, index schema, degraded flags, per-session coverage, and `ops`, the [request statistics](#timeouts-and-what-a-deadline-leaves-behind) of the process (answered even while the engine is busy). |
 | **Checklist & Evidence** | `update_checklist` | Update requirements; enforces evidence gating for completion. |
 | | `get_checklist` | Inspect checklist status, history and linked evidence. |
 | **GraphRAG & Architecture** | `get_graph_context` | Query entity dependencies and the active knowledge graph. |
@@ -860,6 +860,27 @@ Requests share an absolute deadline and cancellation control through nested call
 
 Default combined writer-lock wait (1 second), audit budget (8 seconds), ordinary budget (45 seconds) and explicit-tool cap (600 seconds) are unchanged. Real writes, initialization, raw captures and derived persistent mutations remain guarded and can still contend. See [implementation and verification boundaries](docs/timeout-fix.md).
 
+### Timeouts and what a deadline leaves behind
+
+A request has one budget: 8 seconds (`SELF_DIRECT_AUDIT_TIMEOUT_SEC`) for hooks and audit-class calls such as `audit_session` and `check_action`, 45 seconds (`SELF_DIRECT_REQUEST_TIMEOUT_SEC`) for the other tools, or the caller's `timeout_ms`. An answer that is not ready within it is `request_deadline`. A sync that the deadline stops before its commit leaves the index as it was and keeps no progress; its worker thread runs on until its next cooperative check and holds its heavy-call slot until it ends.
+
+An answer that did not complete carries `timings_ms` (`gate_wait`, the wait for a heavy-call slot, and `elapsed`, the whole request, in milliseconds) and `budget_ms`, so the time can be placed in the queue or in the work. The reasons remain an open set: a client must not reject one it does not know.
+
+**`audit_status.ops`.** `audit_status` attaches the request statistics of the process to every answer as `ops`, an `index_busy` or `request_deadline` answer included: they sit behind their own short lock and never wait for the engine. They are in memory only (a restart starts at zero), hold no session id, path, contract text, argument or error message, and use closed vocabularies; any other name is counted as `other`.
+
+| Field | Content |
+|---|---|
+| `since`, `uptime_sec` | When the counting began (ISO time, UTC) and for how long. |
+| `buckets_ms` | The inclusive upper bounds of the histogram buckets: 50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 45000 and `"+inf"`. |
+| `tools.<name>` | Only for tools that were called. Names: the registered tool names, `hook` (the Codex hook tool) and `other`. |
+| `calls`, `outcomes` | Requests, each counted once at its response, and how they ended: `ok`; `degraded` (answered from the stored index, `sync_deadline`); `incomplete` (no answer); `client_cancelled`; `error`; `other`. |
+| `reasons` | For `incomplete` and `degraded`: `request_deadline`, `index_busy`, `request_cancelled`, `operation_timeout`, `sync_deadline`, `other`. |
+| `elapsed_ms`, `gate_wait_ms` | `counts` per bucket (one more than there are bounds) and `max`. The wait is recorded only for calls that queue for a heavy-call slot. |
+| `workers` | `abandoned_now`: worker threads still running after their request was answered `request_deadline`; `abandoned_total`; `late_finish_total`. The end of such a worker is not a request. |
+| `gate` | `slots` (`SELF_DIRECT_MAX_CONCURRENT_CALLS`) and `in_use` (slots held, abandoned workers included). |
+
+Counted: the MCP tool calls, with the Codex hook tool as `hook`. Not counted: the Claude Code and AGY command hooks, which do not pass the MCP dispatcher, and the `workflow_*` tools. A resident daemon counts across all of its connections.
+
 ---
 
 ## Upgrading to 0.6.0
@@ -1019,7 +1040,7 @@ GitHub Actions runs two workflows. Superseded runs for the same ref are cancelle
 The `CI` workflow runs three jobs on every push and pull request:
 
 - **`test`** (Ubuntu and Windows, Python 3.12, 10 minutes): the explicit MCP transport, Jev boundary and Windows session-path smoke tests and the compressed Codex session tests (without their two 50 MB allocation probes), then builds the source distribution and wheel.
-- **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, checklist conflicts, quiet hooks, AGY and Claude Code hooks, the Claude Code installer and provider, and hook gating. It also runs the hook import budget and settings parity tests ([Hook import budget](#hook-import-budget)) and the BLAS thread test. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
+- **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, request statistics, checklist conflicts, quiet hooks, AGY and Claude Code hooks, the Claude Code installer and provider, and hook gating. It also runs the hook import budget and settings parity tests ([Hook import budget](#hook-import-budget)) and the BLAS thread test. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
 - **`bench`** (Ubuntu, Python 3.12, 10 minutes): `scripts/bench_hooks.py --check` on small synthetic sessions. It fails when a gated metric exceeds 1.5 times its target and uploads the JSON report and the markdown table as an artifact ([Hook cost benchmark](#hook-cost-benchmark)). The 300 MB session is never run in CI.
 
 The `Memory` workflow (pull requests to `main`, `main`, nightly and on demand) is described in [Memory verification](#memory-verification).
