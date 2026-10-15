@@ -19,6 +19,8 @@ Grok reply shapes (command hooks, ``docs/10-hooks.md`` of its user guide), all J
 * A failure is visible and still fail-open: the reply allows, the first line of stderr names the failure, and the
   exit code is 1 (Grok records "exit code 1: <first stderr line>" in the scrollback and blocks nothing). The one
   exception is a high-risk ask, which exits 0 so the prompt carries the reason. Exit code 2 is never used: it denies.
+  Grok drops the ``additionalContext`` of a hook that exits non-zero, so a failed PreToolUse also queues a warning
+  that the next PostToolUse (exit 0) hands to the model.
 """
 from __future__ import annotations
 
@@ -123,6 +125,12 @@ def fail_open(event, payload, error_class: str, kind: str = CHECK_FAILED, *, mod
         recorded = health.record_error(kind, event or "unknown", error_class)
         if event == "SessionStart":
             banner = health.banner()
+        session = payload.get("session_id", payload.get("sessionId")) if isinstance(payload, dict) else None
+        if event == "PreToolUse" and isinstance(session, str) and session:
+            # A non-zero exit drops the reply's additionalContext (Grok), so the model hears of the unverified call
+            # with the next PostToolUse, which exits 0 (see ``grok_hooks.handle_light``).
+            health.queue_warning(session[:64], f"A PreToolUse call was allowed without verification ({error_class}): "
+                                 "fail-open, not a compliance verdict; do not claim compliance for it.")
     except Exception:
         pass
     if event == "PreToolUse" and mode != "advisory" and isinstance(payload, dict):

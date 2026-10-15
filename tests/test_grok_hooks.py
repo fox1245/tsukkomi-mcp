@@ -674,6 +674,36 @@ def test_a_stop_error_always_allows_even_with_a_confirmed_miss_pending(env, monk
     assert health(engine).continue_claims(SID) in (0, None)
 
 
+def test_a_failed_pretooluse_reaches_the_model_with_the_next_post_tool_use_once(env):
+    """Grok drops the additionalContext of a hook that exits non-zero, so the warning waits for an exit-0 hook."""
+    engine, path = env
+    corrupt_contracts(engine)
+    failed, was_failure = grok_hooks._run("PreToolUse", hook_payload("PreToolUse", path), engine)
+    assert was_failure and failed["decision"] == "allow"
+    for event in ("SessionStart", "UserPromptSubmit"):
+        assert run(engine, path, event) == {}                      # Grok discards context there: nothing is spent
+    first = run(engine, path, "PostToolUse")
+    context = first["hookSpecificOutput"]
+    assert context["hookEventName"] == "PostToolUse" and set(first) == {"hookSpecificOutput"}
+    assert "allowed without verification (ValidationError)" in context["additionalContext"]
+    assert "not a compliance verdict" in context["additionalContext"]
+    assert run(engine, path, "PostToolUse") == {}
+    grok_hooks._run("PreToolUse", hook_payload("PreToolUse", path), engine)
+    again = run(engine, path, "PostToolUseFailure")
+    assert again["hookSpecificOutput"]["hookEventName"] == "PostToolUseFailure"
+    assert run(engine, path, "PostToolUseFailure") == {}
+
+
+def test_the_queue_is_per_session_and_never_holds_payload_text(env):
+    engine, path = env
+    corrupt_contracts(engine)
+    other = write(session_file(engine.settings.resolve_grok_sessions_dir(), OTHER), user("hi"))
+    grok_hooks._run("PreToolUse", hook_payload("PreToolUse", path, tool_input={"command": f"echo {SENTINEL}"}), engine)
+    assert run(engine, other, "PostToolUse", sid=OTHER) == {}
+    delivered = run(engine, path, "PostToolUse")["hookSpecificOutput"]["additionalContext"]
+    assert SENTINEL not in delivered
+
+
 def test_every_reply_is_masked(env):
     engine, path = env
     engine.upsert_contracts([{"id": "c", "type": "must_not", "scope": "tool_call", "regex": "forbidden",

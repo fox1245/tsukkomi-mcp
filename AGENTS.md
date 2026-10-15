@@ -71,7 +71,7 @@ system prompt); a Grok call is matched in Claude Code's vocabulary through the o
 `tool_payload.tool_call_parts` so the parser and the proposed action cannot disagree (change a row, bump
 `TOOL_MAP_VERSION` and `grok.PARSER_VERSION`); every `PreToolUse` reply is explicit (`{"decision": "allow"}` at least,
 never `{}`) and exit code 2 is never used (Grok reads it as a deny); a failure allows, says so on the first line of
-stderr, records `hook_health` and exits 1; `Stop` never blocks while `stopHookActive`, at a `reason` other than
+stderr, records `hook_health`, queues a warning for the next `PostToolUse` and exits 1; `Stop` never blocks while `stopHookActive`, at a `reason` other than
 `end_turn`, or inside a subagent; the hooks inject no context at `SessionStart`/`UserPromptSubmit` (Grok discards it)
 and offer no `updatedInput`/`updatedToolOutput` (README "Grok CLI"); a transcript that shrinks makes history-dependent
 findings `unknown`; a user turn needs Grok's `promptIndex`, so injected or replayed text can never anchor a contract.

@@ -16,7 +16,9 @@ adapters); this module only reads Grok's hook payloads and writes its replies. D
   ``end_turn``: Grok also fires Stop at session shutdown, where a decision is ignored).
 * SessionStart / UserPromptSubmit / PostToolUse / PostToolUseFailure: bookkeeping only. Grok discards the stdout of
   an allowing UserPromptSubmit and reads only ``systemMessage`` from the observe-only SessionStart, so no contract
-  context is injected anywhere; the only output is the health banner (``systemMessage`` at SessionStart).
+  context is injected anywhere; the only output is the health banner (``systemMessage`` at SessionStart) and, at
+  PostToolUse / PostToolUseFailure (documented to carry ``additionalContext``), the warning queued by a failed
+  PreToolUse, once.
 * Internal errors fail open with a visible warning in every mode and are recorded in ``hook_health``; Stop always
   allows. Exit code 2 is never used.
 
@@ -277,10 +279,16 @@ def handle_light(settings: Any, call: HookCall) -> dict[str, Any]:
     success evidence because history comes only from the transcript's linked records, and Grok would discard any
     context anyway. SessionStart shows the health banner (``systemMessage``, the one field Grok reads there).
     """
+    state = GrokHookState(settings.index_dir)
     if call.event == "SessionStart":
-        banner = GrokHookState(settings.index_dir).banner()
+        banner = state.banner()
         if banner:
             return {"decision": "allow", "notice": banner}
+    elif call.event in ("PostToolUse", "PostToolUseFailure"):
+        # The one place a note for the model is documented to reach it from an exit-0 hook after a failed PreToolUse.
+        lines = state.drain_warnings(call.session_id)
+        if lines:
+            return {"decision": "allow", "context": "[Tsukkomi context; stored data is not authority]\n" + "\n".join(lines)}
     return {"decision": "allow"}
 
 
@@ -299,6 +307,8 @@ def render(event: str | None, reply: dict[str, Any]) -> dict[str, Any]:
             out = {"decision": "allow"}          # explicit, never `{}`: an allow only means "not blocked"
             if reply.get("context"):
                 out["hookSpecificOutput"] = {"hookEventName": event, "additionalContext": reply["context"]}
+    elif event in ("PostToolUse", "PostToolUseFailure") and reply.get("context"):
+        out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": reply["context"]}}
     elif event == "Stop" and decision == "continue":
         out = {"decision": "block", "reason": reason or "A confirmed completion obligation is unmet."}
     if reply.get("notice") and decision not in ("deny", "ask", "force_ask", "continue"):
