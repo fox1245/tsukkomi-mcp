@@ -56,14 +56,14 @@ TOOL_ROWS: tuple[ToolRow, ...] = (
     ToolRow("search_replace", "Edit", (), frozenset(),
             "recorded hook payloads: file_path, old_string, new_string (the same names Claude Code's Edit uses)"),
     ToolRow("write", "Write", (("target_file", "file_path"), ("path", "file_path"), ("contents", "content")), frozenset(),
-            "named by Grok's hook documentation; its arguments are NOT in the recorded fixtures (verify with a live run)"),
+            "live run (grok 1.0.52): file_path, content; the other keys are tolerated"),
     ToolRow("grep", "Grep", (), frozenset(),
             "recorded hook payloads: pattern, path (Claude Code's Grep uses the same names)"),
     ToolRow("list_dir", "LS", (("target_directory", "path"),), frozenset(),
             "recorded hook payloads: target_directory; LS is Claude Code's directory listing (its Glob needs a pattern)"),
     ToolRow("web_search", "WebSearch", (), frozenset(), "named by Grok's hook documentation; arguments pass through"),
     ToolRow("web_fetch", "WebFetch", (), frozenset(), "named by Grok's hook documentation; arguments pass through"),
-    ToolRow("spawn_subagent", "Task", (), frozenset(), "named by Grok's hook documentation; arguments pass through"),
+    ToolRow("spawn_subagent", "Task", (), frozenset(), "live run (grok 1.0.52): description, prompt (Claude Code's Task uses the same names)"),
 )
 _BY_NATIVE = {row.native: row for row in TOOL_ROWS}
 _CANONICAL = frozenset(row.canonical for row in TOOL_ROWS)

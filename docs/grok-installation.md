@@ -139,12 +139,12 @@ Contracts are regexes over `[tool_call:<tool_name>] <json arguments>`. The contr
 | `run_terminal_command` | `Bash` | `command`; `is_background` becomes `run_in_background`; `description` is model-written prose, kept out of the matched text (`meta.tool_prose`) |
 | `read_file` | `Read` | `target_file` (or `path`) becomes `file_path`; `limit`, `offset` unchanged |
 | `search_replace` | `Edit` | `file_path`, `old_string`, `new_string`, `replace_all` unchanged |
-| `write` | `Write` | `target_file` (or `path`) becomes `file_path`; `contents` becomes `content`. **Not in the recorded fixtures:** verify with a live run |
+| `write` | `Write` | A live run (1.0.52) sent `file_path` and `content`, which pass through; `target_file` / `path` become `file_path` and `contents` becomes `content` in case another version spells them so |
 | `grep` | `Grep` | `pattern`, `path` and the rest unchanged |
 | `list_dir` | `LS` | `target_directory` becomes `path` (Claude Code's `Glob` needs a pattern that `list_dir` lacks) |
 | `web_search` | `WebSearch` | unchanged |
 | `web_fetch` | `WebFetch` | unchanged |
-| `spawn_subagent` | `Task` | unchanged |
+| `spawn_subagent` | `Task` | unchanged (a live run sent `description` and `prompt`, the names Claude Code's `Task` uses) |
 | `<server>__<tool>` (MCP) | `mcp__<server>__<tool>` | unchanged |
 | anything else | the native name | unchanged |
 
@@ -169,7 +169,7 @@ Parser version 1 (`src/self_directing_mcp/grok.py`) reads `updates.jsonl` only. 
 | anything else (an unknown `sessionUpdate`, a compaction or rewind marker, an unknown method, non-text content, an unknown status) | One placeholder flagged `unsupported_event`: counted in `coverage.unsupported_event_count`, keeps coverage incomplete and never becomes `clean`. |
 | a malformed record | One `parse_error` chunk and no partial evidence. |
 
-A denied call (by this server or any hook) is an attempt: its result is a failed `tool_result` with Grok's text, and a prohibition still matches the call in the history audit. Grok records no structured refusal, so the "rejected proposals" report that Claude Code's transcripts allow is not available for Grok.
+A denied call (by this server or any hook) is an attempt: its result is a failed `tool_result` with Grok's text, and a prohibition still matches the call in the history audit. Grok records no structured refusal on the call, so the "rejected proposals" report that Claude Code's transcripts allow is not available for Grok. Its own note of a refusal is a `hook_annotation` record of kind `tool_outcome` ("`read_file` blocked by project/tsukkomi: ..."), which names no call id; in a live run it directly followed the call's `failed` update (event ids n+2 and n+3). That adjacency is not relied on in v1, so a `Stop` note can call a contract violated for a call that the hook refused and that never ran.
 
 Resume appends to the same file and is indexed like any append, from the stored offset. A file that shrinks or is rewritten is re-indexed from byte 0 (`reindex_reason: "source_changed"`). A streamed run still open at the end of what was read is emitted as it stands, and chunks that arrive later start a new event: a message split by a sync that fell mid-stream is two events, deterministically for those sync points. Sessions name no working directory in `updates.jsonl`, so pass `project_dir` to the contract-candidate tools.
 
@@ -191,7 +191,7 @@ Grok reads Claude Code's settings file (`~/.claude/settings.json`) by default, s
 
 ### Assumptions a live Grok run should verify
 
-1. The `write` tool's argument names and the argument names of `web_search`, `web_fetch` and `spawn_subagent` (the recorded fixtures contain none of them).
+1. The argument names of `web_search` and `web_fetch` (not exercised). A live run on 1.0.52 verified `write` (`file_path`, `content`), `spawn_subagent` (`description`, `prompt`), `grep` and `list_dir`: a contract on `Write`, `Task`, `Grep` or `LS` denied each call and the reason reached the model.
 2. How an MCP tool call appears in `updates.jsonl`: the map expects its `title` to be the qualified `<server>__<tool>` name, as the hook payload's `toolName` is documented. If Grok records `use_tool` there, such a call passes through under that name and its arguments.
 3. That every typed prompt carries `_meta.promptIndex` (also after a resume) and that a hook's `additionalContext` or a Stop block reason is not written as a plain `user_message_chunk` with that index. A typed prompt without the index would be runtime text and could not anchor a contract.
 4. That Grok shows `systemMessage` of `SessionStart` and the first stderr line of a failed hook to the user.
