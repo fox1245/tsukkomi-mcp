@@ -51,7 +51,7 @@ def leaves(value):
 def test_the_vocabularies_are_the_documented_closed_sets():
     assert OUTCOMES == ("ok", "degraded", "incomplete", "client_cancelled", "error")
     assert REASONS == ("request_deadline", "index_busy", "request_cancelled", "operation_timeout", "sync_deadline",
-                       "sync_in_progress", "other")
+                       "sync_in_progress", "reindex_ready_to_commit", "other")
     assert BUCKETS_MS == (50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 45000)
     assert "hook" in TOOLS and "check_action" in TOOLS and "audit_status" in TOOLS
     assert len(set(TOOLS)) == len(TOOLS)

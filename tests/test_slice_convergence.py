@@ -6,7 +6,9 @@ say, and the switches that restore the all-or-nothing sync.
   slice q that was observed, and the index equals the one-shot index. The same calls with slicing off make no progress.
 * Verdicts. A partial prefix never yields ``clean`` (and never ``judged_prefix``), a forbidden call in it is a violation,
   a proposed prohibited action is a violation whatever the backlog, an obligation stays unknown.
-* Switches. ``off``, no finite deadline, a compressed source, and every reindex keep the all-or-nothing behaviour.
+* Switches. ``off``, no finite deadline and a compressed source keep the all-or-nothing behaviour. A reindex is not sliced
+  into the index either: its capture is whole, an interrupted one leaves the old index, and the rows it parsed wait in a
+  spool until one commit publishes them (``tests/test_reindex_*.py``).
 """
 from __future__ import annotations
 
@@ -342,7 +344,7 @@ def reindex_world(tmp_path, monkeypatch):
     return world, engine, snapshot(engine, "codex", world.sid)
 
 
-def test_a_parser_update_is_never_sliced_and_an_interrupted_reindex_keeps_the_old_index(tmp_path, monkeypatch):
+def test_a_parser_update_is_captured_whole_and_an_interrupted_reindex_keeps_the_old_index(tmp_path, monkeypatch):
     world, engine, before = reindex_world(tmp_path, monkeypatch)
     try:
         control = Tripwire()
@@ -356,8 +358,10 @@ def test_a_parser_update_is_never_sliced_and_an_interrupted_reindex_keeps_the_ol
         assert windows == [None]                              # the stored parser version is known: no cut capture at all
         assert (after.events, after.cursor, after.blocks, after.metrics, after.versions) == \
             (before.events, before.cursor, before.blocks, before.metrics, before.versions)      # nothing of it was kept
+        engine.slice_policy = None                            # the settings alone decide: with a far deadline it fits one call
         info = engine.sync_session(**world.sync_args(), derived=False, _deadline=FAR())
         assert info["reindexed"] is True and info["sync"]["state"] == "complete"
+        assert info["sync"]["reindex"]["state"] == "committed"
         assert snapshot(engine, "codex", world.sid).versions != before.versions
     finally:
         world.close()
@@ -379,6 +383,7 @@ def test_a_changed_source_found_after_a_cut_capture_is_reindexed_whole(tmp_path,
         after = snapshot(engine, "codex", world.sid)
         assert (after.events, after.cursor, after.blocks, after.metrics) == \
             (before.events, before.cursor, before.blocks, before.metrics)
+        engine.slice_policy = None
         info = engine.sync_session(**world.sync_args(), derived=False, _deadline=FAR())
         assert info["reindexed"] is True and info["reindex_reason"] == "source_changed" and info["sync"]["state"] == "complete"
     finally:
@@ -400,7 +405,7 @@ def test_an_append_to_an_indexed_session_may_be_sliced_and_keeps_the_events_it_h
         world.close()
 
 
-def test_a_receipt_change_that_forces_a_reindex_is_never_sliced_either(tmp_path, monkeypatch):
+def test_a_receipt_change_that_forces_a_reindex_is_captured_whole_too(tmp_path, monkeypatch):
     """AGY: the reindex is decided after the capture (a changed hook receipt of an indexed result), so a cut capture is
     discarded for a whole one, and an interrupted reindex leaves the old events in place."""
     from self_directing_mcp.agy_receipts import ReceiptStore
@@ -429,6 +434,7 @@ def test_a_receipt_change_that_forces_a_reindex_is_never_sliced_either(tmp_path,
         assert windows[0] is not None and windows[-1] is None            # cut, found to need a reindex, observed whole
         after = snapshot(engine, "agy", world.sid)
         assert (after.events, after.cursor, after.metrics, after.agy) == (before.events, before.cursor, before.metrics, before.agy)
+        engine.slice_policy = None
         info = engine.sync_session(**world.sync_args(), derived=False, _deadline=FAR())
         assert info["reindexed"] is True and info["reindex_reason"] == "hook_receipts_changed"
         assert info["sync"]["state"] == "complete"
