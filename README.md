@@ -1214,6 +1214,15 @@ What the tables show, and what they do not:
 
 - **A resident engine writes no commit for the schedule** (`--defer`: the schedule is held with the monitor states). A synchronous engine writes it with the states when a request writes states, and in a commit of its own otherwise: the one compared request of a nothing-appended cell, which is why those cells show 0.03 more durable commits per request (1 in 30) in the default column and none past the warm-up.
 
+**What a violation that stands costs.** A violation (and a flip, and a changed high-risk summary) is called for by the finished answer, so the comparison it owes is a second, scoped pass over the same request, and it is owed again by every request that appends an event while the violation stands: the stored events changed, so the remembered comparison does not apply (an identical repeat is not compared twice, and a `PreToolUse` check does not evaluate prohibitions over history). The same cells with one more contract that the benchmark sessions violate from their first event on (`scripts/bench_warm.py`, `--defer`, 60 requests per cell after a warm-up of 12, median of three interleaved rounds, each started alone, load average 2.2 to 3.1; each entry is `p50 / p95 / p99 ms [shadow comparisons]`):
+
+| `Stop` with 4 KB appended, daemon engine, 60 requests | no violation (p50 / p95 / p99 ms) | a contract violated from the first event, as built | the same with the second pass left out |
+|---|---|---|---|
+| Claude Code session, 1,729 events | 20.0 / 60.3 / 74 [11] | 41.8 / 66.4 / 77 [60] | 20.5 / 64.6 / 84 [11] |
+| AGY session, 3,265 events | 24.3 / 99.0 / 109 [9] | 76.5 / 104.7 / 131 [60] | 26.5 / 105.0 / 119 [9] |
+
+The pass adds about 21 ms (Claude Code) and 50 ms (AGY) to the p50 of such a request, growing with the size of the session, and nothing to a repeat of the same request (9.6 against 9.0 ms without the violation, nothing appended). It stays: a state that missed events is what the pass is for, and a violation is not monotone (a refused call is subtracted later, a `must` can be met afterwards), so skipping it while a violation stands would leave a wrong block unnoticed until a sampled comparison. The third column is that skipping, measured, not offered.
+
 The resident daemon through `scripts/bench_daemon.py --runs 30 --only hooks` (cold hook processes through a warm daemon; one run per side, load average at the start 2.99 before and 3.83 after; the cells of a host share one session and one daemon engine, so the first `Stop` cells build the audit variant's states in the middle of the run). Wall time of the whole new process and the daemon-side time, p50 / p95 / p99 ms:
 
 | Event (new process) | through the daemon, before: wall p50 / p95 / p99 ms | after | daemon-side before: p50 / p95 / p99 ms | after |
