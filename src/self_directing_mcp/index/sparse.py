@@ -335,7 +335,7 @@ class CompactSparseIndex(SparseIndex):
 
     * ``chunks_fts`` is a contentless FTS5 table (``content=''``, ``contentless_delete=1``) over the masked text, with the
       same tokenizer and so the same stemming: it stores the inverted index and document sizes, **no text**.
-    * ``chunk_rows(rowid, chunk_id, session_no, kind)`` maps a chunk to its FTS rowid (the same number); sessions and kinds
+    * ``chunk_rows(rowid, chunk_id, session_no, kind_no)`` maps a chunk to its FTS rowid (the same number); sessions and kinds
       are small integers resolved through ``sparse_sessions`` and ``sparse_kinds``. ``sparse_meta`` holds the format
       marker and the SQLite version that created the file.
 
@@ -441,7 +441,8 @@ class CompactSparseIndex(SparseIndex):
     def _drop(self, rowids: list[int]) -> None:
         # Highest rowid first. FTS5 records each contentless delete as a tombstone in the segment that holds the row, and
         # tombstones inserted in ascending rowid order made it rebuild its tombstone tables over and over (a 100,000-event
-        # Codex-like index grew by 17 % in free pages after deleting 1,000 evenly spaced rows; any other order did not).
+        # Codex-like index grew by 17 % in free pages after deleting 1,000 evenly spaced rows; descending, random and chunk-id
+        # order did not).
         for rowid in sorted(rowids, reverse=True):
             check_request()
             self._conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (rowid,))
