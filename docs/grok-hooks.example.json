@@ -1,0 +1,73 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 30,
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/grok_hook.py --event=SessionStart --mode=confirmed_only"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 30,
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/grok_hook.py --event=UserPromptSubmit --mode=confirmed_only"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 60,
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/grok_hook.py --event=PreToolUse --mode=confirmed_only"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 30,
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/grok_hook.py --event=PostToolUse --mode=confirmed_only"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 30,
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/grok_hook.py --event=PostToolUseFailure --mode=confirmed_only"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 120,
+            "command": "/absolute/path/to/venv/bin/python /absolute/path/to/tsukkomi-mcp/scripts/grok_hook.py --event=Stop --mode=confirmed_only"
+          }
+        ]
+      }
+    ]
+  }
+}

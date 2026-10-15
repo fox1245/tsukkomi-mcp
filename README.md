@@ -12,7 +12,7 @@ Every check returns one of four verdicts: `clean`, `violation`, `suspicious` or 
 ```
                   ┌──────────────────────────────────────────────┐
                   │          Autonomous Agent Client             │
-                  │ (Claude Code / AGY / Codex / OMP / Grok Bot) │
+                  │ (Claude Code / AGY / Codex / OMP / Grok CLI) │
                   └──────────────────────┬───────────────────────┘
                                          │
                       Lifecycle hooks (host dependent) or MCP calls
@@ -218,6 +218,7 @@ A contract has the portable fields of a contract: `id` (stable, at most 200 char
 | Claude Code | `claude` | `<projects>/<project>/<session-uuid>.jsonl` plus `<session-uuid>/subagents/agent-*.jsonl` | Opt-in command hooks from `scripts/install_claude_hooks.py`: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `SubagentStop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`ask`); never an explicit `allow`. A `Stop` blocks at most once per session for a confirmed `auto_continue` miss. `SubagentStop` never blocks. See [docs/claude-installation.md](docs/claude-installation.md) | 3 |
 | OpenAI Codex CLI | `codex` | Rollout JSONL in the Codex sessions directory, plain or zstd-compressed (`rollout-*.jsonl.zst`) | Three `mcp_tool` hooks installed by `scripts/install_codex.py`: `UserPromptSubmit`, `PreToolUse`, `Stop` | No. Hooks are advisory | 3 |
 | OMP | `omp` | OMP session JSONL | Opt-in extension `extensions/tsukkomi-omp.ts` | Only confirmed `violation`/`suspicious` on model-issued tools. `unknown` and transport failures never block | 8 |
+| Grok CLI (xAI) | `grok` | `<sessions>/<url-encoded cwd>/<session-uuid>/updates.jsonl` (the ACP update stream; nothing else in a session directory is read) | Opt-in command hooks from `scripts/install_grok_hooks.py`, one file `<grok home>/hooks/tsukkomi.json`: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop` | By default (`confirmed_only`) only a confirmed `violation` (`deny`) and `suspicious` (`ask`); every other `PreToolUse` reply is an explicit `allow`. A `Stop` blocks at most once per session for a confirmed `auto_continue` miss. See [docs/grok-installation.md](docs/grok-installation.md) | 1 |
 | Cursor / Grok Bot | `grokbot` | `agent-transcripts` roots | None; call the MCP tools manually | No | 1 (unversioned) |
 
 A parser version is recorded per session. When a provider's version is raised, each already-indexed session is reparsed from byte 0 on its next sync or audit, one session at a time. Unchanged event ids, anchors and cached vectors survive, and no embedding API is called when `embed=false`. A running MCP process only picks up a new parser after it is restarted.
@@ -235,6 +236,26 @@ Hook receipts cost what was appended, not the size of the transcript. A receipt 
 ### Claude Code parser (version 3)
 
 Only a record the host stamped `origin.kind == "human"` (or, in a main transcript, a legacy prompt from before origin stamps, or a human `queued_command` prompt) is a user turn. Task notifications, peer and coordinator messages, injected meta messages, compaction summaries, attachments, hook output, tool results and a subagent's task prompt are runtime evidence. Unknown record, attachment, block and origin shapes are unsupported events that keep coverage incomplete. Opaque payloads (thinking, images, hook output) are placeholders. A subagent transcript is its own session, `<session-uuid>_agent-<agent-id>`. Version 3 keeps the model-written `description` of a built-in tool call (`Bash`, `Task`, `Monitor`, ...) out of the call text and records it in `meta.tool_prose`; the call text contains only the other input fields, exactly like the proposed action a `PreToolUse` hook asks about. An MCP tool's own `description` argument is payload. Version 2 accepts the `system` record `scheduled_task_fire` (a scheduled task fired) as runtime metadata: its `prompt` is automation text, not something the user said, so it is validated, never indexed, and cannot satisfy or violate a user-role contract; every other unknown system subtype stays unsupported. See [docs/claude-installation.md](docs/claude-installation.md#9-how-the-claude-parser-decides-who-is-the-user).
+
+### Grok CLI parser (version 1)
+
+`updates.jsonl` is the only file read (`chat_history.jsonl` and `system_prompt.txt` hold the rendered system prompt and are refused by the resolver). A `user_message_chunk` is a user turn only when Grok stamped it with its `promptIndex`, it does not open with the `<system-reminder>` wrapper Grok puts around hook-injected text and it is not replayed from another session; everything else is runtime text and cannot anchor a contract. Streamed `agent_message_chunk` records are joined into one message (a run still open at the end of a read is emitted as it stands); `agent_thought_chunk` becomes a `[thinking]` placeholder, never indexed text. A `tool_call` is a call and a `tool_call_update` with a terminal `status` its result, linked by `toolCallId` (`failed`, a non-zero exit code, a timeout or a signal are failure; a call with no result is in flight or cancelled, never success). The host's own `hook_execution` and `hook_annotation` records, which describe this server's denials, are skipped; any other unknown record kind is an unsupported event that keeps coverage incomplete. A `spawn_subagent` child is another session directory and is not followed.
+
+**Tool names are rendered in Claude Code's vocabulary** at the one boundary where text is matched (the parser, the hook's proposed action and the hook-side pre-checks), so the contracts you wrote for Claude Code match the same call from Grok. The map (`src/self_directing_mcp/grok_tools.py`, `TOOL_MAP_VERSION = 1`; the native name and arguments stay in the event metadata):
+
+| Grok tool | Rendered as | Argument keys |
+|---|---|---|
+| `run_terminal_command` | `Bash` | `command`; `is_background` to `run_in_background`; the model-written `description` is kept out of the matched text |
+| `read_file` | `Read` | `target_file` (or `path`) to `file_path`; `limit`, `offset` unchanged |
+| `search_replace` | `Edit` | unchanged (`file_path`, `old_string`, `new_string`, `replace_all`) |
+| `write` | `Write` | `target_file`/`path` to `file_path`; `contents` to `content` (its arguments are not in the recorded fixtures) |
+| `grep` | `Grep` | unchanged |
+| `list_dir` | `LS` | `target_directory` to `path` |
+| `web_search`, `web_fetch`, `spawn_subagent` | `WebSearch`, `WebFetch`, `Task` | unchanged |
+| `<server>__<tool>` | `mcp__<server>__<tool>` | unchanged |
+| anything else | the native name | unchanged |
+
+A contract that names a Grok spelling (`run_terminal_command`, `target_file`) does not match; write contracts against the Claude vocabulary. Details, the reply formats and what a live run should verify are in [docs/grok-installation.md](docs/grok-installation.md).
 
 ### OMP parser (version 8)
 
@@ -370,7 +391,7 @@ openrouter_api_key_file = "../credentials/openrouter.env"
 sqlite_vector_path = "native/vector.so"
 ```
 
-The nine supported keys are `index_dir`, `codex_sessions_dir`, `omp_sessions_dir`, `claude_projects_dir`, `grokbot_transcripts_dir`, `agy_app_data_dirs`, `contracts_path`, `sqlite_vector_path` and `openrouter_api_key_file`. AGY roots use a string array; Grokbot accepts its existing delimiter-separated string or an array of individual paths. Empty arrays disable those optional roots.
+The ten supported keys are `index_dir`, `codex_sessions_dir`, `omp_sessions_dir`, `claude_projects_dir`, `grok_sessions_dir`, `grokbot_transcripts_dir`, `agy_app_data_dirs`, `contracts_path`, `sqlite_vector_path` and `openrouter_api_key_file`. AGY roots use a string array; Grokbot accepts its existing delimiter-separated string or an array of individual paths. Empty arrays disable those optional roots.
 
 TOML paths expand `~`; relative paths resolve against the canonical TOML file's directory, not the working directory or a symlink's directory. `${ENV_VAR}` interpolation is not performed. The selector `SELF_DIRECT_CONFIG_FILE` is environment-only, so a `.env` cannot silently select another TOML file. An absent default file keeps the defaults. An explicitly selected missing file, malformed TOML, an unknown section or key, or an invalid path value fails instead of silently selecting another index. Settings capture the selected sources, so restart affected servers and extensions after changing them.
 
@@ -382,14 +403,16 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 |---|---|---|
 | `SELF_DIRECT_INDEX_DIR` | `~/.self_direct_index` | Private index directory (events, FTS, vectors, contracts, checklists). |
 | `SELF_DIRECT_CONTRACTS_PATH` | `<index_dir>/contracts.json` | Contracts file. |
-| `SELF_DIRECT_SESSION_PROVIDER` | `codex` | Provider used when a tool call omits `provider`: `codex`, `grokbot`, `omp`, `agy` or `claude`. |
+| `SELF_DIRECT_SESSION_PROVIDER` | `codex` | Provider used when a tool call omits `provider`: `codex`, `grokbot`, `omp`, `agy`, `claude` or `grok`. |
 | `SELF_DIRECT_CODEX_SESSIONS_DIR`, `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Codex session root. |
 | `SELF_DIRECT_OMP_SESSIONS_DIR` | `~/.omp/sessions` | OMP session root. |
 | `SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR` | empty (disabled) | Cursor / Grok Bot transcript roots. |
 | `SELF_DIRECT_AGY_APP_DATA_DIRS` | `~/.gemini/antigravity`, `-cli`, `-ide` | JSON array of AGY app-data directories. |
 | `SELF_DIRECT_CLAUDE_PROJECTS_DIR` | `$CLAUDE_CONFIG_DIR/projects` if `CLAUDE_CONFIG_DIR` is set, else `~/.claude/projects` | Claude Code projects root (TOML `claude_projects_dir`). The environment variable wins over TOML, and TOML over the default. |
+| `SELF_DIRECT_GROK_SESSIONS_DIR` | `$GROK_HOME/sessions` if `GROK_HOME` is set, else `~/.grok/sessions` | Grok CLI sessions root (TOML `grok_sessions_dir`). The environment variable wins over TOML, and TOML over the default. The layout is `<root>/<url-encoded cwd>/<session-uuid>/updates.jsonl`. |
 | `SELF_DIRECT_AGY_ENFORCEMENT` | `confirmed_only` | AGY hook policy: `confirmed_only`, `advisory` (never blocks) or `enforced` (also denies an unverifiable `PreToolUse`). Hook errors fail open in every mode. |
 | `SELF_DIRECT_CLAUDE_ENFORCEMENT` | `confirmed_only` | Claude Code hook policy, same values, independent of the AGY setting. `scripts/install_claude_hooks.py` writes it into the Claude Code settings `env`. |
+| `SELF_DIRECT_GROK_ENFORCEMENT` | `confirmed_only` | Grok CLI hook policy, same values, independent of the others. `scripts/install_grok_hooks.py` writes the mode into every hook command (`--mode=...`), which takes precedence over this variable. |
 | `SELF_DIRECT_USE_FAKE_EMBEDDER` | `false` | Offline/test embedder; never a silent fallback. |
 | `SELF_DIRECT_LOCAL_ONLY` | `false` | Explicit offline mode: no embedder or dense index; embedding, dense/hybrid search and LLM graph updates are rejected. |
 | `SELF_DIRECT_DENSE_BACKEND` | `sqlite-vector` | `sqlite-vector`, `numpy` (explicit offline option) or `pgvector` (opt-in extra; the vectors go to a PostgreSQL server, see [Dense backends](#dense-backends)). Never substituted for one another. |
@@ -468,6 +491,27 @@ python scripts/install_claude_hooks.py --apply --settings /absolute/path/to/sett
 ```
 
 `--print` is the default and changes nothing; `--apply` merges into the settings file you name, keeps unrelated hooks, backs the file up when it changes and replaces it atomically. Add `--index-dir /absolute/path/to/index` to point the hooks at the index whose contracts should apply (the one the MCP server writes to); hooks never read a project `.env`. See [docs/claude-installation.md](docs/claude-installation.md) for the policy table, the Stop budget, subagents, fail-open behavior and verification steps, and [docs/claude-hooks.example.json](docs/claude-hooks.example.json) for the complete hooks block.
+
+### Grok CLI
+
+Register the MCP server with Grok (see the Grok documentation for your version; use an absolute interpreter), then, if the user wants lifecycle controls, review and install the opt-in hooks. They go into one dedicated file, `<grok home>/hooks/tsukkomi.json`, and nothing else is read or written (never `~/.claude/settings.json`, `config.toml` or `trusted_folders.toml`; the `grok` binary is never run):
+
+```bash
+python scripts/install_grok_hooks.py --print --python /absolute/path/to/venv/bin/python
+python scripts/install_grok_hooks.py --apply --python /absolute/path/to/venv/bin/python --local-only --index-dir /absolute/path/to/index
+python scripts/install_grok_hooks.py --verify --python /absolute/path/to/venv/bin/python --local-only --index-dir /absolute/path/to/index
+python scripts/install_grok_hooks.py --uninstall
+```
+
+`--print` is the default and changes nothing; `--apply` writes (atomically, with a backup only when an existing file changes, and nothing at all for an unchanged result) and respects `GROK_HOME` or `--grok-home`; `--verify` also runs the registered command twice on synthetic data in a temporary directory. User-level hooks are always trusted by Grok and need no folder trust. Pass calls to the MCP tools with `provider: "grok"`.
+
+- **Modes.** `confirmed_only` (default) denies a confirmed `violation`, asks on `suspicious`, and allows `unknown` with a warning the model receives (an `ask` for a `risk: "high"` contract); `advisory` never gates; `enforced` also denies `unknown`. The same `hook_policy` table as the AGY and Claude Code hooks. Every `PreToolUse` reply is explicit (`{"decision": "allow"}` at least, never `{}`); `Stop` keeps the agent working at most once per session, never while `stopHookActive`, and never at the session-end `Stop` (`reason` other than `end_turn`).
+- **Failures are visible and fail open.** Settings, contracts or engine unavailable, an invalid payload: the hook still allows, names the failure on the first line of stderr, records `hook_health` and exits 1 (Grok shows the failed hook and blocks nothing). Exit code 2, which Grok treats as a deny, is never used.
+- **Supported:** the six events above, the tool-name map (see "Grok CLI parser" in [Supported hosts and parser versions](#supported-hosts-and-parser-versions)), the Claude-style evidence and `Stop` obligations on the parsed history, a transcript that shrinks becoming `unknown` instead of compliance.
+- **Not supported (cut from this version):** input rewrite (`updatedInput`) and output redaction (`updatedToolOutput`) — future work, left out because the model acts on altered input and output without knowing it, a partial mask can leave a secret reconstructible, binary and very large outputs have no safe text form, and the original result stays in `updates.jsonl` anyway; context injection at `SessionStart` and `UserPromptSubmit` (Grok discards it); the resident daemon; project-level `.grok/hooks`; following a `spawn_subagent` child session.
+- **Together with the Claude Code hooks.** Grok loads `~/.claude/settings.json` by default, so installed Claude hooks also run on Grok's events. `scripts/claude_hook.py` recognises the Grok payload (a `.grok/sessions` transcript path, or Grok's own camelCase envelope) before it imports the package and answers with silence: nothing printed or written, exit 0. Earlier versions printed a "check FAILED (PathTraversalError)" warning on every Grok tool call.
+
+See [docs/grok-installation.md](docs/grok-installation.md) for the event table, the exact reply formats, the parser rules and the list of assumptions a live Grok run should verify, and [docs/grok-hooks.example.json](docs/grok-hooks.example.json) for the complete hook file.
 
 ### OMP (OpenRouter-backed retrieval, deterministic contract hooks)
 

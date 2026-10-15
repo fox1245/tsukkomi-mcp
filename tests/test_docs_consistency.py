@@ -53,6 +53,16 @@ def test_claude_hooks_example_is_what_the_installer_prints():
     assert json.loads((ROOT / "docs" / "claude-hooks.example.json").read_text(encoding="utf-8")) == expected
 
 
+def test_grok_hooks_example_is_what_the_installer_prints():
+    spec = importlib.util.spec_from_file_location("install_grok_hooks", ROOT / "scripts" / "install_grok_hooks.py")
+    installer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = installer
+    spec.loader.exec_module(installer)
+    expected = {"hooks": installer.desired_hooks("/absolute/path/to/venv/bin/python",
+                                                 "/absolute/path/to/tsukkomi-mcp/scripts/grok_hook.py")}
+    assert json.loads((ROOT / "docs" / "grok-hooks.example.json").read_text(encoding="utf-8")) == expected
+
+
 @pytest.mark.parametrize("path", MARKDOWN, ids=lambda p: p.name)
 def test_relative_links_and_anchors_resolve(path):
     problems = []
@@ -69,7 +79,8 @@ def test_relative_links_and_anchors_resolve(path):
     assert not problems, problems
 
 
-@pytest.mark.parametrize("path", MARKDOWN + [ROOT / ".env.example", ROOT / "docs" / "claude-hooks.example.json"],
+@pytest.mark.parametrize("path", MARKDOWN + [ROOT / ".env.example", ROOT / "docs" / "claude-hooks.example.json",
+                                             ROOT / "docs" / "grok-hooks.example.json"],
                          ids=lambda p: p.name)
 def test_no_private_paths_in_documentation(path):
     text = path.read_text(encoding="utf-8")
