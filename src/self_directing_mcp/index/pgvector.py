@@ -832,7 +832,7 @@ class PgVectorIndex(VectorIndex):
             params["blob"], params["odd"] = self._filter_parameters(allowed)
         before = []
         if approximate:
-            # pgvector's own default (40) gave a recall@20 of 0.81 at 300 000 clustered vectors, 100 gave 0.91 for 0.2 ms more
+            # pgvector's own default (40) gave a recall@20 of 0.80 at 300 000 clustered vectors, 100 gave 0.89 for 0.1 ms more
             # (README, "pgvector numbers")
             ef = self.hnsw_ef_search or min(1000, max(100, 4 * int(top_k)))
             before.append(("SELECT set_config('hnsw.ef_search', %s, false)", (str(ef),)))

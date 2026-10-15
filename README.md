@@ -455,38 +455,40 @@ export SELF_DIRECT_PGVECTOR_DSN_FILE=/absolute/path/pgvector.dsn
 
 #### HNSW (optional approximate search)
 
-`SELF_DIRECT_PGVECTOR_HNSW=true` creates `chunk_vectors_embedding_hnsw` (cosine, pgvector's defaults `m=16`, `ef_construction=64`; at most 2000 dimensions) and serves searches **without** an id filter with `hnsw.ef_search = max(100, 4 x top_k)`. It is off by default because the exact scan is the reference and because of what it costs: the index is as large as the table, every write maintains it, and it is approximate. Searches with an id filter are always exact, and **`search_history` always passes one** (the session's ids, or every id of the provider), so with the current engine the index is built and kept but not used: turn it on only when calling the backend directly. A large table's index takes minutes to build; build it outside a request with `PgVectorIndex(...).build_hnsw_index(maintenance_work_mem='2GB', timeout_ms=0)` (a build inside a request that runs out of time says so and names this command). The recall trade-off below is measured on clustered synthetic vectors; vectors with no neighbourhood structure (uniform random in 1024 dimensions) are the worst case, with recall@20 of 0.04 at 100,000 vectors and `ef_search=40`.
+`SELF_DIRECT_PGVECTOR_HNSW=true` creates `chunk_vectors_embedding_hnsw` (cosine, pgvector's defaults `m=16`, `ef_construction=64`; at most 2000 dimensions) and serves searches **without** an id filter with `hnsw.ef_search = max(100, 4 x top_k)`. It is off by default because the exact scan is the reference and because of what it costs: the index is as large as the table, every write maintains it, and it is approximate. Searches with an id filter are always exact, and **`search_history` always passes one** (the session's ids, or every id of the provider), so with the current engine the index is built and kept but not used: turn it on only when calling the backend directly. A large table's index takes minutes to build; build it outside a request with `PgVectorIndex(...).build_hnsw_index(maintenance_work_mem='2GB', timeout_ms=0)` (a build inside a request that runs out of time says so and names this command). The recall trade-off below is measured on clustered synthetic vectors; vectors with no neighbourhood structure (uniform random in 1024 dimensions) are the worst case, with recall@20 of 0.03 at 100,000 vectors and `ef_search=40`.
 
 ### pgvector numbers
 
-Synthetic unit float32 vectors of dimension 1024 (uniform random for the comparison, 500 Gaussian clusters for HNSW recall), top_k = 20, 30 searches per cell after 2 warm-ups, p50 / p95 in milliseconds, one client, one machine (16 logical CPUs, WSL2). pgvector: PostgreSQL 17.11 and pgvector 0.8.7 in a loopback container with a tmpfs data directory, `shared_buffers=512MB`, PostgreSQL's default of 2 parallel workers per scan, inline vector storage, batches of 2000 rows per call. sqlite-vector 1.1.0 on a local file; NumPy in memory (loaded by one call: every call re-stacks the whole matrix). The filters are 500 stored ids and 50,000 ids (ids that are not stored pad the set when N is below 50,000, so that row measures the filter, not the hits). `scripts/bench_pgvector.py` reproduces everything; the 300,000-vector runs needed a larger tmpfs (8 GB) and, for HNSW, `--shm 6g --maintenance-work-mem 4GB`.
+Synthetic unit float32 vectors of dimension 1024 (uniform random for the comparison, 500 Gaussian clusters for HNSW recall), top_k = 20, 30 searches per cell after 2 warm-ups, p50 / p95 in milliseconds, one client on one machine (16 logical CPUs, WSL2, shared with other work: repeated runs differed by up to 35 %, so read the ratios, not the digits). pgvector: PostgreSQL 17.11 and pgvector 0.8.7 in a loopback container with a tmpfs data directory, `shared_buffers=512MB`, PostgreSQL's default of 2 parallel workers per scan, inline vector storage, batches of 2000 rows per call. sqlite-vector 1.1.0 on a local file; NumPy in memory (loaded by one call, because every call re-stacks the whole matrix). Ids are 65 characters long, like the engine's chunk ids. The filters are 500 stored ids and 50,000 ids (ids that are not stored pad the set when N is below 50,000). `scripts/bench_pgvector.py` reproduces everything; the 300,000-vector runs needed a larger tmpfs (8 GB) and, for HNSW, `--shm 6g --maintenance-work-mem 4GB`.
 
 | N | backend | upsert rows/s | `present` of 500 | search, no filter | 500 ids | 50,000 ids | size |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1,000 | pgvector | 8,752 | 1.5 | 1.2 / 1.4 | 1.4 / 2.0 | 31 / 36 | 8 MB |
-| | sqlite-vector | 45,395 | 0.5 | 2.0 / 2.5 | 2.4 / 3.1 | 22 / 24 | 4 MB |
-| | NumPy | 208,552 | 0.04 | 4.0 / 7.6 | 4.0 / 4.8 | 4.0 / 6.2 | 8 MB |
-| 10,000 | pgvector | 8,792 | 1.6 | 8.2 / 11.9 | 1.9 / 2.6 | 42 / 52 | 78 MB |
-| | sqlite-vector | 48,242 | 0.4 | 18.7 / 22.6 | 19.8 / 24.1 | 41 / 50 | 44 MB |
-| | NumPy | 102,194 | 0.2 | 18.1 / 32.3 | 8.0 / 12.2 | 30 / 48 | 78 MB |
-| 100,000 | pgvector | 9,818 | 1.9 | 82 / 90 | 2.7 / 4.0 | 153 / 196 | 784 MB |
-| | sqlite-vector | 65,709 | 0.5 | 183 / 213 | 193 / 219 | 227 / 257 | 441 MB |
-| | NumPy | 97,732 | 0.8 | 136 / 165 | 17.7 / 30.9 | 90 / 119 | 781 MB |
-| 300,000 | pgvector | 9,174 | 3.0 | 185 / 203 | 2.3 / 3.0 | 110 / 128 | 2,353 MB |
-| | sqlite-vector | 39,573 | 0.5 | 584 / 628 | 586 / 635 | 629 / 678 | 1,324 MB |
-| | NumPy | 72,344 | 2.9 | 413 / 451 | 36 / 48 | 113 / 136 | 2,344 MB |
+| 1,000 | pgvector | 6,570 | 2.5 | 1.3 / 1.6 | 1.8 / 2.6 | 1.5 / 1.8 | 8 MB |
+| | sqlite-vector | 47,943 | 0.45 | 1.6 / 1.8 | 2.1 / 2.2 | 43 / 51 | 4 MB |
+| | NumPy | 311,380 | 0.02 | 4.0 / 8.1 | 4.0 / 4.1 | 4.4 / 8.1 | 8 MB |
+| 10,000 | pgvector | 9,325 | 2.5 | 8.6 / 10.0 | 2.2 / 3.1 | 9.1 / 12.3 | 81 MB |
+| | sqlite-vector | 64,158 | 0.47 | 18.2 / 25.7 | 20.2 / 22.7 | 59 / 76 | 45 MB |
+| | NumPy | 106,060 | 0.15 | 16.5 / 27.3 | 4.0 / 13.0 | 16.9 / 22.6 | 78 MB |
+| 100,000 | pgvector | 9,733 | 2.4 | 78 / 85 | 2.5 / 4.6 | 80 / 93 | 810 MB |
+| | sqlite-vector | 59,424 | 1.2 | 195 / 212 | 214 / 244 | 266 / 294 | 448 MB |
+| | NumPy | 96,826 | 1.2 | 142 / 166 | 17.2 / 34.8 | 88 / 117 | 781 MB |
+| 300,000 | pgvector | 9,739 | 4.4 | 248 / 277 | 4.0 / 5.2 | 229 / 265 | 2,429 MB |
+| | sqlite-vector | 51,361 | 1.7 | 646 / 711 | 682 / 787 | 727 / 773 | 1,343 MB |
+| | NumPy | 70,276 | 4.0 | 417 / 438 | 43.7 / 64.9 | 142 / 168 | 2,344 MB |
 
-Where pgvector is **slower**: writes (about 9,000 rows/s, a fifth of sqlite-vector's: one transaction per batch, and a 4 kB vector fills a whole 8 kB page), `present` (a round trip, 1.5 to 3 ms against 0.5), disk (784 MB against 441 MB at 100,000, because inline storage wastes half of each page; the default storage is 32 % smaller but scans 2.4 times slower), the first query of a process (a validation round trip), and everything for a small index: below about 10,000 vectors the local file backends answer first. Where it **wins**: the exact scan once the index is large (2.2 times faster than sqlite-vector at 100,000 vectors, 3.2 times at 300,000: pgvector's SIMD distance and parallel scan against a single-threaded scan; with `max_parallel_workers_per_gather=0` expect less), a session-scoped search (500 ids: 2 to 3 ms at every size, an index lookup per id, where sqlite-vector scans everything and filters afterwards, 190 to 586 ms, and NumPy copies the matrix, 18 to 36 ms), and concurrent readers and writers. A 50,000-id filter costs 12 ms to send (one text parameter; as a `text[]` it was 42 ms) and, below a third of the table, an index lookup per id.
+Where pgvector is **slower**: writes (about 9,000 rows/s, a sixth of sqlite-vector's: one transaction per batch, and a 4 kB vector fills a whole 8 kB page), `present` (a round trip: 2.4 to 4.4 ms against 0.5 to 1.7), disk (810 MB against 448 MB at 100,000, because inline storage wastes half of each page; pgvector's default storage is 32 % smaller but scans 2.4 times slower), the first query of a process (a validation round trip), a 50,000-id filter on a large table when the filter names less than a quarter of it (the ids are sent and looked up: 229 ms at 300,000 against NumPy's 142), and everything on a small index: below about 10,000 vectors the local backends answer first. Where it **wins**: the exact scan once the index is large (2.5 times faster than sqlite-vector at 100,000 vectors and at 300,000, 1.7 to 1.8 times faster than NumPy: pgvector's SIMD distance and parallel scan against a single-threaded one; with `max_parallel_workers_per_gather=0` expect less), a session-scoped search (500 ids: 2 to 4 ms at every size, an index lookup per id, where sqlite-vector scans everything and filters afterwards, 20 to 682 ms, and NumPy copies the matrix, 4 to 44 ms), a search over most of the index (a filter naming a quarter of the table or more is applied after one unfiltered scan, so no ids are sent), and concurrent readers and writers.
+
+How a filter is sent matters more than it looks. A 50,000-id filter of 65-character ids is 3.4 MB: as a `text[]` parameter it cost 42 ms to send, as one joined text parameter that the server splits 12 ms (what is used), and a hashed `= ANY` scan with such ids was 4 times slower than the scan alone (290 against 72 ms at 100,000 rows) and slower than looking the ids up by primary key (146 ms for 50,000 ids), so the planner's choice is left alone. A filter naming a quarter of the table or more therefore sends nothing: the top rows of the whole table are fetched, the ids that are not allowed are dropped here, and the fetch is widened (4 times as many rows, at most three scans) until enough allowed rows are in hand; the answer is exact, and after three scans that were not enough the ids are sent after all.
 
 HNSW on clustered vectors (build with 2 parallel workers; `ef_search` is the search width; p50 latency at `ef_search=100`, the default here, against the exact scan):
 
 | N | build | index size | recall@20 at `ef_search` 40 / 100 / 200 / 400 | HNSW p50 | exact p50 |
 |---:|---:|---:|---|---:|---:|
-| 10,000 | 5.6 s | 78 MB | 0.989 / 0.995 / 0.999 / 1.000 | 2.2 ms | 8.1 ms |
-| 100,000 | 24 s | 781 MB | 0.938 / 0.998 / 0.998 / 0.998 | 1.6 ms | 69.5 ms |
-| 300,000 | 73 s | 2,344 MB | 0.825 / 0.952 / 0.955 / 0.972 | 1.7 ms | 176 ms |
+| 10,000 | 5.0 s | 78 MB | 0.989 / 0.993 / 0.998 / 1.000 | 3.2 ms | 11.1 ms |
+| 100,000 | 30 s | 781 MB | 0.918 / 0.998 / 0.998 / 0.999 | 1.7 ms | 92.9 ms |
+| 300,000 | 89 s | 2,344 MB | 0.797 / 0.894 / 0.956 / 0.980 | 1.8 ms | 227.9 ms |
 
-**A LAN adds round trips, not computation.** A search or `present` costs about two round trips; a write batch pipelines its rows. Measured through a loopback proxy that delays each direction (10,000 vectors, p50): 0.25 ms each way (a 0.5 ms round trip) adds about 1 ms to `present` and to a 500-id search and 6 ms to a 50,000-id search; 1 ms each way adds about 4.5 ms and 30 ms, and cuts bulk upserts from 6,800 to 4,700 rows/s (bandwidth was not limited: 4 kB per vector is 30,000 rows/s per gigabit). A 50,000-id filter is 1.6 MB, 13 ms on a gigabit link.
+**A LAN adds round trips, not computation.** A search or `present` costs about one round trip; a write batch pipelines its rows. Measured through a loopback proxy that delays each direction (10,000 vectors, p50): 0.25 ms each way (a 0.5 ms round trip) adds about 0.5 ms to `present` and nothing measurable to a search; 1 ms each way (2 ms round trip) adds 2.3 ms to `present` and about 1.5 ms to a search, and lowers bulk upserts from 6,700 to 6,000 rows/s (bandwidth was not limited: 4 kB per vector is 30,000 rows/s per gigabit). A filter sent as ids is 3.4 MB per 50,000 ids, 27 ms on a gigabit link.
 
 These are one machine's numbers on synthetic data. They do not include concurrent load, a cold cache or a remote server, and loopback understates every network cost.
 
@@ -1259,6 +1261,8 @@ python scripts/bench_daemon.py --out bench-daemon.json --markdown bench-daemon.m
 python scripts/bench_warm.py --defer --spans claude:Stop:4096                      # the warm judgement of one engine, in-process
 python scripts/measure_shadow_detection.py --scenario missed --every adaptive --floor  # fault injection: requests until a defect of the incremental path is noticed
 python scripts/bench_commit.py --samples 300 --kill 50 --tmpdir /path/on/ext4  # commit latency and crash survival by journal mode
+python scripts/bench_pgvector.py --sizes 1000,10000,100000 --sqlite-vector /abs/vector.so --out /abs/pgvector.json  # pgvector against sqlite-vector and NumPy, see "pgvector numbers"
+pip install -e ".[dev,pgvector]" && TSUKKOMI_REQUIRE_PGVECTOR=1 python -m pytest -q tests/test_pgvector_integration.py tests/test_pgvector_engine.py tests/test_dense_backend_parity.py  # needs Docker and the pgvector/pgvector:pg17 image
 TSUKKOMI_TEST_DEFER_DERIVED=1 python -m pytest -q                                 # the whole suite with every engine holding its derived writes
 ```
 
@@ -1268,10 +1272,11 @@ The resident daemon's tests live in `tests/daemon/` (Linux only; other platforms
 
 GitHub Actions runs two workflows. Superseded runs for the same ref are cancelled, and no API keys or paid model calls are used.
 
-The `CI` workflow runs three jobs on every push and pull request:
+The `CI` workflow runs four jobs on every push and pull request:
 
 - **`test`** (Ubuntu and Windows, Python 3.12, 10 minutes): the explicit MCP transport, Jev boundary and Windows session-path smoke tests and the compressed Codex session tests (without their two 50 MB allocation probes), then builds the source distribution and wheel.
 - **`memory-audit-regressions`** (Ubuntu, Python 3.12, 15 minutes): small offline regression files for, among others, audit memory, prefix judgement, current-action prerequisites, append and source capture, single-flight, index and server concurrency, deadlines, request statistics and degraded evaluation, checklist conflicts, quiet hooks, AGY and Claude Code hooks, the Claude Code installer and provider, and hook gating. It also runs the hook import budget and settings parity tests ([Hook import budget](#hook-import-budget)) and the BLAS thread test. It runs with the fake embedder and the NumPy backend and deselects the one test that measures allocation of a large capture. These tests check ratios on small inputs; they do not certify live-service memory.
+- **`pgvector`** (Ubuntu, Python 3.12, 20 minutes; a failure fails the workflow): the optional pgvector backend against a `pgvector/pgvector:pg17` service container, with `TSUKKOMI_REQUIRE_PGVECTOR=1` (a missing server is a failure, never a skip) and the official sqlite-vector library, running `tests/test_pgvector_unit.py`, `test_pgvector_config.py`, `test_pgvector_integration.py`, `test_pgvector_engine.py` and `test_dense_backend_parity.py`. The first two (a fake driver, no psycopg, no Docker) also run in the `test` and `memory-audit-regressions` jobs, so the smoke job never needs either. The container's password belongs to that throwaway service and protects nothing.
 - **`bench`** (Ubuntu, Python 3.12, 10 minutes): `scripts/bench_hooks.py --check` on small synthetic sessions. It fails when a gated metric exceeds 1.5 times its target and uploads the JSON report and the markdown table as an artifact ([Hook cost benchmark](#hook-cost-benchmark)). The 300 MB session is never run in CI.
 
 The `Memory` workflow (pull requests to `main`, `main`, nightly and on demand) is described in [Memory verification](#memory-verification).
