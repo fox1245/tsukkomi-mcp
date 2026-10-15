@@ -422,7 +422,10 @@ class CompactSparseIndex(SparseIndex):
         return rowids
 
     def _drop(self, rowids: list[int]) -> None:
-        for rowid in rowids:
+        # Highest rowid first. FTS5 records each contentless delete as a tombstone in the segment that holds the row, and
+        # tombstones inserted in ascending rowid order made it rebuild its tombstone tables over and over (a 100,000-event
+        # Codex-like index grew by 17 % in free pages after deleting 1,000 evenly spaced rows; any other order did not).
+        for rowid in sorted(rowids, reverse=True):
             check_request()
             self._conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (rowid,))
             self._conn.execute("DELETE FROM chunk_rows WHERE rowid=?", (rowid,))

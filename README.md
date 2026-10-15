@@ -1244,6 +1244,7 @@ python scripts/bench_daemon.py --out bench-daemon.json --markdown bench-daemon.m
 python scripts/bench_warm.py --defer --spans claude:Stop:4096                      # the warm judgement of one engine, in-process
 python scripts/measure_shadow_detection.py --scenario missed --every adaptive --floor  # fault injection: requests until a defect of the incremental path is noticed
 python scripts/bench_commit.py --samples 300 --kill 50 --tmpdir /path/on/ext4  # commit latency and crash survival by journal mode
+python scripts/bench_sparse.py --profile codex --events 100000 --candidate a,p --out sparse.json  # sparse index formats: size, parity, latency (synthetic)
 TSUKKOMI_TEST_DEFER_DERIVED=1 python -m pytest -q                                 # the whole suite with every engine holding its derived writes
 ```
 
