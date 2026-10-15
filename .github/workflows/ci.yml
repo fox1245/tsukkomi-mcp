@@ -130,6 +130,7 @@ jobs:
           tests/test_reindex_convergence.py
           tests/test_eval_cost.py
           tests/test_eval_converges.py
+          tests/test_eval_reindex.py
           tests/test_bench_eval_converge.py
           tests/test_runtime_threads.py
           --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file

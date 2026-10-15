@@ -414,7 +414,9 @@ def test_a_small_session_never_pays_for_the_cost_bound(tmp_path, monkeypatch):
         real = SelfDirectEngine._sizing_numbers
         monkeypatch.setattr(SelfDirectEngine, "_sizing_numbers", lambda self, *a: asked.append(a) or real(self, *a))
         for _ in range(3):
-            answer = engine.audit_session(SID, provider="codex", path=str(small.path), _deadline=time.monotonic() + BUDGET)
+            # Real time: nothing here is cut by a clock (the session is far below the minimum progress of a slice), the deadline
+            # only has to be far enough for a slow machine.
+            answer = engine.audit_session(SID, provider="codex", path=str(small.path), _deadline=time.monotonic() + 600)
             assert answer["coverage"]["complete"] and "sync" not in answer
             small.append(20)
         assert asked == []                                                         # the contracts were not read for the bound

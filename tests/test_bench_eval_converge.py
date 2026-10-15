@@ -9,6 +9,9 @@ import sys
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+# Real time, a tiny session: every call is far inside the budget. The budget is the longest one the benchmark offers (45 s) so that
+# a runner that is many times slower than usual (a sanitizer build is 3 to 4 times slower, a loaded runner more) still has room: the
+# test is about what the report says, not about how fast the machine is.
 
 
 @pytest.mark.parametrize("tool", ["audit", "check"])
@@ -16,7 +19,7 @@ def test_reports_every_combination_with_its_calls_and_checks_the_answer(tmp_path
     report = tmp_path / "report.json"
     done = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "bench_eval_converge.py"), "--events", "2500", "--sets", "2,18",
-         "--budgets", "8", "--scenarios", "cold,synced", "--tool", tool, "--dir", str(tmp_path), "--json", str(report)],
+         "--budgets", "45", "--scenarios", "cold,synced", "--tool", tool, "--dir", str(tmp_path), "--json", str(report)],
         capture_output=True, text=True, timeout=240, cwd=tmp_path)
     assert done.returncode == 0, done.stderr[-2000:]
     runs = json.loads(report.read_text())["runs"]
@@ -33,7 +36,7 @@ def test_a_resident_engine_is_a_scenario_of_its_own(tmp_path):
     report = tmp_path / "report.json"
     done = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "bench_eval_converge.py"), "--events", "2500", "--sets", "6",
-         "--budgets", "8", "--scenarios", "cold+idle,synced+idle", "--dir", str(tmp_path), "--json", str(report)],
+         "--budgets", "45", "--scenarios", "cold+idle,synced+idle", "--dir", str(tmp_path), "--json", str(report)],
         capture_output=True, text=True, timeout=240, cwd=tmp_path)
     assert done.returncode == 0, done.stderr[-2000:]
     runs = json.loads(report.read_text())["runs"]
