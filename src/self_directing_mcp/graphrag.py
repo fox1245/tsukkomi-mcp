@@ -112,8 +112,13 @@ class GraphStore:
                 self._conn.commit()
 
     def apply_proposal(self, proposal: dict[str, Any], *, session_id: str, provider: str,
-                       base_version: int, through_order: int) -> dict[str, Any]:
-        """Atomic apply: nodes/edges + cursor advance. Unknown outcome stays unclear."""
+                       base_version: int, through_order: int, job_start: int = 0,
+                       job_digest: str = "", job_detail: str | None = None) -> dict[str, Any]:
+        """Atomic apply: nodes/edges + cursor advance. Unknown outcome stays unclear.
+
+        With a ``job_id`` the applied job is recorded in the same transaction; ``job_start``, ``job_digest`` and
+        ``job_detail`` complete that row (the defaults are what every earlier caller got).
+        """
         check_request()
         edge_rows = []
         for edge in proposal.get("edges", []):
@@ -155,8 +160,8 @@ class GraphStore:
                         "INSERT OR REPLACE INTO graph_jobs (job_id,provider,session_id,"
                         "range_start,range_end,input_digest,base_graph_version,status,"
                         "detail,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        (job_id, provider, session_id, 0, through_order, "", base_version,
-                         "applied", None, now, now))
+                        (job_id, provider, session_id, job_start, through_order, job_digest, base_version,
+                         "applied", job_detail, now, now))
                 with publication():
                     self._conn.commit()
         except sqlite3.Error as exc:
