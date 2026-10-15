@@ -20,7 +20,8 @@ OTHER = "other"
 # The registered MCP tools, plus ``hook`` for the Codex lifecycle tool (its requests are counted as hooks).
 TOOLS = (
     "sync_session", "search_history", "audit_session", "check_action", "get_chunk", "list_contracts",
-    "revoke_contract", "upsert_contracts", "audit_status", "update_checklist", "get_checklist", "analyze_activity",
+    "revoke_contract", "upsert_contracts", "list_contract_candidates", "adopt_contracts", "export_contracts",
+    "audit_status", "update_checklist", "get_checklist", "analyze_activity",
     "get_graph_context", "propose_graph_update", "commit_graph_update", "run_neograph_update",
     "graph_next_batch", "graph_submit_batch",
     "workflow_status", "workflow_run_checks", "workflow_classify", "workflow_transition", "workflow_authorize",

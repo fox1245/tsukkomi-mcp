@@ -62,7 +62,33 @@ class ContractWhen(BaseModel):
 
 # Fields added after 1.0. They are omitted from serialized contracts while at their default so files written
 # by this version stay loadable by older processes (extra="forbid") and snapshots of unchanged contracts hold.
-_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None}
+_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None, "origin": None}
+
+
+class ContractOrigin(BaseModel):
+    """Where an adopted contract came from. Written only by ``adopt_contracts``; informational, never authority.
+
+    The contract was loaded from a portable bundle file and became an ordinary stored contract when the user adopted
+    it on this device: ``adopted_by_event_id`` is the local user message that did so (checked against this device's
+    index when the adoption happened). ``bundle_path`` is a relative or labelled path, never an absolute one. The
+    ``claimed_*`` values were written in the file, by whoever wrote it: they are not verified and not an anchor.
+    """
+    model_config = ConfigDict(extra="forbid")
+    bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$", description="SHA-256 of the bundle file's bytes.")
+    bundle_label: str = Field(max_length=80)
+    origin_kind: Literal["project", "personal"]
+    bundle_path: str | None = Field(default=None, max_length=300)
+    adopted_by_event_id: str = Field(min_length=1, max_length=400)
+    claimed_origin_event_id: str | None = Field(default=None, max_length=400)
+    claimed_quote: str | None = Field(default=None, max_length=500)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_claims(self, handler):
+        data = handler(self)
+        for name in ("bundle_path", "claimed_origin_event_id", "claimed_quote"):
+            if data.get(name) is None:
+                data.pop(name, None)
+        return data
 
 
 class ContractRule(BaseModel):
@@ -138,6 +164,11 @@ class ContractRule(BaseModel):
         default=None,
         description="Optional applicability condition for must obligations; see ContractWhen. "
                     "Unmet conditions report not_applicable with a reason.",
+    )
+    origin: ContractOrigin | None = Field(
+        default=None,
+        description="Read-only: set by adopt_contracts when the contract came from a portable bundle file. "
+                    "upsert_contracts rejects an origin that the stored contract does not already have.",
     )
 
     @model_serializer(mode="wrap")

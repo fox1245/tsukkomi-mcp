@@ -105,7 +105,8 @@ def test_literal_choices_match_the_model():
                           ("graph_extractor", settings_core.GRAPH_EXTRACTORS),
                           ("daemon", settings_core.DAEMON_MODES),
                           ("sqlite_journal", settings_core.SQLITE_JOURNAL_MODES),
-                          ("sync_slicing", settings_core.SYNC_SLICING_MODES)):
+                          ("sync_slicing", settings_core.SYNC_SLICING_MODES),
+                          ("project_contracts", settings_core.PROJECT_CONTRACT_MODES)):
         assert typing.get_args(Settings.model_fields[name].annotation) == choices, name
 
 
@@ -201,16 +202,22 @@ CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Adviso
            "daemon": ["off", "on", "On", "ON", "", " on", "on ", "auto", "true", "1", "false", "Off"],
            "sqlite_journal": ["auto", "delete", "Auto", "DELETE", "", " auto", "delete ", "wal", "off", "true", "truncate"],
            "sync_slicing": ["auto", "off", "Auto", "OFF", "Off", "", " off", "auto ", "on", "false", "0", "true", "slice",
-                           "off\n"]}
+                           "off\n"],
+           "project_contracts": ["candidates", "off", "Candidates", "OFF", "", " off", "off ", "on", "enforce", "true",
+                                 "adopt", "auto", "candidate", "candidates\n"]}
 # SELF_DIRECT_AUDIT_SHADOW_EVERY: a non-negative integer, or "adaptive" in any case with surrounding whitespace.
 SHADOW_EVERY = [*INTS, "adaptive", "Adaptive", "ADAPTIVE", " adaptive ", "adaptive\n", "\tadaptive", "adaptiv", "adaptive!",
                 "adapt ive", "fixed", "auto", "none", "-1", "adaptive0", "0adaptive", "\u0430daptive", "adaptive\u200b"]
+# SELF_DIRECT_CONTRACT_BUNDLE_PATHS: absolute paths separated by os.pathsep; a relative one is an error.
+PATHSEP = [os.pathsep.join(["/a/one.json", "/b/two.json"]), "/a/one.json", "", os.pathsep, "/a" + os.pathsep,
+           os.pathsep + "/a", "~/x.json", "relative.json", "/a" + os.pathsep + "rel", " ", "/a b/c.json", ".", "..",
+           "/a" + os.pathsep + os.pathsep + "/b", "~", "C:\\x\\y.json", "//double/x.json", "/" + "x" * 300]
 KIND_VALUES = {"bool": BOOLS, "int": INTS, "float": FLOATS, "path": PATHS, "list": LISTS, "mixed": STR_OR_LISTS,
-               "shadow_every": SHADOW_EVERY}
+               "shadow_every": SHADOW_EVERY, "pathsep": PATHSEP}
 FIELD_KINDS = {
     "codex_sessions_dir": "path", "omp_sessions_dir": "path", "claude_projects_dir": "path", "index_dir": "path",
     "contracts_path": "path", "sqlite_vector_path": "path", "openrouter_api_key_file": "path", "pgvector_dsn_file": "path",
-    "agy_app_data_dirs": "list", "grokbot_transcripts_dir": "mixed",
+    "agy_app_data_dirs": "list", "grokbot_transcripts_dir": "mixed", "contract_bundle_paths": "pathsep",
     "use_fake_embedder": "bool", "local_only": "bool", "seed_example_contracts": "bool", "pgvector_hnsw": "bool",
     "embedding_dim": "int", "max_concurrent_calls": "int", "max_decompressed_session_bytes": "int", "rrf_k": "int",
     "retrieve_top_k": "int", "search_top_k": "int",
@@ -292,12 +299,14 @@ def test_environment_beats_toml_for_every_path_field(world):
     toml(world, "[paths]\n" + "\n".join([
         'index_dir = "ti"', 'contracts_path = "tc.json"', 'claude_projects_dir = "tp"', 'omp_sessions_dir = "to"',
         'agy_app_data_dirs = ["ta", "tb"]', 'grokbot_transcripts_dir = ["tg1", "tg2"]',
+        'contract_bundle_paths = ["tb1.json", "/tb2.json"]',
         'sqlite_vector_path = "tv.so"', 'openrouter_api_key_file = "tk.env"', 'pgvector_dsn_file = "tp.dsn"']) + "\n")
     agree("toml only")
     put(world, SELF_DIRECT_INDEX_DIR=str(world["tmp"] / "ei"), SELF_DIRECT_AGY_APP_DATA_DIRS='["/ea"]',
         SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR="/eg", SELF_DIRECT_SQLITE_VECTOR_PATH="/ev.so",
-        SELF_DIRECT_PGVECTOR_DSN_FILE="/ep.dsn")
+        SELF_DIRECT_PGVECTOR_DSN_FILE="/ep.dsn", SELF_DIRECT_CONTRACT_BUNDLE_PATHS="/ec.json")
     agree("env over toml")
+    assert load_hook_settings().contract_bundle_paths == [Path("/ec.json")]
 
 
 def test_toml_relative_paths_resolve_against_the_toml_directory_and_tilde_expands(world):
@@ -329,6 +338,9 @@ def test_toml_default_location_under_home_is_used_without_an_explicit_file(world
     '[paths]\ngrokbot_transcripts_dir = ""\n', '[paths]\ngrokbot_transcripts_dir = 5\n',
     '[paths]\ngrokbot_transcripts_dir = ["a", "b"]\n', 'paths = "x"\n', "[paths]\ncontracts_path = []\n",
     '[paths]\nopenrouter_api_key_file = "k.env"\nsqlite_vector_path = "v.so"\n',
+    '[paths]\ncontract_bundle_paths = ["a.json", "/b.json", "~/c.json"]\n', '[paths]\ncontract_bundle_paths = []\n',
+    '[paths]\ncontract_bundle_paths = "a.json"\n', '[paths]\ncontract_bundle_paths = [""]\n',
+    '[paths]\ncontract_bundle_paths = [1]\n',
 ])
 def test_toml_documents_agree_including_invalid_ones(world, text):
     toml(world, text)
@@ -384,10 +396,10 @@ def random_world(rng: random.Random, world) -> str:
         parts.append("CLAUDE_CONFIG_DIR")
     keys = rng.sample(["index_dir", "contracts_path", "claude_projects_dir", "omp_sessions_dir", "codex_sessions_dir",
                        "sqlite_vector_path", "openrouter_api_key_file", "pgvector_dsn_file", "agy_app_data_dirs",
-                       "grokbot_transcripts_dir"], rng.randint(0, 6))
+                       "grokbot_transcripts_dir", "contract_bundle_paths"], rng.randint(0, 6))
     lines = ["[paths]"]
     for key in keys:
-        if key == "agy_app_data_dirs":
+        if key in ("agy_app_data_dirs", "contract_bundle_paths"):
             lines.append(f"{key} = {json.dumps(rng.sample(['a', '/b', '~/c', 'd/e'], rng.randint(0, 3)))}")
         elif key == "grokbot_transcripts_dir":
             lines.append(f"{key} = {json.dumps(rng.choice(['x;y', ['p', '/q'], '/solo']))}")
@@ -407,3 +419,37 @@ def test_random_combinations_agree(world, seed):
                 world["monkeypatch"].delenv(name, raising=False)
         description = random_world(rng, world)
         agree(description)
+
+
+# --- portable contracts: SELF_DIRECT_PROJECT_CONTRACTS and SELF_DIRECT_CONTRACT_BUNDLE_PATHS -----------------------------
+
+def test_the_portable_contract_settings_default_to_discovery_only_and_no_personal_files(world):
+    for settings in (hook_settings(), load_hook_settings()):
+        assert settings.project_contracts == "candidates" and settings.contract_bundle_paths == []
+    assert settings_core.DEFAULT_PROJECT_CONTRACTS == "candidates"
+
+
+def test_the_bundle_paths_are_split_on_the_platform_separator_and_must_be_absolute(world):
+    first, second = world["tmp"] / "one.json", world["tmp"] / "two.json"
+    put(world, SELF_DIRECT_CONTRACT_BUNDLE_PATHS=os.pathsep.join([str(first), "", str(second)]))
+    agree("two paths")
+    assert hook_settings().contract_bundle_paths == load_hook_settings().contract_bundle_paths == [first, second]
+    for bad in ("relative.json", str(first) + os.pathsep + "rel.json"):
+        put(world, SELF_DIRECT_CONTRACT_BUNDLE_PATHS=bad)
+        assert outcome(hook_settings)[0] == "error" and outcome(load_hook_settings)[0] == "error", bad
+
+
+def test_the_toml_key_contract_bundle_paths_is_read_and_the_environment_beats_it(world):
+    toml(world, '[paths]\ncontract_bundle_paths = ["mine/contracts.json", "/abs/other.json"]\n')
+    agree("toml")
+    expected = [(world["config"].parent / "mine" / "contracts.json").resolve(), Path("/abs/other.json")]
+    assert hook_settings().contract_bundle_paths == load_hook_settings().contract_bundle_paths == expected
+    put(world, SELF_DIRECT_CONTRACT_BUNDLE_PATHS="/env/only.json")
+    assert hook_settings().contract_bundle_paths == load_hook_settings().contract_bundle_paths == [Path("/env/only.json")]
+
+
+def test_project_contracts_off_and_unknown_values(world):
+    put(world, SELF_DIRECT_PROJECT_CONTRACTS="off")
+    assert hook_settings().project_contracts == load_hook_settings().project_contracts == "off"
+    put(world, SELF_DIRECT_PROJECT_CONTRACTS="enforce")           # a mode that would enforce does not exist
+    assert outcome(hook_settings)[0] == "error" and outcome(load_hook_settings)[0] == "error"

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Annotated, Callable, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource, SettingsConfigDict
 
 from self_directing_mcp import settings_core
 from self_directing_mcp.settings_core import SettingsAccessors, get_config_path  # noqa: F401  (public name here)
@@ -207,6 +207,35 @@ class Settings(SettingsAccessors, BaseSettings):
             return settings_core.check_pgvector_schema(value)
         except ValueError:
             raise ValueError("invalid PostgreSQL schema name for pgvector_schema") from None
+
+    project_contracts: Literal["candidates", "off"] = Field(
+        default=settings_core.DEFAULT_PROJECT_CONTRACTS,
+        description="'candidates' (default): list_contract_candidates and audit_status find the project's "
+                    ".tsukkomi/contracts.json (from the project directory up to the repository root) as candidates; "
+                    "nothing is enforced until adopt_contracts adopts it with a user message of this device. 'off': "
+                    "the project bundle is not looked for. Personal bundles are unaffected. "
+                    "SELF_DIRECT_PROJECT_CONTRACTS.",
+    )
+    contract_bundle_paths: Annotated[list[Path], NoDecode] = Field(
+        default_factory=list,
+        description="Personal contract bundle files (absolute paths separated by the platform path separator in the "
+                    "environment; an array in the TOML [paths] table), also the only places besides the project "
+                    "directory that export_contracts may write. Candidates only, like the project bundle. "
+                    "SELF_DIRECT_CONTRACT_BUNDLE_PATHS.",
+    )
+
+    @field_validator("contract_bundle_paths", mode="before")
+    @classmethod
+    def _bundle_path_list(cls, value):
+        # The environment spelling is one string; the TOML source and callers pass lists. Either way: absolute paths.
+        if isinstance(value, str):
+            return settings_core.parse_bundle_paths("contract_bundle_paths", value)
+        if isinstance(value, (list, tuple)):
+            paths = [Path(item).expanduser() if isinstance(item, (str, Path)) else item for item in value]
+            if any(not isinstance(item, Path) or not item.is_absolute() for item in paths):
+                raise ValueError("invalid absolute path for contract_bundle_paths")
+            return paths
+        return value
 
     @field_validator("audit_shadow_every", mode="before")
     @classmethod

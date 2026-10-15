@@ -4,7 +4,7 @@ Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions 
 
 ## Unreleased
 
-**Highlights.** A third dense backend: PostgreSQL with the pgvector extension, behind the existing `VectorIndex` interface, as an opt-in extra. SQLite stays the default and the canonical store, the default install needs neither Docker nor PostgreSQL, and no backend is ever substituted for another.
+**Highlights.** Two results of the storage roundtable ([#33](https://github.com/fox1245/tsukkomi-mcp/issues/33)): portable contracts (the bullets that start with that name below) and a third dense backend, PostgreSQL with the pgvector extension, behind the existing `VectorIndex` interface, as an opt-in extra. SQLite stays the default and the canonical store, the default install needs neither Docker nor PostgreSQL, and no backend is ever substituted for another.
 
 ### Added
 
@@ -16,9 +16,21 @@ Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions 
 - CI: a `pgvector` job (Linux, a `pgvector/pgvector:pg17` service container, the official sqlite-vector library for the three-way parity tests); the unit and config tests also run in the smoke and regression jobs, which need neither Docker nor psycopg.
 - `scripts/bench_pgvector.py` and README "Dense backends" / "pgvector numbers": upsert, `present`, filtered and unfiltered search, size on disk and HNSW build time and recall for pgvector, sqlite-vector and NumPy on the same synthetic vectors.
 
+- **Portable contracts: candidates, adopt, export** (storage roundtable, [#33](https://github.com/fox1245/tsukkomi-mcp/issues/33), P3). Contracts can move between devices as files without moving authority. A bundle is a JSON file `tsukkomi.contracts-bundle/1` (`label` plus contracts with the portable fields only; `source_event_id`, `applies_from_event_id`, `session_id`, `revision` and `origin` are rejected by name), read strictly and as data (UTF-8, at most 1 MiB and 200 contracts, the validation `upsert_contracts` applies, nothing executed). Three tools: `list_contract_candidates` (read-only; the project's `.tsukkomi/contracts.json` from the project directory up to the repository root, never above the user's home, plus the files in `SELF_DIRECT_CONTRACT_BUNDLE_PATHS`; each contract is `new`, `same`, `adopted`, `differs` or `changed_since_adoption`; refused files are listed with a reason; no absolute path in any answer), `adopt_contracts` (needs `source_event_id`, a **user message of this device's index**, else nothing is adopted; the file is re-read and its SHA-256 must equal `bundle_id`; a contract whose id exists here with other content is a conflict that is not adopted unless named in `replace_ids`, and a replacement that may enforce less is reported under `weakened`; adopting again changes nothing) and `export_contracts` (project path or configured personal path only, atomic, mode 0644 or 0600, never over a file that is not a bundle). Finding a bundle enforces nothing; a changed or deleted file, or a contract that disappears from it, never weakens or revokes anything.
+- **`origin` on adopted contracts** (`bundle_sha256`, `bundle_label`, `origin_kind`, `bundle_path`, `adopted_by_event_id`, and the file's unverified `claimed_origin_event_id` and `claimed_quote`), shown by `list_contracts`, omitted from contracts that were never adopted (their files are byte-identical to before). Only `adopt_contracts` writes it: `upsert_contracts` rejects an `origin` the stored contract does not already carry. The adoption anchor is recorded in `origin.adopted_by_event_id` and the stored contract is a global contract without `source_event_id`, because an audit judges a global contract anchored to another session's event as `unknown` ("contract source or activation event is not in this session").
+- **`audit_status.contract_bundles`**: `candidates`, `pending_adoption`, `changed_since_adoption`, `conflicts` (plus `refused` and `project_directory_known`), counted for the project directory the session's index names; no path, no contract text.
+- Settings `SELF_DIRECT_PROJECT_CONTRACTS` (`candidates`, the default, or `off`) and `SELF_DIRECT_CONTRACT_BUNDLE_PATHS` (TOML `contract_bundle_paths`), in `config.Settings`, `settings_core.FIELDS`, the parity tables, `.env.example` and `config.example.toml`.
+- **`ContractRepository`** (`audit/contracts.py`): a `typing.Protocol` of exactly the operations the engine performs on its contracts (`capture`, `current_token`, `publish_document`, `prepare_upsert`, `prepare_revoke`, `seed_from`, `seed_missing`). `ContractStore` (the local file) is the only implementation; there is no remote store and no behavior change, and the command hooks still read the local file only. A conformance suite runs against the file store and an in-memory double, and the engine runs through the double.
+- `SessionStore.session_working_dir`: the working directory a Codex (`session_meta`) or Claude Code session names, from its first indexed records; other providers' indexes carry none.
+- Tests: `tests/test_contract_bundles.py`, `tests/test_portable_contracts.py` (including the two-device round trip), `tests/test_contract_repository.py`, `tests/test_portable_contract_hooks.py`; the hook import budget now also forbids `self_directing_mcp.contract_bundles`; the settings parity tables cover both settings.
+
 ### Fixed
 
 - `NumpyVectorIndex.search` returned the head of the ranking minus its tail for a negative `top_k`; it now returns nothing, like the other backends.
+
+### Upgrading
+
+A contracts file that holds an adopted contract has a new `origin` key; an older process (extra keys are forbidden there) cannot read it and reports the contracts as unavailable. Upgrade every process that shares the index before adopting a bundle. Files that hold no adopted contract are unchanged byte for byte.
 
 ## 0.7.0 - 2026-10-15
 

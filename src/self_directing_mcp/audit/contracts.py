@@ -5,7 +5,9 @@ import json
 import hashlib
 from pathlib import Path
 import threading
+from typing import Protocol, runtime_checkable
 
+from self_directing_mcp.audit.patterns import compile_contract
 from self_directing_mcp.schemas import ContractRule, ContractsDocument
 from self_directing_mcp.request_control import check_request, publication
 
@@ -32,6 +34,22 @@ def scope_counts(selected: list[ContractRule], store_count: int) -> dict[str, in
         "global": sum(1 for rule in selected if rule.session_id is None),
         "store": store_count,
     }
+
+
+def check_rule_patterns(rule: ContractRule) -> None:
+    """The gate every contract passes before it is stored (``upsert_contracts`` and ``adopt_contracts`` alike).
+
+    Every pattern must compile under the contract engine (``re.error`` otherwise), and a high-risk ``must_not`` must
+    name the actions it covers: without a regex it would apply to every action and could never be verified, so every
+    tool call would be unknown, hence asked (a denial when headless).
+    """
+    for pattern in (rule.regex, rule.before_regex, rule.exception_regex,
+                    rule.when.tool_call_regex if rule.when else None):
+        if pattern:
+            compile_contract(pattern)   # the syntax gate of both engines (raises re.error)
+    if rule.risk == "high" and rule.type == "must_not" and not rule.regex:
+        raise ValueError(f"contract {rule.id!r}: a high-risk must_not needs a regex that names the actions it "
+                         "covers; without one it would ask on every tool call")
 
 
 def loosening_reasons(previous: ContractRule, new: ContractRule) -> list[str]:
@@ -126,6 +144,44 @@ def parse_contracts(raw: bytes | None) -> ContractsDocument:
         if memoize:
             _DOCUMENTS.put(raw, document)
     return document
+
+
+@runtime_checkable
+class ContractRepository(Protocol):
+    """The operations the engine performs on the contracts it enforces; ``ContractStore`` (a local JSON file) is the
+    only implementation.
+
+    The shape is what the engine needs today, no more: read one consistent snapshot with a token, publish a new
+    document only if the snapshot is still current, and compute (without publishing) an edited document. A backend
+    that keeps contracts elsewhere must keep these guarantees:
+
+    * ``capture()`` returns ``(raw document bytes or None, token)``; ``None`` and ``"missing"`` mean no document. The
+      token changes whenever the content does and is the compare-and-set key of ``publish_document``.
+    * ``publish_document(document, payload, expected_token)`` replaces the document atomically. With an
+      ``expected_token`` it raises ``ValueError`` when the document changed since that token (a stale preparation),
+      and publishes nothing. A reader never sees a half-written document.
+    * ``prepare_upsert`` / ``prepare_revoke`` edit the given in-memory document (revision, history) and publish
+      nothing; every weakening decision (anchors, pending changes) is made by the engine before it publishes.
+    * ``seed_from`` / ``seed_missing`` add example contracts on explicit opt-in and never alter an existing one.
+
+    The command hooks do not go through a repository: they read the local contracts file directly (a hook must not
+    wait for a remote service). A non-file backend would have to keep that local snapshot current.
+    """
+
+    def capture(self) -> tuple[bytes | None, str]: ...
+
+    def current_token(self) -> str: ...
+
+    def publish_document(self, document: ContractsDocument, payload: str,
+                         expected_token: str | None = None) -> None: ...
+
+    def prepare_upsert(self, document: ContractsDocument, rules: list[ContractRule]) -> list[ContractRule]: ...
+
+    def prepare_revoke(self, document: ContractsDocument, rule_id: str) -> ContractRule | None: ...
+
+    def seed_from(self, seed_path: Path) -> int: ...
+
+    def seed_missing(self, preset_path: Path) -> int: ...
 
 
 class ContractStore:

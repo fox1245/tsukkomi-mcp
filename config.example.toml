@@ -27,3 +27,8 @@ agy_app_data_dirs = [
 # Grokbot also accepts its existing delimiter-separated string syntax, or arrays
 # of individual paths (including paths containing delimiter characters).
 # grokbot_transcripts_dir = ["history/grokbot", "history/mirror"]
+
+# Personal contract bundle files (portable contracts, README "Sharing contracts across devices"): candidates only,
+# adopted on this device with adopt_contracts; also the only places besides the project directory that
+# export_contracts may write. Same as SELF_DIRECT_CONTRACT_BUNDLE_PATHS in the environment.
+# contract_bundle_paths = ["~/.config/tsukkomi-mcp/contracts.json"]
