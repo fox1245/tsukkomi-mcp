@@ -10,8 +10,11 @@ import time
 import pytest
 
 from test_reliability import session, SID
+from self_directing_mcp import engine as engine_module
 from self_directing_mcp import request_stats, server
-from self_directing_mcp.request_control import IndexBusy, RequestStopped
+from self_directing_mcp.engine import SelfDirectEngine
+from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request
+from self_directing_mcp.schemas import ProposedAction
 
 OLD_KEYS = {"ok", "verdict", "error", "coverage", "action_executed", "requires_attention", "nudge"}
 NO_DELETE = {"id": "no-delete", "type": "must_not", "scope": "tool_call", "regex": r"rm\s+-rf",
@@ -57,6 +60,16 @@ async def until(condition, seconds=5.0):
 def use_engine(monkeypatch, engine):
     monkeypatch.setattr(server, "_engine", engine)
     return engine
+
+
+def stuck(monkeypatch, share=0.05):
+    def wait_for_stop(self, **kwargs):
+        while True:
+            check_request()
+            time.sleep(0.005)
+
+    monkeypatch.setattr(SelfDirectEngine, "_sync_session", wait_for_stop)
+    monkeypatch.setattr(engine_module, "SYNC_BUDGET_SHARE", share)
 
 
 # --- what is counted, and when -------------------------------------------------------------------------------------
@@ -371,6 +384,41 @@ def test_ops_does_not_depend_on_what_the_engine_answers(monkeypatch, stats):
     assert status["error"] == "index_busy" and counted(status["ops"], "audit_status")[0] == 1
 
 
+# --- degraded answers, and the hook tool ----------------------------------------------------------------------------
+
+def test_a_check_whose_sync_ran_out_of_time_is_counted_degraded_not_ok(session, monkeypatch, stats):
+    engine, _ = session
+    use_engine(monkeypatch, engine)
+    engine.upsert_contracts([NO_DELETE])
+    stuck(monkeypatch)
+    action = ProposedAction(tool_name="shell", arguments={"command": "rm -rf /fictional-path"})
+    response = asyncio.run(server.check_action(SID, action, timeout_ms=8000))
+    assert response["verdict"] == "violation" and "sync_deadline" in response["coverage"]["issues"]
+    assert counted(stats.snapshot(), "check_action") == (1, {"degraded": 1}, {"degraded": {"sync_deadline": 1}})
+    harmless = ProposedAction(tool_name="shell", arguments={"command": "echo harmless"})
+    response = asyncio.run(server.check_action(SID, harmless, timeout_ms=8000))
+    assert response["verdict"] == "unknown"
+    audited = asyncio.run(server.audit_session(SID, timeout_ms=8000))
+    assert audited["verdict"] == "unknown" and "sync_deadline" in audited["coverage"]["issues"]
+    snapshot = stats.snapshot()
+    assert counted(snapshot, "check_action")[1] == {"degraded": 2}
+    assert counted(snapshot, "audit_session") == (1, {"degraded": 1}, {"degraded": {"sync_deadline": 1}})
+
+
+def test_a_hook_whose_sync_ran_out_of_time_still_reports_the_violation_and_is_counted_degraded(session, monkeypatch, stats):
+    engine, path = session
+    use_engine(monkeypatch, engine)
+    engine.settings.audit_timeout_sec = 8.0
+    engine.upsert_contracts([NO_DELETE])
+    stuck(monkeypatch)
+    answer = asyncio.run(server.codex_session_hook(
+        event_name="PreToolUse", session_id=SID, transcript_path=str(path), tool_name="shell",
+        tool_input={"command": "rm -rf /fictional-path"}))
+    context = answer["hookSpecificOutput"]["additionalContext"]
+    assert '"verdict": "violation"' in context and "sync_deadline" in context
+    assert counted(stats.snapshot(), "hook") == (1, {"degraded": 1}, {"degraded": {"sync_deadline": 1}})
+
+
 @pytest.mark.parametrize("event", ["PreToolUse", "Stop"])
 def test_a_hook_that_cannot_finish_keeps_its_advisory_message_and_is_counted_incomplete(monkeypatch, stats, event):
     def busy(*args, **kwargs):
@@ -382,3 +430,32 @@ def test_a_hook_that_cannot_finish_keeps_its_advisory_message_and_is_counted_inc
     assert answer == ({"systemMessage": text} if event == "Stop" else
                       {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
     assert counted(stats.snapshot(), "hook") == (1, {"incomplete": 1}, {"incomplete": {"index_busy": 1}})
+
+
+def test_the_requests_deadline_during_the_fallback_is_still_the_incomplete_answer(session, monkeypatch, stats):
+    engine, _ = session
+    use_engine(monkeypatch, engine)
+    engine.upsert_contracts([NO_DELETE])
+    stuck(monkeypatch, share=0.2)
+    original = engine_module.coverage_from_capture
+
+    def slow_coverage(*args, **kwargs):
+        time.sleep(1.0)             # the sync ended at 0.2 s of 1 s; this overruns the request, which was answered at 1 s
+        check_request()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "coverage_from_capture", slow_coverage)
+    action = ProposedAction(tool_name="shell", arguments={"command": "rm -rf /fictional-path"})
+
+    async def scenario():
+        response = await server.check_action(SID, action, timeout_ms=1000)
+        during = stats.snapshot()
+        await until(lambda: stats.snapshot()["workers"]["abandoned_now"] == 0)
+        return response, during, stats.snapshot()
+
+    response, during, after = asyncio.run(scenario())
+    assert response["error"] == "request_deadline" and response["verdict"] == "unknown"
+    assert counted(after, "check_action") == (1, {"incomplete": 1}, {"incomplete": {"request_deadline": 1}})
+    assert during["workers"]["abandoned_now"] == 1
+    assert after["workers"] == {"abandoned_now": 0, "abandoned_total": 1, "late_finish_total": 1}
+    assert after["gate"]["in_use"] == 0

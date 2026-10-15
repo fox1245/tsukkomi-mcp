@@ -87,6 +87,7 @@ jobs:
           tests/test_timeout_regression.py
           tests/test_tool_timeout_arg.py
           tests/test_request_stats.py
+          tests/test_degraded_evaluation.py
           tests/test_server_ops.py
           tests/test_quiet_hooks.py
           tests/test_agy_hooks.py
