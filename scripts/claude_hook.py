@@ -62,6 +62,73 @@ def _apply_index_dir(argv):
             os.environ["SELF_DIRECT_INDEX_DIR"] = arg.split("=", 1)[1]
 
 
+_GROK_ENVELOPE = ("workspaceRoot", "sessionId", "toolUseId", "permissionMode")
+
+
+def _segments(path):
+    return [part for part in path.replace("\\", "/").split("/") if part]
+
+
+def _is_grok_payload(text):
+    """Whether ``text`` (the hook's stdin) is a Grok CLI payload. Standard library only, and cheap: a payload with
+    no sign of Grok is not even parsed. Keep in step with ``self_directing_mcp.grok_ids.is_grok_payload`` (a test
+    runs both over the same payloads).
+
+    Grok loads Claude Code's settings file by default, so this hook, installed there, is also run on Grok's events
+    with Grok's payload: a transcript outside the Claude projects root, which this hook would reject loudly on every
+    tool call without protecting anything. Grok has its own hook (``grok_hook.py``).
+    """
+    if ".grok" not in text.lower() and "hookEventName" not in text:
+        return False
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    path = next((payload[key] for key in ("transcript_path", "transcriptPath")
+                 if isinstance(payload.get(key), str) and payload[key]), None)
+    if path is not None:
+        parts = [part.lower() for part in _segments(path)]
+        if any(left == ".grok" and right == "sessions" for left, right in zip(parts, parts[1:])):
+            return True
+    if not isinstance(payload.get("hookEventName"), str):
+        return False
+    if path is not None and any(part.lower() == ".claude" for part in _segments(path)):
+        return False
+    return any(isinstance(payload.get(key), str) for key in _GROK_ENVELOPE)
+
+
+def _reexec_target():
+    """The repository's own interpreter when this process is not it (the hook then re-executes), else None."""
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    venv = os.path.join(root, ".venv")
+    python = os.path.join(venv, "Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if os.path.isfile(python) and os.path.realpath(sys.prefix) != os.path.realpath(venv):
+        return python
+    return None
+
+
+def _bypass_grok():
+    """Answer a Grok payload with silence: nothing printed, nothing written, no health record, exit code 0.
+
+    stdin is consumed here and replaced by a replayable copy, so every path below reads the same payload. When this
+    process is about to re-execute into the repository's interpreter it does not read stdin (the next process would
+    find it empty), and the check happens there instead.
+    """
+    if _reexec_target() is not None:
+        return False
+    try:
+        text = sys.stdin.read()
+    except Exception:
+        text = ""
+    if _is_grok_payload(text):
+        return True
+    import io
+    sys.stdin = io.StringIO(text)
+    return False
+
+
 def _via_daemon():
     """Resident-daemon mode (``SELF_DIRECT_DAEMON=on``, Linux): a thin client that imports only the standard library
     and the daemon's client module (not even ``pathlib``, whose import costs more than the rest of the client).
@@ -101,6 +168,8 @@ def _via_daemon():
 
 
 def main():
+    if _bypass_grok():
+        return
     _apply_index_dir(sys.argv[1:])
     if _via_daemon():
         return

@@ -33,6 +33,7 @@ from typing import Any, TYPE_CHECKING
 
 from self_directing_mcp import claude_hook_state as hook_state
 from self_directing_mcp import claude_ids
+from self_directing_mcp import grok_ids
 from self_directing_mcp import hook_policy
 from self_directing_mcp.agy_hook_state import AUDIT_UNAVAILABLE, CHECK_FAILED
 from self_directing_mcp.claude_hook_state import CONTEXT_EVENTS, EVENTS, STOP_EVENTS, ClaudeHookState
@@ -316,6 +317,10 @@ def _new_engine():
 
 def _dispatch(payload: Any, event: str | None, engine: SelfDirectEngine | None, context: dict[str, Any]) -> dict[str, Any]:
     """The host-neutral reply; ``context`` receives settings-derived paths as soon as known."""
+    if grok_ids.is_grok_payload(payload):
+        # Grok CLI loads Claude Code's settings file too, so a Grok event can reach this hook. It is not a Claude Code
+        # event: no judgement, no state and no health record (``context`` stays empty); Grok has its own hook.
+        return {}
     call = _validate_payload(payload, event)
     if event in LIGHT_EVENTS:
         settings = engine.settings if engine is not None else _new_settings()
@@ -392,6 +397,8 @@ def main() -> None:
         # Only the error class is reported; the raw stdin payload never reaches diagnostics.
         response = mask_value(hook_state.fail_open(event, None, type(exc).__name__, CHECK_FAILED))
     else:
+        if grok_ids.is_grok_payload(payload):
+            return          # silent: see _dispatch
         response = run_hook(event or _event_from_payload(payload), payload)
     json.dump(mask_value(response), sys.stdout)
     sys.stdout.write("\n")
