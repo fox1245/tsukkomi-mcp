@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from self_directing_mcp import journal as _journal, settings_core
+from self_directing_mcp import journal as _journal, reindex_spool, settings_core
 from self_directing_mcp._runtime import np
 
 from self_directing_mcp.compressed_source import CompressedSourceError, is_compressed
@@ -199,11 +199,15 @@ def _agy_stats_dict(counter):
 
 
 class RowSpool:
-    """Prepared event rows spooled to disk (memory below 1 MiB); parsers append, publication replays in batches."""
+    """Prepared event rows spooled to disk (memory below 1 MiB); parsers append, publication replays in batches.
 
-    def __init__(self):
+    ``track_calls``: also keep the earliest byte of every tool call (``calls``, OMP) which the parse of the next slice of a
+    staged re-index needs (``reindex_spool``)."""
+
+    def __init__(self, track_calls=False):
         self._file = tempfile.SpooledTemporaryFile(max_size=1 << 20, mode="w+", encoding="utf-8", newline="\n")
         self.count, self.ids, self.flags, self.tallies = 0, set(), {}, {}
+        self.calls = {} if track_calls else None
 
     @classmethod
     def from_chunks(cls, chunks):
@@ -219,6 +223,9 @@ class RowSpool:
         self._file.write(json.dumps(row) + "\n")
         self.count += 1
         self.ids.add(chunk.chunk_id)
+        if self.calls is not None and chunk.kind == "tool_call":
+            key, start = (chunk.meta.get("call_id"), chunk.meta.get("tool_name")), chunk.byte_start or 0
+            self.calls[key] = min(self.calls.get(key, start), start)
         if chunk.meta.get("parse_error") or chunk.meta.get("unsupported_event"):
             self.flags[chunk.chunk_id] = (bool(chunk.meta.get("parse_error")), bool(chunk.meta.get("unsupported_event")))
         if chunk.provider == "agy":
@@ -244,6 +251,21 @@ class RowSpool:
                 batch = []
         if batch:
             yield batch
+
+    def blocks(self, limit=1 << 20):
+        """The rows as they are in the file, ``(text as bytes, rows)`` in blocks of about ``limit`` bytes (a row is one
+        ASCII line): what a staged re-index copies into its spool without reading a row."""
+        self._file.flush()
+        self._file.seek(0)
+        pending, size = [], 0
+        for line in self._file:
+            pending.append(line)
+            size += len(line)
+            if size >= limit:
+                yield "".join(pending).encode("ascii"), len(pending)
+                pending, size = [], 0
+        if pending:
+            yield "".join(pending).encode("ascii"), len(pending)
 
     def close(self):
         self._file.close()
@@ -567,7 +589,8 @@ class SessionStore:
 
         ``receipt_deps`` (AGY): the JSON of ``agy_receipts.dependencies`` for the events as they stand after this
         commit, written with the cursor. A commit without it leaves none, which makes the next receipt change reparse."""
-        spool = prepared_rows if isinstance(prepared_rows, RowSpool) else RowSpool.from_chunks(chunks)
+        # ``prepared_rows``: a RowSpool or any row source of its interface (``reindex_spool.StagedRows``).
+        spool = prepared_rows if hasattr(prepared_rows, "batches") else RowSpool.from_chunks(chunks)
         try:
             self._commit_spool(spool, session_id=session_id, provider=provider, path=path, offset=offset, digest=digest,
                                replace=replace, parser_version=parser_version, expected_token=expected_token,
@@ -1472,14 +1495,22 @@ SOFT_DEADLINE_MIN_SEC = 0.25
 FLIGHT_WAIT_MAX_SEC = 1.0
 FLIGHT_WAIT_SHARE = 0.25
 RETRY_AFTER_MS = 500    # the hint a partial sync gives; advisory, nothing retries by itself
+# Staging a re-index (``reindex_spool``): the parse of a re-index goes into a spool slice by slice and ONE ordinary replace
+# commit publishes it. That commit cannot be cut, so it is started only when its predicted time fits what the request has
+# left. Module constants, so tests can move them.
+COMMIT_SECONDS_PER_ROW = 18e-6   # measured on synthetic sessions (ext4): the replace commit costs about 18 microseconds per event
+COMMIT_SAFETY = 1.5              # the prediction is multiplied by this before it is compared with the time left
+COMMIT_RESERVE = 0.1             # the share of the time left that a commit leaves for the answer and the derived work
+REINDEX_STATES = ("staging", "ready_to_commit", "committed", "discarded", "disabled")
 
 
 @dataclass(frozen=True)
 class SlicePolicy:
     """Whether a sync may publish a prefix instead of all or nothing, and how a slice is bounded.
 
-    ``mode``: ``"auto"`` (a request with a finite deadline, a plain file, nothing replaced) or ``"off"`` (exactly the
-    all-or-nothing sync of before). ``cap_bytes``: the most a slice observes past the indexed offset
+    ``mode``: ``"auto"`` (a request with a finite deadline and a plain file: appends are published in slices, a re-index
+    is staged in a spool and published by one commit) or ``"off"`` (exactly the all-or-nothing sync of before).
+    ``cap_bytes``: the most a slice observes past the indexed offset
     (``SELF_DIRECT_SYNC_SLICE_BYTES``). The rest bounds the parse (``slice_budget.SliceBudget``); the defaults are the
     production ones, and tests set ``max_records``/``max_bytes`` to force deterministic stops and ``clock`` to move time.
     """
@@ -1520,14 +1551,18 @@ def _flight_wait(slicing, path):
     return min(FLIGHT_WAIT_MAX_SEC, FLIGHT_WAIT_SHARE * max(0.0, current_request().deadline - time.monotonic()))
 
 
-def _new_budget(slicing, start, pending=None) -> SliceBudget:
+def _new_budget(slicing, start, pending=None, judged=True) -> SliceBudget:
     """The budget of a slice that starts at ``start`` and has ``pending`` bytes to parse (``None``: not known). A parse
     shorter than the minimum progress is never cut, so it does not need the cost numbers (and a request that only ever
-    appends a little never reads the contracts for them)."""
+    appends a little never reads the contracts for them).
+
+    ``judged``: whether the request judges what this slice publishes. A staged slice of a re-index does not: its rows wait in
+    a spool, the index stays as it is, and the evaluation that follows reads the OLD index. Such a slice is sized by the
+    share alone, and neither the contracts nor the index are read for numbers that would not be used."""
     remaining = max(0.0, current_request().deadline - time.monotonic())
     started = slicing.clock()
     options = {}
-    sizing = current_sizing()
+    sizing = current_sizing() if judged else None
     if sizing is not None and (pending is None or pending > slicing.min_bytes) and sizing.resolve():
         # The request judges what this slice publishes: parse + commit + evaluating the records must fit what is left
         # of the REQUEST (not of the narrower share its sync runs in), less the reserve for the response and less the
@@ -1542,28 +1577,171 @@ def _new_budget(slicing, start, pending=None) -> SliceBudget:
                        max_records=slicing.max_records, clock=slicing.clock, **options)
 
 
-def _sync_report(indexed, target, pending, budget, observation, provider=None) -> dict:
+def _sync_report(indexed, target, pending, budget, observation, reindex=None, provider=None) -> dict:
     """The ``sync`` object of a result: how far the index got, how far this sync means to go, and why it stopped.
 
-    ``progress`` is the share of the target that is COMMITTED (what a parse read but did not publish does not count).
+    ``progress`` is the share of the target that is COMMITTED (what a parse read but did not publish does not count). While a
+    re-index is staged and not yet published (``reindex``: its report, see ``_Stage.report``) the index in force is still the
+    old one: the sync is partial whatever the cursor says, ``progress`` is the staged share, and a staged range that reaches the
+    end of the source stopped at ``eof``.
+
     ``cost`` is what sized the slice: ``slice_us`` the expected microseconds to parse and commit an event, ``eval_us`` the
-    expected microseconds to judge one (0: nothing is judged after this sync), ``debt_events`` the events already
-    indexed that no monitor state covers, and ``limited_by`` which limit ended it (``share``: the soft deadline,
-    ``cost``: the cost bound, ``None``: neither, e.g. the end of the file)."""
-    partial = indexed < target
+    expected microseconds to judge one (0: nothing is judged after this sync; so it is for a staged re-index, whose rows no
+    audit reads until they are published), ``debt_events`` the events already indexed that no monitor state covers, and
+    ``limited_by`` which limit ended it (``share``: the soft deadline, ``cost``: the cost bound, ``None``: neither, e.g. the
+    end of the file)."""
+    waiting = reindex is not None and reindex["state"] in ("staging", "discarded", "ready_to_commit")
+    partial = indexed < target or waiting
     stopped = "eof"
-    if partial:
+    if waiting:
+        stopped = ("eof" if reindex["state"] == "ready_to_commit" else
+                   budget.stopped_by if budget is not None else None) or "slice_cap"
+    elif partial:
         stopped = (budget.stopped_by if budget is not None and indexed < observation.complete_end else None) or "slice_cap"
+    share = reindex["staged_through"] if waiting else indexed
     report = {"state": "partial" if partial else "complete", "indexed_through": indexed, "pending_bytes": pending,
-              "target_bytes": target, "progress": round(min(1.0, indexed / target), 4) if partial and target else 1.0,
+              "target_bytes": target, "progress": round(min(1.0, share / target), 4) if partial and target else 1.0,
               "retry_after_ms": RETRY_AFTER_MS if partial else None, "stopped_by": stopped}
+    if reindex is not None:
+        report["reindex"] = reindex
     if budget is not None:
         sizing = current_sizing()
         report["cost"] = {"slice_us": round(COSTS.slice_cost(provider) * 1e6, 1),
                           "eval_us": round(budget.cost_per_record * 1e6, 1),
-                          "debt_events": sizing.debt_events if sizing is not None else 0,
+                          "debt_events": sizing.debt_events if sizing is not None and budget.cost_budget is not None else 0,
                           "limited_by": budget.bound if partial else None}
     return report
+
+
+def _commit_fits(rows: int) -> bool:
+    """Whether the replace commit of ``rows`` staged events is predicted to fit what the request has left. It is never
+    started otherwise: a transaction that starts and is rolled back by the deadline only spends the budget."""
+    left = max(0.0, current_request().deadline - time.monotonic())
+    return COMMIT_SECONDS_PER_ROW * rows * COMMIT_SAFETY <= left * (1.0 - COMMIT_RESERVE)
+
+
+class _Stage:
+    """The staged re-index of one sync (``reindex_spool``): the spool, what this request did with it, what it reports.
+
+    ``spool`` is None when staging is off for this request (``disabled``: the index volume has no room, or the directory is
+    not private): the sync is then the all-or-nothing re-index of before."""
+
+    def __init__(self):
+        self.spool = None
+        self.disabled = None        # why staging is off for this request
+        self.discarded = None       # why a spool that was found has been thrown away
+        self.complete = False       # the staged range reaches the end of what the capture observed
+        self.committed = False
+        self.rows = 0               # rows published, once committed
+
+    @property
+    def active(self) -> bool:
+        return self.spool is not None
+
+    @property
+    def start(self) -> int:
+        """The source offset this request's parse starts at: where the staged range ends (0 for a spool to be started)."""
+        return self.spool.staged_through if self.spool is not None and self.spool.valid else 0
+
+    @classmethod
+    def begin(cls, *, store, provider, sid, cursor, observation, path, kind, parser_version, receipt_digest, receipt_rows):
+        """Open and validate the spool of this re-index, or find that staging is off for this request.
+
+        ``receipt_rows`` (AGY): a spool whose rows were parsed with other receipts survives only if the receipts that changed
+        are none of those its events were derived from (``agy_receipts.affects_index``); a new receipt for a later step must
+        not restart the staging of a session that is still being written."""
+        stage, index_dir, length = cls(), store.db_path.parent, observation.length
+        head = min(reindex_spool.HEAD_BYTES, length)
+        binding = reindex_spool.SpoolBinding(
+            provider=provider, session_id=sid, target_version=parser_version, base_version=cursor["parser_version"],
+            base_stamp=cursor["synced_at"], hash_kind=kind, dev=observation.identity[0], ino=observation.identity[1],
+            path=str(path), size=length, head_length=head, head_hash=observation.head_digest(head),
+            receipt_digest=receipt_digest)
+        try:
+            spool = reindex_spool.ReindexSpool.open(index_dir, binding, source_length=length,
+                                                    head_hash=observation.head_digest,
+                                                    cursor_hash=lambda offset: observation.cursor_hash(offset, kind))
+        except reindex_spool.SpoolBusy:
+            raise FlightBusy() from None       # another process is staging this session: judge on what is committed
+        except reindex_spool.SpoolUnsafe:
+            stage.disabled = "unsafe"
+            return stage
+        except (RequestStopped, IndexBusy):
+            raise
+        except OSError:
+            stage.disabled = "unavailable"     # the directory cannot be made or read: the re-index is the one of before
+            return stage
+        try:
+            if spool.valid and receipt_rows is not None and spool.slices and spool.receipt_digest != receipt_digest:
+                from self_directing_mcp.agy_receipts import DEPENDENCIES_VERSION, affects_index
+                staged = {"v": DEPENDENCIES_VERSION, "first": spool.deps_first, "steps": dict(spool.deps_steps)}
+                if affects_index(staged, receipt_rows):
+                    spool.discard("receipts_changed")
+            if not reindex_spool.has_room(index_dir, observation.complete_end - (spool.staged_through if spool.valid else 0)):
+                if spool.valid:
+                    spool.discard("disk")      # the space it holds is given back; the sync is the all-or-nothing one
+                stage.disabled = "disk"
+        except BaseException:
+            spool.close()
+            raise
+        stage.discarded = spool.discard_reason
+        if stage.disabled:
+            spool.close()
+        else:
+            stage.spool = spool
+        return stage
+
+    def persist(self, rows, start, end, digest, *, deps, receipt_digest) -> None:
+        """Make the slice just parsed (``[start, end)``) durable: its rows, then the trailer that names them."""
+        try:
+            self.spool.append_slice(rows, end, digest, start_offset=start, deps=deps, receipt_digest=receipt_digest)
+        except reindex_spool.SpoolBusy:
+            raise FlightBusy() from None
+
+    def published(self, rows) -> None:
+        """The re-index is in the index: the spool (if any file exists) has done its job."""
+        self.committed, self.rows = True, rows
+        if self.spool is not None:
+            self.spool.finish()
+
+    def report(self, target, offset) -> dict:
+        """The ``reindex`` object of the ``sync`` report. States, in order of precedence: ``disabled`` (no spool for this
+        request, ``reason`` says why); ``committed``; ``ready_to_commit`` (everything is staged, the commit did not fit the
+        time left); ``discarded`` (a spool that no longer matched was thrown away and the staging started over, ``reason`` says
+        why); ``staging``."""
+        spool = self.spool
+        through, rows = (spool.staged_through, spool.rows) if spool is not None else (0, 0)
+        if self.disabled:
+            state, reason = "disabled", self.disabled
+        elif self.committed:
+            state, reason, through, rows = "committed", None, offset, self.rows
+        elif self.complete:
+            state, reason = "ready_to_commit", "commit_exceeds_budget"
+        elif self.discarded:
+            state, reason = "discarded", self.discarded
+        else:
+            state, reason = "staging", None
+        return {"state": state, "staged_through": through, "target_bytes": target, "rows": rows, "reason": reason}
+
+    def abort(self) -> None:
+        """The request stopped inside a slice: cut what it wrote after the last trailer, let go of the lock."""
+        if self.spool is not None:
+            self.spool.abort()
+
+    def close(self) -> None:
+        if self.spool is not None:
+            self.spool.close()
+
+
+class _NoRows:
+    """The row source of a request that publishes nothing (a slice was staged; the index stays as it is)."""
+    count, ids, flags, tallies = 0, frozenset(), {}, {}
+
+    def batches(self, size=256):
+        return iter(())
+
+    def close(self):
+        pass
 
 
 def _signed64(value: int) -> int:
@@ -1754,10 +1932,13 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
     ``slicing`` (``SlicePolicy``; None: off): with ``auto``, a request that has a finite deadline syncs a plain file
     in slices. The parse ends at a record boundary when its soft deadline passes (``slice_budget``) and the prefix
     it read is published, so the next call continues from there; a capture is cut short past ``slicing.cap_bytes``.
-    Nothing is ever published over events that exist (a reindex is all or nothing, as before). The result then has
-    a ``sync`` object, and ``coverage`` says how many bytes of the capture are still to be indexed
-    (``backlog_bytes``, the issue ``sync_in_progress``). A waiter on the session's flight gives up after a bounded
-    wait with ``FlightBusy``.
+    Nothing is ever published over events that exist, but a reindex keeps its progress too: its slices wait in a spool
+    next to the index (``reindex_spool``) and ONE ordinary replace commit publishes them once they are all there and the
+    commit is predicted to fit the time left; until then the index is the old one, byte for byte. The result then has
+    a ``sync`` object (with a ``reindex`` object while a reindex is staged), and ``coverage`` says how many bytes of the
+    capture are still to be indexed (``backlog_bytes``, the issue ``sync_in_progress``) or that a staged reindex waits for
+    its commit (``reindex_ready_to_commit``). A waiter on the session's flight gives up after a bounded wait with
+    ``FlightBusy``.
     """
     policy = policy or IntegrityPolicy()
     requested = Path(path).resolve()
@@ -1921,6 +2102,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
     path = Path(path).resolve()
     policy = policy or IntegrityPolicy()
     reports, sliceable = _may_slice(slicing, path)
+    stageable = sliceable                 # a re-index may be staged (a capture that is whole is needed, and taken, either way)
     sliceable = sliceable and not whole   # ``whole``: this call observes the file whole (it needs a reindex)
     planned = None  # the cursor a fast capture was planned from; it must still be the current one
     if observation is None:
@@ -1943,6 +2125,13 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                     from self_directing_mcp.agy_receipts import ReceiptStore
                     hint += ReceiptStore(store.db_path.parent, held=store.derived if store.defer_derived else None,
                                          journal=store.journal_policy).checkpoints(sid_hint.lower(), path)
+                if stageable and known:
+                    # A staged re-index continues from where its spool ends: that offset's hash is a checkpoint of the
+                    # one pass over the source, and nothing is read twice to verify the staged range.
+                    staged = reindex_spool.ReindexSpool.peek(store.db_path.parent, provider, known["session_id"],
+                                                             current_parser_version(provider))
+                    if staged:
+                        hint += (staged,)
             except (OSError, sqlite3.Error):
                 hint, known, record, looked = (), None, None, False
         # A capture is cut short only where a prefix commit can only add: nothing indexed yet, or an append to the
@@ -2035,22 +2224,46 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 start, reindexed, reindex_reason = 0, True, "hook_receipts_changed"
         if reindexed and observation.limited_from is not None:
             raise _NeedsWholeCapture()   # a reindex replaces events: never a prefix over an index that exists
-        # Only the parse that adds to what is stored may stop early; one that replaces it is all or nothing.
-        budget = _new_budget(slicing, start, observation.complete_end - start) if sliceable and not reindexed else None
-        chunks = RowSpool()
-        uses = set()
-        parse_started = time.perf_counter()
-        try:
+        index_dir, kind = store.db_path.parent, "blocks" if _blockable(provider, path) else "sha"
+        stage, stage_only = None, False
+        if not reindexed:
+            # The index is current for this source and parser: a spool of this session is an orphan (another process
+            # finished the re-index, or the source went back to what is indexed).
+            reindex_spool.ReindexSpool.discard_session(index_dir, provider, sid)
+        elif stageable and observation.mode == "full":
+            # A re-index replaces what is stored: it is staged slice by slice in a spool and published by ONE commit, so
+            # a request that runs out of time keeps its parse and the index is not touched until then. (A capture that did
+            # not scan the whole prefix cannot vouch for the staged range: that re-index is the all-or-nothing one.)
+            stage = _Stage.begin(store=store, provider=provider, sid=sid, cursor=cursor, observation=observation, path=path,
+                                 kind=kind, parser_version=parser_version, receipt_digest=receipt_digest,
+                                 receipt_rows=receipt_rows if receipt_store is not None else None)
+        staging = stage is not None and stage.active
+        if staging:
+            start = stage.start          # where the staged range ends: the parse continues from there
+        # The parse that adds to what is stored, and a staged slice of a re-index, may stop early at their soft deadline;
+        # any other re-index is all or nothing, as before.
+        budget, chunks, uses = None, _NoRows(), set()
+        try:   # from here on whatever ends the request lets go of the spool (its lock is a file descriptor)
+            if (sliceable and not reindexed) or staging:
+                # What a staged slice holds is judged by nobody until it is published (the audit that follows reads the OLD
+                # index), so only a slice that adds to what is stored is sized by what judging it costs, and only that one
+                # reads the contracts and the index for the numbers.
+                budget = _new_budget(slicing, start, observation.complete_end - start, judged=not staging)
+            chunks = RowSpool(track_calls=staging and provider == "omp")
+            parse_started = time.perf_counter()
             with slice_scope(budget):
                 if cursor and not reindexed and provider != "agy" and start >= observation.complete_end:
                     offset, parsed_sid = start, sid
+                elif staging and start >= observation.complete_end:
+                    offset, parsed_sid = start, sid       # everything is staged already: only the commit is left
                 elif provider == "agy":
                     _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start,
                                                                  receipts=receipts, sink=chunks, uses=uses)
                 elif provider == "omp" and start:
-                    # This lookup is request-owned and bound to the captured cursor generation.
-                    earliest = {}
-                    for before, call_id, name in prior_calls:
+                    # This lookup is request-owned and bound to the captured cursor generation (or, for a staged re-index,
+                    # to the calls of the slices staged so far).
+                    earliest = dict(stage.spool.calls) if staging else {}
+                    for before, call_id, name in () if staging else prior_calls:
                         key = (call_id, name)
                         earliest[key] = min(earliest.get(key, before), before)
                     _, offset, parsed_sid = parse_session_chunks(
@@ -2064,16 +2277,37 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             blockable = _blockable(provider, path)
             digest = observation.cursor_hash(offset, "blocks" if blockable else "sha")
             draft = _draft(observation, offset, record) if blockable else None
-            receipt_deps = None
+            receipt_deps = slice_deps = None
             if receipt_store is not None:
                 from self_directing_mcp.agy_receipts import dependencies
                 # An append extends what the stored events depend on; without stored dependencies (an index from
                 # before they were kept) there is nothing to extend and the next receipt change reparses.
                 prior = None if reindexed or not cursor else cursor_deps
                 if reindexed or not cursor or prior is not None:
-                    receipt_deps = json.dumps(dependencies(receipt_rows, uses, prior), sort_keys=True)
+                    # A staged re-index: every slice has used some receipts; the events depend on all of them.
+                    used = uses | set(stage.spool.deps_steps) if staging else uses
+                    receipt_deps = json.dumps(dependencies(receipt_rows, used, prior), sort_keys=True)
+                    slice_deps = dependencies(receipt_rows, uses, None) if staging else None
+            if staging:
+                stage.complete = offset >= observation.complete_end
+                # A re-index that is parsed whole in this request and whose commit fits is published straight from memory,
+                # as before: no file is made for it. Anything else is staged, so that the work outlives this request.
+                if not (stage.complete and not stage.spool.slices and _commit_fits(chunks.count)):
+                    stage.persist(chunks, start, offset, digest, deps=slice_deps, receipt_digest=receipt_digest)
+                    chunks.close()
+                    if stage.complete and _commit_fits(stage.spool.rows):
+                        # The capture is the verification of [0, target_end): it scanned the whole prefix in this request,
+                        # and every staged slice was bound to it by the hash of the range it ended at.
+                        if not (observation.mode == "full" and observation.limited_from is None
+                                and offset == observation.complete_end == observation.target_end):
+                            raise AssertionError("a staged re-index is committed only against a whole capture")
+                        chunks = stage.spool.as_row_source()
+                    else:
+                        chunks, stage_only = _NoRows(), True    # the index is left as it is; the staged rows wait
         except BaseException:
             chunks.close()
+            if stage is not None:
+                stage.abort()
             raise
     try:
         check_request()
@@ -2084,7 +2318,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             if not observation.validate_prefix(locked=True):
                 raise SourceChanged("source changed during preparation")
             current = store.cursor_record(sid, provider)
-            changed_token = store.state_token(sid, provider) != expected_token
+            # A request that only stages publishes nothing, so it has no state to compare-and-swap.
+            changed_token = not stage_only and store.state_token(sid, provider) != expected_token
             equivalent = bool(changed_token and current and current["path"] == str(path)
                               and current["byte_offset"] == offset and current["prefix_hash"] == digest
                               and current["parser_version"] == parser_version)
@@ -2101,7 +2336,9 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                                   and receipt_store.read_capture(sid)[0] == receipt_rows)
             if changed_token and not equivalent:
                 raise ValueError("stale session preparation")
-            if not equivalent:
+            if stage_only:
+                pass    # the staged slice is on disk; the index is not touched until the re-index is complete
+            elif not equivalent:
                 if receipt_store is not None:
                     if receipt_store.authority_token(sid) != receipt_authority_before:
                         raise ValueError("receipt authority changed during preparation")
@@ -2115,12 +2352,23 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                         or relation == "moved" or needs_table or receipts_dirty):
                     # receipts_dirty: the events stand, but they now belong to these receipts (and their dependencies).
                     committing = time.perf_counter()
-                    store.commit_events((), session_id=sid, provider=provider, path=path, offset=offset,
-                                        digest=digest, replace=reindexed, parser_version=parser_version,
-                                        expected_token=expected_token, prepared_rows=chunks, receipt_digest=receipt_digest,
-                                        blocks=draft, receipt_deps=receipt_deps)
+                    try:
+                        store.commit_events((), session_id=sid, provider=provider, path=path, offset=offset,
+                                            digest=digest, replace=reindexed, parser_version=parser_version,
+                                            expected_token=expected_token, prepared_rows=chunks,
+                                            receipt_digest=receipt_digest, blocks=draft, receipt_deps=receipt_deps)
+                    except reindex_spool.SpoolError:
+                        if staging:
+                            stage.spool.discard("corrupt")   # a frame did not verify: the commit rolled back, start over
+                        raise
                     if not reindexed:       # what an appended event costs to parse and commit (a replace costs more)
                         COSTS.observe_slice(provider, chunks.count, spent + time.perf_counter() - committing)
+                    if staging:
+                        stage.published(chunks.count)
+                    elif reindexed:
+                        # Not staged (slicing off, no deadline, a compressed source): a spool of this session that an
+                        # earlier request left is moot now.
+                        reindex_spool.ReindexSpool.discard_session(index_dir, provider, sid)
                 elif bound and observation.mode == "full":
                     # Nothing to publish, but every block was just compared: stamp the stored table.
                     stamp = observation.stamp
@@ -2130,6 +2378,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 if receipt_store is not None:
                     receipt_store.mark_indexed(sid, receipt_digest)
             else:
+                if staging:
+                    stage.published(chunks.count)    # another process published this very re-index meanwhile
                 chunks.count = 0
             with store._read_boundary():
                 committed_token = store.state_token(sid, provider)
@@ -2141,6 +2391,12 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
     finally:
         new_chunks = chunks.count
         chunks.close()
+        if stage is not None:
+            stage.close()
+    if stage_only:
+        # Nothing was replaced: the cursor and the events are the old ones. ``reindex_reason`` keeps saying why a re-index is
+        # under way, ``reindexed`` that it has not happened yet.
+        offset, reindexed = committed_cursor["byte_offset"], False
     alias = committed_cursor["path"] != str(path)  # an equal or shorter copy never moves the cursor
     coverage = coverage_from_capture(sid, provider, committed_cursor, metrics, observation, alias=alias,
                                      max_bytes=store.max_decompressed_bytes)
@@ -2157,8 +2413,16 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             coverage["backlog_bytes"] = backlog
             coverage["issues"].append("sync_in_progress")
             coverage["complete"] = False
+        reindex = stage.report(observation.target_end, offset) if stage is not None else None
+        if reindex is not None and reindex["state"] in ("staging", "discarded", "ready_to_commit"):
+            # The old index is still the one in force (coverage keeps ``parser_outdated`` / ``source_changed``): the verdict
+            # is never clean while the re-index waits, and the issue says what it waits for.
+            waiting = "reindex_ready_to_commit" if reindex["state"] == "ready_to_commit" else "sync_in_progress"
+            if waiting not in coverage["issues"]:
+                coverage["issues"].append(waiting)
+            coverage["complete"] = False
         sync = _sync_report(indexed, observation.target_end, coverage.get("pending_bytes", backlog), budget, observation,
-                            provider)
+                            reindex, provider)
     info = {"session_id": sid, "provider": provider, "path": str(path), "byte_offset": offset,
             "new_chunks": new_chunks, "embedded": 0, "total_chunks": coverage["chunk_count"],
             "reindexed": reindexed, "parser_version": parser_version, "reindex_reason": reindex_reason,

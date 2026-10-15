@@ -27,11 +27,12 @@ TOOLS = (
     "workflow_execute", "codex_session_hook", "hook",
 )
 # How a request ended: answered; answered from less evidence than wanted (the sync ran out of its share of the time, or
-# the session's sync is still in progress: a prefix is committed, or another request is writing it); no answer (a
-# deadline, a busy index, a cancellation inside the engine); the client went away; an unexpected failure.
+# the session's sync is still in progress: a prefix is committed, a re-index is being staged or waits for its commit, or
+# another request is writing it); no answer (a deadline, a busy index, a cancellation inside the engine); the client went
+# away; an unexpected failure.
 OUTCOMES = ("ok", "degraded", "incomplete", "client_cancelled", "error")
 REASONS = ("request_deadline", "index_busy", "request_cancelled", "operation_timeout", "sync_deadline",
-           "sync_in_progress", OTHER)
+           "sync_in_progress", "reindex_ready_to_commit", OTHER)
 WITH_REASON = ("incomplete", "degraded")        # the outcomes that carry a reason
 BUCKETS_MS = (50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 45000)    # upper bounds, inclusive; one more bucket: +inf
 _MAX_MS = 86_400_000.0                           # a day: keeps a corrupt measurement a finite number

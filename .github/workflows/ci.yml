@@ -45,6 +45,9 @@ jobs:
           tests/test_slice_settings.py
           tests/test_slice_flight.py
           tests/test_slice_adapters.py
+          tests/test_reindex_spool.py
+          tests/test_reindex_equivalence.py
+          tests/test_reindex_staging.py
           tests/test_eval_cost.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
@@ -120,6 +123,11 @@ jobs:
           tests/test_slice_settings.py
           tests/test_slice_flight.py
           tests/test_slice_adapters.py
+          tests/test_reindex_spool.py
+          tests/test_reindex_equivalence.py
+          tests/test_reindex_staging.py
+          tests/test_reindex_faults.py
+          tests/test_reindex_convergence.py
           tests/test_eval_cost.py
           tests/test_eval_converges.py
           tests/test_bench_eval_converge.py

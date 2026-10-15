@@ -578,7 +578,25 @@ class SelfDirectEngine:
             "file-destructive actions."
         )
         sync = info.get("sync")
-        if sync is not None and sync["state"] == "partial":
+        reindex = (sync or {}).get("reindex")
+        if sync is not None and sync["state"] == "partial" and reindex is not None:
+            # The old index is still the one in force; the new one is being staged beside it (README, "Re-indexing").
+            if reindex["state"] == "ready_to_commit":
+                info["nudge"] = (
+                    f"NUDGE: The re-index is staged ({reindex['rows']} events) but its commit does not fit the time this call "
+                    "had left; call sync_session again (a larger timeout_ms gives the commit more room) to publish it. "
+                    "Until then audits and action checks judge the previous index and cannot be clean "
+                    "(coverage.issues has reindex_ready_to_commit)."
+                )
+            else:
+                info["nudge"] = (
+                    f"NUDGE: The re-index is staged through {reindex['staged_through']} of {reindex['target_bytes']} bytes "
+                    f"({reindex['rows']} events); call sync_session again to continue (retry_after_ms="
+                    f"{sync['retry_after_ms']} is a hint, nothing retries by itself). The previous index stays in force until "
+                    "it is published, so audits and action checks cannot be clean meanwhile (coverage.issues has "
+                    "sync_in_progress)."
+                )
+        elif sync is not None and sync["state"] == "partial":
             info["nudge"] = (
                 f"NUDGE: Sync is partial ({sync['indexed_through']} of {sync['target_bytes']} bytes indexed, stopped by "
                 f"{sync['stopped_by']}); call sync_session again to continue (retry_after_ms={sync['retry_after_ms']} is "
