@@ -63,3 +63,19 @@ def test_the_setting_decides_which_file_the_engine_opens(clean, tmp_path, value,
         assert [p.name for p in (tmp_path / "index").glob("sparse*.sqlite")] == [engine.sparse.db_path.name]   # only the one in use
     finally:
         engine.close()
+
+
+def test_the_hook_reader_does_not_import_the_sparse_index_or_the_maintenance_command():
+    """The setting is plain data in ``settings_core``: reading it must not pull the index code into a hook process
+    (tests/test_hook_import_budget.py checks the whole hook path)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    code = ("import sys; from self_directing_mcp import settings_core; settings_core.load_hook_settings(); "
+            "bad = [m for m in ('self_directing_mcp.index.sparse', 'self_directing_mcp.maintenance', 'self_directing_mcp.engine', 'sqlite3') "
+            "if m in sys.modules]; print(bad)")
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=root, timeout=60,
+                          env={**os.environ, "PYTHONPATH": str(root / "src"), "PYTHONDONTWRITEBYTECODE": "1"})
+    assert done.returncode == 0, done.stderr[-1000:]
+    assert done.stdout.strip() == "[]", done.stdout
