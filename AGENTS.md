@@ -88,6 +88,16 @@ The default index is `~/.self_direct_index` (older versions used a directory ins
 An install that relied on that default must set `SELF_DIRECT_INDEX_DIR` to its existing directory
 before upgrading; nothing is moved automatically. The Codex installer registers an explicit directory.
 
+The sparse (FTS5) search index has two storage formats (`SELF_DIRECT_SPARSE_FORMAT=auto|legacy|compact`, default
+`auto`). `auto` and `compact` use `<index dir>/sparse-v2.sqlite`, a contentless index that returns the same ranked ids and
+bm25 scores as the legacy `sparse.sqlite` from a file about 70 % smaller. The legacy file is never read, written,
+truncated or deleted by the program: it stays until the owner deletes it, and the compact file fills lazily like any
+missing derived index (a search or a sync materializes the sessions it needs; the search never answers from the old file).
+Convert a whole index outside a request with `python -m self_directing_mcp.maintenance sparse-rebuild` (bounded, resumable,
+progress on stderr). A SQLite older than 3.43 is an explicit error for `compact` and a visible fallback for `auto`
+(`audit_status`: `sparse_format`, `sparse_files`, `degraded_flags`); never substitute a format silently. Keep the two
+formats' search results identical (`tests/test_sparse_compact.py`) when changing either.
+
 `SELF_DIRECT_DENSE_BACKEND=pgvector` (optional extra `tsukkomi-mcp[pgvector]`) keeps the dense index on a PostgreSQL
 server and is an opt-in data flow: chunk ids and embedding vectors, never session text, leave the machine, and vectors are
 not anonymous. The no-silent-fallback rule applies to it as to sqlite-vector: an unreachable server, a missing `vector`

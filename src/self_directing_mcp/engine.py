@@ -55,7 +55,7 @@ from self_directing_mcp.index.ingest import (
     AmbiguousSessionSource, AuditEventSnapshot, FlightBusy, IntegrityPolicy, SessionStore, SlicePolicy,
     capture_for_cursor, coverage_from_capture, ingest_session,
 )
-from self_directing_mcp.index.sparse import SparseIndex
+from self_directing_mcp.index.sparse import SparseIndex, count_sparse_file, open_sparse_index, sparse_file
 from self_directing_mcp.index.vector import DenseBackendError, build_vector_index
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.retrieve.checks import regex_search
@@ -143,6 +143,7 @@ VERIFY_MODES = ("full", "fast")
 # A deadline-bound audit or action check gives its evidence refresh this share of the time it has left and keeps the rest
 # for judging; see ``_refresh_evidence``.
 SYNC_BUDGET_SHARE = 0.6
+SPARSE_REPAIR_BATCH = 500     # documents per transaction when a search or the rebuild command materializes the sparse index
 
 
 def _request_over(control) -> bool:
@@ -227,6 +228,7 @@ class SelfDirectEngine:
         self.defer_derived = defer_derived
         self.store: SessionStore | None = None
         self.sparse: SparseIndex | None = None
+        self.sparse_resolution: dict[str, Any] = {}     # how SELF_DIRECT_SPARSE_FORMAT was resolved (open_sparse_index)
         self.dense = None
         self.dense_backend = "disabled"
         self.embedder = None
@@ -416,7 +418,7 @@ class SelfDirectEngine:
             self.dense, self.dense_backend = build_vector_index(
                 index_dir / ("vectors-v2-" + policy), dim=s.embedding_dim,
                 backend=s.dense_backend, extension_path=s.sqlite_vector_path, **remote)
-        self.sparse = SparseIndex(index_dir / "sparse.sqlite")
+        self.sparse, self.sparse_resolution = open_sparse_index(index_dir, getattr(s, "sparse_format", "auto"))
         self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes,
                                   defer_derived=self.defer_derived, journal=self._journal_policy())
         self.contracts = ContractStore(s.resolve_contracts_path())
@@ -693,20 +695,82 @@ class SelfDirectEngine:
                 "message": str(exc), "provider": provider}
 
     def _repair_sparse_for_search(self, session_id, provider):
-        """Materialize deferred canonical evidence before searching its derived view."""
+        """Materialize deferred canonical evidence before searching its derived view.
+
+        The missing documents are written in bounded batches, each committed on its own, so a repair that the request
+        deadline interrupts keeps what it wrote and the next call continues (a repeat of a one-transaction repair would
+        make no progress). The search never answers from a partial index: a repair that does not finish ends the
+        request (``request_deadline``)."""
         with self._publication_guard():
             allowed = self.store.chunk_ids(session_id, provider)
             # A session search probes only its own ids; a global search needs every id, so one scan is cheaper.
             missing = allowed - (self.sparse.present(allowed) if session_id else self.sparse.ids())
-            if not missing:
-                return
-            snapshot = self.store.capture_evidence(session_id, provider, history=False, anchors=missing)
-        documents = snapshot.list_chunks(session_id, provider)
+        if missing:
+            self._fill_sparse(session_id, provider, sorted(missing))
+
+    def _fill_sparse(self, session_id, provider, ids, *, batch=None, progress=None):
+        """Write the sparse documents of the canonical events ``ids``, ``batch`` at a time. Returns how many were written."""
+        written = 0
+        batch = batch or SPARSE_REPAIR_BATCH
+        for start in range(0, len(ids), batch):
+            check_request()
+            with self._publication_guard():
+                snapshot = self.store.capture_evidence(session_id, provider, history=False, anchors=ids[start:start + batch])
+            documents = snapshot.list_chunks(session_id, provider)
+            with self._publication_guard():
+                # An event that a concurrent reindex removed meanwhile is not indexed (its deletion is journalled).
+                groups: dict[tuple, list[str]] = {}
+                for chunk in documents:
+                    groups.setdefault((chunk.provider, chunk.session_id), []).append(chunk.chunk_id)
+                live: set[str] = set()
+                for (chunk_provider, chunk_session), chunk_ids in groups.items():
+                    live |= self.store.live_ids(chunk_session, chunk_provider, chunk_ids)
+                documents = [chunk for chunk in documents if chunk.chunk_id in live]
+                if documents:
+                    self.sparse.upsert_many(documents)
+            written += len(documents)
+            if progress is not None:
+                progress(start + len(ids[start:start + batch]), len(ids), written)
+        return written
+
+    @detached_operation
+    def rebuild_sparse(self, *, budget_sec: float | None = None, batch: int | None = None, progress=None) -> dict[str, Any]:
+        """Materialize every canonical event the active sparse index lacks, outside a request (``python -m
+        self_directing_mcp.maintenance sparse-rebuild``). Bounded (``budget_sec``), resumable and safe to interrupt: each
+        batch is its own transaction and only missing events are written, so running it again continues where it stopped
+        and a finished index is left unchanged. It converts a legacy index to the compact format without reading or
+        touching the legacy file; the canonical store is the only source."""
+        started = time.monotonic()
+        deadline = started + budget_sec if budget_sec is not None else None
+        batch = batch or SPARSE_REPAIR_BATCH
+        resolution = dict(self.sparse_resolution)
+        info: dict[str, Any] = {"ok": True, "format": self.sparse.format, "setting": resolution.get("setting"),
+                                "file": str(self.sparse.db_path), "state": "complete", "stopped_by": None}
+        if self.sparse.format != "compact":
+            info.update(ok=False, error="sparse_format_not_compact", state="unchanged",
+                        reason=resolution.get("reason") or "the active sparse format is legacy (SELF_DIRECT_SPARSE_FORMAT=legacy); there is nothing to convert")
+            return info
         with self._publication_guard():
-            current = self.store.chunk_ids(session_id, provider)
-            documents = [chunk for chunk in documents if chunk.chunk_id in current]
-            if documents:
-                self.sparse.upsert_many(documents)
+            canonical = self.store.chunk_ids(None, None)
+            missing = sorted(canonical - self.sparse.ids())
+        info.update(canonical=len(canonical), already_indexed=len(canonical) - len(missing), written=0, remaining=len(missing))
+        for start in range(0, len(missing), batch):
+            if deadline is not None and time.monotonic() >= deadline:
+                info.update(state="partial", stopped_by="time_budget")
+                break
+            piece = missing[start:start + batch]
+            try:
+                info["written"] += self._fill_sparse(None, None, piece, batch=len(piece))
+            except IndexBusy:
+                info.update(state="partial", stopped_by="index_busy")
+                break
+            info["remaining"] = len(missing) - (start + len(piece))
+            if progress is not None:
+                progress(info["already_indexed"] + start + len(piece), len(canonical), info["written"])
+        info["seconds"] = round(time.monotonic() - started, 2)
+        if info["state"] == "complete":
+            info["statistics"] = self.sparse.verify_statistics()
+        return info
 
     def _refresh_evidence(self, sid, provider, path=None, verify="full", *, sync_share=None, sizing=None):
         """Refresh only authority; return detached coverage and its exact inputs.
@@ -2489,6 +2553,28 @@ class SelfDirectEngine:
             info["needs_review"] = report["needs_review"]
         return info
 
+    def _sparse_status(self) -> dict[str, Any]:
+        """``audit_status`` fields of the sparse index: its format and how the setting was resolved, both files with their
+        sizes (so the owner sees what can be deleted once the compact index is complete) and the document count of each
+        (the one that is not in use is read through a read-only connection and is never modified)."""
+        index_dir = Path(self.settings.index_dir)
+        active = self.sparse.format
+        files, counts = [], {}
+        for fmt in ("legacy", "compact"):
+            path = sparse_file(index_dir, fmt)
+            size = None
+            for part in (path, Path(f"{path}-journal"), Path(f"{path}-wal")):
+                try:
+                    size = (size or 0) + part.stat().st_size            # a journal comes and goes while another process writes
+                except OSError:
+                    pass
+            exists = path.exists()
+            files.append({"name": path.name, "format": fmt, "active": fmt == active, "exists": exists,
+                          "bytes": size if exists else None})
+            counts[fmt] = self.sparse.count() if fmt == active else (count_sparse_file(path) if exists else None)
+        return {"sparse_format": active, "sparse_format_setting": self.sparse_resolution.get("setting"),
+                "sparse_format_reason": self.sparse_resolution.get("reason"), "sparse_files": files, "sparse_counts": counts}
+
     def _journal_status(self):
         """``(journal, journal_fallback)`` for ``audit_status``: the journal mode of each authority database, and the
         databases that use the rollback journal because their file system is denied or unknown (a fallback is the old
@@ -2534,10 +2620,13 @@ class SelfDirectEngine:
             "legacy_chunks_retained": self.store.legacy_count(),
             "index_schema": 2,
             "sparse_count": self.sparse.count(),
+            **self._sparse_status(),
         }
         status["journal"], status["journal_fallback"] = self._journal_status()
         worker = self._integrity_worker
         status["integrity_worker"] = worker.snapshot() if worker is not None else None
+        if self.sparse_resolution.get("reason"):
+            status["degraded_flags"].append("sparse_legacy_fallback")       # auto asked for compact and this SQLite cannot
         if self.embedder_degraded:
             status["degraded_flags"].append("embedder_fake_fallback")
         if self.dense_backend == "numpy":

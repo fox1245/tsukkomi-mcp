@@ -407,6 +407,7 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_SQLITE_JOURNAL` | `delete` | Journal mode of the authority databases `meta.sqlite` and `agy-receipts.sqlite`: `delete` (the rollback journal) or `auto` (write-ahead logging on a verified local file system, the rollback journal elsewhere). Always `synchronous=FULL`. Faster for resident processes only; see [SQLite journal mode](#sqlite-journal-mode-index-files-and-backups). |
 | `SELF_DIRECT_SYNC_SLICING` | `auto` | A sync that cannot finish inside its request budget publishes the records it parsed (a slice) and the next call continues from there. `auto`: requests with a finite deadline, plain session files; appends are published in slices, and a re-index is staged in a spool and published by one commit, never in pieces over an existing index; `off`: the all-or-nothing sync of before. See [Large sessions and deadlines](#large-sessions-and-deadlines). |
 | `SELF_DIRECT_SYNC_SLICE_BYTES` | `67108864` | The most a slice observes (hashes and parses) past the indexed offset, to the end of a record (a slice always holds at least one whole record). Plain session files only. |
+| `SELF_DIRECT_SPARSE_FORMAT` | `auto` | Storage format of the sparse (FTS5) search index. `auto`: the compact format (`sparse-v2.sqlite`, about 70 % smaller, the same results) when this SQLite can use it (3.43 or newer), else the legacy `sparse.sqlite`, visibly (`audit_status`: `sparse_format`, `degraded_flags`); `compact`: the compact format or an error naming the repair; `legacy`: the previous format. The file of the format that is not used is never touched. See [Sparse index formats](#sparse-index-formats). |
 | `SELF_DIRECT_PROJECT_CONTRACTS` | `candidates` | `candidates`: the project's `.tsukkomi/contracts.json` is found as a candidate; nothing is enforced until `adopt_contracts`. `off`: it is not looked for. See [Sharing contracts across devices](#sharing-contracts-across-devices). |
 | `SELF_DIRECT_CONTRACT_BUNDLE_PATHS` | empty | Personal contract bundle files, absolute paths separated by `:` (`;` on Windows); TOML `contract_bundle_paths`. Candidates only, and, with the project directory, the only places `export_contracts` writes. |
 
@@ -878,7 +879,9 @@ The index directory (`SELF_DIRECT_INDEX_DIR`) holds these SQLite files and one J
 |---|---|---|
 | `meta.sqlite` | **Authority.** Events, cursors, and for AGY the digest of the receipts each session was indexed with. Also derived audit state. | `SELF_DIRECT_SQLITE_JOURNAL` |
 | `agy-receipts.sqlite` | **Authority.** AGY host hook receipts and the receipts ledger. | `SELF_DIRECT_SQLITE_JOURNAL` |
-| `sparse.sqlite`, `graph.sqlite`, `dense.sqlite` / `vectors-v2-*`, `neograph_checkpoints.sqlite`, `workflow.sqlite` | Derived indexes, GraphRAG and checkpoints. | rollback journal, never changed |
+| `sparse-v2.sqlite` | Derived: the compact sparse (FTS5) search index, the default. Holds no text (see [Sparse index formats](#sparse-index-formats)). | rollback journal, never changed |
+| `sparse.sqlite` | Derived: the legacy sparse index of earlier versions. Not read or written by the compact format and never deleted by the program; delete it yourself once the compact index is complete. | rollback journal, never changed |
+| `graph.sqlite`, `dense.sqlite` / `vectors-v2-*`, `neograph_checkpoints.sqlite`, `workflow.sqlite` | Derived indexes, GraphRAG and checkpoints. | rollback journal, never changed |
 | `claude-hook-state.sqlite`, `agy-hook-state.sqlite` | Hook health and the continue budget. Not authority records; they use the standard library only so that hooks can still report when the runtime cannot import. | rollback journal, never changed |
 | `contracts.json`, `checklists/` | Own publication protocol (atomic replace). Not SQLite. | not applicable |
 
@@ -902,6 +905,53 @@ The index directory (`SELF_DIRECT_INDEX_DIR`) holds these SQLite files and one J
 **Receipt and event pairing (AGY).** The receipts live in their own database file, so an event commit and a receipt commit are two commits. They are tied by content, not by a request id: with every cursor the index stores the SHA-256 of the receipt rows the events were derived from (`session_receipt_versions.digest`) and the receipts those events depend on (`session_receipt_deps`), and every status, sync and judgement compares that digest with the digest of the receipts database as it stands. A receipt committed without the events commit that follows it, or an events commit whose receipt commit is missing, differ in that digest and report `receipts_not_indexed` (the coverage is incomplete, so a verdict that depends on it is `unknown`) until a sync brings the two together. Receipts are written before the events that cite them, each with `synchronous=FULL`, so the order survives a crash in either journal mode. A receipt for a step whose result is not indexed yet is still a plain append. Nothing about what a receipt may prove changed; `tests/test_journal_engine.py` pins both directions.
 
 ---
+
+### Sparse index formats
+
+The sparse search index (SQLite FTS5, BM25) is derived data: the canonical store (`meta.sqlite`) can always rebuild it. Until now it was the largest file of an index (a Codex index of 365,768 events: 4.6 GB of 7.0 GB), because its FTS5 table kept a copy of every masked text next to its inverted index and that text is never read back (a search returns ids and scores). There are now two formats, chosen by `SELF_DIRECT_SPARSE_FORMAT` (`auto`, `legacy`, `compact`; default `auto`):
+
+| | legacy, `sparse.sqlite` | compact, `sparse-v2.sqlite` |
+|---|---|---|
+| FTS5 table | stores a copy of every masked text | contentless (`content=''`, `contentless_delete=1`): the inverted index and the document sizes, **no text** |
+| tokenizer | `porter unicode61` | `porter unicode61`, so the same stemming |
+| ids, sessions, kinds | in the FTS5 table | `chunk_rows` (the FTS rowid is the `chunk_rows` rowid), `sparse_sessions`, `sparse_kinds`; format marker in `sparse_meta` |
+| needs | any SQLite with FTS5 | SQLite 3.43 or newer (`contentless_delete`); the Linux system Python 3.12 has 3.45, the Windows Python 3.13 has 3.50 |
+
+**Measured** (`scripts/bench_sparse.py`: a seeded synthetic coding-agent corpus of chat turns, shell commands, multi-KB logs, diffs, JSON, stack traces, paths, hashes, ids and some Korean text; the same events written through the real write path, 500 per transaction; SQLite 3.53.1; 20,000 events on SQLite 3.45.1 gave the same sizes and the same parity result):
+
+| corpus (100,000 events) | legacy | compact | smaller | build, legacy / compact |
+|---|---|---|---|---|
+| Codex-like, 5.6 KB of text per event | 918.8 MB (9,188 B per event) | **269.1 MB** (2,691 B per event) | **70.7 %** | 95 s / 89 s |
+| OMP-like, 1.6 KB of text per event | 321.3 MB (3,213 B per event) | **98.0 MB** (980 B per event) | **69.5 %** | 28 s / 27 s |
+
+(`mask_secrets` alone takes 58 s of the Codex-like and 14 s of the OMP-like build in either format.)
+
+Size and build time are linear in the number of events (20,000 to 100,000 checked), so apply the percentage to your own index: the 4.6 GB sparse file of the 365,768-event Codex index above would be expected near 1.4 GB, the 556 MB file of the 300,474-event OMP index near 170 MB (an estimate; your texts decide). Where the bytes were: in the legacy Codex-like file 592.8 MB was the stored text (and 27 MB of it page waste), 303.5 MB the inverted index; the compact file is the 246.7 MB inverted index plus 17 MB of id map. A bigger SQLite page size (8, 16 or 32 KiB) does not help (+0 to +4 %): the stored text, not overflow pages, was the cost.
+
+**The results are identical, not similar.** For the same chunks written in the same order, both formats return the same ranked ids with the same BM25 scores (to the last bit in the benchmark: 200 queries per run, over single and multi-token, hyphenated and `snake_case`, Korean, no-match, frequent and rare terms, `session_id`, `allowed_ids` and `top_k` 5/20/100, before and after deleting and re-inserting 1,000 events and after `optimize`: 0 divergent queries on both 100,000-event corpora with SQLite 3.53.1 and on both 20,000-event corpora with SQLite 3.45.1), ties included (equal scores rank in write order, as the legacy query returns them). Two details make that true and are tested (`tests/test_sparse_compact.py`, with mutation checks in `tests/test_sparse_compact_mutations.py`):
+
+- FTS5 does not take a deleted row out of its BM25 statistics (document count, total tokens) in a contentless table, so after a delete the scores drift from an index that never held the row (158 to 162 of 200 queries diverged in the benchmark). The compact format corrects the statistics record in the transaction of the delete, from the stored document sizes, and proves the mechanism on the running SQLite before it opens a file (`compact_support`).
+- Tokenization is unchanged. Two cheaper variants were measured and rejected because they change results: `detail=column` drops term positions, which turns every hyphenated or `snake_case` query (a quoted token that tokenizes into several terms is a phrase) into an error and makes every term frequency 1 (170 to 177 of 200 queries differ), and `tokenize='unicode61'` without the porter stemmer is no smaller (the dictionary dominates) and changes stemming (68 of 200 differ).
+
+**Speed.** A search with a session filter is 7 to 30 times faster than before, because it no longer reads the large stored rows; the others are as fast or a little faster. p50 / p95 in milliseconds at 100,000 Codex-like events: a global frequent term 13.2 / 25.2 legacy, 12.7 / 24.6 compact; `session_id` 181.8 / 232.7 and 5.3 / 8.0; with `allowed_ids` (what `search_history` always passes) 197.9 / 397.6 and 14.6 / 34.8. Deleting 1,000 events and inserting them again takes 0.5 s + 1.5 s legacy and 0.8 s + 1.3 s compact; `PRAGMA integrity_check` takes 2.8 s instead of 6.2 s. `VACUUM` and the FTS5 `optimize` command do not pay: together they shrank the compact file by 4 % in about 8 seconds, with the file locked.
+
+**What the file holds.** No text, masked or raw: the masked text is tokenized and only the lower-case, stemmed terms and their positions are kept. That is strictly less than the legacy file held (see the [masking contract](SECURITY.md#masking-contract)).
+
+**Choosing a format.** `auto` (default) uses the compact format when this process's SQLite supports it and otherwise the legacy file, and says so: `audit_status` shows `sparse_format: "legacy"`, `sparse_format_reason` (the SQLite version and the repair) and the degraded flag `sparse_legacy_fallback`. `compact` never falls back: an unsupported SQLite is an error that names the repair (a Python build with SQLite 3.43 or newer, or `SELF_DIRECT_SPARSE_FORMAT=legacy`), and no file is created. `legacy` is exactly the previous behaviour, in the same `sparse.sqlite`. Every process that shares an index should use the same format; a process on an older version keeps using `sparse.sqlite`.
+
+**Converting an index.** Nothing is converted in place. The compact index is a new file that fills the way a missing derived index always has:
+
+- A `sync_session` writes the sessions it syncs, and a `sparse` or `hybrid` `search_history` writes what its scope lacks before it searches (in batches of 500 documents, each its own transaction, so a search that runs out of time keeps what it wrote and the next call continues; it never answers from a partial index and never from the old file). The first search over a large index would have to build all of it, so convert it once, outside a request:
+
+  ```bash
+  python -m self_directing_mcp.maintenance sparse-rebuild [--budget-sec 600] [--index-dir DIR]
+  ```
+
+  The command writes the missing documents from the canonical store (the old file is neither read nor written), shows progress on stderr, stops at the time budget, is safe to interrupt (every batch is committed on its own) and continues where it stopped when run again; on a complete index it changes nothing. Exit status 0 complete, 3 partial (run it again), 2 nothing to do or failed, 130 interrupted. It writes about 1,100 Codex-like events a second (10,000 events of 5.6 KB: 9 s in two runs, the first stopped by `--budget-sec 5`), so a 365,768-event index takes about 6 minutes, most of it `mask_secrets`.
+- `audit_status` shows both files and both counts: `sparse_format`, `sparse_files` (name, format, `active`, `exists`, `bytes`) and `sparse_counts` (`legacy` and `compact`, the file that is not in use is read through a read-only connection and never modified), next to the existing `sparse_count` (the active file) and `total_chunks`. The conversion is complete when `sparse_counts.compact` equals `total_chunks`.
+- **What to delete, and when.** The program never deletes, truncates or rewrites `sparse.sqlite`; it keeps taking its space until you remove it. When the compact index is complete and no process uses the legacy format any more (restart every process that shares the index first), stop them, delete `<index dir>/sparse.sqlite` (and a leftover `sparse.sqlite-journal`) and start them again. `audit_status.sparse_files` lists the sizes. To go back, set `SELF_DIRECT_SPARSE_FORMAT=legacy`: the legacy file is used as it was (it lacks the sessions synced while the compact format was active, which the next sync or search adds).
+
+Limits: a very large first search or sync over an unconverted index is bounded by the request deadline (run the rebuild command instead); deletes leave free pages inside the file (from 1 % of its pages after the build to 2 % after 1,000 deleted documents and 11 % after deleting the largest session, 13,471 of 100,000 Codex-like events), which later writes reuse and `VACUUM` returns, and the file never shrinks by itself; the compact format deletes the highest rowid first because FTS5 grew the file by 17 % when the same 1,000 deletes arrived in ascending rowid order; the compact format cannot be opened by a SQLite older than 3.43.
 
 ## Resident daemon (experimental, off by default)
 
@@ -1167,6 +1217,15 @@ A parser upgrade (the AGY parser moved to version 8 and the Claude Code parser t
 
 ---
 
+## Upgrading to the next release (unreleased)
+
+1. **Restart every process that uses the index.** A process on the older code keeps writing `sparse.sqlite`.
+2. **The sparse index has a new default format.** `SELF_DIRECT_SPARSE_FORMAT=auto` uses `sparse-v2.sqlite` (about 70 % smaller, identical results) when the running SQLite is 3.43 or newer. The old `sparse.sqlite` is never read, written or deleted by the program; delete it yourself when the new file is complete. See [Sparse index formats](#sparse-index-formats).
+3. **Convert once, outside a request:** `python -m self_directing_mcp.maintenance sparse-rebuild` (bounded, resumable, progress on stderr). Without it the new file fills session by session as syncs and searches touch them, and the first global `sparse` or `hybrid` search over a big index may end at the request deadline (each attempt keeps what it wrote).
+4. **Check with `audit_status`:** `sparse_format`, `sparse_files` and `sparse_counts`; `degraded_flags` has `sparse_legacy_fallback` only when `auto` could not use the compact format (SQLite older than 3.43). `SELF_DIRECT_SPARSE_FORMAT=legacy` keeps the previous behaviour.
+
+---
+
 ## Upgrading to 0.7.0
 
 1. **Restart every process that uses the index** (Codex, OMP, AGY, Claude Code, any manual `python -m self_directing_mcp`). A running process keeps the old code in memory.
@@ -1325,6 +1384,7 @@ python scripts/measure_shadow_detection.py --scenario missed --every adaptive --
 python scripts/bench_commit.py --samples 300 --kill 50 --tmpdir /path/on/ext4  # commit latency and crash survival by journal mode
 python scripts/bench_pgvector.py --sizes 1000,10000,100000 --sqlite-vector /abs/vector.so --out /abs/pgvector.json  # pgvector against sqlite-vector and NumPy, see "pgvector numbers"
 pip install -e ".[dev,pgvector]" && TSUKKOMI_REQUIRE_PGVECTOR=1 python -m pytest -q tests/test_pgvector_integration.py tests/test_pgvector_engine.py tests/test_dense_backend_parity.py  # needs Docker and the pgvector/pgvector:pg17 image
+python scripts/bench_sparse.py --profile codex --events 100000 --candidate a,p --out sparse.json  # sparse index formats: size, parity, latency (synthetic)
 TSUKKOMI_TEST_DEFER_DERIVED=1 python -m pytest -q                                 # the whole suite with every engine holding its derived writes
 ```
 
