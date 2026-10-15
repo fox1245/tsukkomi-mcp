@@ -718,8 +718,8 @@ class PgVectorIndex(VectorIndex):
     @staticmethod
     def _filter_parameters(allowed: list[str]) -> tuple[str, list[str]]:
         """A filter as ``(blob, odd)``: the ids joined by ``ID_SEPARATOR`` into ONE text parameter, which the server splits with
-        ``string_to_array``, and the few ids that contain the separator, as an array. A 50 000-id filter costs about 12 ms to
-        send this way and about 42 ms as a ``text[]`` parameter (psycopg dumps an array element by element)."""
+        ``string_to_array``, and the few ids that contain the separator, as an array. With 8-character ids a 50 000-id
+        filter took 12 ms to send this way and 42 ms as a ``text[]`` parameter (psycopg dumps an array element by element)."""
         blob = ID_SEPARATOR.join(allowed)
         if blob.count(ID_SEPARATOR) == len(allowed) - 1:
             return blob, []

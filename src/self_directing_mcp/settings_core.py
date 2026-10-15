@@ -171,7 +171,7 @@ def read_pgvector_dsn_file(path: Path) -> str:
     Nothing from the file is ever put into an error message."""
     source = Path(path).expanduser()
     try:
-        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))     # a FIFO must not block the open
+        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))   # a FIFO must not block
     except OSError:
         raise ValueError("The pgvector connection-string file cannot be opened; check SELF_DIRECT_PGVECTOR_DSN_FILE") from None
     try:
