@@ -1477,8 +1477,9 @@ REINDEX_STATES = ("staging", "ready_to_commit", "committed", "discarded", "disab
 class SlicePolicy:
     """Whether a sync may publish a prefix instead of all or nothing, and how a slice is bounded.
 
-    ``mode``: ``"auto"`` (a request with a finite deadline, a plain file, nothing replaced) or ``"off"`` (exactly the
-    all-or-nothing sync of before). ``cap_bytes``: the most a slice observes past the indexed offset
+    ``mode``: ``"auto"`` (a request with a finite deadline and a plain file: appends are published in slices, a re-index
+    is staged in a spool and published by one commit) or ``"off"`` (exactly the all-or-nothing sync of before).
+    ``cap_bytes``: the most a slice observes past the indexed offset
     (``SELF_DIRECT_SYNC_SLICE_BYTES``). The rest bounds the parse (``slice_budget.SliceBudget``); the defaults are the
     production ones, and tests set ``max_records``/``max_bytes`` to force deterministic stops and ``clock`` to move time.
     """
