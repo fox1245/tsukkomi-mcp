@@ -144,6 +144,9 @@ VERIFY_MODES = ("full", "fast")
 # for judging; see ``_refresh_evidence``.
 SYNC_BUDGET_SHARE = 0.6
 SPARSE_REPAIR_BATCH = 500     # documents per transaction when a search or the rebuild command materializes the sparse index
+SPARSE_PRUNE_BATCH = 500      # documents per transaction when a search or the rebuild command deletes sparse documents the store lacks
+SPARSE_PRUNE_SEARCH_SEC = 2.0     # a search spends at most this long on that deletion (it is housekeeping, never part of the answer) ...
+SPARSE_PRUNE_SEARCH_SHARE = 0.25  # ... and at most this share of the time its request has left
 
 
 def _request_over(control) -> bool:
@@ -700,13 +703,67 @@ class SelfDirectEngine:
         The missing documents are written in bounded batches, each committed on its own, so a repair that the request
         deadline interrupts keeps what it wrote and the next call continues (a repeat of a one-transaction repair would
         make no progress). The search never answers from a partial index: a repair that does not finish ends the
-        request (``request_deadline``)."""
+        request (``request_deadline``).
+
+        A search of all sessions also deletes the documents of the compact index that the canonical store no longer holds
+        (``_prune_sparse_for_search``): they never reach a result, but they cost disk and scanning, and they take part
+        in the bm25 statistics. A search of one session leaves them alone: the compact index has no index on a document's
+        session, so listing one session's ids would scan the whole id map on every such search."""
         with self._publication_guard():
             allowed = self.store.chunk_ids(session_id, provider)
             # A session search probes only its own ids; a global search needs every id, so one scan is cheaper.
-            missing = allowed - (self.sparse.present(allowed) if session_id else self.sparse.ids())
+            if session_id:
+                missing, extra = allowed - self.sparse.present(allowed), ()
+            else:
+                indexed = self.sparse.ids()
+                missing = allowed - indexed
+                extra = self._sparse_extra_ids(indexed, len(missing))
         if missing:
             self._fill_sparse(session_id, provider, sorted(missing))
+        if extra:
+            self._prune_sparse_for_search(extra)
+
+    def _sparse_extra_ids(self, indexed, pending):
+        """The ids of ``indexed`` (every id of the compact index) that the store lacks; call it under the publication
+        guard. ``provider`` and ``session_id`` of a search never narrow it: a document of another provider is no orphan.
+        A consistent index holds exactly the store's events, so unless it will hold more than the store's event count once
+        its ``pending`` missing documents are written, there is nothing to look for and the common case costs one cached
+        count (an index that lacks documents of other providers can hide a few orphans from this gate; the rebuild
+        command, which needs no gate, finds them)."""
+        if self.sparse.format != "compact" or len(indexed) + pending <= self.store.chunk_count():
+            return []
+        return sorted(indexed - self.store.chunk_ids(None, None))
+
+    def _prune_sparse_batch(self, ids):
+        """Delete the sparse documents ``ids`` that the store still does not hold, in one transaction, under the publication
+        guard. ``ids`` come from an earlier snapshot, and a sync publishes its events under the same guard, so the store is
+        asked again here: an event that arrived (or came back) since the snapshot is held by the store now and is kept.
+        Returns ``(removed, kept)``."""
+        with self._publication_guard():
+            held = self.store.existing_ids(ids)
+            gone = [cid for cid in ids if cid not in held]
+            removed = self.sparse.delete_ids(gone) if gone else 0
+        return removed, len(ids) - len(gone)
+
+    def _prune_sparse_for_search(self, ids):
+        """Housekeeping inside a search: delete ``ids`` in batches while the search's own stop has not fired and the
+        housekeeping budget lasts (``SPARSE_PRUNE_SEARCH_SEC``, ``SPARSE_PRUNE_SEARCH_SHARE`` of the request's time left).
+        The answer does not depend on it, so a spent budget or a busy index ends the deletion, not the search; every batch
+        that finished is kept and the next global search (or the rebuild command) continues. A cancellation or the
+        request's own deadline still ends the request, as in ``_fill_sparse``."""
+        started = time.monotonic()
+        limit = started + SPARSE_PRUNE_SEARCH_SEC
+        control = current_request()
+        if control is not None and control.deadline is not None:
+            limit = min(limit, started + SPARSE_PRUNE_SEARCH_SHARE * max(0.0, control.deadline - started))
+        for start in range(0, len(ids), SPARSE_PRUNE_BATCH):
+            check_request()
+            if time.monotonic() >= limit:
+                break
+            try:
+                self._prune_sparse_batch(ids[start:start + SPARSE_PRUNE_BATCH])
+            except IndexBusy:
+                break
 
     def _fill_sparse(self, session_id, provider, ids, *, batch=None, progress=None):
         """Write the sparse documents of the canonical events ``ids``, ``batch`` at a time. Returns how many were written."""
@@ -734,14 +791,27 @@ class SelfDirectEngine:
         return written
 
     @detached_operation
-    def rebuild_sparse(self, *, budget_sec: float | None = None, batch: int | None = None, progress=None) -> dict[str, Any]:
-        """Materialize every canonical event the active sparse index lacks, outside a request (``python -m
-        self_directing_mcp.maintenance sparse-rebuild``). Bounded (``budget_sec``), resumable and safe to interrupt: each
-        batch is its own transaction and only missing events are written, so running it again continues where it stopped
+    def rebuild_sparse(self, *, budget_sec: float | None = None, batch: int | None = None, progress=None,
+                       orphan_progress=None) -> dict[str, Any]:
+        """Make the active (compact) sparse index hold exactly the canonical events, outside a request (``python -m
+        self_directing_mcp.maintenance sparse-rebuild``): first write the events it lacks, then delete the documents the
+        store no longer holds (orphans). Bounded (``budget_sec``), resumable and safe to interrupt: each batch is its own
+        transaction and only what is still missing or still extra is touched, so running it again continues where it stopped
         and a finished index is left unchanged. It converts a legacy index to the compact format without reading or
-        touching the legacy file; the canonical store is the only source."""
+        touching the legacy file; the canonical store is the only source.
+
+        Both sets come from one snapshot, taken under the publication guard: the event ids of the store and the ids of the
+        index. The events are written first because a missing document makes a search incomplete while an orphan only
+        costs space, so a budget that runs out leaves the more useful index. The orphans are deleted afterwards, in batches,
+        and each batch asks the store again under the guard before it deletes (``_prune_sparse_batch``): an event that a
+        sync published since the snapshot is kept, and ``orphans_spared`` counts those.
+
+        ``progress(done, total, written)`` reports the writes, ``orphan_progress(examined, orphans, removed)`` the
+        deletions. The result reports ``orphans`` (found), ``orphans_removed``, ``orphans_spared`` and ``orphans_remaining``
+        (not yet examined: nonzero when the run stopped early)."""
         started = time.monotonic()
         deadline = started + budget_sec if budget_sec is not None else None
+        prune_batch = batch or SPARSE_PRUNE_BATCH
         batch = batch or SPARSE_REPAIR_BATCH
         resolution = dict(self.sparse_resolution)
         info: dict[str, Any] = {"ok": True, "format": self.sparse.format, "setting": resolution.get("setting"),
@@ -752,8 +822,11 @@ class SelfDirectEngine:
             return info
         with self._publication_guard():
             canonical = self.store.chunk_ids(None, None)
-            missing = sorted(canonical - self.sparse.ids())
-        info.update(canonical=len(canonical), already_indexed=len(canonical) - len(missing), written=0, remaining=len(missing))
+            indexed = self.sparse.ids()
+        missing = sorted(canonical - indexed)
+        extra = sorted(indexed - canonical)
+        info.update(canonical=len(canonical), already_indexed=len(canonical) - len(missing), written=0, remaining=len(missing),
+                    orphans=len(extra), orphans_removed=0, orphans_spared=0, orphans_remaining=len(extra))
         for start in range(0, len(missing), batch):
             if deadline is not None and time.monotonic() >= deadline:
                 info.update(state="partial", stopped_by="time_budget")
@@ -767,6 +840,22 @@ class SelfDirectEngine:
             info["remaining"] = len(missing) - (start + len(piece))
             if progress is not None:
                 progress(info["already_indexed"] + start + len(piece), len(canonical), info["written"])
+        if info["state"] == "complete":
+            for start in range(0, len(extra), prune_batch):
+                if deadline is not None and time.monotonic() >= deadline:
+                    info.update(state="partial", stopped_by="time_budget")
+                    break
+                piece = extra[start:start + prune_batch]
+                try:
+                    removed, kept = self._prune_sparse_batch(piece)
+                except IndexBusy:
+                    info.update(state="partial", stopped_by="index_busy")
+                    break
+                info["orphans_removed"] += removed
+                info["orphans_spared"] += kept
+                info["orphans_remaining"] = len(extra) - (start + len(piece))
+                if orphan_progress is not None:
+                    orphan_progress(start + len(piece), len(extra), info["orphans_removed"])
         info["seconds"] = round(time.monotonic() - started, 2)
         if info["state"] == "complete":
             info["statistics"] = self.sparse.verify_statistics()
@@ -2622,6 +2711,10 @@ class SelfDirectEngine:
             "sparse_count": self.sparse.count(),
             **self._sparse_status(),
         }
+        compact = status["sparse_counts"].get("compact")
+        # Documents of the compact file the store does not hold (orphans), from counts this status already has: no scan.
+        # A lower bound while the file lacks documents (they offset the orphans); None when there is no compact file.
+        status["sparse_extra_ids"] = max(0, compact - status["total_chunks"]) if compact is not None else None
         status["journal"], status["journal_fallback"] = self._journal_status()
         worker = self._integrity_worker
         status["integrity_worker"] = worker.snapshot() if worker is not None else None

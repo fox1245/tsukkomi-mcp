@@ -2,12 +2,14 @@
 
     python -m self_directing_mcp.maintenance sparse-rebuild [--budget-sec N] [--batch N] [--index-dir DIR]
 
-``sparse-rebuild`` materializes the sparse (FTS5) search index that is missing: it converts a whole index to the compact
-format (``SELF_DIRECT_SPARSE_FORMAT``, README "Sparse index formats") without waiting for searches and syncs to do it
-session by session, and it repairs a compact index that lost documents. The canonical store (``meta.sqlite``) is the only
-source. The legacy ``sparse.sqlite`` is neither read nor written. The command is bounded (``--budget-sec``), resumable and
-safe to interrupt: every batch is its own transaction and only missing documents are written, so running it again
-continues where it stopped, and on a finished index it changes nothing. Progress goes to stderr; stdout gets one JSON line.
+``sparse-rebuild`` makes the sparse (FTS5) search index hold exactly the canonical events: it converts a whole index to the
+compact format (``SELF_DIRECT_SPARSE_FORMAT``, README "Sparse index formats") without waiting for searches and syncs to do
+it session by session, it repairs a compact index that lost documents, and it deletes the documents of a compact index that
+the canonical store no longer holds (orphans). The canonical store (``meta.sqlite``) is the only source. The legacy
+``sparse.sqlite`` is neither read nor written. The command is bounded (``--budget-sec``), resumable and safe to interrupt:
+every batch is its own transaction and only missing documents are written and only extra ones deleted (never one that the
+store holds), so running it again continues where it stopped, and on a finished index it changes nothing. Progress goes to
+stderr; stdout gets one JSON line (``written``, ``orphans_removed``, ``orphans_remaining``, ...).
 
 Exit status: 0 complete, 3 partial (time budget or busy index: run it again), 2 nothing to do or failed, 130 interrupted.
 """
@@ -21,18 +23,18 @@ import time
 EXIT_COMPLETE, EXIT_FAILED, EXIT_PARTIAL, EXIT_INTERRUPTED = 0, 2, 3, 130
 
 
-def _progress_printer(stream, every: float = 1.0):
+def _progress_printer(stream, every: float = 1.0, *, what: str = "events", did: str = "written"):
     started = time.monotonic()
     last = [0.0]
 
-    def show(done: int, total: int, written: int, *, final: bool = False) -> None:
+    def show(done: int, total: int, count: int, *, final: bool = False) -> None:
         now = time.monotonic()
         if not final and now - last[0] < every:
             return
         last[0] = now
-        rate = written / max(now - started, 1e-9)
+        rate = count / max(now - started, 1e-9)
         percent = 100.0 * done / total if total else 100.0
-        print(f"sparse-rebuild: {done}/{total} events ({percent:.1f} %), {written} written this run, {rate:.0f} events/s",
+        print(f"sparse-rebuild: {done}/{total} {what} ({percent:.1f} %), {count} {did} this run, {rate:.0f} {what}/s",
               file=stream, flush=True)
 
     return show
@@ -62,9 +64,10 @@ def sparse_rebuild(args, stderr=None, stdout=None) -> int:
         return EXIT_FAILED
     engine = SelfDirectEngine(settings)
     show = _progress_printer(stderr)
+    show_orphans = _progress_printer(stderr, what="extra documents", did="removed")
     try:
         try:
-            info = engine.rebuild_sparse(budget_sec=args.budget_sec, batch=args.batch, progress=show)
+            info = engine.rebuild_sparse(budget_sec=args.budget_sec, batch=args.batch, progress=show, orphan_progress=show_orphans)
         except SparseFormatError as exc:
             print(f"sparse-rebuild: {exc}", file=stderr)
             return EXIT_FAILED
@@ -78,13 +81,15 @@ def sparse_rebuild(args, stderr=None, stdout=None) -> int:
         engine.close()
     if info.get("canonical") is not None:
         show(info["canonical"] - info["remaining"], info["canonical"], info["written"], final=True)
+    if info.get("orphans"):
+        show_orphans(info["orphans"] - info["orphans_remaining"], info["orphans"], info["orphans_removed"], final=True)
     print(json.dumps(info, sort_keys=True), file=stdout)
     if not info["ok"]:
         print(f"sparse-rebuild: {info.get('reason') or info.get('error')}", file=stderr)
         return EXIT_FAILED
     if info["state"] != "complete":
-        print(f"sparse-rebuild: stopped by {info['stopped_by']} with {info['remaining']} events left; run the command again to continue",
-              file=stderr)
+        left = f"{info['remaining']} events" + (f" and {info['orphans_remaining']} extra documents" if info["orphans_remaining"] else "")
+        print(f"sparse-rebuild: stopped by {info['stopped_by']} with {left} left; run the command again to continue", file=stderr)
         return EXIT_PARTIAL
     if info.get("statistics") and not info["statistics"]["ok"]:
         print(f"sparse-rebuild: the FTS5 statistics do not match the documents: {info['statistics']}", file=stderr)
@@ -95,7 +100,8 @@ def sparse_rebuild(args, stderr=None, stdout=None) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m self_directing_mcp.maintenance", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    rebuild = commands.add_parser("sparse-rebuild", help="materialize the missing documents of the sparse search index")
+    rebuild = commands.add_parser("sparse-rebuild", help="make the sparse search index hold exactly the canonical events: write the missing "
+                                                       "documents and delete the extra ones")
     rebuild.add_argument("--budget-sec", type=float, default=None, help="stop after this many seconds (default: run to the end)")
     rebuild.add_argument("--batch", type=int, default=None, help="documents per transaction (default 500)")
     rebuild.add_argument("--index-dir", default=None, help="the index directory (default: SELF_DIRECT_INDEX_DIR or the user's default)")

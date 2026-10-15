@@ -750,6 +750,19 @@ class SessionStore:
                     + ",".join("?" * len(batch)) + ")", [provider, session_id, *batch]))
         return out
 
+    def existing_ids(self, ids):
+        """The subset of ``ids`` the store holds, whatever provider and session (the primary key answers each lookup, in
+        bounded batches). A derived index asks it before it deletes a document: a stored event is never an orphan."""
+        ids = list(ids)
+        out = set()
+        with self._read_boundary():
+            for start in range(0, len(ids), 500):
+                check_request()
+                batch = ids[start:start + 500]
+                out.update(row[0] for row in self._conn.execute(
+                    "SELECT chunk_id FROM session_events WHERE chunk_id IN (" + ",".join("?" * len(batch)) + ")", batch))
+        return out
+
     def has_prior_tool_call(self, session_id, provider, call_id, name, before_byte):
         row = self._conn.execute(
             """SELECT 1 FROM session_events WHERE provider=? AND session_id=? AND byte_start<?
