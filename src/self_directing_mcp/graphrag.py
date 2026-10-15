@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import unicodedata
 from pathlib import Path
 from typing import Any, Union
 
@@ -25,6 +26,44 @@ ALLOWED_RELATIONS = {
     "IMPLEMENTS", "DEPENDS_ON", "MODIFIES", "PRODUCES",
     "CHECKS_VERSION", "EVIDENCED_BY", "SUPERSEDES",
 }
+
+# A stored id, kind or label is model-authored text that later reaches a model's context line by line (the AGY
+# PreInvocation hook prints each relation). These characters would let such a value start a line of its own or hide
+# and reorder text: controls (newline, escape), format characters (zero-width, bidi), lone surrogates and the line and
+# paragraph separators. Ordinary Unicode text, Hangul for one, is not affected.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_BACKSLASH = chr(92)
+
+
+def unsafe_characters(text: str) -> list[str]:
+    """The distinct characters of ``text`` that may not appear in a stored node id, kind or label, as ``U+XXXX``."""
+    found: list[str] = []
+    for ch in text:
+        if unicodedata.category(ch) in _UNSAFE_CATEGORIES:
+            code = f"U+{ord(ch):04X}"
+            if code not in found:
+                found.append(code)
+    return found
+
+
+def escape_unsafe(value: Any, limit: int | None = None) -> str:
+    """``value`` as text on one line: each character ``unsafe_characters`` lists is shown as a backslash escape."""
+    shown = "".join(
+        (f"{_BACKSLASH}u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"{_BACKSLASH}U{ord(ch):08x}")
+        if unicodedata.category(ch) in _UNSAFE_CATEGORIES else ch for ch in str(value))
+    return shown if limit is None or len(shown) <= limit else shown[:max(0, limit - 3)] + "..."
+
+
+def unsafe_text_problem(where: str, value: Any) -> str | None:
+    """A problem text when the string ``value`` holds characters ``unsafe_characters`` lists, else None.
+
+    It names the characters by code point and never repeats the text itself.
+    """
+    found = unsafe_characters(value) if isinstance(value, str) else []
+    if not found:
+        return None
+    return (f"{where} contains control, format or line-separator characters ({', '.join(found[:4])}); "
+            "ids, kinds and labels must be single-line text")
 
 
 class GraphStore:
@@ -98,18 +137,25 @@ class GraphStore:
         row = self._conn.execute("SELECT * FROM graph_jobs WHERE job_id=?", (job_id,)).fetchone()
         return dict(row) if row else None
 
-    def record_job(self, job: dict[str, Any]) -> None:
+    def record_job(self, job: dict[str, Any]) -> bool:
+        """Write (or replace) the job row of this session. False, and nothing written, when the id is another
+        session's or provider's: a job id is global, its row belongs to whoever recorded it first."""
         check_request()
         values = (job["job_id"], job["provider"], job["session_id"], job["range_start"],
                   job["range_end"], job["input_digest"], job["base_graph_version"],
                   job["status"], job.get("detail"), job["created_at"], job["updated_at"])
         with self._conn:
+            owner = self._conn.execute("SELECT provider, session_id FROM graph_jobs WHERE job_id=?",
+                                       (job["job_id"],)).fetchone()
+            if owner is not None and (owner[0], owner[1]) != (job["provider"], job["session_id"]):
+                return False
             self._conn.execute(
                 "INSERT OR REPLACE INTO graph_jobs (job_id,provider,session_id,range_start,range_end,"
                 "input_digest,base_graph_version,status,detail,created_at,updated_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?)", values)
             with publication():
                 self._conn.commit()
+        return True
 
     def apply_proposal(self, proposal: dict[str, Any], *, session_id: str, provider: str,
                        base_version: int, through_order: int, job_start: int = 0,
@@ -117,7 +163,9 @@ class GraphStore:
         """Atomic apply: nodes/edges + cursor advance. Unknown outcome stays unclear.
 
         With a ``job_id`` the applied job is recorded in the same transaction; ``job_start``, ``job_digest`` and
-        ``job_detail`` complete that row (the defaults are what every earlier caller got).
+        ``job_detail`` complete that row (the defaults are what every earlier caller got). A job id is global but its
+        row is this session's: an id already recorded for another session or provider is ``job_id_in_use`` and
+        nothing is written, and only this session's applied job makes the call ``already_applied``.
         """
         check_request()
         edge_rows = []
@@ -135,7 +183,10 @@ class GraphStore:
                     # Post-crash replay guard: an already-recorded successful
                     # job is never applied twice at the storage layer either.
                     prior = self._conn.execute(
-                        "SELECT status FROM graph_jobs WHERE job_id=?", (job_id,)).fetchone()
+                        "SELECT status, provider, session_id FROM graph_jobs WHERE job_id=?", (job_id,)).fetchone()
+                    if prior and (prior[1], prior[2]) != (provider, session_id):
+                        return {"ok": False, "status": "job_id_in_use",
+                                "detail": "this job id is recorded for another session or provider; nothing was written"}
                     if prior and prior[0] == "applied":
                         return {"ok": True, "status": "already_applied",
                                 "graph_version": version - 1}
@@ -286,30 +337,45 @@ def validate_proposal(proposal: dict[str, Any], *, store, session_id: str, provi
 
     Edges need evidence chunk ids that exist in the indexed session and stay
     inside it. origin distinguishes observed facts from agent-inferred
-    relations. Rejections never partially update the graph.
+    relations. Node ids, kinds and labels and the ends of an edge must be
+    single-line text (``unsafe_characters``). Rejections never partially
+    update the graph, and a problem text never repeats caller text unescaped.
     """
     problems = []
+    shown = lambda value: escape_unsafe(value, 80)          # noqa: E731
     known_chunks = set(store.chunk_ids(session_id, provider))
     node_ids = {n.get("node_id") for n in proposal.get("nodes", [])}
-    for edge in proposal.get("edges", []):
+    for index, node in enumerate(proposal.get("nodes", [])):
+        check_request()
+        for key in ("node_id", "kind", "label"):
+            found = unsafe_text_problem(f"nodes[{index}].{key}", node.get(key))
+            if found:
+                problems.append(found)
+    for index, edge in enumerate(proposal.get("edges", [])):
         check_request()
         relation = edge.get("relation", "")
+        for key in ("src", "dst"):
+            found = unsafe_text_problem(f"edges[{index}].{key}", edge.get(key))
+            if found:
+                problems.append(found)
         if relation not in ALLOWED_RELATIONS:
-            problems.append(f"edge {edge.get('src')}->{edge.get('dst')}: unknown relation {relation!r}")
+            problems.append(f"edge {shown(edge.get('src'))}->{shown(edge.get('dst'))}: unknown relation {relation!r}")
         evidence = edge.get("evidence_chunk_ids") or []
         if not evidence:
-            problems.append(f"edge {edge.get('src')}->{edge.get('dst')} ({relation}): no evidence_chunk_ids")
+            problems.append(f"edge {shown(edge.get('src'))}->{shown(edge.get('dst'))} ({shown(relation)}): "
+                            "no evidence_chunk_ids")
         else:
             missing = [c for c in evidence if c not in known_chunks]
             if missing:
-                problems.append(f"edge ({relation}): evidence not in this session: {missing[:3]}")
+                problems.append(f"edge ({shown(relation)}): evidence not in this session: {missing[:3]}")
         if edge.get("origin") not in (None, "observed", "inferred"):
-            problems.append(f"edge ({relation}): origin must be observed|inferred")
+            problems.append(f"edge ({shown(relation)}): origin must be observed|inferred")
     if len(node_ids := {n.get("node_id") for n in proposal.get("nodes", [])}) != len(proposal.get("nodes", [])):
         problems.append("duplicate node_id in proposal")
     for edge in proposal.get("edges", []):
         check_request()
         if edge.get("src") not in node_ids or edge.get("dst") not in node_ids:
-            problems.append(f"edge {edge.get('src')}->{edge.get('dst')}: references node outside this proposal")
+            problems.append(f"edge {shown(edge.get('src'))}->{shown(edge.get('dst'))}: "
+                            "references node outside this proposal")
     return {"ok": not problems, "problems": problems}
 

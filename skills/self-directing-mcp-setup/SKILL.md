@@ -13,7 +13,7 @@ This skill provides step-by-step instructions to install, configure, verify, and
 - **Contract & Action Auditing**: `check_action`, `audit_session`, `upsert_contracts`, `list_contracts`, `revoke_contract`
 - **Checklists & Activity Tracking**: `update_checklist`, `get_checklist`, `analyze_activity`
 - **Session History & Retrieval**: `search_history`, `get_chunk`, `sync_session`, `audit_status`
-- **GraphRAG & Knowledge Topology**: `run_neograph_update`, `propose_graph_update`, `commit_graph_update`
+- **GraphRAG & Knowledge Topology**: `run_neograph_update`, `graph_next_batch`, `graph_submit_batch`, `propose_graph_update`, `commit_graph_update`
 
 ---
 

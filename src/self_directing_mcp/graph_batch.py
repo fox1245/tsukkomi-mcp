@@ -21,12 +21,17 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from self_directing_mcp.graphrag import ALLOWED_RELATIONS
+from self_directing_mcp.graphrag import ALLOWED_RELATIONS, unsafe_text_problem
 from self_directing_mcp.security.mask import mask_secrets
 
-BATCH_MAX_EVENTS = 100
+BATCH_MAX_EVENTS = 100              # the most a batch can hold (run_neograph_update always cuts at these two)
 BATCH_MAX_CHARS = 95_000
 BATCH_EVENT_OVERHEAD = 80           # what one event costs in the prompt besides its text and its chunk id
+# What graph_next_batch hands the calling agent unless it asks for more. A full 95,000-character batch is about 100 KB
+# of JSON, more than a host may let one tool result carry; a host that cuts a result short would show the agent part of
+# a batch while a submit covers all of it. The caller may raise max_chars up to BATCH_MAX_CHARS.
+HOST_BATCH_MAX_CHARS = 24_000
+HOST_BATCH_MAX_EVENTS = 100
 BATCH_ID_VERSION = "gb1"            # part of the id and of the digest: a different recipe is a different version
 
 MAX_NODES = 500
@@ -47,11 +52,40 @@ SUBMIT_HINT = (
     "Call graph_submit_batch with this batch_id and the proposal (JSON matching schema; evidence_chunk_ids must be "
     "chunk_ids of this batch). If the events state no relation, call it without a proposal and give "
     "no_graph_facts_reason: the specific reason, which is recorded. Never invent edges to pass.")
+TEXT_RULES = (
+    "node_id, kind, label, src and dst are single-line text: no newline, control, zero-width, bidi or "
+    "line-separator characters (the proposal is rejected, not edited). Every edge cites chunk_ids of this batch.")
+TRUNCATION_HINT = (
+    "If your host shortened this response (no end_of_batch at the end), call again with a smaller max_chars; "
+    "never submit a batch you did not read completely.")
 
 
 def batch_event_cost(frame: dict[str, Any]) -> int:
     """What an unmasked event counts against ``BATCH_MAX_CHARS``."""
     return len(frame["text"]) + len(frame["chunk_id"]) + BATCH_EVENT_OVERHEAD
+
+
+def batch_limits(max_chars: Any, max_events: Any) -> tuple[int | None, int | None, str | None]:
+    """``(max_chars, max_events, problem)`` for one ``graph_next_batch`` call: what was asked for, else the host
+    defaults, never more than a batch can hold. A value that is not a positive integer is the ``problem``."""
+    asked = {"max_chars": (max_chars, HOST_BATCH_MAX_CHARS, BATCH_MAX_CHARS),
+             "max_events": (max_events, HOST_BATCH_MAX_EVENTS, BATCH_MAX_EVENTS)}
+    limits = {}
+    for name, (value, default, ceiling) in asked.items():
+        if value is None:
+            value = default
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return None, None, f"{name} must be a positive integer"
+        limits[name] = min(value, ceiling)
+    return limits["max_chars"], limits["max_events"], None
+
+
+def adhoc_job_id(provider: str, session_id: str, through_order: int | None, proposal: Any) -> str:
+    """The job id of a ``commit_graph_update`` that names none. It is scoped to the provider, the session and
+    ``through_order`` and carries a digest of the proposal: an identical resubmit is the same job (idempotent), a
+    different proposal, another ``through_order`` or another session is not."""
+    document = json.dumps([provider, session_id, through_order, proposal], sort_keys=True, separators=(",", ":"))
+    return "adhoc-" + hashlib.sha256(document.encode("ascii")).hexdigest()[:24]
 
 
 def cursor_start(cursor: dict[str, int]) -> int:
@@ -126,7 +160,11 @@ def extraction_block() -> dict[str, Any]:
     of the proposal, the relations the graph accepts and how to hand the result back."""
     from self_directing_mcp.neograph_runner import EXTRACT_INSTRUCTIONS, PROPOSAL_SCHEMA
     return {"instructions": EXTRACT_INSTRUCTIONS, "schema": copy.deepcopy(PROPOSAL_SCHEMA),
-            "allowed_relations": sorted(ALLOWED_RELATIONS), "submit": SUBMIT_HINT}
+            "allowed_relations": sorted(ALLOWED_RELATIONS),
+            "limits": {"nodes": MAX_NODES, "edges": MAX_EDGES, "evidence_chunk_ids_per_edge": BATCH_MAX_EVENTS,
+                       "characters_per_string": MAX_TEXT, "characters_per_id": MAX_ID,
+                       "extraction_summary_characters": MAX_SUMMARY, "no_graph_facts_reason_characters": MAX_REASON},
+            "text_rules": TEXT_RULES, "submit": SUBMIT_HINT}
 
 
 # --- caller-supplied text --------------------------------------------------------------------------------------------
@@ -202,6 +240,7 @@ def _node_problems(index: int, node: Any) -> list[str]:
     for key, limit in (("node_id", MAX_ID), ("kind", MAX_TEXT), ("label", MAX_TEXT)):
         if key in node:
             found = _text_problem(f"{where}.{key}", node[key], limit, nonempty=key == "node_id")
+            found = found or unsafe_text_problem(f"{where}.{key}", node[key])
             if found:
                 problems.append(found)
     return problems
@@ -215,6 +254,7 @@ def _edge_problems(index: int, edge: Any) -> list[str]:
     for key in ("src", "dst"):
         if key in edge:
             found = _text_problem(f"{where}.{key}", edge[key], MAX_ID, nonempty=True)
+            found = found or unsafe_text_problem(f"{where}.{key}", edge[key])
             if found:
                 problems.append(found)
     if "relation" in edge:

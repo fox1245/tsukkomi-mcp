@@ -621,7 +621,12 @@ async def commit_graph_update(session_id: str, proposal: dict[str, Any],
     extracted. Pass through_order, the order of the last event the proposal covers
     (at least the first unprocessed event, at most the last event; otherwise
     status=invalid_through_order and nothing is stored), to advance only that far.
-    Idempotent by job_id: replaying an applied job returns already_applied.
+    Idempotent by job_id: replaying an applied job returns already_applied; a job_id
+    that another session or provider recorded is job_id_in_use. Without a job_id the job
+    is named by a digest of provider, session, through_order and proposal, so repeating
+    the identical call is already_applied and any other commit applies.
+    Node ids, kinds, labels and edge ends must be single-line text (no newline, control,
+    zero-width, bidi or line-separator characters); a proposal with any is rejected.
     Rejected proposals store nothing and never advance the cursor. A failed
     write reports status=unclear; the range is not advanced and recovery is
     re-run. Existing search/audit paths keep working when the graph lags.
@@ -651,6 +656,7 @@ async def run_neograph_update(session_id: str, provider: str | None = None,
 
 @mcp.tool()
 async def graph_next_batch(session_id: str, provider: str | None = None, after_order: int | None = None,
+                           max_chars: int | None = None, max_events: int | None = None,
                            timeout_ms: int | None = None) -> dict[str, Any]:
     """Next batch of session events for YOU to extract graph relations from (no model, key or network used here).
 
@@ -660,9 +666,14 @@ async def graph_next_batch(session_id: str, provider: str | None = None, after_o
 
     Returns status=batch (batch_id, range, events masked as run_neograph_update masks
     them, remaining_events after this batch, the graph cursor, and extraction: the
-    extractor instructions, the proposal JSON schema and the allowed relations) or
-    status=up_to_date when nothing is pending. Same size limits as run_neograph_update;
-    an event over the limit is reported as graph_event_too_large, never truncated.
+    extractor instructions, the proposal JSON schema, the allowed relations and the
+    limits) or status=up_to_date when nothing is pending. A batch ends at max_events
+    events (default and maximum 100) or max_chars of event size (default 24,000, maximum
+    95,000, the limits run_neograph_update uses): a full 95,000-character batch is about
+    100 KB of JSON, more than many hosts let one tool result carry. A complete result ends
+    with end_of_batch=true; if yours does not, your host shortened it: call again with a
+    smaller max_chars and never submit a batch you did not read completely. An event
+    larger than max_chars is graph_event_too_large with needed_max_chars (never truncated).
     after_order=k starts the batch at event k+1 (k at least cursor.processed_through_order
     when the graph has one): a lookahead for extracting several batches in parallel,
     which graph_submit_batch then commits in order. Works with SELF_DIRECT_LOCAL_ONLY=true
@@ -670,7 +681,7 @@ async def graph_next_batch(session_id: str, provider: str | None = None, after_o
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.graph_next_batch, session_id, provider=provider, after_order=after_order,
-                           budget_override=budget)
+                           max_chars=max_chars, max_events=max_events, budget_override=budget)
 
 
 @mcp.tool()
@@ -681,15 +692,17 @@ async def graph_submit_batch(session_id: str, batch_id: str, proposal: dict[str,
 
     proposal: {nodes: [{node_id, kind, label}], edges: [{src, dst, relation, origin,
     evidence_chunk_ids}], extraction_summary} as in the batch's schema. Every edge must
-    cite chunk_ids of THIS batch; relations only from the allowed list; at most 500 nodes,
-    1000 edges, 500 characters per string, 200 per id, 2000 for the summary. Nothing is
-    stored unless the batch is current (status=batch_changed otherwise) and is the next
+    cite chunk_ids of THIS batch (at most 100 per edge); relations only from the allowed
+    list; at most 500 nodes, 1000 edges, 500 characters per string, 200 per id, 2000 for
+    the summary; node_id, kind, label, src and dst are single-line text (a newline,
+    control, zero-width, bidi or line-separator character rejects the proposal). Nothing
+    is stored unless the batch is current (status=batch_changed otherwise) and is the next
     one: status=out_of_order (expected_start_order) means submit the earlier batches
-    first and retry; stale_batch means the cursor is already past it. A proposal without
-    edges is rejected (empty_graph_requires_review, cursor retained; never invent edges).
-    If the batch really states no relation, omit the proposal and give
-    no_graph_facts_reason (up to 500 characters): the cursor moves past the batch and the
-    reason is recorded (status=skipped_no_graph_facts). extractor is a free-text label
+    first and then this one again; stale_batch means the cursor is already past it. A
+    proposal without edges is rejected (empty_graph_requires_review, cursor retained;
+    never invent edges). If the batch really states no relation, omit the proposal and
+    give no_graph_facts_reason (up to 500 characters): the cursor moves past the batch and
+    the reason is recorded (status=skipped_no_graph_facts). extractor is a free-text label
     (80 characters, default host:unspecified) stored for provenance only; it is not trusted.
     Idempotent: repeating a submit returns already_applied. Result: graph_version,
     processed_through_order, remaining_events.
