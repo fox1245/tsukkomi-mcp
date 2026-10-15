@@ -17,6 +17,8 @@ from self_directing_mcp import journal as _journal
 from self_directing_mcp._runtime import np
 
 from self_directing_mcp.compressed_source import CompressedSourceError
+from self_directing_mcp.audit.shadow import ShadowState
+from self_directing_mcp.index import shadow_state as shadow_sql
 from self_directing_mcp.index.deferred import DerivedBuffer
 from self_directing_mcp.schemas import AuditEvent, Chunk
 from self_directing_mcp.security.mask import mask_secrets
@@ -434,7 +436,7 @@ class SessionStore:
                 evaluator_version INTEGER NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL,
                 PRIMARY KEY(provider,session_id,monitor_id,evaluator_version)
             );
-        """)
+        """ + shadow_sql.SCHEMA)
         check_request()
         self._conn.commit()
 
@@ -903,8 +905,82 @@ class SessionStore:
             self.derived.forget_monitors(provider, session_id, monitor_ids)
             check_request()
 
-    def save_audit_states(self, session_id, provider, needs_digest, rows, snapshot):
+    # -- the shadow-comparison schedule and the review ranges (audit/shadow.py, index/shadow_state.py) ----------------
+
+    def load_shadow_state(self, session_id, provider):
+        """The stored schedule, or ``None``. A deferring store may hold a newer one; the larger epoch wins, so a reset that
+        another process stored is not hidden by an older held state. A row that cannot be read (damaged, written for other
+        constants, an invalid field) comes back as a placeholder that keeps its epoch (``ShadowState.unreadable``): the policy
+        starts again at 1/4 with its warm-up, and the state that replaces it is not refused by the epoch guard."""
+        held = self.derived.shadow_for(provider, session_id)
+        found = shadow_sql.load(self._conn, provider, session_id)
+        if held is not None and (found is None or found[0] <= held[0]):
+            found = held
+        if found is None:
+            return None
+        try:
+            return ShadowState.load(found[0], found[1])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return ShadowState.unreadable(found[0])
+
+    def save_shadow_state(self, session_id, provider, state):
+        """Persist a schedule: held in a deferring store (written with the next authority commit), else committed. A writer
+        that read before a reset (an older epoch) is refused (``"stale"``); one of the same epoch keeps the flags of the
+        request kinds it did not handle (``ShadowState.touched``)."""
+        if self.defer_derived:
+            if self.derived.shadow_for(provider, session_id) is None:
+                # Nothing is held (a reset dropped it, or it was flushed): the stored row is the authority. While one is held,
+                # the holder applies the same guard to its own epoch, and the flush applies the table's.
+                found = shadow_sql.load(self._conn, provider, session_id)
+                if found is not None and found[0] > state.epoch:
+                    return "stale"
+            if not self.derived.hold_shadow(provider, session_id, state.epoch, state.dump(), state.touched):
+                return "stale"
+            if self.derived.full():
+                self.flush_derived()
+            return "deferred"
+        with self._conn, publication():
+            self._conn.execute("BEGIN IMMEDIATE")
+            written = shadow_sql.write(self._conn, provider, session_id, state.epoch, state.dump(),
+                                       touched=state.touched)
+            check_request()
+        return "saved" if written else "stale"
+
+    def record_incremental_mismatch(self, session_id, provider, evaluator_version, monitor_ids, detail, state=None,
+                                    review=None):
+        """Everything a mismatch changes, in ONE transaction (all of it or none): the health rows that keep the contracts on the
+        full evaluator until the evaluator version changes, their deleted monitor states, the schedule reset to 1/4 and the range
+        of requests that need review. It is not undone by a cancellation that arrives once it was admitted: a contract must
+        never stay disabled without the reset that goes with it."""
+        now = datetime.now(timezone.utc).isoformat()
+        self.derived.drop_shadow(provider, session_id)
+        with self._conn, publication():
+            self._conn.execute("BEGIN IMMEDIATE")
+            for monitor_id in monitor_ids:
+                self._conn.execute("INSERT OR REPLACE INTO audit_incremental_health VALUES (?,?,?,?,?,?,?)",
+                                   (provider, session_id, monitor_id, evaluator_version, "incremental_mismatch",
+                                    detail[:2000], now))
+                self._conn.execute("DELETE FROM audit_monitor_state WHERE provider=? AND session_id=? AND monitor_id=?",
+                                   (provider, session_id, monitor_id))
+            self.derived.forget_monitors(provider, session_id, monitor_ids)
+            if state is not None:
+                shadow_sql.write(self._conn, provider, session_id, state.epoch, state.dump(), now)
+            if review is not None:
+                shadow_sql.add_range(self._conn, provider, session_id, now=now, **review)
+
+    def shadow_report(self, session_id, provider, evaluator_version):
+        """What ``audit_status`` shows of the schedule of one session: the state, the contracts whose incremental path is
+        switched off (for this evaluator version) and the ranges that need review."""
+        state = self.load_shadow_state(session_id, provider)
+        rows = self._conn.execute(
+            "SELECT monitor_id,status,detail,at FROM audit_incremental_health WHERE provider=? AND session_id=?"
+            " AND evaluator_version=? AND monitor_id NOT LIKE '#%'", (provider, session_id, evaluator_version)).fetchall()
+        return {"state": state, "disabled": [{"contract_id": r[0], "status": r[1], "detail": r[2], "at": r[3]} for r in rows],
+                "needs_review": shadow_sql.ranges(self._conn, provider, session_id)}
+
+    def save_audit_states(self, session_id, provider, needs_digest, rows, snapshot, shadow=None):
         """Write monitor states and the evaluated cursor in one transaction; returns ``"saved"`` or why not.
+        ``shadow``: the session's ``ShadowState``, written in the same transaction (held when the store defers).
 
         ``snapshot`` is what the evaluation read: ``generation`` (``None`` when no valid commit chain existed),
         ``offset``, ``prefix_hash``, ``synced_at``, ``path`` and ``count``. The write is refused unless the index
@@ -913,6 +989,8 @@ class SessionStore:
         """
         now = datetime.now(timezone.utc).isoformat()
         if self.defer_derived and snapshot["generation"] is not None:
+            if shadow is not None:
+                self.save_shadow_state(session_id, provider, shadow)
             return self._hold_audit_states(session_id, provider, needs_digest, rows, snapshot, now)
         with self._conn, publication():
             self._conn.execute("BEGIN IMMEDIATE")
@@ -952,6 +1030,9 @@ class SessionStore:
                     snapshot["offset"], snapshot["prefix_hash"], snapshot["count"], snapshot["path"],
                     json.dumps(item["state"], separators=(",", ":")), now))
             self._trim_state_variants(provider, session_id)
+            if shadow is not None:
+                shadow_sql.write(self._conn, provider, session_id, shadow.epoch, shadow.dump(), now,
+                                 touched=shadow.touched)
             check_request()
             return "saved"
 
@@ -1016,11 +1097,14 @@ class SessionStore:
         write those that still fit; the rest are dropped (they are cache). Nothing here may fail the transaction it
         rides in, so the work runs in a savepoint that a SQLite error rolls back."""
         states, stamps = self.derived.drain()
-        if not states and not stamps:
+        shadows = self.derived.drain_shadows()
+        if not states and not stamps and not shadows:
             return 0
         written, touched = 0, set()
         self._conn.execute("SAVEPOINT derived_flush")
         try:
+            for provider, session_id, epoch, state, flags_touched in shadows:   # self-validating (premise, epoch): no lineage check
+                written += bool(shadow_sql.write(self._conn, provider, session_id, epoch, state, touched=flags_touched))
             lineage = {}
             for provider, session_id, needs_digest, monitor_id, row in states:
                 key = (provider, session_id, row["generation"], row["byte_offset"])

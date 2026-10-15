@@ -310,19 +310,24 @@ def test_a_shadow_mismatch_returns_the_full_result_and_disables_that_contract(co
         reopened.close()
 
 
-def test_an_audit_samples_the_shadow_comparison_and_says_so(codex):
+def test_an_audit_samples_the_shadow_comparison_and_says_so(codex, no_forced_comparisons):
     twin, path = codex
     rng = random.Random(10)
     numbered = []
     write(path, codex_records(rng, 20, numbered), "a")
-    twin.upsert(RULES[:2])
-    twin.fast.settings.audit_shadow_every = 1
-    first = twin.fast.audit_session(SID, provider="codex")
-    assert first["incremental"]["shadow"] is True and first["incremental"]["shadow_compared"] is True
+    twin.upsert([{"id": "never", "type": "must_not", "scope": "tool_call", "regex": "zzz-never", "roles": ["assistant"]}])
+    # (a contract that holds: a violation would be compared whatever the setting says)
     twin.fast.settings.audit_shadow_every = 0
+    first = twin.fast.audit_session(SID, provider="codex")        # a rebuild is compared whatever the setting says
+    assert first["incremental"]["shadow"] is True and first["incremental"]["shadow_compared"] is True
+    assert {"rebuild", "premise"} <= set(first["incremental"]["shadow_reasons"])
     write(path, codex_records(rng, 3, numbered), "a")
-    second = twin.fast.audit_session(SID, provider="codex")
+    second = twin.fast.audit_session(SID, provider="codex")       # 0: only the forced comparisons, and none is due
     assert second["incremental"]["shadow"] is False and "shadow_compared" not in second["incremental"]
+    twin.fast.settings.audit_shadow_every = 1
+    write(path, codex_records(rng, 3, numbered), "a")
+    third = twin.fast.audit_session(SID, provider="codex")        # 1: every audit
+    assert third["incremental"]["shadow_reasons"] == ["sampled"] and third["incremental"]["shadow_compared"] is True
 
 
 def test_incremental_audits_can_be_switched_off(codex):

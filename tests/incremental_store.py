@@ -110,4 +110,6 @@ class Harness:
         if plan is not None and save:
             rows = plan.state_rows()
             report["state"] = store.save_audit_states(SID, provider, plan.digest, rows, plan.snapshot) if rows else "unchanged"
+            if plan.schedule is not None:     # the engine keeps the comparison schedule next to the states
+                store.save_shadow_state(SID, provider, plan.schedule)
         return result, report, plan

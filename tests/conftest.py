@@ -61,6 +61,16 @@ def defer_derived_everywhere(monkeypatch):
     monkeypatch.setattr(engine_module.SelfDirectEngine, "__init__", deferring)
 
 
+@pytest.fixture
+def no_forced_comparisons(monkeypatch):
+    """Tests that measure the delta path alone (rows read, bytes hashed, memory) with ``audit_shadow_every=0`` also have to
+    switch off the warm-up comparisons that follow a rebuild or a change of premise (``audit.shadow.WARMUP_REQUESTS``);
+    without that, the first requests of every session also run the full evaluator. Violations, flips and high-risk contracts
+    are still compared; those tests have none."""
+    from self_directing_mcp.audit import shadow
+    monkeypatch.setattr(shadow, "WARMUP_REQUESTS", 0)
+
+
 class HashMeter:
     """Counts the bytes fed to every ``hashlib.sha256`` object created while installed (copies included).
 
@@ -121,8 +131,8 @@ def strict_incremental(monkeypatch, request):
     from self_directing_mcp.audit import incremental
     real = incremental.compare
 
-    def strict(result, reference):
-        bad = real(result, reference)
+    def strict(result, reference, *args, **kwargs):
+        bad = real(result, reference, *args, **kwargs)
         if bad and request.node.get_closest_marker("allow_incremental_mismatch") is None:
             raise AssertionError(f"incremental audit differs from the full evaluator for {bad}: "
                                  f"{[f.model_dump() for f in result.findings]} != "

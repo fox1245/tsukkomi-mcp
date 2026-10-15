@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Annotated, Callable, Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from self_directing_mcp import settings_core
@@ -127,13 +127,23 @@ class Settings(SettingsAccessors, BaseSettings):
         description="Evaluate contracts incrementally from stored per-contract monitor state (see README, 'Incremental "
                     "audits'). false evaluates every audit over the whole session. SELF_DIRECT_AUDIT_INCREMENTAL.",
     )
-    audit_shadow_every: int = Field(
+    audit_shadow_every: Annotated[int, Field(ge=0)] | Literal["adaptive"] = Field(
         default=settings_core.DEFAULT_AUDIT_SHADOW_EVERY,
-        ge=0,
-        description="Also run the full evaluator beside the incremental one on about every Nth audit and compare. A "
-                    "mismatch returns the full result and disables incremental evaluation of that contract in that "
-                    "session until the evaluator version changes. 1 compares every audit; 0 compares only when state "
-                    "was just rebuilt. SELF_DIRECT_AUDIT_SHADOW_EVERY.",
+        description="How often the full evaluator also runs beside the incremental one and the two are compared (see "
+                    "README, 'Incremental audits'). 'adaptive' (default): the rate starts at 1/4 and halves after every "
+                    "8 consecutive matching comparisons down to 1/32, and returns to 1/4 when the contracts, the parser "
+                    "or evaluator version, the session generation or a mismatch change the premise; comparisons are also "
+                    "forced after a rebuild and for the next 4 compared requests, for a violation/suspicious finding, "
+                    "when a violation turns clean and for a high-risk contract. An integer pins the fixed legacy rate and switches adaptation off: 1 compares "
+                    "every audit, 0 only the forced comparisons, N about one audit in N. A mismatch returns the full "
+                    "result and disables incremental evaluation of that contract in that session until the evaluator "
+                    "version changes. SELF_DIRECT_AUDIT_SHADOW_EVERY.",
+    )
+    audit_shadow_idle_sec: float = Field(
+        default=settings_core.DEFAULT_AUDIT_SHADOW_IDLE_SEC, ge=0, allow_inf_nan=False,
+        description="Resident servers (the daemon, the MCP stdio server) compare the latest incremental state of a "
+                    "session that answered requests without a comparison against a full evaluation after this many idle "
+                    "seconds (0 switches it off). Hook processes never do. SELF_DIRECT_AUDIT_SHADOW_IDLE_SEC.",
     )
     audit_incremental_min_events: int = Field(
         default=settings_core.DEFAULT_AUDIT_INCREMENTAL_MIN_EVENTS,
@@ -151,7 +161,6 @@ class Settings(SettingsAccessors, BaseSettings):
                     "thin clients of one per-user process; 'off' (default) is the standalone mode. The entry points "
                     "read it from the process environment before importing anything else. SELF_DIRECT_DAEMON.",
     )
-
     sqlite_journal: Literal["auto", "delete"] = Field(
         default=settings_core.DEFAULT_SQLITE_JOURNAL,
         description="Journal mode of the authority databases (meta.sqlite, agy-receipts.sqlite). 'auto': write-ahead "
@@ -159,6 +168,14 @@ class Settings(SettingsAccessors, BaseSettings):
                     "fixed Windows drive), the rollback journal everywhere else; 'delete': the rollback journal everywhere. "
                     "Always synchronous=FULL. SELF_DIRECT_SQLITE_JOURNAL.",
     )
+
+    @field_validator("audit_shadow_every", mode="before")
+    @classmethod
+    def _adaptive_spelling(cls, value):
+        # 'adaptive' in any case and with surrounding whitespace, like the light reader (settings_core).
+        if isinstance(value, str) and value.strip(settings_core._WHITESPACE).lower() == "adaptive":
+            return "adaptive"
+        return value
 
     @classmethod
     def settings_customise_sources(

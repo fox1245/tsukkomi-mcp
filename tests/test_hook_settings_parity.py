@@ -78,6 +78,25 @@ def test_the_field_table_covers_exactly_the_settings_model():
     assert [spec.name for spec in FIELDS] == list(Settings.model_fields)
 
 
+def test_the_shadow_comparison_settings_default_to_the_adaptive_schedule(world):
+    for settings in (hook_settings(), load_hook_settings()):
+        assert settings.audit_shadow_every == "adaptive" and settings.audit_shadow_idle_sec == 2.0
+
+
+@pytest.mark.parametrize("text,expected", [("adaptive", "adaptive"), ("  ADAPTIVE\t", "adaptive"), ("0", 0), ("1", 1),
+                                            ("16", 16), (" 4 ", 4), ("1_0", 10)])
+def test_the_shadow_every_spellings_mean_the_same_to_both_readers(world, text, expected):
+    put(world, SELF_DIRECT_AUDIT_SHADOW_EVERY=text)
+    agree(text)
+    assert hook_settings().audit_shadow_every == expected == load_hook_settings().audit_shadow_every
+
+
+@pytest.mark.parametrize("text", ["-1", "fixed", "", "1.5", "adaptive 1"])
+def test_the_shadow_every_values_both_readers_reject(world, text):
+    put(world, SELF_DIRECT_AUDIT_SHADOW_EVERY=text)
+    assert outcome(hook_settings)[0] == "error" and outcome(load_hook_settings)[0] == "error"
+
+
 def test_literal_choices_match_the_model():
     for name, choices in (("agy_enforcement", settings_core.ENFORCEMENT_MODES),
                           ("claude_enforcement", settings_core.ENFORCEMENT_MODES),
@@ -166,7 +185,11 @@ CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Adviso
                                "open_router", "open-router", "local", "none", "true", "1", "host\n"],
            "daemon": ["off", "on", "On", "ON", "", " on", "on ", "auto", "true", "1", "false", "Off"],
            "sqlite_journal": ["auto", "delete", "Auto", "DELETE", "", " auto", "delete ", "wal", "off", "true", "truncate"]}
-KIND_VALUES = {"bool": BOOLS, "int": INTS, "float": FLOATS, "path": PATHS, "list": LISTS, "mixed": STR_OR_LISTS}
+# SELF_DIRECT_AUDIT_SHADOW_EVERY: a non-negative integer, or "adaptive" in any case with surrounding whitespace.
+SHADOW_EVERY = [*INTS, "adaptive", "Adaptive", "ADAPTIVE", " adaptive ", "adaptive\n", "\tadaptive", "adaptiv", "adaptive!",
+                "adapt ive", "fixed", "auto", "none", "-1", "adaptive0", "0adaptive", "\u0430daptive", "adaptive\u200b"]
+KIND_VALUES = {"bool": BOOLS, "int": INTS, "float": FLOATS, "path": PATHS, "list": LISTS, "mixed": STR_OR_LISTS,
+               "shadow_every": SHADOW_EVERY}
 FIELD_KINDS = {
     "codex_sessions_dir": "path", "omp_sessions_dir": "path", "claude_projects_dir": "path", "index_dir": "path",
     "contracts_path": "path", "sqlite_vector_path": "path", "openrouter_api_key_file": "path",
@@ -179,7 +202,8 @@ FIELD_KINDS = {
     "integrity_fast_recent_blocks": "int", "integrity_fast_sample_blocks": "int",
     "integrity_full_verify_interval_sec": "float", "integrity_background_verify": "bool",
     "integrity_background_idle_sec": "float", "integrity_background_max_scans": "int",
-    "audit_incremental": "bool", "audit_shadow_every": "int", "audit_incremental_min_events": "int",
+    "audit_incremental": "bool", "audit_shadow_every": "shadow_every", "audit_shadow_idle_sec": "float",
+    "audit_incremental_min_events": "int",
 }
 FREE_TEXT = {"embedding_model": ["m", "", " spaced model ", "a/b:c"], "embedding_base_url": ["http://x", "", "u r l"],
              "openrouter_api_key": ["k", "", " k ", "sk-synthetic"]}
