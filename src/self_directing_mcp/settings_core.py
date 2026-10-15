@@ -171,7 +171,7 @@ def read_pgvector_dsn_file(path: Path) -> str:
     Nothing from the file is ever put into an error message."""
     source = Path(path).expanduser()
     try:
-        descriptor = os.open(source, os.O_RDONLY)
+        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))     # a FIFO must not block the open
     except OSError:
         raise ValueError("The pgvector connection-string file cannot be opened; check SELF_DIRECT_PGVECTOR_DSN_FILE") from None
     try:
@@ -188,6 +188,9 @@ def read_pgvector_dsn_file(path: Path) -> str:
             raw = stream.read(PGVECTOR_DSN_FILE_MAX_BYTES + 1)
     finally:
         os.close(descriptor)
+    if len(raw) > PGVECTOR_DSN_FILE_MAX_BYTES:
+        raise ValueError(f"The pgvector connection-string file is larger than {PGVECTOR_DSN_FILE_MAX_BYTES} bytes; "
+                         "it must hold one connection string")
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -271,6 +274,9 @@ class SettingsAccessors:
     def resolve_pgvector_dsn(self) -> str:
         """The libpq connection string from ``pgvector_dsn_file``, or ``""`` to use the libpq environment alone
         (``PGHOST``, ``PGSERVICE``, ``PGPASSFILE``...). Raises ``ValueError`` without echoing the file's content."""
+        if os.environ.get("SELF_DIRECT_PGVECTOR_DSN"):
+            raise ValueError("SELF_DIRECT_PGVECTOR_DSN is not a setting: a connection string is a secret and is read only "
+                             "from a private file (SELF_DIRECT_PGVECTOR_DSN_FILE, chmod 600) or the libpq environment")
         if self.pgvector_dsn_file is None:
             return ""
         return read_pgvector_dsn_file(self.pgvector_dsn_file)
