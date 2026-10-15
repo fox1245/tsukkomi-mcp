@@ -166,6 +166,29 @@ def test_a_forced_second_pass_that_runs_out_of_time_keeps_the_first_answer(lab, 
     assert again["incremental"]["shadow_reasons"] == ["violation"] and again["incremental"]["shadow_compared"]
 
 
+def test_a_planned_comparison_that_runs_out_of_its_room_keeps_the_answer(lab, draw, slow_reference):
+    """The first-pass counterpart of the test above (PR4): a comparison that the schedule planned (here the draw) shares the
+    pass of the answer. It runs in the room that is left after the incremental answer, not in the part that gives it, so a
+    full evaluator that does not finish there leaves the incremental answer standing, unverified, instead of a deadline error."""
+    box = lab(every="adaptive")
+    settle_in(box)
+    draw.value = True
+    box.append(call("echo hello", "c-new"))
+    slow_reference.on = True
+    began = time.monotonic()
+    payload = box.engine.audit_session(SID, provider="codex", _deadline=time.monotonic() + 2.5)
+    elapsed = time.monotonic() - began
+    report = payload["incremental"]
+    assert payload["ok"] is True and payload["verdict"] in ("clean", "unknown")
+    assert report["shadow_skipped"] == "deadline" and "shadow_compared" not in report and report["shadow"] is False
+    assert slow_reference.calls == 1                      # the comparison did start, and was cut at its room
+    assert elapsed < 2.5                                  # and the request answered inside its deadline
+    assert report["state"] == "saved"                     # with the states of the pass kept
+    slow_reference.on = False
+    again = box.audit()
+    assert again["incremental"]["shadow_compared"] and again["incremental"]["mode"] == "delta"   # the next request compares
+
+
 def test_a_forced_pass_that_finds_the_index_busy_keeps_the_first_answer(lab, draw, monkeypatch):
     box = lab(every="adaptive")
     settle_in(box)

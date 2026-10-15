@@ -27,7 +27,12 @@ Contract sets (all of them need history, so judging a slice costs something):
              parsing and committing it)
 
     python scripts/bench_eval_converge.py [--events 150000,300000] [--sets 2,6,18] [--budgets 8,45]
-                                          [--scenarios cold,synced] [--limit 14] [--detail] [--json FILE] [--dir DIR]
+                                          [--scenarios cold,synced] [--tool audit|check] [--limit 14] [--detail]
+                                          [--json FILE] [--dir DIR]
+
+``--tool check`` repeats ``check_action`` for the proposed action ``deploy now`` instead of ``audit_session``: the order rule
+(tests before deploy) that gates it needs history, so judging a slice costs what it costs for an audit (with two contracts,
+two prohibitions, nothing about the action needs history and only the sync is left).
 
 The cost model of a fresh server process is reset before every run (``eval_cost.COSTS``, when this checkout has it), so each run
 is the first request of a freshly started server. The script also runs on a checkout without it, which is how the "before" numbers
@@ -49,6 +54,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 SID = "11111111-2222-3333-4444-555555555555"
+ACTION = {"tool_name": "shell", "arguments": {"command": "deploy now"}}      # what ``--tool check`` asks about
 TOLERANCE = 0.25        # seconds a call may run past its budget: the cooperative checks of a loop are 25 ms apart at worst
 WORDS = ("alpha beta gamma delta epsilon zeta theta iota kappa lambda sigma omega build test deploy review lint format "
          "merge plan note check retry cache index stream record slice commit").split()
@@ -162,17 +168,24 @@ def fresh_server():
     COSTS.reset()
 
 
-def one_shot(base, root, path, rules):
+def ask(engine, path, tool, **kwargs):
+    """One call of the tool that is measured."""
+    if tool == "check":
+        return engine.check_action(SID, ACTION, provider="codex", path=str(path), **kwargs)
+    return engine.audit_session(SID, provider="codex", path=str(path), **kwargs)
+
+
+def one_shot(base, root, path, rules, tool="audit"):
     """The unbounded answer: the full evaluator over a session synced with no deadline."""
     engine = make_engine(base, "one-shot", root, rules, audit_incremental=False)
     engine.sync_session(session_id=SID, provider="codex", embed=False, derived=False)
-    answer = engine.audit_session(SID, provider="codex", path=str(path))
+    answer = ask(engine, path, tool)
     engine.close()
     shutil.rmtree(base / "index-one-shot", ignore_errors=True)
     return answer
 
 
-def converge(base, root, path, rules, budget, scenario, expected, limit, name):
+def converge(base, root, path, rules, budget, scenario, expected, limit, name, tool="audit"):
     engine = make_engine(base, name, root, rules)
     fresh_server()
     start, _, resident = scenario.partition("+")
@@ -187,7 +200,7 @@ def converge(base, root, path, rules, budget, scenario, expected, limit, name):
     for _ in range(limit):
         began = time.perf_counter()
         try:
-            last = engine.audit_session(SID, provider="codex", path=str(path), _deadline=time.monotonic() + budget)
+            last = ask(engine, path, tool, _deadline=time.monotonic() + budget)
             outcome = "ok"
         except Exception as exc:                                          # noqa: BLE001 - reported, not hidden
             if type(exc).__name__ != "RequestStopped":
@@ -207,7 +220,8 @@ def converge(base, root, path, rules, budget, scenario, expected, limit, name):
     engine.close()
     shutil.rmtree(base / f"index-{name}", ignore_errors=True)
     done = bool(calls) and calls[-1]["complete"]
-    return {"scenario": scenario, "budget": budget, "calls": calls, "k": len(calls), "converged": done, "idle_jobs": idle_jobs,
+    return {"scenario": scenario, "tool": tool, "budget": budget, "calls": calls, "k": len(calls), "converged": done,
+            "idle_jobs": idle_jobs,
             "lost": sum(1 for c in calls if c["outcome"] == "x"),
             "max_call": max(c["elapsed"] for c in calls), "total": round(sum(c["elapsed"] for c in calls), 1),
             "inside_budget": all(c["elapsed"] <= budget + TOLERANCE for c in calls),
@@ -239,6 +253,7 @@ def main():
     parser.add_argument("--sets", default="2,6,18")
     parser.add_argument("--budgets", default="8,45")
     parser.add_argument("--scenarios", default="cold,synced", help="cold, synced, cold+idle, synced+idle")
+    parser.add_argument("--tool", default="audit", choices=("audit", "check"), help="audit_session or check_action")
     parser.add_argument("--limit", type=int, default=14, help="stop after this many calls without a complete answer")
     parser.add_argument("--detail", action="store_true", help="print every call")
     parser.add_argument("--json", help="also write the results to this file (outside the repository)")
@@ -261,11 +276,11 @@ def main():
             rows = []
             for name in args.sets.split(","):
                 rules = SETS[name]
-                expected = one_shot(base, root, path, rules)
+                expected = one_shot(base, root, path, rules, args.tool)
                 for budget in [float(x) for x in args.budgets.split(",")]:
                     for scenario in args.scenarios.split(","):
                         row = converge(base, root, path, rules, budget, scenario, expected, args.limit,
-                                       f"{name}-{int(budget)}-{scenario}")
+                                       f"{name}-{int(budget)}-{scenario}", args.tool)
                         row.update(events=events, contracts=len(rules))
                         rows.append(row)
             table(rows, args.detail)
