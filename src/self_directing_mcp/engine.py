@@ -33,6 +33,9 @@ from self_directing_mcp.audit.contracts import (
 from self_directing_mcp.audit import incremental
 from self_directing_mcp.audit import shadow as shadow_policy
 from self_directing_mcp.audit.patterns import compile_contract
+from self_directing_mcp import eval_cost
+from self_directing_mcp.eval_cost import COSTS
+from self_directing_mcp.slice_budget import Sizing, sizing_scope
 from self_directing_mcp.audit.runner import (
     REGEX_TIMEOUT, _worse, action_applies, audit_needs, downgrade_unproven_absence, prefix_note, run_audit,
 )
@@ -688,14 +691,17 @@ class SelfDirectEngine:
             if documents:
                 self.sparse.upsert_many(documents)
 
-    def _refresh_evidence(self, sid, provider, path=None, verify="full", *, sync_share=None):
+    def _refresh_evidence(self, sid, provider, path=None, verify="full", *, sync_share=None, sizing=None):
         """Refresh only authority; return detached coverage and its exact inputs.
 
         ``sync_share``: when the request has a deadline, the sync may use that share of the time left, so that judging
         keeps the rest. A sync that runs out of its share while the request itself is still live is handled like any
         other failed sync: the stored index is judged, ``sync_deadline`` joins the coverage issues (nothing is clean),
         and a confirmed ``must_not`` match is still a violation. A stop of the request (its deadline, a cancellation)
-        and a busy index propagate as before."""
+        and a busy index propagate as before.
+
+        ``sizing`` (``slice_budget.Sizing``): the request will also judge what the sync publishes, so a slice is sized
+        to leave the time that judging takes (see ``_sizing`` and the cost bound of ``SliceBudget``)."""
         with self._publication_guard():
             record = self.store.cursor_record(sid, provider)
         failed = {}
@@ -705,7 +711,7 @@ class SelfDirectEngine:
             now = time.monotonic()
             limit = now + sync_share * max(0.0, request.deadline - now)
         try:
-            with request_scope(deadline=limit) if limit is not None else nullcontext():
+            with request_scope(deadline=limit) if limit is not None else nullcontext(), sizing_scope(sizing):
                 info = self._sync_session(session_id=sid, provider=provider, embed=False,
                                           path=path if path is not None else record["path"] if record else None,
                                           derived=False, verify=verify)
@@ -745,6 +751,59 @@ class SelfDirectEngine:
                 "reason": failure}
 
     @staticmethod
+    def _cost_key(provider, history):
+        """The key of a contract set in the cost model: the provider and the ids and revisions of the rules that need history."""
+        return provider + ":" + shadow_policy.contracts_digest(history)
+
+    def _sizing(self, sid, provider, proposed, idle):
+        """The cost numbers that size the sync slice of a request that will also judge it, or ``None``.
+
+        Only a request with a deadline slices, and the idle comparison of a resident engine has its own large budget. The
+        numbers are read lazily, when a slice with something big to parse is about to start, so the usual small append
+        pays nothing for them. Without incremental audits (``SELF_DIRECT_AUDIT_INCREMENTAL=false``) every audit evaluates
+        the whole session again whatever is synced, so there is nothing to size: the slices are those of the share alone."""
+        control = current_request()
+        if idle or control is None or control.deadline is None or not self.settings.audit_incremental:
+            return None
+        return Sizing(control.deadline, lambda: self._sizing_numbers(sid, provider, proposed))
+
+    def _sizing_numbers(self, sid, provider, proposed):
+        """``(seconds to evaluate one more event, events no monitor state covers)`` for this request, or ``None`` when no
+        contract needs history (a check of a proposed action against prohibitions judges nothing the sync publishes)."""
+        try:
+            with self._publication_guard():
+                raw, _token = self.contracts.capture()
+            rules = parse_contracts(raw).contracts
+        except ValueError:
+            return None
+        active = [rule for rule in rules if rule.enabled and rule.provider in (None, provider)
+                  and rule.session_id in (None, sid)]
+        if proposed is not None:
+            active = [rule for rule in active if rule.type != "must" or rule.before_regex]
+        history = [rule for rule in active if rule.regex and (rule.type == "must" or proposed is None)]
+        if not history:
+            return None
+        try:
+            with self._publication_guard():
+                debt = self.store.audit_debt(sid, provider)
+        except (RequestStopped, IndexBusy):
+            raise
+        except (sqlite3.Error, OSError):
+            debt = 0            # a number that sizes a slice must never fail the sync it sizes
+        return COSTS.eval_cost(self._cost_key(provider, history), len(history)), debt
+
+    def _comparison_skip(self, plan, events, cost_key, scale=1.0):
+        """Why the comparison that is due after the incremental pass should not start (``"deadline"``, or ``"deferred"``
+        when a resident engine's idle comparison will verify the state instead), or ``None``. The best number there is
+        for the cost of a fold is the speed of the pass that just ran; without one, what this process measured earlier;
+        without either there is no opinion and the scope of the comparison is the only protection."""
+        if plan.fold_events >= eval_cost.MIN_SAMPLE_EVENTS:
+            rate = plan.fold_seconds / plan.fold_events
+        else:
+            rate = COSTS.eval_cost(cost_key, 1) if COSTS.observed(cost_key) else None
+        return incremental.comparison_shortfall(events, rate, defer=self._shadow_worker is not None, scale=scale)
+
+    @staticmethod
     def _comparison_scope():
         """The time share of a pass that only verifies an answer already in hand: it ends ``comparison_reserve`` before the
         request's own deadline, so a verification that does not finish leaves time to return the answer it was verifying."""
@@ -759,7 +818,8 @@ class SelfDirectEngine:
         provider = self._resolve_provider(provider)
         sid = session_id.lower() if provider in ("codex", "agy") else session_id
         # The idle comparison is not a request: a refresh it cannot finish still ends it (and it backs off).
-        refreshed = self._refresh_evidence(sid, provider, path, verify, sync_share=None if idle else SYNC_BUDGET_SHARE)
+        refreshed = self._refresh_evidence(sid, provider, path, verify, sync_share=None if idle else SYNC_BUDGET_SHARE,
+                                           sizing=self._sizing(sid, provider, proposed, idle))
         integrity = dict(refreshed.get("integrity") or {})
         if escalated:
             integrity["full_reason"] = escalated
@@ -792,7 +852,9 @@ class SelfDirectEngine:
             contracts = [rule for rule in contracts if rule.type != "must" or rule.before_regex]
         active = [rule for rule in contracts if rule.enabled and rule.provider in (None, provider)
                   and rule.session_id in (None, sid)]
-        history = any(rule.regex and (rule.type == "must" or planned is None) for rule in active)
+        history_rules = [rule for rule in active if rule.regex and (rule.type == "must" or planned is None)]
+        history = bool(history_rules)
+        cost_key = self._cost_key(provider, history_rules) if history else None
         anchors = {anchor for rule in active for anchor in (rule.source_event_id, rule.applies_from_event_id) if anchor}
         observation = refreshed["_source_observation"]
         report, plan, force_full = {}, None, frozenset()
@@ -839,7 +901,8 @@ class SelfDirectEngine:
                                 plan = incremental.AuditPlan.prepare(
                                     self.store, session_id=sid, provider=provider, active=active, planned=planned,
                                     needs=needs, link_calls=link_calls, shadow_every=every, force_full=force_full,
-                                    report=report, premise_rules=premise_rules, force=force, idle=idle)
+                                    report=report, premise_rules=premise_rules, force=force, idle=idle,
+                                    cost_key=cost_key, defer=self._shadow_worker is not None and not idle)
                             except (RequestStopped, IndexBusy):
                                 raise
                             except Exception as exc:  # the cache could not even be read: evaluate everything in full
@@ -892,8 +955,30 @@ class SelfDirectEngine:
                     # Shadow: the full evaluator over the same events (for a scoped comparison, over the compared contracts
                     # alone). It is the answer whenever the two differ.
                     subject = [rule for rule in contracts if rule.id in plan.comparison.scope] if scoped else contracts
-                    full = run_audit(session_id=sid, contracts=subject, store=reference, provider=provider,
-                                     proposed=planned, coverage=reference_coverage)
+                    # The incremental answer is in hand. A comparison that was planned (``force`` is None: not one that an
+                    # answer called for, which has its own pass and its own fallback below) runs in the time that is left
+                    # after it, and never in the part that gives it: it does not start when the speed of the pass that just
+                    # ran says it cannot finish, and one that does not finish leaves the answer standing, unverified (the
+                    # rule of a forced second pass). A stop of the request itself is not absorbed.
+                    planned_pass = force is None
+                    full, skipped = None, None if idle or not planned_pass else self._comparison_skip(
+                        plan, len(plan.reference), cost_key, scale=len(subject) / max(1, len(contracts)))
+                    if skipped is None:
+                        try:
+                            with self._comparison_scope() if planned_pass else nullcontext():
+                                full = run_audit(session_id=sid, contracts=subject, store=reference, provider=provider,
+                                                 proposed=planned, coverage=reference_coverage)
+                        except RequestStopped:
+                            if not planned_pass or _request_over(current_request()):
+                                raise
+                            skipped = "deadline"
+                    if skipped is not None:
+                        report["shadow_skipped"], report["shadow"] = skipped, False
+                        report.pop("shadow_reasons", None)
+                        report.pop("shadow_scope", None)
+                        plan.shadow, plan.comparison = False, shadow_policy.Comparison()
+                        reference = None
+                if reference is not None:
                     timed_out = sorted({item.contract_id for item in full.findings if item.reason == REGEX_TIMEOUT})
                     if timed_out:
                         # A time limit is not a result: the full evaluator could not finish these contracts in its budget, so
@@ -942,7 +1027,10 @@ class SelfDirectEngine:
                         if shadow_policy.memo_covers(plan.schedule, plan.state_key(), request_key, result, wanted_ids):
                             report["shadow_skipped"] = "verified_before"
                             late = {}
-                        elif attempt < 3 and incremental._shadow_affordable(plan.count):
+                        elif (attempt < 3 and report.get("shadow_skipped") not in ("deadline", "deferred")
+                              and incremental._shadow_affordable(plan.count)):
+                            # (A planned comparison that this pass just declined for lack of room is not asked for again:
+                            # a second pass would repeat the fold and have even less time for it.)
                             force = shadow_policy.Comparison()
                             for reason, ids in wanted.items():
                                 force.add(reason, ids)
@@ -958,6 +1046,14 @@ class SelfDirectEngine:
         except (RequestStopped, IndexBusy) as stopped:
             passes.close()                  # leave the time share of the forced pass before anything else runs
             if fallback is None:
+                worker = self._shadow_worker
+                if (worker is not None and not idle and use_plan and history and isinstance(stopped, RequestStopped)
+                        and stopped.reason == "request_deadline"):
+                    # An evaluation the deadline cut saves nothing in this request, so the next one starts again. A resident
+                    # engine does not have to wait for that: its idle comparison audits the session with the large budget of a
+                    # background job (it never delays a request: the next request cancels it) and keeps the monitor states.
+                    worker.note(provider, sid, coverage.get("path"), variant, proposed, coverage.get("byte_offset", 0),
+                                "unverified")
                 raise
             # The pass that was to verify the answer could not finish (its share of the time budget ran out, or the index was
             # busy): the answer of the pass before it stands, unverified. A verification that ran out of time must never turn
@@ -1001,6 +1097,9 @@ class SelfDirectEngine:
         payload["timings_ms"] = {
             "sync": round((sync_finished - started) * 1000, 2),
             "evaluation": round((time.perf_counter() - sync_finished) * 1000, 2)}
+        sync = refreshed.get("sync")
+        if sync is not None and sync["state"] != "complete":
+            payload["sync"] = sync       # how far the index got and what sized the slice; a finished sync adds nothing to coverage
         if report:
             payload["incremental"] = report
         payload["nudge"] = (
@@ -2034,7 +2133,21 @@ class SelfDirectEngine:
                     status["session"]["complete"] = False
                     status["session"]["issues"].append("receipts_changed_during_status")
         status["incremental_verification"] = self._verification_status(sid, resolved)
+        status["evaluation"] = self._evaluation_status(sid, resolved)
         return status
+
+    def _evaluation_status(self, sid, provider) -> dict[str, Any]:
+        """What a deadline-bound audit sizes its sync by, and how far the monitor states of a session lag behind its events
+        (``events_without_state``: what the next incremental audit must fold; a state belongs to one contract set, so this
+        is the lag of the newest). A session whose lag is more than one request can fold is brought up to date by an audit
+        with a larger ``timeout_ms`` (up to ``max_tool_timeout_sec``), see the README, "Large sessions and deadlines"."""
+        info: dict[str, Any] = {"cost": COSTS.snapshot(), "session": None}
+        if sid:
+            with self._publication_guard():
+                total, covered, through = self.store.audit_progress(sid, provider)
+            info["session"] = {"events_indexed": total, "events_without_state": max(0, total - covered),
+                               "states_through_byte": through}
+        return info
 
     def _verification_status(self, sid, provider) -> dict[str, Any]:
         """How incremental audits are compared with the full evaluator, and what a session's record says (see README,
