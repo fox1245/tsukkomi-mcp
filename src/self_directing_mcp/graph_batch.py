@@ -53,8 +53,10 @@ SUBMIT_HINT = (
     "chunk_ids of this batch). If the events state no relation, call it without a proposal and give "
     "no_graph_facts_reason: the specific reason, which is recorded. Never invent edges to pass.")
 TEXT_RULES = (
-    "node_id, kind, label, src and dst are single-line text: no newline, control, zero-width, bidi or "
-    "line-separator characters (the proposal is rejected, not edited). Every edge cites chunk_ids of this batch.")
+    "node_id, kind, label, src and dst are single-line plain text: no control characters (newline and tab included), "
+    "no bidirectional or other invisible formatting characters (zero-width space, word joiner, byte order mark), no "
+    "line or paragraph separators; the zero-width joiner and non-joiner are fine. A proposal that breaks this is "
+    "rejected, not edited. Every edge cites chunk_ids of this batch.")
 TRUNCATION_HINT = (
     "If your host shortened this response (no end_of_batch at the end), call again with a smaller max_chars; "
     "never submit a batch you did not read completely.")
@@ -80,11 +82,12 @@ def batch_limits(max_chars: Any, max_events: Any) -> tuple[int | None, int | Non
     return limits["max_chars"], limits["max_events"], None
 
 
-def adhoc_job_id(provider: str, session_id: str, through_order: int | None, proposal: Any) -> str:
+def adhoc_job_id(provider: str, session_id: str, through: Any, proposal: Any) -> str:
     """The job id of a ``commit_graph_update`` that names none. It is scoped to the provider, the session and
-    ``through_order`` and carries a digest of the proposal: an identical resubmit is the same job (idempotent), a
-    different proposal, another ``through_order`` or another session is not."""
-    document = json.dumps([provider, session_id, through_order, proposal], sort_keys=True, separators=(",", ":"))
+    ``through``, the event order the commit moves the cursor to (the requested ``through_order``, else the end of the
+    session as it stands), and carries a digest of the proposal: an identical resubmit at the same place is the same
+    job (idempotent); a different proposal, another end, another session or a session that has grown since is not."""
+    document = json.dumps([provider, session_id, through, proposal], sort_keys=True, separators=(",", ":"))
     return "adhoc-" + hashlib.sha256(document.encode("ascii")).hexdigest()[:24]
 
 

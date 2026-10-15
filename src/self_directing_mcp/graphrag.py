@@ -28,18 +28,28 @@ ALLOWED_RELATIONS = {
 }
 
 # A stored id, kind or label is model-authored text that later reaches a model's context line by line (the AGY
-# PreInvocation hook prints each relation). These characters would let such a value start a line of its own or hide
-# and reorder text: controls (newline, escape), format characters (zero-width, bidi), lone surrogates and the line and
-# paragraph separators. Ordinary Unicode text, Hangul for one, is not affected.
+# PreInvocation hook prints each relation). A value must not be able to start a line of its own or to hide or
+# reorder text, so these are unsafe: controls (newline, tab, carriage return, escape), the line and paragraph
+# separators, lone surrogates and the format characters (category Cf), which is where the bidirectional controls, the
+# zero-width space, the word joiner and invisible operators, the byte order mark, the tag characters and the
+# interlinear annotation characters live. Three format characters are allowed because they only join or hyphenate and
+# cannot break a line, hide or reorder anything, and whole scripts need them: the zero-width non-joiner (Persian,
+# Indic scripts), the zero-width joiner (Indic scripts, emoji sequences) and the soft hyphen. Everything else,
+# Hangul and Persian text and emoji sequences for example, is ordinary text.
 _UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_ALLOWED_FORMAT = frozenset({chr(0x00AD), chr(0x200C), chr(0x200D)})
 _BACKSLASH = chr(92)
+
+
+def _unsafe(ch: str) -> bool:
+    return unicodedata.category(ch) in _UNSAFE_CATEGORIES and ch not in _ALLOWED_FORMAT
 
 
 def unsafe_characters(text: str) -> list[str]:
     """The distinct characters of ``text`` that may not appear in a stored node id, kind or label, as ``U+XXXX``."""
     found: list[str] = []
     for ch in text:
-        if unicodedata.category(ch) in _UNSAFE_CATEGORIES:
+        if _unsafe(ch):
             code = f"U+{ord(ch):04X}"
             if code not in found:
                 found.append(code)
@@ -49,8 +59,8 @@ def unsafe_characters(text: str) -> list[str]:
 def escape_unsafe(value: Any, limit: int | None = None) -> str:
     """``value`` as text on one line: each character ``unsafe_characters`` lists is shown as a backslash escape."""
     shown = "".join(
-        (f"{_BACKSLASH}u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"{_BACKSLASH}U{ord(ch):08x}")
-        if unicodedata.category(ch) in _UNSAFE_CATEGORIES else ch for ch in str(value))
+        (f"{_BACKSLASH}u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"{_BACKSLASH}U{ord(ch):08x}") if _unsafe(ch) else ch
+        for ch in str(value))
     return shown if limit is None or len(shown) <= limit else shown[:max(0, limit - 3)] + "..."
 
 
@@ -62,8 +72,8 @@ def unsafe_text_problem(where: str, value: Any) -> str | None:
     found = unsafe_characters(value) if isinstance(value, str) else []
     if not found:
         return None
-    return (f"{where} contains control, format or line-separator characters ({', '.join(found[:4])}); "
-            "ids, kinds and labels must be single-line text")
+    return (f"{where} contains control, invisible or bidirectional formatting or line-separator characters "
+            f"({', '.join(found[:4])}); ids, kinds and labels must be single-line plain text")
 
 
 class GraphStore:

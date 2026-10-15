@@ -121,9 +121,17 @@ def _resolve_engine(engine):
 
 
 def _stamp(result):
-    """Results served by the daemon say so (``served_by``); a standalone server's results are unchanged."""
+    """Results served by the daemon say so (``served_by``); a standalone server's results are unchanged.
+
+    ``end_of_batch`` ends a complete ``graph_next_batch`` result so that a result a host cut short visibly lacks it; the
+    stamp goes in before it.
+    """
     if current_engine.get() is not None and isinstance(result, dict):
-        return {**result, "served_by": "daemon"}
+        stamped = {key: value for key, value in result.items() if key != "end_of_batch"}
+        stamped["served_by"] = "daemon"
+        if "end_of_batch" in result:
+            stamped["end_of_batch"] = result["end_of_batch"]
+        return stamped
     return result
 
 _contract_list_adapter = TypeAdapter(list[ContractRule])
@@ -624,10 +632,13 @@ async def commit_graph_update(session_id: str, proposal: dict[str, Any],
     status=invalid_through_order and nothing is stored), to advance only that far.
     Idempotent by job_id: replaying an applied job returns already_applied; a job_id
     that another session or provider recorded is job_id_in_use. Without a job_id the job
-    is named by a digest of provider, session, through_order and proposal, so repeating
-    the identical call is already_applied and any other commit applies.
-    Node ids, kinds, labels and edge ends must be single-line text (no newline, control,
-    zero-width, bidi or line-separator characters); a proposal with any is rejected.
+    is named by a digest of provider, session, the event order the commit moves the cursor
+    to and the proposal, so repeating the identical call is already_applied and any other
+    commit applies.
+    Node ids, kinds, labels and edge ends must be single-line plain text (no control
+    characters such as newline or tab, no bidirectional or other invisible formatting
+    characters, no line separators; the zero-width joiner and non-joiner are fine); a
+    proposal with any is rejected.
     Rejected proposals store nothing and never advance the cursor. A failed
     write reports status=unclear; the range is not advanced and recovery is
     re-run. Existing search/audit paths keep working when the graph lags.
@@ -695,8 +706,10 @@ async def graph_submit_batch(session_id: str, batch_id: str, proposal: dict[str,
     evidence_chunk_ids}], extraction_summary} as in the batch's schema. Every edge must
     cite chunk_ids of THIS batch (at most 100 per edge); relations only from the allowed
     list; at most 500 nodes, 1000 edges, 500 characters per string, 200 per id, 2000 for
-    the summary; node_id, kind, label, src and dst are single-line text (a newline,
-    control, zero-width, bidi or line-separator character rejects the proposal). Nothing
+    the summary; node_id, kind, label, src and dst are single-line plain text (a control
+    character such as newline or tab, a bidirectional or other invisible formatting
+    character or a line separator rejects the proposal; the zero-width joiner and
+    non-joiner are fine). Nothing
     is stored unless the batch is current (status=batch_changed otherwise) and is the next
     one: status=out_of_order (expected_start_order) means submit the earlier batches
     first and then this one again; stale_batch means the cursor is already past it. A

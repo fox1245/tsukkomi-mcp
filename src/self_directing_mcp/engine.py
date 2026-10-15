@@ -1569,18 +1569,20 @@ class SelfDirectEngine:
         covers; it must lie between the first event not yet processed and the last event of the session, and the
         cursor then moves only that far (``invalid_through_order`` otherwise; nothing is stored).
 
-        A proposal without a ``job_id`` is named by a digest of provider, session, ``through_order`` and proposal, so
-        repeating the identical call is ``already_applied`` and any other commit applies. A ``job_id`` that another
-        session or provider recorded is ``job_id_in_use``.
+        A proposal without a ``job_id`` is named by a digest of provider, session, the event order the commit moves
+        the cursor to and the proposal, so repeating the identical call is ``already_applied`` and any other commit
+        applies, one after the session has grown included. A ``job_id`` that another session or provider recorded is
+        ``job_id_in_use``.
         """
         resolved_provider = self._resolve_provider(provider)
         sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
         anchors = {cid for edge in proposal.get("edges", []) for cid in edge.get("evidence_chunk_ids", [])}
-        job_id = proposal.get("job_id") or graph_batch.adhoc_job_id(resolved_provider, sid, through_order, proposal)
         with self._publication_guard(), self.store._read_boundary():
             cursor = self.graph.cursor(sid, resolved_provider)
             count = self.store.chunk_count(sid, resolved_provider)
             covers = graph_batch.covers_through_order(count, cursor)
+            through = covers if through_order is None else through_order        # where this commit moves the cursor
+            job_id = proposal.get("job_id") or graph_batch.adhoc_job_id(resolved_provider, sid, through, proposal)
             held, existing = self._job_state(job_id, sid, resolved_provider)
             if held == "applied":
                 return {"ok": True, "status": "already_applied", "job": existing, "covers_through_order": covers}
@@ -1604,7 +1606,6 @@ class SelfDirectEngine:
         verdict = validate_proposal(proposal, store=snapshot, session_id=sid, provider=resolved_provider)
         if not verdict["ok"]:
             return {"ok": False, "status": "rejected", **verdict, "covers_through_order": covers}
-        through = covers if through_order is None else through_order
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         job = {"job_id": job_id, "provider": resolved_provider,

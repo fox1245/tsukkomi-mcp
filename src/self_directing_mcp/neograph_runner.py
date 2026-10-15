@@ -61,7 +61,9 @@ Rules:
   means the statement is present in the transcript, not independently proven true.
 - Include both endpoint nodes for each edge and preserve explicit entity identifiers.
 - Include extraction_summary describing what was extracted. If no relations can be
-  extracted, explain the specific reason there; do not invent relations to fill arrays."""
+  extracted, explain the specific reason there; do not invent relations to fill arrays.
+- node_id, kind and label must be single-line plain text: no control characters (newline,
+  tab) and no bidirectional or other invisible formatting characters."""
 
 EXTRACT_PROMPT = EXTRACT_INSTRUCTIONS + """
 
