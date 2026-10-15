@@ -118,7 +118,10 @@ def test_a_staged_slice_is_sized_by_the_share_alone(stale, sized, monkeypatch, s
                             "limited_by": "share" if stop == "share" else None}
     assert (sized.resolved, sized.numbers) == (0, 0)                  # the contracts and the index were not read for numbers
     assert answer["coverage"]["complete"] is False                     # and the answer judged the old index: never clean
-    assert "parser_outdated" in answer["coverage"]["issues"]
+    issues = set(answer["coverage"]["issues"])                         # the coverage issues are the re-index's own (PR3)
+    assert "parser_outdated" in issues
+    assert ("reindex_ready_to_commit" in issues and "sync_in_progress" not in issues) if stop == "commit_waits" \
+        else ("sync_in_progress" in issues and "reindex_ready_to_commit" not in issues)
 
 
 def test_the_same_session_is_staged_then_appended_and_only_the_append_is_cost_sized(stale, sized, monkeypatch):
