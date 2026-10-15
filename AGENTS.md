@@ -197,6 +197,19 @@ Heavy tool calls run at most SELF_DIRECT_MAX_CONCURRENT_CALLS (default 4) at a t
 expires while queued returns request_deadline and never started. update_checklist returns
 status checklist_conflict, with nothing saved, after three conflicting evaluation attempts; retry.
 
+A sync that cannot finish inside its request budget (a request with a finite deadline, a plain session
+file) publishes the prefix it parsed, ending at a record boundary, in one transaction
+(SELF_DIRECT_SYNC_SLICING=auto, the default; SELF_DIRECT_SYNC_SLICE_BYTES bounds one slice's capture) and
+reports sync {state partial|complete, indexed_through, pending_bytes, target_bytes, progress,
+retry_after_ms, stopped_by}, coverage.backlog_bytes and the issue sync_in_progress. retry_after_ms is a
+hint: nothing retries automatically, call again to continue. While a backlog exists the verdict is never
+clean and judged_prefix is never set: a forbidden match in the committed prefix is a violation, a proposed
+action that matches a prohibition is a violation, everything else is unknown. A reindex (parser upgrade,
+changed source, changed AGY receipts) and a .zst source are never sliced; an interrupted reindex leaves
+the previous index. A request that waits for another request's sync of the same session gives up after
+min(1 s, a quarter of its time) with sync_in_progress. Response reasons and coverage issues are an open
+set: show an unknown one as an opaque string and treat it as unverified.
+
 ## Codex event coverage and parser upgrades
 
 The Codex parser supports world_state, token_usage_record, compacted, and native

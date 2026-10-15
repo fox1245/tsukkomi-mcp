@@ -204,7 +204,7 @@ Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout
 | | `run_neograph_update` | Run the LLM GraphRAG extraction pipeline through NeoGraph. |
 | | `graph_next_batch` | Next batch of events for the **calling agent** to extract (no model call, key use or network access here); `after_order` looks ahead, `max_chars` and `max_events` size the result. See [Host-side GraphRAG extraction](#host-side-graphrag-extraction). |
 | | `graph_submit_batch` | Validate and commit the agent's extraction of one batch, in order and idempotently; a batch without relations needs a recorded reason. |
-| **Search & Analytics** | `sync_session` | Incremental evidence sync for Codex, Grok Bot, OMP, AGY and Claude Code transcripts. |
+| **Search & Analytics** | `sync_session` | Incremental evidence sync for Codex, Grok Bot, OMP, AGY and Claude Code transcripts. A session too large for the request budget is indexed in slices: the result's `sync` object says how far it got ([Large sessions and deadlines](#large-sessions-and-deadlines)). |
 | | `search_history` | Hybrid retrieval (dense vector + BM25 + regex) over history. |
 | | `get_chunk` | Retrieve a raw evidence chunk with secret masking. |
 | | `analyze_activity` | SQLite time-series analysis: retry gaps, error bursts, stalled items. |
@@ -326,6 +326,8 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS` | `false` | Seed disabled demonstration contracts. |
 | `SELF_DIRECT_DAEMON` | `off` | **Experimental.** `on` makes hooks and the MCP entry point clients of the resident daemon (Linux only; read from the process environment by the entry points). See [Resident daemon](#resident-daemon-experimental-off-by-default), which also lists the daemon's own `SELF_DIRECT_DAEMON_*` limits. |
 | `SELF_DIRECT_SQLITE_JOURNAL` | `delete` | Journal mode of the authority databases `meta.sqlite` and `agy-receipts.sqlite`: `delete` (the rollback journal) or `auto` (write-ahead logging on a verified local file system, the rollback journal elsewhere). Always `synchronous=FULL`. Faster for resident processes only; see [SQLite journal mode](#sqlite-journal-mode-index-files-and-backups). |
+| `SELF_DIRECT_SYNC_SLICING` | `auto` | A sync that cannot finish inside its request budget publishes the records it parsed (a slice) and the next call continues from there. `auto`: requests with a finite deadline, plain session files, never over an existing index; `off`: the all-or-nothing sync of before. See [Large sessions and deadlines](#large-sessions-and-deadlines). |
+| `SELF_DIRECT_SYNC_SLICE_BYTES` | `67108864` | The most a slice observes (hashes and parses) past the indexed offset, to the end of a record (a slice always holds at least one whole record). Plain session files only. |
 
 #### Credentials
 
@@ -403,7 +405,7 @@ Set `SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR` (or `grokbot_transcripts_dir` in TOML)
 
 ## Coverage and verdicts
 
-`sync_session`, `audit_session` and `check_action` report a `coverage` object (`audit_status` reports the same data under `session` when given a session id). It holds the indexed source `path`, `byte_offset` (how far the index has parsed), `file_size`, `chunk_count`, `parser_version`, an `issues` list and `complete`, which is true only when `issues` is empty. The same responses carry an `integrity` object that says how the source was verified for that request and when it was last verified in full ([Source integrity](#source-integrity-full-and-fast-verification)).
+`sync_session`, `audit_session` and `check_action` report a `coverage` object (`audit_status` reports the same data under `session` when given a session id). It holds the indexed source `path`, `byte_offset` (how far the index has parsed), `file_size`, `chunk_count`, `parser_version`, an `issues` list and `complete`, which is true only when `issues` is empty. While a sync is still in progress it adds `backlog_bytes` and the issue `sync_in_progress` ([Large sessions and deadlines](#large-sessions-and-deadlines)). The same responses carry an `integrity` object that says how the source was verified for that request and when it was last verified in full ([Source integrity](#source-integrity-full-and-fast-verification)).
 
 | Verdict | Meaning |
 |---|---|
@@ -887,6 +889,43 @@ Audit evaluation and source hashing or parsing do not hold the shared writer lea
 Requests share an absolute deadline and cancellation control through nested calls and native callbacks. Non-authorizing responses distinguish `index_busy`, `request_deadline`, `request_cancelled` and `operation_timeout`; unrelated SQLite failures are not converted into successful empty searches. A stopped request cannot begin a later publication, but an admitted commit or one already-running blocking call may finish. This is cooperative stopping, not forced thread termination or proof of rollback.
 
 Default combined writer-lock wait (1 second), audit budget (8 seconds), ordinary budget (45 seconds) and explicit-tool cap (600 seconds) are unchanged. Real writes, initialization, raw captures and derived persistent mutations remain guarded and can still contend. See [implementation and verification boundaries](docs/timeout-fix.md).
+
+### Large sessions and deadlines
+
+A source that could not be synced inside the request budget (8 seconds for hooks, `audit_session` and `check_action`, 45 seconds for the other tools) used to be parsed until the hard deadline, rolled back, and started again from zero by the next call: repeating the call only used the slot and the CPU again. On a synthetic Codex session of 300,000 events (65 MB, about 9 seconds one-shot), four consecutive 4-second syncs left no cursor and no event, and four consecutive 8-second audits were all `request_deadline`.
+
+**What a slice is.** A request that has a finite deadline and syncs a plain session file may stop parsing at a record boundary when its soft deadline passes, and publishes the prefix it parsed in one transaction, exactly like any other append: the events, the cursor, the block table and the metrics together, so the index is always a valid earlier state and a crash or a stop at any point keeps either the previous index or the new prefix. The next call continues from the cursor. Nothing else about the index changes: event ids, anchors, cached vectors, the commit log and the incremental audit state are the same as for a sync in one piece (`tests/test_slice_equivalence.py` compares the two row for row, for all five parsers).
+
+- **Soft deadline.** `now + 0.5 * remaining / 1.3` (parse and commit use about half of the budget and at least a quarter remains for the evaluation and the response; never less than 0.25 s after the start). The parse always makes a minimum of progress even when its time is already spent: 256 records **and** 1 MiB. The hard deadline is untouched.
+- **Capture cap.** `SELF_DIRECT_SYNC_SLICE_BYTES` (default 64 MiB) bounds how much of a source that is far from indexed one slice observes: the capture ends at the last record inside `cursor + cap`, or at the first record end after it when none ends inside. The observation then behaves exactly like one made when the file was shorter.
+- **Only additions.** A parse that would replace events that exist (a parser upgrade, a source whose stored hash no longer matches, changed AGY receipts, another path) is never cut: it stays all or nothing in one transaction, so a stop or a crash leaves the previous index, its ids, anchors and vectors, untouched. A capture that was cut short and then turns out to need a reindex is taken again whole. `.jsonl.zst` sources are never cut either (a forward seek in a compressed stream decodes the prefix again).
+- **What was consumed is verified.** At a stop the iterator checks what it read against the capture before the prefix can be published: a stop inside a block is compared with the capture's digest of the whole block, so a byte that changed between the capture and the parse is an error, not evidence.
+
+**What a call says.** `sync_session` gets a `sync` object (calls with a deadline only; `SELF_DIRECT_SYNC_SLICING=off` and requests without a deadline answer exactly as before):
+
+| Field | Meaning |
+|---|---|
+| `state` | `partial` (the index holds a prefix of what was observed) or `complete`. |
+| `indexed_through` | The cursor: the byte offset up to which events are committed. |
+| `pending_bytes` | Bytes of the file after the cursor (as `coverage.pending_bytes`). |
+| `target_bytes` | How far this sync meant to go: the last record boundary it observed, or the size of the file when the capture was cut short. |
+| `progress` | `indexed_through / target_bytes`: the committed share, never what was parsed but not yet committed. |
+| `retry_after_ms` | A hint (500) while `partial`; `null` when complete. Advisory: nothing in this package retries by itself. |
+| `stopped_by` | `soft_deadline`, `slice_cap` (the capture cap) or `eof`. |
+
+`coverage` then has `backlog_bytes` (records the capture saw that the index does not hold yet) and the issue `sync_in_progress` next to `unread_bytes`, and `complete` is false. Because `sync_in_progress` is a coverage issue, `judged_prefix` is never set while a backlog exists: **a partial prefix is never `clean`, not even "as of the cursor"** (`judged_prefix` stays for pure append). An `audit_session` or `check_action` that meets a backlog syncs one more slice itself and then judges what is committed: a forbidden match in the prefix is a `violation`; a `must_not` that merely found no match, an obligation and a proposed action's prerequisite are `unknown`; a proposed action that matches a prohibition is a `violation` whatever the backlog. Call again to make progress; every call moves the cursor further (`tests/test_slice_convergence.py`: 50,000 events in a handful of calls, each inside its budget).
+
+**One writer per session.** Requests for one session still queue behind a single flight. A request that may slice no longer waits for the leader until its own deadline: it waits at most `min(1 s, a quarter of its time left)`, so a heavy-call slot is never held idle longer than that, and then judges on what is committed with the issue `sync_in_progress`. A direct `sync_session` that meets a busy session is answered with an incomplete response (`ok: false`, `verdict: unknown`, `error: "sync_in_progress"`); a deadline that really ran out still says `request_deadline`. **Reasons and issues are an open set:** every client in this repository (the OMP extension, the Codex hook, the AGY and Claude Code adapters) shows them as opaque strings and reads an unknown one as "unverified" (`tests/test_slice_adapters.py`), and a client outside it should do the same.
+
+**Limits, stated precisely.**
+
+- The guarantee of progress is conditional: one record larger than the whole budget, or I/O that stalls, can still overrun the hard deadline, and the answer is then `unknown`, as before. Nothing is skipped or truncated.
+- A re-index is not sliced. A parser upgrade or a changed source of a very large session is one transaction whose parse and commit grow with the session, so it may still need an explicit `sync_session` with a larger `timeout_ms` (up to `SELF_DIRECT_MAX_TOOL_TIMEOUT_SEC`); until it is done, audits report `parser_outdated` and judge the old events, as before.
+- Evaluation is not sliced: a contract audit of a very large session (hundreds of thousands of events) can take longer than its own budget even when everything is indexed.
+- The parsers are not modified, so what a parser remembers from record to record is per call: a slice boundary is an append boundary. The only such memory that matters is the Claude Code subagent file's check that all of its records name one agent (`_File.pinned_agent`): a file whose records disagree with each other keeps a record in slices that a single pass rejects (pinned as a strict `xfail` in `tests/test_slice_equivalence.py`; files whose records carry the agent id of their file name are unaffected). OMP's lookup of earlier tool calls reads every stored call of the session on each append (about 10 microseconds per stored call), which a sliced sync repeats once per slice.
+- Only requests with a finite deadline slice: the Claude Code and AGY command hooks, which run without one (unless they go through the resident daemon, which gives every request a deadline), still sync in one piece within their host's hook timeout.
+
+`scripts/bench_slicing.py` measures all of this on synthetic sessions: calls to converge and per-call wall time for several budgets, total CPU against a one-shot sync, the capture time against the number of slices, and the cost of the stop checks when no stop happens.
 
 ---
 

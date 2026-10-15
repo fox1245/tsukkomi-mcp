@@ -565,8 +565,8 @@ class SelfDirectEngine:
             info["nudge"] = (
                 f"NUDGE: Sync is partial ({sync['indexed_through']} of {sync['target_bytes']} bytes indexed, stopped by "
                 f"{sync['stopped_by']}); call sync_session again to continue (retry_after_ms={sync['retry_after_ms']} is "
-                "a hint, nothing retries by itself). Until it completes, audits and action checks report unknown "
-                "(sync_in_progress)."
+                "a hint, nothing retries by itself). Until it completes, audits and action checks cannot be clean "
+                "(coverage.issues has sync_in_progress)."
             )
         return info
 

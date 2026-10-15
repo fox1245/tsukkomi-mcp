@@ -391,6 +391,8 @@ async def sync_session(
     (overrides the default request timeout, capped by max_tool_timeout_sec).
     verify: "full" (default) verifies every block of the source; "fast" compares only its tail, latest and sampled
     blocks. The result's integrity object says which happened and when the source was last verified in full.
+    A session too large for the budget is indexed in slices: when the result's sync object says state "partial" the
+    prefix up to sync.indexed_through is committed (coverage.issues has sync_in_progress); call again to continue.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.sync_session, session_id=session_id, path=path, provider=provider, embed=embed,
