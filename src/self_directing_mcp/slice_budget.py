@@ -28,7 +28,9 @@ class SliceBudget:
     Minimum progress: a soft deadline is honoured only after ``min_records`` records AND ``min_bytes`` bytes were
     consumed, so a call that arrives with its time spent still moves the cursor. The caps are hard: ``max_bytes``
     (source bytes) and ``max_records`` stop the slice when reached, whatever the minimums say (tests use
-    ``max_records`` to force deterministic stops). A slice always holds at least one whole record.
+    ``max_records`` to force deterministic stops). A slice always holds at least one whole record. (OMP's parse peeks at
+    the head of a cold file for its session id with the same iterator; with the production minimums that probe is never
+    cut, but a test cap of one record would cut it behind a title line.)
 
     Outputs: ``stopped_by`` (one of ``STOP_REASONS``, ``None`` when the parse ran to the end of what it was given),
     ``records`` and ``consumed`` (the records and source bytes the stopping iterator had yielded) and
