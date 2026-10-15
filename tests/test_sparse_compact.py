@@ -252,6 +252,33 @@ def test_a_write_transaction_holds_the_write_lock_from_its_start(tmp_path):
         other._conn.close()
 
 
+def test_opening_an_existing_index_takes_no_write_lock(tmp_path):
+    """A hook process that opens the index while a rebuild is writing must not wait for it."""
+    docs = corpus(30)
+    _legacy, compact = pair(tmp_path, docs)
+    with compact._write():
+        compact._conn.execute("INSERT INTO sparse_meta(key, value) VALUES ('probe', '1')")       # a write transaction is open
+        other = CompactSparseIndex(compact.db_path)
+        try:
+            assert other.count() == 30 and other.search("alpha") is not None
+        finally:
+            other._conn.close()
+    assert compact.meta()["probe"] == "1"
+
+
+def test_a_file_missing_one_of_its_tables_is_completed_not_replaced(tmp_path):
+    docs = corpus(30)
+    _legacy, compact = pair(tmp_path, docs)
+    compact._conn.execute("DROP TABLE sparse_kinds")
+    compact._conn.commit()
+    compact._conn.close()
+    again = CompactSparseIndex(compact.db_path)
+    try:
+        assert again.count() == 30 and again._conn.execute("SELECT COUNT(*) FROM sparse_kinds").fetchone()[0] == 0
+    finally:
+        again._conn.close()
+
+
 def test_the_search_is_driven_by_the_fts_scan(tmp_path):
     docs = corpus(80)
     _legacy, compact = pair(tmp_path, docs)

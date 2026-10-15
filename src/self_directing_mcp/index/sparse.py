@@ -358,8 +358,25 @@ class CompactSparseIndex(SparseIndex):
         self._patch_statistics = _statistics_probe(sqlite3.sqlite_version)[1]
         super().__init__(db_path)
 
+    _TABLES = ("sparse_meta", "chunks_fts", "chunk_rows", "sparse_sessions", "sparse_kinds")
+
+    def _schema_ready(self) -> bool:
+        """An existing, complete file of this format: opening it takes no write lock (a hook process that opens the index
+        while a rebuild writes must not wait for it)."""
+        names = {row[0] for row in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN (" + ",".join("?" * len(self._TABLES)) + ")", self._TABLES)}
+        if names != set(self._TABLES):
+            return False
+        found = self._conn.execute("SELECT value FROM sparse_meta WHERE key='format'").fetchone()
+        if not found or found[0] != COMPACT_FORMAT:
+            raise SparseFormatError(f"{self.db_path.name} is not a {COMPACT_FORMAT} sparse index "
+                                    f"(format {found[0] if found else 'missing'!r}); it is left untouched")
+        return True
+
     def _init_schema(self) -> None:
         check_request()
+        if self._schema_ready():
+            return
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             existing = self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sparse_meta'").fetchone()
