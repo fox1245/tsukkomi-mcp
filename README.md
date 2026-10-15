@@ -119,6 +119,7 @@ Abridged example for `{"id": "no-rm", "type": "must_not", "scope": "tool_call", 
 - Entity dependency graph (nodes, relations, cursors) in SQLite, executed through the **NeoGraph** engine.
 - Typed relations: `IMPLEMENTS`, `DEPENDS_ON`, `MODIFIES`, `PRODUCES`, `CHECKS_VERSION`, `EVIDENCED_BY`, `SUPERSEDES`.
 - Graph updates are validated against session history and applied idempotently. Updates require an explicit `run_neograph_update` call; lifecycle hooks never send session text to a model.
+- The extraction can also be done by the calling agent instead of an OpenRouter model: [Host-side GraphRAG extraction](#host-side-graphrag-extraction).
 - In Google Antigravity, active graph relationships are delivered into agent context before each tool invocation.
 
 ### 4. Hybrid history search
@@ -201,6 +202,8 @@ Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout
 | | `propose_graph_update` | Validate node/edge additions with evidence chunk requirements. |
 | | `commit_graph_update` | Atomically commit validated graph updates with cursor progression. |
 | | `run_neograph_update` | Run the LLM GraphRAG extraction pipeline through NeoGraph. |
+| | `graph_next_batch` | Next batch of events for the **calling agent** to extract (no model call, key use or network access here); `after_order` looks ahead. See [Host-side GraphRAG extraction](#host-side-graphrag-extraction). |
+| | `graph_submit_batch` | Validate and commit the agent's extraction of one batch, in order and idempotently; a batch without relations needs a recorded reason. |
 | **Search & Analytics** | `sync_session` | Incremental evidence sync for Codex, Grok Bot, OMP, AGY and Claude Code transcripts. |
 | | `search_history` | Hybrid retrieval (dense vector + BM25 + regex) over history. |
 | | `get_chunk` | Retrieve a raw evidence chunk with secret masking. |
@@ -212,6 +215,24 @@ Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout
 | | `workflow_transition` | Evaluate the current classification through the compiled Lean transition function. |
 | | `workflow_authorize` | Issue a single-use, action/version/state-bound execution grant. |
 | | `workflow_execute` | Recheck and consume the grant, run the exact argv, then record success or failure. |
+
+### Host-side GraphRAG extraction
+
+`run_neograph_update` sends one batch per call to an OpenRouter model. Two tools let the calling agent (or a restricted subagent) do the extraction instead: they make no model call and no network call and do not use the OpenRouter key (a server that is not in local-only mode still needs its embedder configuration to start, as for every tool). They work with `SELF_DIRECT_LOCAL_ONLY=true` and with either `SELF_DIRECT_GRAPH_EXTRACTOR` value, like `propose_graph_update` and `commit_graph_update`, which make no model or network call either. `SELF_DIRECT_GRAPH_EXTRACTOR=host` also turns `run_neograph_update` off, so this server sends no session text to a model for graph extraction.
+
+1. `graph_next_batch(session_id)` returns the next batch: up to 100 complete events and 95,000 characters, cut and masked exactly as `run_neograph_update` cuts and masks them (an event over the limit stops the loop as `graph_event_too_large` and is never truncated), a `batch_id`, `remaining_events`, the graph cursor, and the extractor instructions, proposal schema and allowed relations. `status: "up_to_date"` ends the loop; a session without indexed events is `no_events`.
+2. The agent extracts nodes and edges whose `evidence_chunk_ids` are `chunk_id`s of that batch.
+3. `graph_submit_batch(session_id, batch_id, proposal, extractor=...)` recomputes the batch from the index (`batch_changed` if its events are not what the id was made from; `invalid_batch_id` for an id `graph_next_batch` could not have written), requires it to be the next one (`out_of_order`, `stale_batch`), checks the proposal's shape and size caps (500 nodes, 1,000 edges, 500 characters per string, 200 per id, 2,000 for the summary), that every edge cites only events of this batch, and the existing evidence rules (`rejected`), then commits with the same graph-version and evidence checks as every graph write. The job id is the batch id, so repeating a submit returns `already_applied`.
+
+A batch is never skipped silently. A proposal without edges is rejected (`empty_graph_requires_review`, cursor retained): submit the relations the events state. When they really state none, call `graph_submit_batch` without a proposal and with `no_graph_facts_reason` (up to 500 characters); the cursor moves past the batch (`skipped_no_graph_facts`) and the reason and the `extractor` label are recorded in the job. A skip stores no nodes.
+
+**Parallel extraction.** `graph_next_batch(session_id, after_order=k)` starts the batch at event `k + 1` and moves nothing, so several batches can be planned from one cursor and extracted at the same time (for example one subagent each). Commits stay in order: a batch submitted before its predecessors returns `out_of_order` with `expected_start_order`; submit the earlier ones and retry. A batch is the events it names, so events appended to a live session meanwhile do not invalidate it.
+
+**Untrusted data.** Event text is copied from a transcript and can contain instructions aimed at whoever reads it. Run the extraction in an agent that has only these two tools (no shell, file or network access) and have it call nothing but `graph_submit_batch` with the result. A submit can add at most 500 nodes and 1,000 edges, every edge backed by events of its own batch, and move the cursor only over that batch. The `extractor` label is free text (control characters removed, 80 characters, default `host:unspecified`) kept for provenance; nothing trusts it.
+
+**Cross-vendor.** Extracting a session with a different vendor's model discloses that session to that vendor. By default extract only the sessions of the host you are running in.
+
+**Batch-range commits.** `commit_graph_update` without `through_order` moves the cursor to the end of the whole session, even when the proposal was built from some of the events; `propose_graph_update` and `commit_graph_update` report that position as `covers_through_order`. Pass `through_order`, the order of the last event the proposal covers (from the first unprocessed event to the last event, otherwise `invalid_through_order` and nothing is stored), to advance only that far. It is also the explicit way past an event too large for a batch: read it with `get_chunk` and commit the relations you find with `through_order` set to its order.
 
 ---
 
@@ -287,6 +308,7 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_AUDIT_TIMEOUT_SEC` | `8` | Response budget for audits and hooks. |
 | `SELF_DIRECT_REQUEST_TIMEOUT_SEC` | `45` | Response budget for ordinary calls. |
 | `SELF_DIRECT_GRAPH_UPDATE_TIMEOUT_SEC` | `300` | Budget for `run_neograph_update`. |
+| `SELF_DIRECT_GRAPH_EXTRACTOR` | `openrouter` | Who extracts for `run_neograph_update`: `openrouter` (an OpenRouter model) or `host`, which disables that tool (`extractor_disabled`; the key and the network are not touched). `graph_next_batch` and `graph_submit_batch` work with either value, also with `SELF_DIRECT_LOCAL_ONLY=true`. An unknown value is an error. See [Host-side GraphRAG extraction](#host-side-graphrag-extraction). |
 | `SELF_DIRECT_MAX_TOOL_TIMEOUT_SEC` | `600` | Upper bound for a client-supplied `timeout_ms`. |
 | `SELF_DIRECT_MAX_CONCURRENT_CALLS` | `4` | **New in 0.6.0.** Heavy tool calls that may run at once (minimum 1); excess calls wait within their own deadline. |
 | `SELF_DIRECT_INTEGRITY_FAST_RECENT_BLOCKS`, `SELF_DIRECT_INTEGRITY_FAST_SAMPLE_BLOCKS` | `4`, `8` | Fast (hook-time) source verification: the latest complete 1 MiB blocks and the random sample compared with their stored digests. `0` for either disables that part (the tail block is always compared). See [Source integrity](#source-integrity-full-and-fast-verification). |
