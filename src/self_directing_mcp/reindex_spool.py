@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import io
 import itertools
 import json
 import os
@@ -53,7 +54,7 @@ SPOOL_FORMAT = 1
 DIRECTORY = "reindex"
 SUFFIX = ".spool"
 HEAD_BYTES = 64 * 1024              # the head of the source whose hash binds a spool to it
-BLOCK_BYTES = 1 << 20               # about this much row text per frame
+BLOCK_BYTES = 1 << 18               # about this much row text per frame (a commit holds one at a time)
 INDEX_CHUNK = 16384                 # ids (and flags, tallies) per index frame: what a commit decodes at a time
 # Free space wanted on the index volume, per source byte, before a spool is started: twice the measured 4.2 spool bytes per
 # source byte (the commit then grows the database by about as much again while the spool still exists).
@@ -593,11 +594,16 @@ class ReindexSpool:
         self.valid, self.receipt_digest = True, self.binding.receipt_digest
         self._remember()
 
-    def _write_frame(self, payload: bytes) -> int:
-        length = len(payload)
+    def _write_frame(self, *parts) -> int:
+        """Write one frame whose payload is ``parts`` joined (without joining them: a block is not copied to be framed)."""
+        length = sum(len(part) for part in parts)
+        crc = zlib.crc32(_LEN.pack(length))
+        for part in parts:
+            crc = zlib.crc32(part, crc)
         offset = self._end
-        _write_all(self._fd, _FRAME.pack(length, _crc(length, payload)))
-        _write_all(self._fd, payload)
+        _write_all(self._fd, _FRAME.pack(length, crc))
+        for part in parts:
+            _write_all(self._fd, part)
         self._end += _FRAME.size + length
         return offset
 
@@ -627,7 +633,7 @@ class ReindexSpool:
             source, ids = self._encode(rows)
         for data, number in source:
             check_request()
-            frames.append((self._write_frame(ROWS + _ROWS.pack(number) + data), number))
+            frames.append((self._write_frame(ROWS + _ROWS.pack(number), data), number))
             count += number
         if hasattr(rows, "blocks") and rows.count != count:
             raise SpoolError("the rows of a slice do not match their count")
@@ -832,15 +838,17 @@ class StagedRows:
         with open(self.path, "rb") as stream:
             for offset, number in self._row_frames:
                 check_request()
-                payload = self._frame(stream, offset)
-                lines = payload[5:].split(b"\n")
-                if len(lines) != number + 1 or lines[-1]:
-                    raise SpoolError("a row frame of the spool does not hold the rows it counts")
-                for line in lines[:-1]:
+                lines = io.BytesIO(self._frame(stream, offset))
+                lines.seek(5)                       # the kind and the row count
+                seen = 0
+                for line in lines:                  # a row at a time: the block is not split into a list of rows
                     batch.append(tuple(json.loads(line)))
+                    seen += 1
                     if len(batch) == size:
                         yield batch
                         batch = []
+                if seen != number:
+                    raise SpoolError("a row frame of the spool does not hold the rows it counts")
         if batch:
             yield batch
 
