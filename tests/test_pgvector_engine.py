@@ -228,3 +228,25 @@ def test_the_derived_free_sync_of_a_hook_never_connects(world, tmp_path):
         assert engine.dense.describe()["connected"] is False
     finally:
         engine.close()
+
+
+def test_switching_the_backend_refills_the_server_from_the_local_embedding_cache(world, monkeypatch):
+    """The migration path: no in-place conversion and no embedding API call, because the cache of embeddings lives in the
+    canonical store (``meta.sqlite``) beside the events, not in the dense index."""
+    from self_directing_mcp.embed.embedder import FakeEmbedder
+
+    before = world.engine(backend="numpy")
+    first = before.sync_session(session_id=SAMPLE_ID)
+    assert first["ok"] and first["embedded"] >= 1
+    chunks = set(before.store.chunk_ids(SAMPLE_ID, "codex"))
+    before.close()
+    calls = []
+    real = FakeEmbedder.embed_documents
+    monkeypatch.setattr(FakeEmbedder, "embed_documents", lambda self, texts: (calls.append(len(texts)), real(self, texts))[1])
+    after = world.engine(backend="pgvector")                       # the same index directory, another dense backend
+    after.ensure_ready()
+    assert after.dense.describe()["connected"] is False             # nothing has reached the server yet
+    refilled = after.sync_session(session_id=SAMPLE_ID)
+    assert refilled["ok"] and refilled["embedded"] == 0 and refilled["dense_restored"] == len(chunks) and calls == []
+    assert table_ids(world) == chunks
+    assert after.search_history("curl", session_id=SAMPLE_ID, mode="dense", top_k=3)["ok"]
