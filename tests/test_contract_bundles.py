@@ -136,7 +136,7 @@ def test_the_top_level_must_be_an_object():
 @pytest.mark.parametrize("data,code", [
     (b"\xff\xfe not utf8", "not_utf8"), (b"{not json", "not_json"), (b"", "not_json"), (b'{"a": NaN}', "not_json"),
     (b'{"schema": "x", "schema": "y"}', "not_json"), (b"[" * 100000, "not_json"),
-])
+], ids=["not-utf8", "broken-json", "empty", "nan-constant", "duplicate-key", "deeply-nested"])   # explicit ids: a 100,000 character id overflows Windows' 32,767 character environment variable limit (PYTEST_CURRENT_TEST)
 def test_bytes_that_are_not_utf8_json_are_refused(data, code):
     with pytest.raises(cb.BundleError) as caught:
         cb.parse_bundle(data, kind="project", path_label="x")
