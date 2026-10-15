@@ -396,7 +396,7 @@ class PgVectorIndex(VectorIndex):
             raise PgVectorUnavailable(
                 f"Cannot connect to the pgvector server {self._endpoint()}: {self._scrub(self._driver.message(exc))}. "
                 "Check that the server is reachable, the credentials in " + ENVIRONMENT_HINT +
-                " are right, and (for a remote server) that sslmode=verify-full is set.") from None
+                " are right, and (for a remote server) that sslmode=verify-full is set. No other dense backend is used.") from None
         try:
             self._verify_transport(connection)
         except BaseException:
