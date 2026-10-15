@@ -270,7 +270,9 @@ def omp_records(seeds):
 
 
 @pytest.fixture
-def omp_scenario(tmp_path, monkeypatch):
+def omp_scenario(tmp_path, monkeypatch, request):
+    if getattr(request, "param", None):                        # indirect parametrization: the sparse index format
+        monkeypatch.setenv("SELF_DIRECT_SPARSE_FORMAT", request.param)
     seeds = Seeds()
     root = tmp_path / "sessions"
     root.mkdir()
@@ -306,13 +308,22 @@ def test_omp_every_tool_and_bridge_path_is_masked_while_raw_audit_detects(omp_sc
     verify_canonical_detection(sc)
 
 
+@pytest.mark.parametrize("omp_scenario", ["compact", "legacy"], indirect=True)
 def test_sparse_index_holds_masked_text_so_search_is_not_a_secret_oracle(omp_scenario):
     sc = omp_scenario
     engine, seeds = sc["engine"], sc["seeds"]
     assert tool("sync_session", session_id="omp-1", provider="omp", path=sc["path"], embed=False)["ok"]
     assert tool("search_history", query="steer", session_id="omp-1", provider="omp", mode="sparse")["hits"]
-    stored = " ".join(row[0] for row in engine.sparse._conn.execute("SELECT text FROM chunks_fts"))
-    assert "sk-***" in stored and not [tag for tag in seeds.tags if tag in stored]
+    if engine.sparse.format == "legacy":
+        stored = " ".join(row[0] for row in engine.sparse._conn.execute("SELECT text FROM chunks_fts"))
+        assert "sk-***" in stored and not [tag for tag in seeds.tags if tag in stored]
+    else:
+        # The compact file keeps no text at all (SECURITY.md); what it indexed is the masked text.
+        assert engine.sparse._conn.execute("SELECT COUNT(*) FROM chunks_fts WHERE text IS NOT NULL").fetchone()[0] == 0
+        assert tool("search_history", query="sk", session_id="omp-1", provider="omp", mode="sparse")["hits"]
+    engine.sparse._conn.commit()
+    on_disk = engine.sparse.db_path.read_bytes().lower()       # FTS5 terms are lower case: a raw token would be one of them
+    assert not [tag for tag in seeds.tags if tag.lower().encode() in on_disk]
     # The raw token is indexed nowhere, so querying for it reveals nothing about the history.
     probe = sk("OMPUSERZQ").rsplit("-", 1)[-1]
     assert any(probe in chunk.text for chunk in engine.store.list_chunks("omp-1", "omp"))
