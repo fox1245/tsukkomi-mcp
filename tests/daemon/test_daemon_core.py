@@ -19,6 +19,13 @@ from self_directing_mcp.daemon import core, envview, protocol as P, rundir
 import daemon_support as support
 
 
+def newer(version: str, field: int) -> str:
+    """The next patch (field 2) or minor (field 1) of ``version``: a version newer than the package's own, whatever it is."""
+    parts = [int(part) for part in version.split(".")]
+    parts[field] += 1
+    return ".".join(str(part) for part in (parts[:field + 1] + [0] * (2 - field)))
+
+
 class Gate:
     """A hook runner that answers ``{"systemMessage": "stub"}`` once released (immediately when not held)."""
 
@@ -241,7 +248,7 @@ def test_malformed_requests_are_answered_bad_request(inproc, frame):
 
 def test_an_older_client_is_told_version_mismatch_and_cannot_replace_or_drain_the_daemon(inproc):
     gate = Gate()
-    daemon = inproc(hook_runner=gate, version="0.6.0")
+    daemon = inproc(hook_runner=gate, version=__version__)
     for version, proto in (("0.5.9", None), ("0.0.1", None), ("0.5.0", P.PROTO + 1)):     # older, older, mixed
         hello, answer = request(daemon, hook_frame(), version=version, proto=proto)
         assert hello["relation"] in ("older", "mixed")
@@ -249,13 +256,13 @@ def test_an_older_client_is_told_version_mismatch_and_cannot_replace_or_drain_th
         _hello, drain = request(daemon, {"op": "drain"}, version=version, proto=proto)
         assert drain["ok"] is False and drain["reason"] == "version_mismatch"
     assert daemon.running and not daemon.daemon.draining and not gate.calls
-    assert request(daemon, hook_frame(), version="0.6.0")[1]["ok"] is True
+    assert request(daemon, hook_frame(), version=__version__)[1]["ok"] is True
 
 
-@pytest.mark.parametrize("version,proto", [("0.7.0", None), ("0.6.1", None), ("0.6.0", P.PROTO + 1)])
+@pytest.mark.parametrize("version,proto", [(newer(__version__, 1), None), (newer(__version__, 2), None), (__version__, P.PROTO + 1)])
 def test_a_newer_client_is_refused_service_and_may_drain_the_daemon(inproc, version, proto):
     gate = Gate()
-    daemon = inproc(hook_runner=gate, version="0.6.0")
+    daemon = inproc(hook_runner=gate, version=__version__)
     sock, hello = daemon.connect(version=version, proto=proto)
     assert hello["relation"] == "newer"
     P.write_frame(sock, hook_frame())
@@ -270,11 +277,11 @@ def test_a_newer_client_is_refused_service_and_may_drain_the_daemon(inproc, vers
 
 def test_a_drain_lets_in_flight_requests_finish_and_refuses_new_ones(inproc):
     gate = Gate(hold=True)
-    daemon = inproc(hook_runner=gate, version="0.6.0")
+    daemon = inproc(hook_runner=gate, version=__version__)
     running = in_thread(request, daemon, hook_frame("a"))
     assert wait_for(lambda: daemon.daemon.inflight == 1)
-    held, _ = daemon.connect(version="0.6.0")                       # an existing connection
-    request(daemon, {"op": "drain"}, version="0.7.0")
+    held, _ = daemon.connect(version=__version__)                       # an existing connection
+    request(daemon, {"op": "drain"}, version=newer(__version__, 1))
     assert wait_for(lambda: daemon.daemon.draining)
     assert not daemon.runtime.exists(rundir.SOCKET_NAME)             # no new clients find this daemon any more
     with pytest.raises(OSError):

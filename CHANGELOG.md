@@ -2,7 +2,11 @@
 
 Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions follow `pyproject.toml`. Releases before 0.6.0 are not itemized here; see the git history.
 
-## Unreleased
+## 0.7.0 - 2026-10-15
+
+**Highlights.** A session that is too big for one request budget no longer makes a request lose everything and start again: a sync publishes the prefix it parsed ([#26](https://github.com/fox1245/tsukkomi-mcp/issues/26)), a re-index is staged in a spool and published by one commit, an audit sizes its slice by what judging it costs, a sync that runs out of time no longer takes the judgement with it (a prohibited proposed action is still a `violation`), and `audit_status.ops` says which tool ended how. Also new: host-side GraphRAG extraction, incremental contract audits with an adaptive shadow comparison, source integrity with a fast hook-time path, an opt-in resident daemon and an opt-in write-ahead journal. Large derived passes and large appends no longer cost the square of the session.
+
+**Upgrading.** Restart every process that shares an index. `regex>=2024.11.6` is a new dependency, and the console entry points (`tsukkomi-mcp`, `self-directing-mcp`) now point at `self_directing_mcp.entry:main`: reinstall the package, do not only copy files. The AGY parser is version 8 and the Claude Code parser version 3 (a session of those providers is re-parsed on its first touch; a large one is staged and no longer needs a single request to finish it), the evaluator version is 8 (the first audit of a session builds its monitor states again). See "Upgrading to 0.7.0" in the [README](README.md).
 
 Source integrity (one scan of the source prefix per request, block digests, a fast path for hook-time checks) and incremental contract audits (a monitor state per contract, so an audit reads only what was appended). Restart every process that shares an index after upgrading (see "Upgrading to 0.6.0" in the [README](README.md): an older process that meets a migrated cursor reindexes that session once).
 
