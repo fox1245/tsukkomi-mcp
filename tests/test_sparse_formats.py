@@ -271,3 +271,43 @@ def test_the_rebuild_command_reports_an_old_sqlite(tmp_path, monkeypatch, capsys
     code = maintenance.main(["sparse-rebuild", "--index-dir", str(tmp_path / "idx"), "--format", "compact"])
     assert code == maintenance.EXIT_FAILED and "SELF_DIRECT_SPARSE_FORMAT=legacy" in capsys.readouterr()[1]
     assert not (tmp_path / "idx" / "sparse-v2.sqlite").exists()
+
+
+def test_a_rebuild_killed_between_batches_leaves_a_sound_index_and_resumes(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from pathlib import Path
+    from self_directing_mcp.index.sparse import CompactSparseIndex
+    engine, path = make(tmp_path, monkeypatch, events=1)
+    write(path, [{"type": "session_meta", "payload": {"id": SID}}]
+          + [message(f"{WORDS[i % 3]} killtest event{i} " + "padding words for the index " * 120) for i in range(1200)])
+    try:
+        engine.sync_session(session_id=SID, embed=False, derived=False)
+        total = engine.store.chunk_count()
+    finally:
+        engine.close()
+    index = tmp_path / "index"
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(root / "src"), "PYTHONDONTWRITEBYTECODE": "1", "SELF_DIRECT_CODEX_SESSIONS_DIR": str(tmp_path / "sessions"),
+           "SELF_DIRECT_USE_FAKE_EMBEDDER": "true", "SELF_DIRECT_DENSE_BACKEND": "numpy"}
+    command = [sys.executable, "-m", "self_directing_mcp.maintenance", "sparse-rebuild", "--index-dir", str(index), "--batch", "10"]
+    process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert "sparse-rebuild:" in process.stderr.readline()            # the first batch is committed before this line
+        process.kill()                                                    # no cleanup, no engine.close(): a crash
+    finally:
+        process.communicate(timeout=60)
+    compact = CompactSparseIndex(index / "sparse-v2.sqlite")
+    try:
+        assert 0 < compact.count() < total                                # interrupted part-way
+        assert compact._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert compact.verify_statistics()["ok"]
+        assert compact.search("killtest")
+        kept = compact.count()
+    finally:
+        compact._conn.close()
+    again = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=300)
+    assert again.returncode == 0, again.stderr[-1500:]
+    info = json.loads(again.stdout)
+    assert info["state"] == "complete" and info["already_indexed"] >= kept and info["already_indexed"] + info["written"] == total
+    assert info["statistics"]["ok"]

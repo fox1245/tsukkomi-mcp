@@ -148,7 +148,9 @@ def install_spans() -> None:
     span(hook_policy, "checkpoint")
     for name in ("record", "mark_indexed", "authority_token", "read_capture", "prepare_bindings", "publish_bindings"):
         span(agy_receipts.ReceiptStore, name)
-    span(sparse.SparseIndex, "upsert_many")
+    for index_class in (sparse.SparseIndex, getattr(sparse, "CompactSparseIndex", None)):      # the compact format is the default
+        if index_class is not None:
+            span(index_class, "upsert_many")
     span(sparse.SparseIndex, "present")
 
 
