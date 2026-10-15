@@ -44,6 +44,7 @@ DAEMON_MODES = ("off", "on")
 SQLITE_JOURNAL_MODES = ("auto", "delete")    # journal.py validates the same two values
 GRAPH_EXTRACTORS = ("openrouter", "host")    # who extracts for run_neograph_update: an OpenRouter model, or only the host agent
 SYNC_SLICING_MODES = ("auto", "off")         # index.ingest.SlicePolicy takes the same two values
+SPARSE_FORMATS = ("auto", "legacy", "compact")   # index.sparse.open_sparse_index takes the same three values
 
 DEFAULT_ENFORCEMENT = "confirmed_only"
 DEFAULT_SESSION_PROVIDER = "codex"
@@ -52,6 +53,7 @@ DEFAULT_DAEMON = "off"
 DEFAULT_GRAPH_EXTRACTOR = "openrouter"
 DEFAULT_SQLITE_JOURNAL = "delete"            # "auto" is opt-in until the commit benchmark says otherwise (README, "SQLite journal")
 DEFAULT_SYNC_SLICING = "auto"                # "off" is exactly the all-or-nothing sync of before slicing (README, "Large sessions and deadlines")
+DEFAULT_SPARSE_FORMAT = "auto"               # compact when this SQLite can, else the legacy file, visibly (README, "Sparse index formats")
 DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 DEFAULT_EMBEDDING_DIM = 1024
 DEFAULT_EMBEDDING_BASE_URL = "https://openrouter.ai/api/v1"
@@ -423,6 +425,7 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("sqlite_journal", _literal(SQLITE_JOURNAL_MODES), _static(DEFAULT_SQLITE_JOURNAL)),
     FieldSpec("sync_slicing", _literal(SYNC_SLICING_MODES), _static(DEFAULT_SYNC_SLICING)),
     FieldSpec("sync_slice_bytes", lambda name, text: _to_int(name, text, 1), _static(DEFAULT_SYNC_SLICE_BYTES)),
+    FieldSpec("sparse_format", _literal(SPARSE_FORMATS), _static(DEFAULT_SPARSE_FORMAT)),
 )
 FIELD_NAMES = tuple(spec.name for spec in FIELDS)
 

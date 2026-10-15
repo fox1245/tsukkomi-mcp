@@ -554,3 +554,18 @@ def open_sparse_index(index_dir, setting: str = "auto") -> tuple[SparseIndex, di
             fmt = "legacy"
     cls = CompactSparseIndex if fmt == "compact" else SparseIndex
     return cls(sparse_file(index_dir, fmt)), {"setting": setting, "format": fmt, "reason": reason}
+
+
+def count_sparse_file(path) -> int | None:
+    """Documents in a sparse file this process does not use (``audit_status`` shows both formats). Read-only: the file is
+    never created, written or recovered, and only its id map is read, not the FTS5 tables. None when it cannot be read."""
+    try:
+        conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
+    except (sqlite3.Error, ValueError):
+        return None
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM chunk_rows").fetchone()[0])
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
