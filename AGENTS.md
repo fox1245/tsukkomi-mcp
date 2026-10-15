@@ -23,8 +23,9 @@ An AI response without edges returns empty_graph_requires_review and retains the
 cursor. The extractor explains its output in extraction_summary; that explanation
 is not proof that the input contains no relations. Review/retry is explicit, including
 for batches that truly contain no graph facts. Do not manufacture edges to pass.
-GraphRAG updates currently require explicit run_neograph_update calls; lifecycle
-hooks do not automatically send session text to the model or update this graph.
+GraphRAG updates currently require explicit calls: run_neograph_update, or
+graph_next_batch plus graph_submit_batch (the calling agent extracts); lifecycle
+hooks do not automatically send session text anywhere or update this graph.
 
 Windows session-root checks compare resolved normal/extended DOS and UNC paths in
 the same namespace and retain the resolved I/O path. Device paths and actual root

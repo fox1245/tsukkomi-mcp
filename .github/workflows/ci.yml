@@ -39,6 +39,7 @@ jobs:
           tests/test_workflow_jev.py
           tests/test_windows_session_paths.py
           tests/test_journal.py
+          tests/test_graph_host_extraction.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
           tests/test_codex_zstd.py
