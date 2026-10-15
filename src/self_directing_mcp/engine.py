@@ -696,6 +696,7 @@ class SelfDirectEngine:
             failure, failed = info.get("error", "sync_failed"), info
         except FlightBusy as busy:
             failure = busy.reason   # another request is syncing this session: judge on what it has committed so far
+            request_stats.note_degraded(failure)
         except IndexBusy:
             raise
         except RequestStopped as stopped:

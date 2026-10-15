@@ -207,14 +207,17 @@ clean and judged_prefix is never set: a forbidden match in the committed prefix 
 action that matches a prohibition is a violation, everything else is unknown. A reindex (parser upgrade,
 changed source, changed AGY receipts) and a .zst source are never sliced; an interrupted reindex leaves
 the previous index. A request that waits for another request's sync of the same session gives up after
-min(1 s, a quarter of its time) with sync_in_progress. Response reasons and coverage issues are an open
-set: show an unknown one as an opaque string and treat it as unverified.
+min(1 s, a quarter of its time) with sync_in_progress (for an audit or check, a quarter of the sync's 60 % share).
+Response reasons and coverage issues are an open set: show an unknown one as an opaque string and treat it as
+unverified.
 
 A deadline-bound check_action or audit_session gives its sync 60 % of the time left (engine.SYNC_BUDGET_SHARE). If that
 runs out while the request is live, the stored index is judged and coverage.issues carries sync_deadline: a must_not match
 is still a violation, nothing else is better than unknown, and the request's own deadline, a cancellation and index_busy
-still end the request as before. audit_status returns the process's request statistics as ops (in memory, closed names,
-no session content), even when the engine is busy.
+still end the request as before. A sync that can slice stops at its soft deadline inside that share and keeps its
+prefix (sync_in_progress above); sync_deadline remains for one that cannot. audit_status returns the process's request
+statistics as ops (in memory, closed names, no session content; both reasons count as degraded), even when the engine
+is busy.
 
 ## Codex event coverage and parser upgrades
 

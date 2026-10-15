@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from self_directing_mcp import agy_hooks, claude_hooks, hook_policy, server
+from self_directing_mcp import agy_hooks, claude_hooks, hook_policy, request_stats, server
 from self_directing_mcp.codex_hooks import handle_hook
 from self_directing_mcp.index.ingest import FlightBusy
 from self_directing_mcp.request_control import RequestControl, request_scope
@@ -67,12 +67,16 @@ def test_the_codex_hook_of_a_waiter_that_gave_up_says_unknown_with_the_reason(mo
     def gave_up(*args, **kwargs):
         raise FlightBusy()
 
+    fresh = request_stats.RequestStats()
+    monkeypatch.setattr(server, "STATS", fresh)
     monkeypatch.setattr(server, "handle_hook", gave_up)
     answer = asyncio.run(server._dispatch_hook("PreToolUse", "sid", "/p", "shell", {"command": "x"}))
     context = answer["hookSpecificOutput"]["additionalContext"]
     assert context == "Self-directing audit: unknown (sync_in_progress); do not claim compliance."
     stop = asyncio.run(server._dispatch_hook("Stop", "sid", "/p"))
     assert stop == {"systemMessage": context}
+    counted = fresh.snapshot()["tools"]["hook"]           # counted under its own name, not folded into "other"
+    assert counted["outcomes"]["incomplete"] == 2 and counted["reasons"]["incomplete"] == {"sync_in_progress": 2}
 
 
 def test_the_agy_adapter_allows_with_a_short_unverified_note_and_asks_for_a_high_risk_contract(tmp_path, monkeypatch):
