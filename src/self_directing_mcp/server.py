@@ -512,7 +512,9 @@ async def audit_session(session_id: str, provider: str | None = None, path: str 
     Refreshes local JSONL first and returns coverage and a contracts snapshot.
     Unknown means evidence/verification is missing; it must not be called compliance.
     provider filters the audit (codex|grokbot|omp|agy|claude).
-    timeout_ms: optional per-call budget in milliseconds for large sessions.
+    timeout_ms: optional per-call budget in milliseconds for large sessions. A session too big for one call is synced
+    and judged in slices over several calls; one that is indexed but has no monitor state yet
+    (audit_status.evaluation.session.events_without_state) may need a larger budget for its first audit.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=True)
     return await _dispatch(_engine.audit_session, session_id, provider=provider, path=path, audit=True, budget_override=budget)

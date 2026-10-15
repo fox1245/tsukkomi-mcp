@@ -40,6 +40,7 @@ from self_directing_mcp.audit import shadow as shadow_module
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 from self_directing_mcp.audit import patterns as _patterns
 from self_directing_mcp.audit.applicability import PROPOSED_CALL_PREFIX, not_applicable_reason
+from self_directing_mcp.eval_cost import COSTS, REFERENCE_PER_EVAL
 from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request, current_request
 from self_directing_mcp.schemas import Evidence, Finding
 from self_directing_mcp.security.mask import mask_secrets
@@ -873,6 +874,36 @@ def _shadow_affordable(events) -> bool:
     return remaining - comparison_reserve(remaining) > events * SHADOW_SECONDS_PER_EVENT * 1.5 + 0.5
 
 
+# A comparison is decided twice, and both decisions can only SKIP more than ``_shadow_affordable`` alone: once before the
+# events of the reference are read (``prepare``, from what earlier requests of this process measured) and once after the
+# incremental pass, when the speed of that very pass is known (``comparison_shortfall``, from the engine). What is skipped
+# is not lost: a resident engine's idle comparison verifies the state (``shadow_worker``), and the policy that decides which
+# requests are compared (rates, warm-up) does not change. ``COMPARISON_MARGIN`` is the safety factor on the estimate, and a
+# comparison starts only if the estimate fits in ``COMPARISON_ROOM_SHARE`` of the time that is left for it: a verification
+# that runs out of that time is cut and was a waste, and the answer it kept waiting was ready long before (measured:
+# a comparison started in 27 s of room on a 300,000-event session of heavy contracts took all of it and was cut).
+COMPARISON_MARGIN = 1.25
+COMPARISON_ROOM_SHARE = 0.5
+
+
+def comparison_shortfall(events, rate, *, delta=0, defer=False, scale=1.0):
+    """Why a comparison does not fit the time left, or ``None`` when it does (or when nothing is known about its cost).
+
+    ``events``: stored events the reference evaluates; ``rate``: seconds one event costs to fold into the monitors (None:
+    unknown, no opinion); ``delta``: events the incremental pass still has to fold before the comparison starts (``prepare``
+    asks before that pass, the engine after it: 0); ``defer``: a resident engine can verify the state later, which the
+    answer then says (``"deferred"``); ``scale``: the share of the contracts the comparison covers (a scoped comparison)."""
+    control = current_request()
+    if rate is None or control is None or control.deadline is None:
+        return None
+    left = control.deadline - time.monotonic()
+    room = left - comparison_reserve(left) - delta * rate * COMPARISON_MARGIN       # what is left once the fold has been made
+    cost = events * rate * REFERENCE_PER_EVAL * scale * COMPARISON_MARGIN
+    if cost > room * COMPARISON_ROOM_SHARE:
+        return "deferred" if defer else "deadline"
+    return None
+
+
 def _shadow_sample(session_id, offset, active, every) -> bool:
     """The fixed legacy draw (``SELF_DIRECT_AUDIT_SHADOW_EVERY`` set to an integer): about one audit in ``every``."""
     if every <= 0:
@@ -883,9 +914,11 @@ def _shadow_sample(session_id, offset, active, every) -> bool:
     return int(hashlib.sha256(token.encode()).hexdigest()[:8], 16) % every == 0
 
 
-def fold(events, monitors, facts, pools):
+def fold(events, monitors, facts, pools, progress=None):
     """Feed ``events`` to every consumer that has not seen them (``monitors``: ``(monitor, offset)`` pairs; ``facts``:
-    ``(facts, offset)`` or ``None``); a consumer skips events whose record starts before its offset."""
+    ``(facts, offset)`` or ``None``); a consumer skips events whose record starts before its offset. ``progress`` (a
+    one-item list) receives how many events were folded, at every cooperative check, so a fold that is stopped can say how
+    far it got."""
     shared, shared_offset = facts if facts is not None else (None, 0)
     shared_on = shared is not None and not shared.overflow
     feeds = [(monitor.feed, offset, monitor) for monitor, offset in monitors]
@@ -893,6 +926,8 @@ def fold(events, monitors, facts, pools):
     for number, event in enumerate(events):
         if not number & 511:
             check_request()
+            if progress is not None:
+                progress[0] = number
         start = event.key[0]
         for feed, offset, monitor in feeds:
             if start >= offset:
@@ -940,19 +975,25 @@ class AuditPlan:
         self.risky, self.prior = risky, prior or {}    # high-risk monitored contracts; their stored summaries
         self.fed = False
         self.overflowed, self.errors, self.timeouts = {}, {}, set()
+        # What this pass measured about itself (see ``eval_cost``): seconds to read the events the fold consumes
+        # (``load_seconds``, set by ``prepare``), seconds to fold them and how many were folded (``load``).
+        self.cost_key, self.load_seconds, self.fold_seconds, self.fold_events = None, 0.0, 0.0, 0
 
     # --- preparation (inside the read boundary) ---
 
     @classmethod
     def prepare(cls, store, *, session_id, provider, active, planned, needs, link_calls, shadow_every,
-                force_full=frozenset(), report=None, premise_rules=None, force=None, idle=False):
+                force_full=frozenset(), report=None, premise_rules=None, force=None, idle=False, cost_key=None,
+                defer=False):
         """Decide how to evaluate and read the events needed; ``None`` means evaluate everything the old way.
 
         ``shadow_every``: ``None`` for the adaptive schedule, else the fixed legacy rate (``audit.shadow``).
         ``premise_rules``: the contracts the verification premise is taken over (default ``active``; the engine passes the
         enabled contracts of the session before the proposed-action filter, so an audit and an action check share one
         schedule). ``force``: comparisons a previous pass of this request found necessary (``shadow.Comparison``).
-        ``idle``: the idle comparison of a resident engine, which compares everything."""
+        ``idle``: the idle comparison of a resident engine, which compares everything. ``cost_key``: the key of this
+        contract set in ``eval_cost.COSTS`` (what a comparison is expected to cost, once this process has measured the set);
+        ``defer``: a resident engine can verify a skipped comparison later, and the report then says ``deferred``."""
         report = {} if report is None else report
         history = [r for r in active if r.regex and (r.type == "must" or planned is None)]
         history_ids = {r.id for r in history}
@@ -1082,9 +1123,32 @@ class AuditPlan:
             for reason in force.reasons:
                 comparison.add(reason, force.scope)
         shadow = comparison.active
-        if shadow and not _shadow_affordable(store.session_metrics(session_id, provider)[0]):
+        total = store.session_metrics(session_id, provider)[0]
+        if shadow and not _shadow_affordable(total):
             shadow = False
-            report["shadow_skipped"] = "deadline"
+            report["shadow_skipped"] = "deferred" if defer else "deadline"
+        elif shadow and not idle and force is None and COSTS.observed(cost_key):
+            # This process has measured what folding one event costs for this contract set: a comparison that cannot
+            # follow the incremental pass in the time left is skipped now, before its events are read. (A request
+            # that has nothing measured yet is judged by the estimate above, and again by the engine after the pass. A
+            # comparison that an answer called for, ``force``, is the business of the pass that asks for it.)
+            building = bool(routes) or bool(rebuilds) or bool(facts_rebuild)
+            behind = total if building else max(0, total - min(
+                (row["event_count"] for row in [*deltas.values(), *([facts_row] if facts_row is not None else [])]),
+                default=total))
+            why = comparison_shortfall(total, COSTS.eval_cost(cost_key, 1), delta=behind, defer=defer)
+            if why is not None:
+                shadow = False
+                report["shadow_skipped"] = why
+
+        loading = {"reference": 0.0, "tail": 0.0}      # seconds spent reading events, for the cost model
+
+        def timed(kind, call, *args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return call(*args, **kwargs)
+            finally:
+                loading[kind] += time.perf_counter() - started
 
         def tail_mismatch(events, mode):
             """Consumers whose stored prefix no longer holds the number of events it was built from."""
@@ -1119,10 +1183,12 @@ class AuditPlan:
             if shadow and not comparison.full and not full:
                 scoped = [r for r in history if r.id in comparison.scope]
                 scoped_needs, scoped_links = runner.audit_needs(scoped, planned)
-                snapshot_events = store.capture_audit_events(session_id, provider, scoped_needs, link_calls=scoped_links)
+                snapshot_events = timed("reference", store.capture_audit_events, session_id, provider, scoped_needs,
+                                        link_calls=scoped_links)
                 partial = True
             else:
-                snapshot_events = store.capture_audit_events(session_id, provider, needs, link_calls=link_calls)
+                snapshot_events = timed("reference", store.capture_audit_events, session_id, provider, needs,
+                                        link_calls=link_calls)
             reference = list(snapshot_events.events)
             if not full:
                 bad = tail_mismatch(reference, "full")
@@ -1133,12 +1199,14 @@ class AuditPlan:
                         comparison.add("rebuild")
                         shadow = True
                     if partial:       # the monitors about to be rebuilt need the text of every rule
-                        snapshot_events = store.capture_audit_events(session_id, provider, needs, link_calls=link_calls)
+                        snapshot_events = timed("reference", store.capture_audit_events, session_id, provider, needs,
+                                                link_calls=link_calls)
                         reference, partial = list(snapshot_events.events), False
         events, mode, count = [], "delta", latest["event_count"] if chain_ok else 0
         if not full:
             from_byte = min([*offsets.values(), *([facts_row["byte_offset"]] if facts_row is not None else [])])
-            events = store.capture_audit_tail(session_id, provider, needs, link_calls=link_calls, from_byte=from_byte)
+            events = timed("tail", store.capture_audit_tail, session_id, provider, needs, link_calls=link_calls,
+                           from_byte=from_byte)
             bad = tail_mismatch(events, "delta")
             if bad:
                 drop(bad)
@@ -1147,7 +1215,8 @@ class AuditPlan:
                     comparison.add("rebuild")
                     shadow = True
                 if reference is None or partial:
-                    snapshot_events = store.capture_audit_events(session_id, provider, needs, link_calls=link_calls)
+                    snapshot_events = timed("reference", store.capture_audit_events, session_id, provider, needs,
+                                            link_calls=link_calls)
                     reference, partial = list(snapshot_events.events), False
         if full:
             events, mode = reference, "full"
@@ -1220,12 +1289,15 @@ class AuditPlan:
                  for rule_id in risky if rule_id in deltas and rule_id in monitors}
         if facts_rebuild:
             report["rebuilt"]["#facts"] = facts_why or "event_count"
-        return cls(session_id=session_id, provider=provider, mode=mode, events=events, count=count,
+        plan = cls(session_id=session_id, provider=provider, mode=mode, events=events, count=count,
                    history_ids=history_ids, monitors=monitors, offsets=offsets, facts=facts,
                    facts_offset=facts_offset, facts_new=facts_row is None, pools=pools, routes=routes,
                    rebuilds=rebuilds, support=support, snapshot=snapshot, shadow=shadow, digest=digest,
                    parser_version=parser_version, report=report, reference=reference, comparison=comparison,
                    schedule=schedule, schedule_loaded=schedule_loaded, risky=risky & set(monitors), prior=prior)
+        plan.cost_key = cost_key
+        plan.load_seconds = loading["tail"] if mode == "delta" else loading["reference"]
+        return plan
 
     # --- comparisons that only the finished answer can call for ---
 
@@ -1275,18 +1347,31 @@ class AuditPlan:
         if self.fed:
             return
         self.fed = True
+        started, progress = time.perf_counter(), [0]
         try:
             # One pooled budget for the walk (a per-event, per-monitor budget would cost more than the walk). A monitor
             # that runs out is dropped and its rule is judged by the reference evaluator with its own budget.
             with contract_budget(_patterns.CONTRACT_BUDGET_SEC * max(1, len(self.monitors))):
                 fold(self.events, [(monitor, self.offsets[monitor.rule.id]) for monitor in self.monitors.values()],
-                     (self.facts, self.facts_offset) if self.facts.needed else None, self.pools)
+                     (self.facts, self.facts_offset) if self.facts.needed else None, self.pools, progress)
         except (RequestStopped, IndexBusy):
+            self._measure(progress[0], started)    # a fold that was stopped still says how fast it was
             raise
         except Exception as exc:
             if self.mode != "full":
                 raise PlanRetry(self.monitors, "monitor_error:" + type(exc).__name__, None, "error") from exc
             raise
+        self._measure(len(self.events), started)
+
+    def _measure(self, folded, started):
+        """Tell the cost model how long ``folded`` events took to read and fold, when every consumer folded the same events
+        (a mixed fold, one rebuilt monitor beside up-to-date ones, says nothing about the cost of a whole contract set)."""
+        self.fold_seconds, self.fold_events = time.perf_counter() - started, folded
+        offsets = {self.offsets[monitor.rule.id] for monitor in self.monitors.values()}
+        if self.facts.needed:
+            offsets.add(self.facts_offset)
+        if len(offsets) == 1 and self.events and folded:
+            COSTS.observe_eval(self.cost_key, folded, self.fold_seconds + self.load_seconds * folded / len(self.events))
 
     def evaluate(self, active, *, proposed, coverage):
         self.load(active)

@@ -28,7 +28,8 @@ from self_directing_mcp.request_control import (
 from self_directing_mcp.session_events import (
     SourceChanged, capture_source, capture_source_fast, observed_source, source_scope,
 )
-from self_directing_mcp.slice_budget import SliceBudget, slice_scope
+from self_directing_mcp.eval_cost import COSTS
+from self_directing_mcp.slice_budget import SliceBudget, current_sizing, slice_scope
 from self_directing_mcp.source_blocks import BlockDraft, BlockRecord, BlockTable, FastFallback, is_block_hash
 
 
@@ -876,6 +877,34 @@ class SessionStore:
             latest = dict(found) if found is not None else None
         return {"cursor": cursor, "generation": row[0] if row is not None else None, "latest": latest}
 
+    def audit_progress(self, session_id, provider):
+        """``(events indexed, events the newest monitor state covers, its byte offset or None)`` as of this read boundary.
+
+        Only a state of the session's CURRENT generation counts (a rewrite drops the others), and a state held in memory
+        (``defer_derived``) counts like a stored one. A state belongs to one contract set; this does not look at which, so
+        what it reports for one set can only be too much covered, never too little."""
+        with self._read_boundary():
+            row = self._conn.execute("SELECT generation FROM session_generations WHERE provider=? AND session_id=?",
+                                     (provider, session_id)).fetchone()
+            total = self.chunk_count(session_id, provider)
+            covered, through = 0, None
+            if row is not None:
+                found = self._conn.execute(
+                    "SELECT MAX(event_count), MAX(byte_offset) FROM audit_monitor_state"
+                    " WHERE provider=? AND session_id=? AND generation=?", (provider, session_id, row[0])).fetchone()
+                covered, through = found[0] or 0, found[1]
+                for item in list(self.derived.states.get((provider, session_id), {}).values()):
+                    if item["generation"] == row[0]:
+                        covered = max(covered, item["event_count"])
+                        through = item["byte_offset"] if through is None else max(through, item["byte_offset"])
+        return total, covered, through
+
+    def audit_debt(self, session_id, provider):
+        """Events the index holds that no monitor state covers (all of them without a state): what the next incremental
+        audit has to fold before it can answer, and what a request sizes its sync by."""
+        total, covered, _through = self.audit_progress(session_id, provider)
+        return max(0, total - covered)
+
     def lineage_row(self, session_id, provider, generation, offset):
         found = self._conn.execute(
             "SELECT byte_offset,prefix_hash,event_count,synced_at FROM session_commit_log"
@@ -1433,7 +1462,9 @@ class IntegrityPolicy:
 # Slicing (``slice_budget``). A slice's soft deadline is ``SYNC_SHARE`` of the time the request has left when the parse
 # starts, divided by ``1 + COMMIT_RATIO`` because the commit of what was parsed costs about that fraction of the parse:
 # parse and commit use about half the budget and at least a quarter remains for the evaluation and the response. Never
-# less than ``SOFT_DEADLINE_MIN_SEC`` after the start. Module constants so tests can move them.
+# less than ``SOFT_DEADLINE_MIN_SEC`` after the start. That share is the UPPER bound: a request that will also judge
+# what it syncs (``slice_budget.Sizing``) ends the slice earlier when parsing, committing and evaluating the records it
+# holds would no longer fit the request (``SliceBudget.cost_budget``). Module constants so tests can move them.
 SYNC_SHARE = 0.5
 COMMIT_RATIO = 0.3
 SOFT_DEADLINE_MIN_SEC = 0.25
@@ -1489,25 +1520,50 @@ def _flight_wait(slicing, path):
     return min(FLIGHT_WAIT_MAX_SEC, FLIGHT_WAIT_SHARE * max(0.0, current_request().deadline - time.monotonic()))
 
 
-def _new_budget(slicing, start) -> SliceBudget:
+def _new_budget(slicing, start, pending=None) -> SliceBudget:
+    """The budget of a slice that starts at ``start`` and has ``pending`` bytes to parse (``None``: not known). A parse
+    shorter than the minimum progress is never cut, so it does not need the cost numbers (and a request that only ever
+    appends a little never reads the contracts for them)."""
     remaining = max(0.0, current_request().deadline - time.monotonic())
-    return SliceBudget(start, soft_deadline=slicing.clock() + max(SOFT_DEADLINE_MIN_SEC,
-                                                                  SYNC_SHARE * remaining / (1.0 + COMMIT_RATIO)),
+    started = slicing.clock()
+    options = {}
+    sizing = current_sizing()
+    if sizing is not None and (pending is None or pending > slicing.min_bytes) and sizing.resolve():
+        # The request judges what this slice publishes: parse + commit + evaluating the records must fit what is left
+        # of the REQUEST (not of the narrower share its sync runs in), less the reserve for the response and less the
+        # evaluation of what the index already holds without a monitor state. ``look`` applies it with the parse speed
+        # this very slice shows, so a guess about the parse cannot break it. The share above stays the upper bound.
+        whole = max(0.0, sizing.deadline - time.monotonic())
+        options = dict(started=started, cost_per_record=sizing.eval_per_event, commit_factor=1.0 + COMMIT_RATIO,
+                       cost_budget=max(0.0, (1.0 - sizing.reserve) * whole - sizing.debt_events * sizing.eval_per_event))
+    return SliceBudget(start, soft_deadline=started + max(SOFT_DEADLINE_MIN_SEC,
+                                                         SYNC_SHARE * remaining / (1.0 + COMMIT_RATIO)),
                        min_records=slicing.min_records, min_bytes=slicing.min_bytes, max_bytes=slicing.max_bytes,
-                       max_records=slicing.max_records, clock=slicing.clock)
+                       max_records=slicing.max_records, clock=slicing.clock, **options)
 
 
-def _sync_report(indexed, target, pending, budget, observation) -> dict:
+def _sync_report(indexed, target, pending, budget, observation, provider=None) -> dict:
     """The ``sync`` object of a result: how far the index got, how far this sync means to go, and why it stopped.
 
-    ``progress`` is the share of the target that is COMMITTED (what a parse read but did not publish does not count)."""
+    ``progress`` is the share of the target that is COMMITTED (what a parse read but did not publish does not count).
+    ``cost`` is what sized the slice: ``slice_us`` the expected microseconds to parse and commit an event, ``eval_us`` the
+    expected microseconds to judge one (0: nothing is judged after this sync), ``debt_events`` the events already
+    indexed that no monitor state covers, and ``limited_by`` which limit ended it (``share``: the soft deadline,
+    ``cost``: the cost bound, ``None``: neither, e.g. the end of the file)."""
     partial = indexed < target
     stopped = "eof"
     if partial:
         stopped = (budget.stopped_by if budget is not None and indexed < observation.complete_end else None) or "slice_cap"
-    return {"state": "partial" if partial else "complete", "indexed_through": indexed, "pending_bytes": pending,
-            "target_bytes": target, "progress": round(min(1.0, indexed / target), 4) if partial and target else 1.0,
-            "retry_after_ms": RETRY_AFTER_MS if partial else None, "stopped_by": stopped}
+    report = {"state": "partial" if partial else "complete", "indexed_through": indexed, "pending_bytes": pending,
+              "target_bytes": target, "progress": round(min(1.0, indexed / target), 4) if partial and target else 1.0,
+              "retry_after_ms": RETRY_AFTER_MS if partial else None, "stopped_by": stopped}
+    if budget is not None:
+        sizing = current_sizing()
+        report["cost"] = {"slice_us": round(COSTS.slice_cost(provider) * 1e6, 1),
+                          "eval_us": round(budget.cost_per_record * 1e6, 1),
+                          "debt_events": sizing.debt_events if sizing is not None else 0,
+                          "limited_by": budget.bound if partial else None}
+    return report
 
 
 def _signed64(value: int) -> int:
@@ -1980,9 +2036,10 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         if reindexed and observation.limited_from is not None:
             raise _NeedsWholeCapture()   # a reindex replaces events: never a prefix over an index that exists
         # Only the parse that adds to what is stored may stop early; one that replaces it is all or nothing.
-        budget = _new_budget(slicing, start) if sliceable and not reindexed else None
+        budget = _new_budget(slicing, start, observation.complete_end - start) if sliceable and not reindexed else None
         chunks = RowSpool()
         uses = set()
+        parse_started = time.perf_counter()
         try:
             with slice_scope(budget):
                 if cursor and not reindexed and provider != "agy" and start >= observation.complete_end:
@@ -2003,6 +2060,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                     _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, sink=chunks)
             if parsed_sid != sid:
                 raise ValueError("session id changed while parsing")
+            spent = time.perf_counter() - parse_started       # parse + commit of this slice, for the cost model
             blockable = _blockable(provider, path)
             digest = observation.cursor_hash(offset, "blocks" if blockable else "sha")
             draft = _draft(observation, offset, record) if blockable else None
@@ -2056,10 +2114,13 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 if (chunks.count or reindexed or cursor is None or offset != cursor["byte_offset"]
                         or relation == "moved" or needs_table or receipts_dirty):
                     # receipts_dirty: the events stand, but they now belong to these receipts (and their dependencies).
+                    committing = time.perf_counter()
                     store.commit_events((), session_id=sid, provider=provider, path=path, offset=offset,
                                         digest=digest, replace=reindexed, parser_version=parser_version,
                                         expected_token=expected_token, prepared_rows=chunks, receipt_digest=receipt_digest,
                                         blocks=draft, receipt_deps=receipt_deps)
+                    if not reindexed:       # what an appended event costs to parse and commit (a replace costs more)
+                        COSTS.observe_slice(provider, chunks.count, spent + time.perf_counter() - committing)
                 elif bound and observation.mode == "full":
                     # Nothing to publish, but every block was just compared: stamp the stored table.
                     stamp = observation.stamp
@@ -2096,7 +2157,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             coverage["backlog_bytes"] = backlog
             coverage["issues"].append("sync_in_progress")
             coverage["complete"] = False
-        sync = _sync_report(indexed, observation.target_end, coverage.get("pending_bytes", backlog), budget, observation)
+        sync = _sync_report(indexed, observation.target_end, coverage.get("pending_bytes", backlog), budget, observation,
+                            provider)
     info = {"session_id": sid, "provider": provider, "path": str(path), "byte_offset": offset,
             "new_chunks": new_chunks, "embedded": 0, "total_chunks": coverage["chunk_count"],
             "reindexed": reindexed, "parser_version": parser_version, "reindex_reason": reindex_reason,

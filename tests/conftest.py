@@ -42,6 +42,16 @@ def explicit_test_backend(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def fresh_cost_model():
+    """What an event costs is measured per process (``eval_cost.COSTS``); every test starts from the defaults, so that what one
+    test measured never decides how another test's slices are sized or its comparisons are skipped."""
+    from self_directing_mcp.eval_cost import COSTS
+    COSTS.reset()
+    yield
+    COSTS.reset()
+
+
+@pytest.fixture(autouse=True)
 def defer_derived_everywhere(monkeypatch):
     """``TSUKKOMI_TEST_DEFER_DERIVED=1`` runs the suite with every engine holding its derived writes (the daemon's mode).
 
