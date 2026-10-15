@@ -2,7 +2,7 @@
 
 Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions follow `pyproject.toml`. Releases before 0.6.0 are not itemized here; see the git history.
 
-## Unreleased
+## 0.8.0 - 2026-10-16
 
 **Highlights.** Three results of the storage roundtable ([#33](https://github.com/fox1245/tsukkomi-mcp/issues/33)): portable contracts (the bullets that start with that name below), a compact sparse index (the next paragraph) and a third dense backend, PostgreSQL with the pgvector extension, behind the existing `VectorIndex` interface, as an opt-in extra. SQLite stays the default and the canonical store, the default install needs neither Docker nor PostgreSQL, and no backend is ever substituted for another.
 
@@ -48,6 +48,8 @@ Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions 
 
 
 ### Upgrading
+
+**Restart every process that shares an index, and upgrade them all before adopting a contract bundle.** The sparse index and `sparse-rebuild` are described above. The pgvector backend needs nothing: it is off unless `SELF_DIRECT_DENSE_BACKEND=pgvector` is set, and psycopg is imported only then.
 
 A contracts file that holds an adopted contract has a new `origin` key; an older process (extra keys are forbidden there) cannot read it and reports the contracts as unavailable. Upgrade every process that shares the index before adopting a bundle. Files that hold no adopted contract are unchanged byte for byte.
 

@@ -59,10 +59,10 @@ def test_both_settings_are_documented_where_users_look_for_them():
 
 def test_the_trust_rule_is_stated_in_the_changelog_the_agent_guide_and_the_skill():
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    unreleased = changelog[changelog.index("## Unreleased"):changelog.index("## 0.7.0")]
+    release_notes = changelog[changelog.index("## 0.8.0"):changelog.index("## 0.7.0")]
     for fragment in ("list_contract_candidates", "adopt_contracts", "export_contracts", "never weakens or revokes",
                      "user message of this device's index", "ContractRepository", "SELF_DIRECT_PROJECT_CONTRACTS"):
-        assert fragment in unreleased, fragment
+        assert fragment in release_notes, fragment
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     assert "## Portable contracts" in agents and "untrusted" in agents and "never weakens or revokes" in agents
     assert "adopt_contracts" in (ROOT / "skills" / "self-directing-mcp-setup" / "SKILL.md").read_text(encoding="utf-8")

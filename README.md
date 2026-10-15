@@ -1,6 +1,6 @@
 # Tsukkomi MCP (ツッコミ)
 
-> A deterministic governance and evidence server for autonomous coding agents, version 0.7.0.
+> A deterministic governance and evidence server for autonomous coding agents, version 0.8.0.
 > The distribution is `tsukkomi-mcp`; the Python package is `self_directing_mcp`.
 
 ## Overview
@@ -32,6 +32,16 @@ Every check returns one of four verdicts: `clean`, `violation`, `suspicious` or 
 ```
 
 Session evidence stays on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter. The canonical index keeps raw text so audits see the truth; everything that leaves it (tool results, errors, hook output, logs, remote payloads) is masked for known secret patterns, and the workflow classifier refuses context in which a secret pattern is found. See the [masking contract](SECURITY.md#masking-contract), [SECURITY.md](SECURITY.md) and [Verification scope](#verification-scope).
+
+## What is new in 0.8.0
+
+Version 0.8.0 (see [CHANGELOG.md](CHANGELOG.md)) is the result of the storage roundtable ([#33](https://github.com/fox1245/tsukkomi-mcp/issues/33)): how the evidence and the contracts are stored, and what can move between devices without moving authority.
+
+- **A compact sparse index.** `sparse-v2.sqlite` is an FTS5 contentless table: about 70 % smaller (a synthetic 100,000-event Codex-like corpus: 918.8 MB to 269.1 MB) with identical ranked results, and session-scoped searches 7 to 30 times faster. The old `sparse.sqlite` is never touched; convert once with `python -m self_directing_mcp.maintenance sparse-rebuild`. See [Sparse index formats](#sparse-index-formats).
+- **Portable contracts.** Contract bundles (a project file or a personal bundle) are only candidates until the user adopts them (`adopt_contracts`, anchored to a message of the local index and pinned by SHA-256); a changed or deleted file never weakens an adopted contract. `export_contracts` writes a bundle from the contracts of one device.
+- **pgvector as an opt-in dense backend.** `pip install 'tsukkomi-mcp[pgvector]'` and `SELF_DIRECT_DENSE_BACKEND=pgvector` keep the vectors in a PostgreSQL server: 2 to 4 ms for a session-scoped search at every size and about 2.5 times faster exact scans at 100,000 vectors, against slower writes and 1.8 times the disk. The connection string comes only from a private file, a remote server requires `sslmode=verify-full`, and there is never a silent fallback to another backend. SQLite stays the default. See [Dense backends](#dense-backends).
+
+---
 
 ## What is new in 0.7.0
 
@@ -1217,12 +1227,14 @@ A parser upgrade (the AGY parser moved to version 8 and the Claude Code parser t
 
 ---
 
-## Upgrading to the next release (unreleased)
+## Upgrading to 0.8.0
 
 1. **Restart every process that uses the index.** A process on the older code keeps writing `sparse.sqlite`.
 2. **The sparse index has a new default format.** `SELF_DIRECT_SPARSE_FORMAT=auto` uses `sparse-v2.sqlite` (about 70 % smaller, identical results) when the running SQLite is 3.43 or newer. The old `sparse.sqlite` is never read, written or deleted by the program; delete it yourself when the new file is complete. See [Sparse index formats](#sparse-index-formats).
 3. **Convert once, outside a request:** `python -m self_directing_mcp.maintenance sparse-rebuild` (bounded, resumable, progress on stderr). Without it the new file fills session by session as syncs and searches touch them, and the first global `sparse` or `hybrid` search over a big index may end at the request deadline (each attempt keeps what it wrote).
 4. **Check with `audit_status`:** `sparse_format`, `sparse_files` and `sparse_counts`; `degraded_flags` has `sparse_legacy_fallback` only when `auto` could not use the compact format (SQLite older than 3.43). `SELF_DIRECT_SPARSE_FORMAT=legacy` keeps the previous behaviour.
+5. **Upgrade every process before adopting a contract bundle.** A contracts file that holds an adopted contract has a new `origin` key; a 0.7.0 or older process cannot read it and reports the contracts as unavailable. Files without an adopted contract are unchanged byte for byte.
+6. **pgvector needs nothing from you.** It is off unless `SELF_DIRECT_DENSE_BACKEND=pgvector` is set; psycopg is imported only then. See [Dense backends](#dense-backends) before pointing an index at a server.
 
 ---
 
