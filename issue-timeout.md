@@ -32,4 +32,4 @@ Suggested options (pick what fits best):
 
 ## Context
 
-Encountered while using Self-directing MCP as the audit hook for the AgentX/NeoGraph session. Server logs and index remain intact; only the verification verdict is blocked by the fixed timeout.
+Encountered while using Self-directing MCP as the audit hook for a long NeoGraph session. Server logs and index remain intact; only the verification verdict is blocked by the fixed timeout.

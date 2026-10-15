@@ -279,7 +279,7 @@ def test_engine_uses_toml_source_index_and_rule_paths(tmp_path, monkeypatch, pro
         source = FIXTURES / "sample_session" / "2026" / "09" / "09" / f"rollout-2026-09-09T01-00-00-{sid}.jsonl"
         relative = source.relative_to(FIXTURES / "sample_session")
     elif provider == "grokbot":
-        sid = "15c5c6e5-f1db-4492-add5-4d6d2ab5600c"
+        sid = "00000000-0000-4000-8000-0000000000a1"
         relative = Path(sid) / f"{sid}.jsonl"
         source = FIXTURES / "sample_grokbot_session" / relative
     elif provider == "agy":
