@@ -62,6 +62,7 @@ def test_concurrent_parser_bump_reparses_once(session, monkeypatch):
 
 def test_waiter_deadline_and_leader_cancel_do_not_poison(session, monkeypatch):
     engine, path = session
+    engine.settings.sync_slicing = "off"   # a waiter that may slice gives up early (FlightBusy): tests/test_slice_flight.py
     write(path, [message("hello")], "a")
     entered, release = threading.Event(), threading.Event()
     original = codex_parser.parse_session_chunks

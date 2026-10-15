@@ -13,19 +13,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from self_directing_mcp import journal as _journal
+from self_directing_mcp import journal as _journal, settings_core
 from self_directing_mcp._runtime import np
 
-from self_directing_mcp.compressed_source import CompressedSourceError
+from self_directing_mcp.compressed_source import CompressedSourceError, is_compressed
 from self_directing_mcp.audit.shadow import ShadowState
 from self_directing_mcp.index import shadow_state as shadow_sql
 from self_directing_mcp.index.deferred import DerivedBuffer
 from self_directing_mcp.schemas import AuditEvent, Chunk
 from self_directing_mcp.security.mask import mask_secrets
-from self_directing_mcp.request_control import IndexBusy, RequestStopped, check_request, publication, request_operation
+from self_directing_mcp.request_control import (
+    IndexBusy, RequestStopped, check_request, current_request, publication, request_operation,
+)
 from self_directing_mcp.session_events import (
     SourceChanged, capture_source, capture_source_fast, observed_source, source_scope,
 )
+from self_directing_mcp.slice_budget import SliceBudget, slice_scope
 from self_directing_mcp.source_blocks import BlockDraft, BlockRecord, BlockTable, FastFallback, is_block_hash
 
 
@@ -248,20 +251,36 @@ class RowSpool:
 _flights, _flights_gate = {}, threading.Lock()
 
 
+class FlightBusy(IndexBusy):
+    """The session is being synced by another request and the bounded wait of a request that may slice ran out.
+
+    Private to the sync path. ``engine._refresh_evidence`` judges on the prefix that is committed when it meets this
+    (coverage incomplete, issue ``sync_in_progress``); a caller that lets it pass is answered with an incomplete
+    response whose reason is ``sync_in_progress``, a planned stop, not a deadline overrun.
+    """
+    reason = "sync_in_progress"
+
+
 @contextmanager
-def session_flight(key):
+def session_flight(key, *, max_wait=None):
     """Single-flight per (index, provider, session): at most one capture/parse/publish at a time.
 
     Waiters poll with their own request control, so a waiter's deadline or cancellation raises for that waiter
     only, and a leader's failure just passes the baton: the next caller becomes leader and finds the cursor
     current (no second parse) or retries. Cross-process safety is still the state token/CAS at publication.
+
+    ``max_wait`` (seconds; None waits for the leader, as before): a request that may slice does not hold a heavy-call
+    slot idle behind a leader that is committing slices; after that long it raises ``FlightBusy``.
     """
     with _flights_gate:
         entry = _flights.setdefault(key, [threading.Lock(), 0])
         entry[1] += 1
     try:
-        while not entry[0].acquire(timeout=0.05):
+        patience = None if max_wait is None else time.monotonic() + max_wait
+        while not entry[0].acquire(timeout=0.05 if patience is None else max(0.0, min(0.05, patience - time.monotonic()))):
             check_request()
+            if patience is not None and time.monotonic() >= patience:
+                raise FlightBusy()
         try:
             check_request()
             yield
@@ -1411,6 +1430,86 @@ class IntegrityPolicy:
         return self.rng() if self.rng is not None else None
 
 
+# Slicing (``slice_budget``). A slice's soft deadline is ``SYNC_SHARE`` of the time the request has left when the parse
+# starts, divided by ``1 + COMMIT_RATIO`` because the commit of what was parsed costs about that fraction of the parse:
+# parse and commit use about half the budget and at least a quarter remains for the evaluation and the response. Never
+# less than ``SOFT_DEADLINE_MIN_SEC`` after the start. Module constants so tests can move them.
+SYNC_SHARE = 0.5
+COMMIT_RATIO = 0.3
+SOFT_DEADLINE_MIN_SEC = 0.25
+# A request that may slice waits for the session's flight at most min(FLIGHT_WAIT_MAX_SEC, FLIGHT_WAIT_SHARE * time left).
+FLIGHT_WAIT_MAX_SEC = 1.0
+FLIGHT_WAIT_SHARE = 0.25
+RETRY_AFTER_MS = 500    # the hint a partial sync gives; advisory, nothing retries by itself
+
+
+@dataclass(frozen=True)
+class SlicePolicy:
+    """Whether a sync may publish a prefix instead of all or nothing, and how a slice is bounded.
+
+    ``mode``: ``"auto"`` (a request with a finite deadline, a plain file, nothing replaced) or ``"off"`` (exactly the
+    all-or-nothing sync of before). ``cap_bytes``: the most a slice observes past the indexed offset
+    (``SELF_DIRECT_SYNC_SLICE_BYTES``). The rest bounds the parse (``slice_budget.SliceBudget``); the defaults are the
+    production ones, and tests set ``max_records``/``max_bytes`` to force deterministic stops and ``clock`` to move time.
+    """
+
+    mode: str = settings_core.DEFAULT_SYNC_SLICING
+    cap_bytes: int = settings_core.DEFAULT_SYNC_SLICE_BYTES
+    min_records: int = 256
+    min_bytes: int = 1 << 20
+    max_records: int | None = None
+    max_bytes: int | None = None
+    clock: Any = time.monotonic
+
+    def __post_init__(self):
+        if self.mode not in settings_core.SYNC_SLICING_MODES or self.cap_bytes < 1:
+            raise ValueError("invalid slice policy")
+
+    @classmethod
+    def from_settings(cls, settings):
+        return cls(mode=getattr(settings, "sync_slicing", settings_core.DEFAULT_SYNC_SLICING),
+                   cap_bytes=getattr(settings, "sync_slice_bytes", settings_core.DEFAULT_SYNC_SLICE_BYTES))
+
+
+def _may_slice(slicing, path) -> tuple[bool, bool]:
+    """``(reports, slices)``: whether a call reports a ``sync`` object, and whether it may cut the sync short.
+
+    Both need ``auto`` and a request with a finite deadline (no deadline: no budget to run out of); only a plain file
+    is ever cut (a ``.zst`` source is decoded from its start, so a forward seek would decode the prefix again)."""
+    control = current_request()
+    reports = (slicing is not None and slicing.mode == "auto" and control is not None
+               and control.deadline is not None)
+    return reports, reports and not is_compressed(path)
+
+
+def _flight_wait(slicing, path):
+    """Seconds a caller waits for the flight of its session (None: until the leader is done, as without slicing)."""
+    if not _may_slice(slicing, path)[0]:
+        return None
+    return min(FLIGHT_WAIT_MAX_SEC, FLIGHT_WAIT_SHARE * max(0.0, current_request().deadline - time.monotonic()))
+
+
+def _new_budget(slicing, start) -> SliceBudget:
+    remaining = max(0.0, current_request().deadline - time.monotonic())
+    return SliceBudget(start, soft_deadline=slicing.clock() + max(SOFT_DEADLINE_MIN_SEC,
+                                                                  SYNC_SHARE * remaining / (1.0 + COMMIT_RATIO)),
+                       min_records=slicing.min_records, min_bytes=slicing.min_bytes, max_bytes=slicing.max_bytes,
+                       max_records=slicing.max_records, clock=slicing.clock)
+
+
+def _sync_report(indexed, target, pending, budget, observation) -> dict:
+    """The ``sync`` object of a result: how far the index got, how far this sync means to go, and why it stopped.
+
+    ``progress`` is the share of the target that is COMMITTED (what a parse read but did not publish does not count)."""
+    partial = indexed < target
+    stopped = "eof"
+    if partial:
+        stopped = (budget.stopped_by if budget is not None and indexed < observation.complete_end else None) or "slice_cap"
+    return {"state": "partial" if partial else "complete", "indexed_through": indexed, "pending_bytes": pending,
+            "target_bytes": target, "progress": round(min(1.0, indexed / target), 4) if partial and target else 1.0,
+            "retry_after_ms": RETRY_AFTER_MS if partial else None, "stopped_by": stopped}
+
+
 def _signed64(value: int) -> int:
     """SQLite integers are signed 64-bit; device and file ids may use the whole unsigned range (stored bit for bit)."""
     return value - (1 << 64) if value >= (1 << 63) else value
@@ -1434,12 +1533,14 @@ def _cursor_kind(cursor):
     return "blocks" if is_block_hash(cursor["prefix_hash"]) else "sha"
 
 
-def capture_for_cursor(provider, path, cursor, checkpoints, max_bytes, *, publish=False):
-    """One full capture collecting what is needed to compare with ``cursor`` (and to publish, with ``publish``)."""
+def capture_for_cursor(provider, path, cursor, checkpoints, max_bytes, *, publish=False, window=None):
+    """One full capture collecting what is needed to compare with ``cursor`` (and to publish, with ``publish``).
+
+    ``window=(floor, cap)`` cuts the observation of a plain file short (``session_events.capture_source``)."""
     kind, blockable = _cursor_kind(cursor), _blockable(provider, path)
     blocks = kind == "blocks" or (publish and blockable)
     sha = kind == "sha" or (publish and not blockable) or not blocks
-    return capture_source(path, checkpoints=checkpoints, max_bytes=max_bytes, sha=sha, blocks=blocks)
+    return capture_source(path, checkpoints=checkpoints, max_bytes=max_bytes, sha=sha, blocks=blocks, window=window)
 
 
 def _hash_matches(observation, offset, stored) -> bool:
@@ -1576,7 +1677,7 @@ def agy_coverage(coverage, stats, receipts=None):
 @request_operation
 def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider="codex",
                    embed=True, derived=True, guard=nullcontext, retain_dense_deletions=False,
-                   verify="full", policy=None):
+                   verify="full", policy=None, slicing=None):
     """Serialize per (index, provider, session). Later callers find the cursor current and skip the parse.
 
     A parser-version bump therefore reparses a session once per process no matter how many hooks race on it;
@@ -1593,18 +1694,32 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
 
     A source change detected while preparing (a rewrite, truncation or replacement between capture and
     publication) discards the observation and recaptures, in full, a bounded number of times.
+
+    ``slicing`` (``SlicePolicy``; None: off): with ``auto``, a request that has a finite deadline syncs a plain file
+    in slices. The parse ends at a record boundary when its soft deadline passes (``slice_budget``) and the prefix
+    it read is published, so the next call continues from there; a capture is cut short past ``slicing.cap_bytes``.
+    Nothing is ever published over events that exist (a reindex is all or nothing, as before). The result then has
+    a ``sync`` object, and ``coverage`` says how many bytes of the capture are still to be indexed
+    (``backlog_bytes``, the issue ``sync_in_progress``). A waiter on the session's flight gives up after a bounded
+    wait with ``FlightBusy``.
     """
     policy = policy or IntegrityPolicy()
     requested = Path(path).resolve()
-    with session_flight(_flight_key(store, provider, requested, session_id)):
+    wait = _flight_wait(slicing, requested)
+    with session_flight(_flight_key(store, provider, requested, session_id), **({} if wait is None else {"max_wait": wait})):
         seen, target, captured = [], requested, None
-        for _ in range(_RECAPTURE_ATTEMPTS):
+        attempt, whole = 0, False
+        while attempt < _RECAPTURE_ATTEMPTS:
+            attempt += 1
             handed, captured = captured, None
             try:
                 info = _ingest_session(path=target, session_id=session_id, store=store, sparse=sparse, dense=dense,
                                        embedder=embedder, provider=provider, embed=embed, derived=derived,
                                        guard=guard, seen=seen, observation=handed, verify=verify, policy=policy,
-                                       retain_dense_deletions=retain_dense_deletions)
+                                       retain_dense_deletions=retain_dense_deletions, slicing=slicing, whole=whole)
+            except _NeedsWholeCapture:
+                whole, attempt = True, attempt - 1   # not a lost race: the next observation is simply not cut short
+                continue
             except _StaleObservation:
                 continue  # another process published past our capture: observe the file again
             except _IndexedElsewhere as elsewhere:
@@ -1624,6 +1739,11 @@ _RECAPTURE_ATTEMPTS = 3
 
 class _StaleObservation(Exception):
     """The committed cursor lies beyond the captured prefix: our capture predates another process's publication."""
+
+
+class _NeedsWholeCapture(Exception):
+    """A capture cut short for a slice turned out to need a reindex (or belongs to another file than planned): a
+    reindex replaces the stored events, so it is all or nothing, as before, and needs the file observed whole."""
 
 
 class _IndexedElsewhere(Exception):
@@ -1713,8 +1833,10 @@ def _draft(observation, offset, record):
     return BlockDraft(table, stamp[0], stamp[1], stamp[2], stamp[3], verified_at, through)
 
 
-def _capture_observation(path, provider, known, record, hint, verify, policy, max_bytes):
-    """The request's capture: a fast check when allowed and possible, otherwise the one full scan of the prefix."""
+def _capture_observation(path, provider, known, record, hint, verify, policy, max_bytes, window=None):
+    """The request's capture: a fast check when allowed and possible, otherwise the one full scan of the prefix.
+
+    ``window=(floor, cap)``: a slice's capture, cut short past ``floor`` (the indexed offset) by ``cap`` bytes."""
     mode, reason = _plan(provider, path, known, record, verify, policy)
     lag = None
     if reason == "interval_elapsed":
@@ -1722,25 +1844,28 @@ def _capture_observation(path, provider, known, record, hint, verify, policy, ma
     if mode == "fast":
         try:
             observation = capture_source_fast(path, record, recent=policy.recent_blocks, samples=policy.sample_blocks,
-                                              rng=policy.new_rng())
+                                              rng=policy.new_rng(), cap=None if window is None else window[1])
         except FastFallback as fallback:
             reason = fallback.reason  # the cheap signals (or a block) say this must be settled by a full scan
         else:
             observation.scanned_at = policy.clock().isoformat()
             return observation
-    observation = capture_for_cursor(provider, path, known, hint, max_bytes, publish=True)
+    observation = capture_for_cursor(provider, path, known, hint, max_bytes, publish=True, window=window)
     observation.full_reason, observation.lag_sec = reason, lag
     observation.scanned_at = policy.clock().isoformat()
     return observation
 
 
 def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard, seen,
-                    observation=None, retain_dense_deletions=False, verify="full", policy=None):
+                    observation=None, retain_dense_deletions=False, verify="full", policy=None, slicing=None,
+                    whole=False):
     if embed and (dense is None or embedder is None):
         raise ValueError("embedding unavailable in local-only mode")
     parse_session_chunks, peek_session_id = _provider_parser(provider)
     path = Path(path).resolve()
     policy = policy or IntegrityPolicy()
+    reports, sliceable = _may_slice(slicing, path)
+    sliceable = sliceable and not whole   # ``whole``: this call observes the file whole (it needs a reindex)
     planned = None  # the cursor a fast capture was planned from; it must still be the current one
     if observation is None:
         hint, known, record, sid_hint = (), None, None, session_id
@@ -1749,6 +1874,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 sid_hint = peek_session_id(path)
             except (OSError, ValueError):
                 sid_hint = None
+        looked = bool(sid_hint)   # the cursor of this session was read, so what is "indexed" is known
         if sid_hint:
             try:
                 with guard(), store._read_boundary():
@@ -1762,9 +1888,16 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                     hint += ReceiptStore(store.db_path.parent, held=store.derived if store.defer_derived else None,
                                          journal=store.journal_policy).checkpoints(sid_hint.lower(), path)
             except (OSError, sqlite3.Error):
-                hint, known, record = (), None, None
+                hint, known, record, looked = (), None, None, False
+        # A capture is cut short only where a prefix commit can only add: nothing indexed yet, or an append to the
+        # file the cursor is on with the current parser. A cursor that is known to need a reindex is not cut.
+        window = None
+        if sliceable and looked and (known is None or (
+                known["path"] == str(path) and type(known["byte_offset"]) is int
+                and known["parser_version"] == current_parser_version(provider))):
+            window = (0 if known is None else known["byte_offset"], slicing.cap_bytes)
         observation = _capture_observation(path, provider, known, record, hint, verify, policy,
-                                           store.max_decompressed_bytes)
+                                           store.max_decompressed_bytes, window)
         planned = known
     if observation.scanned_at is None:  # an observation handed in by a retry: its scan finished before now
         observation.scanned_at = policy.clock().isoformat()
@@ -1810,6 +1943,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         # A file with another path but the same session id: AGY hook receipts bind to an exact path, so it keeps
         # reindexing on a path change; elsewhere a copy or continuation of the indexed prefix is not a new source.
         relation = None
+        if observation.limited_from is not None and cursor and cursor["path"] != str(path):
+            raise _NeedsWholeCapture()   # the cut was planned for an append to this file; the cursor is on another
         if cursor and provider != "agy" and cursor["path"] != str(path) and type(cursor["byte_offset"]) is int:
             relation = _other_source(cursor, path, observation, sid, store.max_decompressed_bytes, provider)
         parser_version = current_parser_version(provider)
@@ -1842,25 +1977,30 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             # case is a receipt for a step that has no result yet. Anything unproven reparses from byte 0.
             if receipts_dirty and (reindexed or affects_index(cursor_deps, receipt_rows)):
                 start, reindexed, reindex_reason = 0, True, "hook_receipts_changed"
+        if reindexed and observation.limited_from is not None:
+            raise _NeedsWholeCapture()   # a reindex replaces events: never a prefix over an index that exists
+        # Only the parse that adds to what is stored may stop early; one that replaces it is all or nothing.
+        budget = _new_budget(slicing, start) if sliceable and not reindexed else None
         chunks = RowSpool()
         uses = set()
         try:
-            if cursor and not reindexed and provider != "agy" and start >= observation.complete_end:
-                offset, parsed_sid = start, sid
-            elif provider == "agy":
-                _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, receipts=receipts,
-                                                             sink=chunks, uses=uses)
-            elif provider == "omp" and start:
-                # This lookup is request-owned and bound to the captured cursor generation.
-                earliest = {}
-                for before, call_id, name in prior_calls:
-                    key = (call_id, name)
-                    earliest[key] = min(earliest.get(key, before), before)
-                _, offset, parsed_sid = parse_session_chunks(
-                    path, session_id=sid, start_byte=start, sink=chunks,
-                    prior_call=lambda call_id, name, before_byte: earliest.get((call_id, name), float("inf")) < before_byte)
-            else:
-                _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, sink=chunks)
+            with slice_scope(budget):
+                if cursor and not reindexed and provider != "agy" and start >= observation.complete_end:
+                    offset, parsed_sid = start, sid
+                elif provider == "agy":
+                    _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start,
+                                                                 receipts=receipts, sink=chunks, uses=uses)
+                elif provider == "omp" and start:
+                    # This lookup is request-owned and bound to the captured cursor generation.
+                    earliest = {}
+                    for before, call_id, name in prior_calls:
+                        key = (call_id, name)
+                        earliest[key] = min(earliest.get(key, before), before)
+                    _, offset, parsed_sid = parse_session_chunks(
+                        path, session_id=sid, start_byte=start, sink=chunks,
+                        prior_call=lambda call_id, name, before_byte: earliest.get((call_id, name), float("inf")) < before_byte)
+                else:
+                    _, offset, parsed_sid = parse_session_chunks(path, session_id=sid, start_byte=start, sink=chunks)
             if parsed_sid != sid:
                 raise ValueError("session id changed while parsing")
             blockable = _blockable(provider, path)
@@ -1945,6 +2085,18 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                                      max_bytes=store.max_decompressed_bytes)
     if agy_stats is not None:
         agy_coverage(coverage, agy_stats, receipts)
+    sync = None
+    if reports:
+        # What the capture saw and the index does not hold yet. Not the same as ``unread_bytes`` (everything past the
+        # cursor, appended after the capture included): a backlog means this sync is not done, so the verdict can never
+        # be "clean as of the cursor" (``engine._mark_growth`` keeps ``judged_prefix`` for pure append only).
+        indexed = committed_cursor["byte_offset"]
+        backlog = max(0, observation.target_end - indexed)
+        if backlog:   # absent when there is none: a finished sync's coverage is what it always was
+            coverage["backlog_bytes"] = backlog
+            coverage["issues"].append("sync_in_progress")
+            coverage["complete"] = False
+        sync = _sync_report(indexed, observation.target_end, coverage.get("pending_bytes", backlog), budget, observation)
     info = {"session_id": sid, "provider": provider, "path": str(path), "byte_offset": offset,
             "new_chunks": new_chunks, "embedded": 0, "total_chunks": coverage["chunk_count"],
             "reindexed": reindexed, "parser_version": parser_version, "reindex_reason": reindex_reason,
@@ -1952,6 +2104,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             "sparse_updated": 0, "coverage": coverage,
             "integrity": integrity_report(observation, committed_cursor, committed_record),
             "_source_observation": observation, "_metadata_token": committed_token, "_receipt_token": receipt_authority}
+    if sync is not None:
+        info["sync"] = sync
     if reindexed:
         # What this request's verification found: the index was rebuilt from the source as it is now. For
         # "source_changed" that is a mismatch of the stored digests, never a runtime failure.

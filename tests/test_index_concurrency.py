@@ -30,7 +30,7 @@ from test_agy_transcript import (
 @pytest.fixture(autouse=True)
 def second_process(monkeypatch):
     """Races here model another process; in-process same-session callers are single-flighted (test_singleflight)."""
-    monkeypatch.setattr(ingest, "session_flight", lambda key: nullcontext())
+    monkeypatch.setattr(ingest, "session_flight", lambda key, **options: nullcontext())
 
 
 @pytest.fixture

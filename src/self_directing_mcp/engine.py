@@ -48,8 +48,8 @@ from self_directing_mcp.grokbot import discover as grokbot_discover
 from self_directing_mcp import omp, agy, claude
 from self_directing_mcp.embed.embedder import build_embedder
 from self_directing_mcp.index.ingest import (
-    AmbiguousSessionSource, AuditEventSnapshot, IntegrityPolicy, SessionStore, capture_for_cursor, coverage_from_capture,
-    ingest_session,
+    AmbiguousSessionSource, AuditEventSnapshot, FlightBusy, IntegrityPolicy, SessionStore, SlicePolicy,
+    capture_for_cursor, coverage_from_capture, ingest_session,
 )
 from self_directing_mcp.index.sparse import SparseIndex
 from self_directing_mcp.index.vector import build_vector_index
@@ -200,6 +200,7 @@ class SelfDirectEngine:
         self._integrity_worker = None  # set only by a resident server (see integrity_worker)
         self._shadow_worker = None     # likewise: the idle comparison of incremental audits (see shadow_worker)
         self.integrity_policy: IntegrityPolicy | None = None  # tests may inject a clock / randomness
+        self.slice_policy: SlicePolicy | None = None  # tests may inject forced stops / a clock (default: the settings)
         if settings is None:
             from self_directing_mcp.config import get_settings    # the server's pydantic settings; hooks pass their own
             settings = get_settings()
@@ -274,6 +275,9 @@ class SelfDirectEngine:
 
     def _policy(self) -> IntegrityPolicy:
         return self.integrity_policy or IntegrityPolicy.from_settings(self.settings)
+
+    def _slice_policy(self) -> SlicePolicy:
+        return self.slice_policy or SlicePolicy.from_settings(self.settings)
 
     def attach_integrity_worker(self, worker) -> None:
         self._integrity_worker = worker
@@ -535,6 +539,7 @@ class SelfDirectEngine:
                 retain_dense_deletions=self.dense is None and any(Path(self.settings.index_dir).glob("vectors-v2-*")),
                 verify=verify,
                 policy=self._policy(),
+                slicing=self._slice_policy(),
             )
         except AmbiguousSessionSource as exc:
             return {"ok": False, "error": "ambiguous_session_source", "message": str(exc), "provider": resolved_provider,
@@ -555,6 +560,14 @@ class SelfDirectEngine:
             "NUDGE: After sync_session, call audit_session before risky shell/network/"
             "file-destructive actions."
         )
+        sync = info.get("sync")
+        if sync is not None and sync["state"] == "partial":
+            info["nudge"] = (
+                f"NUDGE: Sync is partial ({sync['indexed_through']} of {sync['target_bytes']} bytes indexed, stopped by "
+                f"{sync['stopped_by']}); call sync_session again to continue (retry_after_ms={sync['retry_after_ms']} is "
+                "a hint, nothing retries by itself). Until it completes, audits and action checks report unknown "
+                "(sync_in_progress)."
+            )
         return info
 
     @request_operation
@@ -655,6 +668,8 @@ class SelfDirectEngine:
             if info.get("ok"):
                 return info
             failure, failed = info.get("error", "sync_failed"), info
+        except FlightBusy as busy:
+            failure = busy.reason   # another request is syncing this session: judge on what it has committed so far
         except (RequestStopped, IndexBusy):
             raise
         except (OSError, ValueError) as exc:
