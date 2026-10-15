@@ -97,6 +97,10 @@ Convert a whole index outside a request with `python -m self_directing_mcp.maint
 progress on stderr). A SQLite older than 3.43 is an explicit error for `compact` and a visible fallback for `auto`
 (`audit_status`: `sparse_format`, `sparse_files`, `degraded_flags`); never substitute a format silently. Keep the two
 formats' search results identical (`tests/test_sparse_compact.py`) when changing either.
+The compact index is also pruned: `sparse-rebuild` and a global `sparse`/`hybrid` search delete documents the canonical store
+does not hold (orphans; `audit_status.sparse_extra_ids`). Each batch asks the store again under the publication guard right
+before it deletes, so an event published after the snapshot is never removed, and the legacy file is never written. Keep that
+second look and `tests/test_sparse_orphans.py` when changing the deletion.
 
 `SELF_DIRECT_DENSE_BACKEND=pgvector` (optional extra `tsukkomi-mcp[pgvector]`) keeps the dense index on a PostgreSQL
 server and is an opt-in data flow: chunk ids and embedding vectors, never session text, leave the machine, and vectors are

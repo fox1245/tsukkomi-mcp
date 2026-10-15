@@ -11,7 +11,8 @@ point (``checkpoints``) and the linearity of size and time.
 Every layout is built through the write path of its class (``upsert_many``, 500-event batches, ``mask_secrets`` on every
 text) and measured for file size and its breakdown (``dbstat``), build time, search parity against the current layout
 (``legacy``: ``SparseIndex`` as released), search latency per query class, ``delete_ids`` plus re-``upsert`` of 1000
-events, ``integrity_check``, the FTS5 ``optimize`` command and ``VACUUM``.
+events, ``integrity_check``, the FTS5 ``optimize`` command and ``VACUUM``; with ``--stages ops,maint,orphans`` also the cost of deleting a
+tenth of the documents in batches (what ``sparse-rebuild`` does to orphans).
 
     python scripts/bench_sparse.py --profile codex --events 100000 --candidate a,c,e [--out results.json]
     python scripts/bench_sparse.py --stats --profile codex --events 20000      # corpus statistics only
@@ -915,6 +916,22 @@ def measure(name: str, profile: str, events: int, work: Path, out: dict, *, quer
         rec["optimize_vacuum"] = {"seconds": round(time.perf_counter() - t, 1), "before": before, "after": file_bytes(db),
                                   "bytes_per_event": round(file_bytes(db) / index.count(), 1)}
         rec["dbstat_final"] = dbstat(index._conn)
+    # --- orphans: delete a seeded tenth of the documents in sorted-id batches, as the rebuild command and a global search do
+    if "orphans" in stages:
+        victims = sorted(random.Random(11).sample(corpus.all_ids, max(1, len(corpus.all_ids) // 10)))
+        before = file_bytes(db)
+        times = []
+        for start in range(0, len(victims), BATCH):
+            t = time.perf_counter()
+            index.delete_ids(victims[start:start + BATCH])
+            times.append(time.perf_counter() - t)
+        total = sum(times)
+        rec["orphans"] = {"documents": len(victims), "seconds": round(total, 2), "per_10k_seconds": round(total * 10_000 / len(victims), 2),
+                          "longest_batch_seconds": round(max(times), 3), "file_before": before, "file_after": file_bytes(db),
+                          "free_bytes": index._conn.execute("PRAGMA freelist_count").fetchone()[0] * index._conn.execute("PRAGMA page_size").fetchone()[0],
+                          "count_after": index.count()}
+        if hasattr(index, "verify_statistics"):
+            rec["orphans"]["statistics_ok"] = index.verify_statistics()["ok"]
     index._conn.close()
     db.unlink(missing_ok=True)
 
@@ -968,6 +985,11 @@ def summary(rec: dict) -> str:
     if "ops" in rec:
         o = rec["ops"]
         lines.append(f"       delete_ids({o['events']}) {o['delete_ids_seconds']} s, re-upsert {o['reupsert_seconds']} s")
+    if "orphans" in rec:
+        o = rec["orphans"]
+        lines.append(f"       delete {o['documents']} documents (orphans) {o['seconds']} s = {o['per_10k_seconds']} s per 10,000, longest batch "
+                     f"{o['longest_batch_seconds']} s, file {o['file_before'] / 1e6:.1f} -> {o['file_after'] / 1e6:.1f} MB ({o['free_bytes'] / 1e6:.1f} MB free pages)"
+                     + (f", statistics ok: {o['statistics_ok']}" if "statistics_ok" in o else ""))
     if "optimize" in rec:
         o, v, ov = rec["optimize"], rec["vacuum"], rec["optimize_vacuum"]
         lines.append(f"       vacuum {v['seconds']} s -> {v['after'] / 1e6:.1f} MB; optimize {o['seconds']} s {o['before'] / 1e6:.1f} -> {o['after'] / 1e6:.1f} MB; "
@@ -982,7 +1004,8 @@ def main(argv=None) -> int:
     ap.add_argument("--events", type=int, default=20_000)
     ap.add_argument("--candidate", default="a", help="comma separated names (see --list); 'a' also writes the reference results")
     ap.add_argument("--queries", type=int, default=200)
-    ap.add_argument("--stages", default="ops,maint", help="comma separated: ops (delete + re-upsert), maint (integrity, optimize, vacuum)")
+    ap.add_argument("--stages", default="ops,maint", help="comma separated: ops (delete + re-upsert), maint (integrity, optimize, vacuum), "
+                    "orphans (delete a tenth of the documents in batches of 500, as sparse-rebuild does; off by default)")
     ap.add_argument("--out", help="write the results as JSON")
     ap.add_argument("--tmpdir", default=DEFAULT_TMP)
     ap.add_argument("--drop-ref", action="store_true", help="also delete the reference results (<tmpdir>/ref) when done")
