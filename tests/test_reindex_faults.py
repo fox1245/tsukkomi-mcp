@@ -9,6 +9,8 @@ The red line: an interrupted or crashed re-index leaves the old ids, anchors and
 * Crash. A subprocess re-indexes in slices and ``os._exit``s at: the row frames written and the trailer not; the trailer
   written and not synced; the spool complete and the commit not started; inside the commit transaction; after the commit and
   before the unlink. The index is verified in a second process each time.
+* A stop right after a step. The request that runs out of time (or is cancelled) at the first check after a slice was spooled,
+  or after the commit that published the re-index, loses its answer and nothing else.
 """
 from __future__ import annotations
 
@@ -22,10 +24,14 @@ from pathlib import Path
 import pytest
 
 from reindex_support import BIG, Pair, canonical, index_dump, old_parser, spool_files
+from self_directing_mcp import reindex_spool
+from self_directing_mcp.codex import parse as codex_parser
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
+from self_directing_mcp.index import ingest
 from self_directing_mcp.request_control import RequestStopped, request_scope
 from slicing_support import PROVIDERS, forced, integrity_ok
+from test_slice_convergence import Tripwire
 from test_slice_faults import Stopper
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -343,5 +349,55 @@ def test_a_staging_process_killed_at_random_moments_leaves_the_old_index_and_a_s
             staged_until_published(p.world, survivor, (50, 200, 1000))        # resumes it, or starts over
             assert canonical(survivor, "codex", p.sid) == expected and not spool_files(survivor)
         assert max(spools) == 1                                # a kill did leave a spool behind to resume
+    finally:
+        p.close()
+
+
+@pytest.mark.parametrize("point", ["slice", "commit"])
+def test_a_stop_right_after_a_spooled_slice_or_the_commit_loses_the_response_only(tmp_path, monkeypatch, point):
+    """``slice``: the request is stopped at the first check after a slice was written to the spool; the old index is untouched,
+    the spool holds the slice, and the next call goes on from where it ended (it does not parse from byte 0 again).
+    ``commit``: it is stopped at the first check after the commit that published the re-index returned; the index IS the
+    re-index (only the answer was lost), and the next call finds it complete and removes what is left of the spool."""
+    p = Pair(tmp_path, monkeypatch, "codex", "parser", seed=11, count=120)
+    try:
+        expected = p.expected()
+        engine = fresh_engine(p, "stopped")
+        before, index = index_dump(engine), engine.settings.index_dir
+        control, parses, spooled = Tripwire(), [], []
+        append, commit = reindex_spool.ReindexSpool.append_slice, ingest.SessionStore.commit_events
+        parse = codex_parser.parse_session_chunks
+
+        def appending(self, rows, end_offset, *args, **kwargs):
+            result = append(self, rows, end_offset, *args, **kwargs)
+            spooled.append(end_offset)
+            control.armed = point == "slice"                 # from now on every look at the clock is a stop
+            return result
+
+        def committing(self, *args, **kwargs):
+            commit(self, *args, **kwargs)
+            control.armed = point == "commit"
+
+        def parsing(*args, **kwargs):
+            parses.append(kwargs.get("start_byte", 0))
+            return parse(*args, **kwargs)
+
+        monkeypatch.setattr(reindex_spool.ReindexSpool, "append_slice", appending)
+        monkeypatch.setattr(ingest.SessionStore, "commit_events", committing)
+        monkeypatch.setattr(codex_parser, "parse_session_chunks", parsing)
+        with pytest.raises(RequestStopped) as stopped:
+            staged_until_published(p.world, engine, CAPS, stopper=control)
+        assert stopped.value.reason == "request_deadline"
+        assert integrity_ok(index)
+        resumed = len(parses)
+        if point == "slice":
+            assert index_dump(engine) == before and len(spool_files(engine)) == 1 and len(spooled) == 1
+            staged_until_published(p.world, engine, CAPS)
+            assert parses[resumed] == spooled[0] > 0                    # the next call went on where the stopped slice ended
+        else:
+            assert canonical(engine, "codex", p.sid) == expected and len(spool_files(engine)) <= 1
+            again = engine.sync_session(**p.world.sync_args(), derived=False, _deadline=time.monotonic() + BIG)
+            assert again["sync"]["state"] == "complete" and "reindex" not in again["sync"]
+        assert canonical(engine, "codex", p.sid) == expected and not spool_files(engine) and integrity_ok(index)
     finally:
         p.close()

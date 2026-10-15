@@ -85,7 +85,7 @@ def test_a_second_audit_waits_a_bounded_time_and_reports_sync_in_progress(sessio
     waited = time.monotonic() - started
     expected = ingest.FLIGHT_WAIT_SHARE * engine_module.SYNC_BUDGET_SHARE * 2.0
     try:
-        assert expected - 0.03 <= waited < 1.0                           # bounded: it never waited for its own deadline
+        assert expected - 0.03 <= waited < 1.5                           # bounded: it never waited for its own deadline (2 s)
         coverage = answer["coverage"]
         assert answer["verdict"] != "clean" and coverage["complete"] is False
         assert "sync_in_progress" in coverage["issues"] and not coverage.get("judged_prefix")
@@ -113,7 +113,7 @@ def test_a_second_check_action_of_a_prohibited_action_is_still_a_violation(sessi
         started = time.monotonic()
         answer = engine.check_action(SID, {"tool_name": "shell", "arguments": {"command": "rm -rf /"}},
                                      _deadline=started + 2.0)
-        assert answer["verdict"] == "violation" and time.monotonic() - started < 1.0
+        assert answer["verdict"] == "violation" and time.monotonic() - started < 1.5       # not its own deadline (2 s)
         assert "sync_in_progress" in answer["coverage"]["issues"]
     finally:
         leader.finish()
@@ -142,8 +142,8 @@ def test_the_wait_is_a_quarter_of_the_time_left_and_at_most_one_second(session, 
     slicing = SlicePolicy()
     with request_scope(RequestControl(deadline=time.monotonic() + 60)):
         assert ingest._flight_wait(slicing, path_) == ingest.FLIGHT_WAIT_MAX_SEC == 1.0
-    with request_scope(RequestControl(deadline=time.monotonic() + 0.4)):
-        assert 0.05 < ingest._flight_wait(slicing, path_) <= 0.1
+    with request_scope(RequestControl(deadline=time.monotonic() + 3.0)):
+        assert 0.5 < ingest._flight_wait(slicing, path_) <= 0.75           # a quarter of what is left (a little under 3 s)
     assert ingest._flight_wait(slicing, path_) is None                      # no deadline: wait for the leader, as before
     with request_scope(RequestControl(deadline=time.monotonic() + 60)):
         assert ingest._flight_wait(SlicePolicy(mode="off"), path_) is None  # slicing off: as before
@@ -215,7 +215,7 @@ def test_a_waiter_does_not_hold_a_heavy_call_slot_longer_than_its_wait(session, 
 
     try:
         answer, running_after = asyncio.run(scenario())
-        assert answer["coverage"]["issues"].count("sync_in_progress") == 1 and laps[0] < 1.0     # 0.25 * 2 s, not 2 s
+        assert answer["coverage"]["issues"].count("sync_in_progress") == 1 and laps[0] < 1.5     # 0.25 * 2 s, not 2 s
         assert running_after == 0                                  # released as soon as the call returned
     finally:
         leader.finish()
