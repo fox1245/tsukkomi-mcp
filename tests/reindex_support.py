@@ -83,24 +83,6 @@ def canonical(engine, provider, sid) -> dict:
             "sparse": sparse_rows(engine, key)}
 
 
-def drive(world, engine, steps, *, route="sync", limit=3000, derived=False, **kwargs):
-    """Call ``engine`` with a fresh forced stop each time (``steps``: an iterator of record caps) until the sync says it is
-    complete; returns every ``sync`` object it answered."""
-    seen = []
-    for _ in range(limit):
-        engine.slice_policy = forced(next(steps))
-        info = engine.sync_session(**world.sync_args(), derived=derived, _deadline=time.monotonic() + BIG, **kwargs)
-        seen.append(info["sync"])
-        if info["sync"]["state"] == "complete":
-            return seen
-    raise AssertionError("the re-index never completed")
-
-
-def cycle(*values):
-    while True:
-        yield from values
-
-
 def commits_one_shot(engine, world, **kwargs):
     """The reference: a sync with no deadline is the re-index of before, in one piece."""
     info = engine.sync_session(**world.sync_args(), **kwargs)

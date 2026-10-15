@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import stat
 import time
 
@@ -25,7 +24,7 @@ from self_directing_mcp import reindex_spool, request_stats, server
 from self_directing_mcp.codex import parse as codex_parser
 from self_directing_mcp.index import ingest
 from self_directing_mcp.index.ingest import FlightBusy, SlicePolicy
-from slicing_support import PROVIDERS, World, forced
+from slicing_support import World, forced
 from test_slice_flight import counted, stats  # noqa: F401  (the statistics fixture of the flight tests)
 
 POSIX = os.name != "nt"

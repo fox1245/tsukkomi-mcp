@@ -17,7 +17,7 @@ import pytest
 
 from reindex_support import (BIG, canonical, commits_one_shot, index_dump, reindex_of, seed_vectors, spool_files,
                              starting_indexes)
-from slicing_support import PROVIDERS, World, forced
+from slicing_support import World, forced
 from test_slice_equivalence import assert_exercised, normalized_audit
 
 

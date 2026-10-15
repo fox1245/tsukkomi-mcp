@@ -14,11 +14,10 @@ from __future__ import annotations
 import math
 import shutil
 import time
-from pathlib import Path
 
 import pytest
 
-from reindex_support import BIG, canonical, old_parser, reindex_of, spool_files
+from reindex_support import canonical, old_parser, reindex_of, spool_files
 from self_directing_mcp import journal
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine

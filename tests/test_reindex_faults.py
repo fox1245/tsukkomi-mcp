@@ -21,11 +21,11 @@ from pathlib import Path
 
 import pytest
 
-from reindex_support import (BIG, Pair, canonical, index_dump, old_parser, reindex_of, spool_files)
+from reindex_support import BIG, Pair, canonical, index_dump, old_parser, spool_files
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.request_control import RequestStopped, request_scope
-from slicing_support import PROVIDERS, World, forced, integrity_ok
+from slicing_support import PROVIDERS, forced, integrity_ok
 from test_slice_faults import Stopper
 
 ROOT = Path(__file__).resolve().parents[1]
