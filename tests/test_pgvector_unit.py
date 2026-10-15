@@ -625,3 +625,21 @@ def test_a_filter_travels_as_one_text_parameter_and_separator_ids_as_an_array():
 def test_lookup_ids_keeps_exactly_the_ids_that_could_be_stored(ids, kept):
     found = PgVectorIndex._lookup_ids(ids)
     assert set(found) == kept and len(found) == len(kept)
+
+
+def test_the_hnsw_search_width_follows_top_k_unless_it_is_set():
+    index, driver, server = make(FakeServer(dim=4, has_index=True), hnsw=True)
+    index.upsert_many([(f"c{n}", unit(seed=n)) for n in range(4)])
+    widths = {}
+    for k in (1, 20, 100, 500):
+        server.log.clear()
+        index.search(unit(), k)
+        widths[k] = [entry[1][0] for entry in server.log if "hnsw.ef_search" in entry[0]][-1]
+    assert widths == {1: "100", 20: "100", 100: "400", 500: "1000"}
+    index, driver, server = make(FakeServer(dim=4, has_index=True), hnsw=True, hnsw_ef_search=64)
+    index.upsert_many([("a", unit())])
+    index.search(unit(), 20)
+    assert [entry[1][0] for entry in server.log if "hnsw.ef_search" in entry[0]] == ["64"]
+    for bad in (0, 1001, True, "40", 2.5):
+        with pytest.raises(ValueError, match="hnsw_ef_search"):
+            PgVectorIndex(DSN, dim=4, hnsw_ef_search=bad, driver=FakeDriver())

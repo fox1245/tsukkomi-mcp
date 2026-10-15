@@ -257,7 +257,7 @@ class PgVectorIndex(VectorIndex):
             raise ValueError("The embedding policy tag must be a short printable string")
         if hnsw_ef_search is not None and (not isinstance(hnsw_ef_search, int) or isinstance(hnsw_ef_search, bool)
                                            or not 1 <= hnsw_ef_search <= 1000):
-            raise ValueError("hnsw_ef_search must be an integer 1..1000 (or None for max(40, 2 * top_k))")
+            raise ValueError("hnsw_ef_search must be an integer 1..1000 (or None for max(100, 4 * top_k))")
         self.hnsw_ef_search = hnsw_ef_search       # programmatic only (the benchmark); not a setting
         self.dim = dim
         self.schema = check_pgvector_schema(schema)
@@ -820,7 +820,9 @@ class PgVectorIndex(VectorIndex):
             params["blob"], params["odd"] = self._filter_parameters(allowed)
         before = []
         if approximate:
-            ef = self.hnsw_ef_search or min(1000, max(40, 2 * int(top_k)))
+            # pgvector's own default (40) gave a recall@20 of 0.83 at 300 000 clustered vectors, 100 gave 0.95 for 0.3 ms more
+            # (README, "pgvector numbers")
+            ef = self.hnsw_ef_search or min(1000, max(100, 4 * int(top_k)))
             before.append(("SELECT set_config('hnsw.ef_search', %s, false)", (str(ef),)))
         return statement, params, before, approximate, allowed
 

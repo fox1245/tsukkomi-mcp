@@ -17,6 +17,7 @@ from __future__ import annotations
 import atexit
 import os
 from pathlib import Path
+import queue
 import secrets
 import shutil
 import signal
@@ -153,16 +154,31 @@ class TcpProxy:
             with self._lock:
                 self._connections.extend((client, upstream))
             for source, sink in ((client, upstream), (upstream, client)):
-                self._threading.Thread(target=self._pump, args=(source, sink), daemon=True).start()
+                line: queue.Queue = queue.Queue()
+                self._threading.Thread(target=self._pump, args=(source, line), daemon=True).start()
+                self._threading.Thread(target=self._deliver, args=(line, source, sink), daemon=True).start()
 
-    def _pump(self, source, sink) -> None:
+    @staticmethod
+    def _pump(source, line) -> None:
+        """Read what ``source`` sends and queue it with its arrival time (a delay line keeps the throughput)."""
         try:
             while True:
                 data = source.recv(65536)
+                line.put((time.monotonic(), data))
+                if not data:
+                    return
+        except OSError:
+            line.put((time.monotonic(), b""))
+
+    def _deliver(self, line, source, sink) -> None:
+        try:
+            while True:
+                arrived, data = line.get()
+                wait = arrived + self.delay - time.monotonic()     # an emulated one-way network delay (latency only)
+                if wait > 0:
+                    time.sleep(wait)
                 if not data:
                     break
-                if self.delay:
-                    time.sleep(self.delay)          # an emulated one-way network delay (latency only, bandwidth is not limited)
                 sink.sendall(data)
         except OSError:
             pass

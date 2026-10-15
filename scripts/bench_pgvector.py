@@ -244,7 +244,8 @@ def main() -> int:
     parser.add_argument("--hnsw-max", type=int, default=300_000)
     parser.add_argument("--no-hnsw", action="store_true")
     parser.add_argument("--build-timeout", type=float, default=3600)
-    parser.add_argument("--lan-delay-ms", type=float, default=0.0)
+    parser.add_argument("--lan-delay-ms", type=float, default=None,
+                        help="run pgvector through a loopback proxy that delays each direction by this much (0: the proxy alone)")
     parser.add_argument("--workdir", default=None, help="where the SQLite files go (default: a temporary directory)")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
@@ -264,7 +265,7 @@ def main() -> int:
     try:
         meta = environment(server, args)
         conninfo = server.conninfo()
-        if args.lan_delay_ms:
+        if args.lan_delay_ms is not None:
             proxy = support.TcpProxy(server.host, server.port)
             proxy.delay = args.lan_delay_ms / 1000
             conninfo = server.conninfo(host="127.0.0.1", port=proxy.port)
