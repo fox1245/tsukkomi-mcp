@@ -211,7 +211,7 @@ class FakeServer:
                 connection.snapshot, connection.in_transaction = dict(self.rows), True
             self.rows = {}
             return FakeResult([])
-        if sql.startswith("SELECT chunk_id, 1.0 - "):
+        if sql.startswith("SELECT chunk_id, embedding <=> "):
             query = params["q"].array()
             allowed = None
             if "blob" in params:                                  # the filter: ids joined by chr(31), plus the odd ones
@@ -222,8 +222,8 @@ class FakeServer:
                     continue
                 v = vector.array()
                 denominator = np.linalg.norm(v) * np.linalg.norm(query)
-                scored.append((cid, float(1.0 - (1.0 - np.dot(v, query) / denominator)) if denominator else float("nan")))
-            scored.sort(key=lambda item: (-(item[1] if item[1] == item[1] else float("-inf")), item[0]))
+                scored.append((cid, float(1.0 - np.dot(v, query) / denominator) if denominator else float("nan")))
+            scored.sort(key=lambda item: (item[1] if item[1] == item[1] else float("inf"), item[0]))     # distance, NaN last
             return FakeResult(scored[:params["k"]])
         return FakeResult([])
 

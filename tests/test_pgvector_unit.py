@@ -193,9 +193,9 @@ def test_search_filters_before_the_limit_and_breaks_ties_by_id_in_byte_order():
     index, driver, server = make()
     index.upsert_many([(f"c{n}", unit(seed=n)) for n in range(6)])
     index.search(unit(seed=3), 4, {"c1", "c2", "c3"})
-    sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, 1.0 -")][-1]
+    sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, embedding <=>")][-1]
     assert sql.index("WHERE chunk_id = ANY(string_to_array(%(blob)s::text, chr(31)) || %(odd)b::text[])") < sql.index("ORDER BY") < sql.index("LIMIT")
-    assert 'ORDER BY embedding <=> %(q)b::vector, chunk_id COLLATE "C" LIMIT' in sql
+    assert 'ORDER BY distance, chunk_id COLLATE "C" LIMIT' in sql
     assert sorted(params["blob"].split("\x1f")) == ["c1", "c2", "c3"] and params["odd"] == [] and params["k"] == 4
     assert "c1" not in sql and "c2" not in sql                       # ids travel as parameters, never inside the text
     hits = index.search(unit(seed=3), 4, {"c1", "c2", "c3"})
@@ -235,11 +235,11 @@ def test_hnsw_serves_only_unfiltered_searches():
     index, driver, server = make(FakeServer(dim=4, has_index=True), hnsw=True)
     index.upsert_many([(f"c{n}", unit(seed=n)) for n in range(4)])
     index.search(unit(), 3)
-    sql = [entry[0] for entry in server.log if entry[0].startswith("SELECT chunk_id, 1.0 -")][-1]
+    sql = [entry[0] for entry in server.log if entry[0].startswith("SELECT chunk_id, embedding <=>")][-1]
     assert "chunk_id COLLATE" not in sql and any("hnsw.ef_search" in entry[0] for entry in server.log)
     server.log.clear()
     index.search(unit(), 3, {"c1", "c2"})
-    sql = [entry[0] for entry in server.log if entry[0].startswith("SELECT chunk_id, 1.0 -")][-1]
+    sql = [entry[0] for entry in server.log if entry[0].startswith("SELECT chunk_id, embedding <=>")][-1]
     assert 'chunk_id COLLATE "C"' in sql and not any("hnsw.ef_search" in entry[0] for entry in server.log)
 
 
@@ -610,7 +610,7 @@ def test_a_filter_travels_as_one_text_parameter_and_separator_ids_as_an_array():
     index.upsert_many([("a", unit(seed=1)), ("b", unit(seed=2)), (odd, unit(seed=3))])
     hits = index.search(unit(seed=3), 5, {"a", odd})
     assert {cid for cid, _ in hits} == {"a", odd}
-    _sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, 1.0 -")][-1]
+    _sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, embedding <=>")][-1]
     assert params["blob"] == "a" and params["odd"] == [odd]
     assert PgVectorIndex._filter_parameters(["x", "y", "z"]) == ("x\x1fy\x1fz", [])
     assert PgVectorIndex._filter_parameters([]) == ("", [])
