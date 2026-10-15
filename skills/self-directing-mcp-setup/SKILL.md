@@ -34,7 +34,7 @@ Clone or place the repository into the standard MCP servers directory:
 ```bash
 mkdir -p ~/.mcp-servers
 # If cloning fresh:
-gh repo clone fox1245/self-directing-mcp ~/.mcp-servers/self-directing-mcp
+git clone https://github.com/fox1245/tsukkomi-mcp.git ~/.mcp-servers/self-directing-mcp
 cd ~/.mcp-servers/self-directing-mcp
 ```
 

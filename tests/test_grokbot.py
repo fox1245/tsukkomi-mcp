@@ -18,7 +18,7 @@ from self_directing_mcp.grokbot.parse import parse_session_chunks, peek_session_
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 GROK_ROOT = FIXTURES / "sample_grokbot_session"
-GROK_SESSION_ID = "15c5c6e5-f1db-4492-add5-4d6d2ab5600c"
+GROK_SESSION_ID = "00000000-0000-4000-8000-0000000000a1"
 GROK_FILE = GROK_ROOT / GROK_SESSION_ID / f"{GROK_SESSION_ID}.jsonl"
 
 
