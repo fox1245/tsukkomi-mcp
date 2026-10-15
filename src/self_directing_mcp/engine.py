@@ -2246,7 +2246,12 @@ class SelfDirectEngine:
         files, counts = [], {}
         for fmt in ("legacy", "compact"):
             path = sparse_file(index_dir, fmt)
-            size = sum(p.stat().st_size for p in (path, Path(f"{path}-journal"), Path(f"{path}-wal")) if p.exists())
+            size = None
+            for part in (path, Path(f"{path}-journal"), Path(f"{path}-wal")):
+                try:
+                    size = (size or 0) + part.stat().st_size            # a journal comes and goes while another process writes
+                except OSError:
+                    pass
             exists = path.exists()
             files.append({"name": path.name, "format": fmt, "active": fmt == active, "exists": exists,
                           "bytes": size if exists else None})
