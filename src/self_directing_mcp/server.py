@@ -602,21 +602,32 @@ async def propose_graph_update(session_id: str, proposal: dict[str, Any],
     CHECKS_VERSION, EVIDENCED_BY, SUPERSEDES) and evidence_chunk_ids present in
     the indexed session. origin marks observed facts vs agent-inferred relations.
     Nothing is stored during validation.
+    covers_through_order in the result is where commit_graph_update would move the
+    processing cursor if called WITHOUT through_order: the end of the whole session,
+    even when the proposal was built from fewer events.
     """
     return await _dispatch(_engine.propose_graph_update, session_id, proposal, provider=provider, audit=True)
 
 
 @mcp.tool()
 async def commit_graph_update(session_id: str, proposal: dict[str, Any],
-                              base_graph_version: int, provider: str | None = None) -> dict[str, Any]:
+                              base_graph_version: int, provider: str | None = None,
+                              through_order: int | None = None) -> dict[str, Any]:
     """Apply a validated graph proposal atomically and advance the processing cursor.
 
+    WARNING: without through_order the cursor moves to the END OF THE SESSION
+    (covers_through_order in the result), even when the proposal was built from
+    only some events; every later event is then marked processed without being
+    extracted. Pass through_order, the order of the last event the proposal covers
+    (at least the first unprocessed event, at most the last event; otherwise
+    status=invalid_through_order and nothing is stored), to advance only that far.
     Idempotent by job_id: replaying an applied job returns already_applied.
     Rejected proposals store nothing and never advance the cursor. A failed
     write reports status=unclear; the range is not advanced and recovery is
     re-run. Existing search/audit paths keep working when the graph lags.
     """
-    return await _dispatch(_engine.commit_graph_update, session_id, proposal, base_graph_version, provider=provider, audit=True)
+    return await _dispatch(_engine.commit_graph_update, session_id, proposal, base_graph_version, provider=provider,
+                           through_order=through_order, audit=True)
 
 
 @mcp.tool()

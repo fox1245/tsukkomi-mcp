@@ -57,6 +57,7 @@ from self_directing_mcp.retrieve.hybrid import HybridRetriever, hits_to_schema
 from self_directing_mcp.schemas import ContractRule, ContractsDocument, PendingChange, ProposedAction
 from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.timeseries import analyze_activity
+from self_directing_mcp import graph_batch
 from self_directing_mcp.graphrag import GraphStore, validate_proposal
 from self_directing_mcp.neograph_runner import run_update_pipeline
 from self_directing_mcp.neograph_runtime import ng, graph_operation
@@ -1353,7 +1354,11 @@ class SelfDirectEngine:
     @graph_operation("validate_graph_proposal")
     def propose_graph_update(self, session_id: str, proposal: dict[str, Any],
                              provider: str | None = None) -> dict[str, Any]:
-        """Validate a node/edge proposal against indexed evidence; nothing stored here."""
+        """Validate a node/edge proposal against indexed evidence; nothing stored here.
+
+        ``covers_through_order`` in the result is the event order a ``commit_graph_update`` WITHOUT ``through_order``
+        would move the cursor to: the end of the whole session, even if the proposal was built from fewer events.
+        """
         assert self.store and self.graph
         resolved_provider = self._resolve_provider(provider)
         sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
@@ -1367,21 +1372,31 @@ class SelfDirectEngine:
             if self.store.state_token(sid, resolved_provider) != metadata_token:
                 return {"ok": False, "status": "evidence_conflict", "cursor": cursor}
         return {"ok": verdict["ok"], **verdict, "cursor": cursor,
+                "covers_through_order": graph_batch.covers_through_order(snapshot.count, cursor),
                 "nudge": None if verdict["ok"] else "Fix problems and resubmit; nothing was stored."}
 
     @detached_operation
     @graph_operation("commit_graph_proposal")
-    def commit_graph_update(self, session_id: str, proposal: dict[str, Any],
-                            base_graph_version: int, provider: str | None = None) -> dict[str, Any]:
-        """Validate detached evidence, then CAS the graph and metadata generations."""
+    def commit_graph_update(self, session_id: str, proposal: dict[str, Any], base_graph_version: int,
+                            provider: str | None = None, through_order: int | None = None) -> dict[str, Any]:
+        """Validate detached evidence, then CAS the graph and metadata generations.
+
+        WITHOUT ``through_order`` the cursor moves to the END OF THE SESSION (``covers_through_order`` in the result),
+        even when the proposal was built from fewer events: every event after the ones the proposal covers is then
+        marked processed without ever being extracted. ``through_order`` is the order of the last event the proposal
+        covers; it must lie between the first event not yet processed and the last event of the session, and the
+        cursor then moves only that far (``invalid_through_order`` otherwise; nothing is stored).
+        """
         resolved_provider = self._resolve_provider(provider)
         sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
         anchors = {cid for edge in proposal.get("edges", []) for cid in edge.get("evidence_chunk_ids", [])}
         with self._publication_guard(), self.store._read_boundary():
+            cursor = self.graph.cursor(sid, resolved_provider)
+            count = self.store.chunk_count(sid, resolved_provider)
+            covers = graph_batch.covers_through_order(count, cursor)
             existing = self.graph.find_job(proposal.get("job_id", "") or "adhoc")
             if existing and existing["status"] == "applied":
-                return {"ok": True, "status": "already_applied", "job": existing}
-            cursor = self.graph.cursor(sid, resolved_provider)
+                return {"ok": True, "status": "already_applied", "job": existing, "covers_through_order": covers}
             metadata_token = self.store.state_token(sid, resolved_provider)
             snapshot = self.store.capture_evidence(sid, resolved_provider, history=False, anchors=anchors)
         if base_graph_version != cursor["graph_version"]:
@@ -1389,10 +1404,18 @@ class SelfDirectEngine:
                     "expected_base_graph_version": cursor["graph_version"],
                     "provided_base_graph_version": base_graph_version,
                     "nudge": "Re-read the current graph and rebuild the proposal against it."}
+        if through_order is not None:
+            problem = graph_batch.through_order_problem(through_order, cursor, count)
+            if problem:
+                return {"ok": False, "status": "invalid_through_order", "problem": problem,
+                        "first_unprocessed_order": graph_batch.cursor_start(cursor), "last_order": count - 1,
+                        "covers_through_order": covers,
+                        "nudge": "Nothing was stored. Pass the order of the last event the proposal covers, between "
+                                 "first_unprocessed_order and last_order, or omit it to cover the whole session."}
         verdict = validate_proposal(proposal, store=snapshot, session_id=sid, provider=resolved_provider)
         if not verdict["ok"]:
-            return {"ok": False, "status": "rejected", **verdict}
-        through = snapshot.count - 1 if snapshot.count else cursor["processed_through_order"]
+            return {"ok": False, "status": "rejected", **verdict, "covers_through_order": covers}
+        through = covers if through_order is None else through_order
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         job = {"job_id": proposal.get("job_id", "adhoc"), "provider": resolved_provider,
@@ -1403,7 +1426,7 @@ class SelfDirectEngine:
         with self._publication_guard():
             existing = self.graph.find_job(proposal.get("job_id", "") or "adhoc")
             if existing and existing["status"] == "applied":
-                return {"ok": True, "status": "already_applied", "job": existing}
+                return {"ok": True, "status": "already_applied", "job": existing, "covers_through_order": covers}
             current_version = self.graph.cursor(sid, resolved_provider)["graph_version"]
             if current_version != base_graph_version:
                 return {"ok": False, "status": "version_conflict",
@@ -1416,16 +1439,32 @@ class SelfDirectEngine:
                                                base_version=base_graph_version, through_order=through)
             job["status"], job["detail"] = result["status"], result.get("detail")
             self.graph.record_job(job)
-            return result
+            return {**result, "covers_through_order": covers}
+
+    def _read_graph_batch(self, sid: str, provider: str) -> graph_batch.BatchRead:
+        """The graph cursor, the event count and the next batch of raw frames, read at one point of the index.
+
+        The batch starts at the first event not yet processed. Only the rows of the batch are read and parsed; what
+        precedes them is stepped over in the index (``event_frames_range``), so a batch costs what it holds, not what
+        the session holds.
+        """
+        with self._publication_guard(), self.store._read_boundary():
+            cursor = self.graph.cursor(sid, provider)
+            first = graph_batch.cursor_start(cursor)
+            total = self.store.chunk_count(sid, provider)
+            start = first
+            frames, blocked = [], None
+            if start < total:
+                frames, blocked = self.store.event_frames_range(
+                    sid, provider, start, graph_batch.BATCH_MAX_EVENTS, graph_batch.BATCH_MAX_CHARS,
+                    cost=graph_batch.batch_event_cost)
+        return graph_batch.BatchRead(cursor, first, total, start, tuple(frames), blocked)
 
     @detached_operation
     def _prepare_neograph_update(self, session_id, provider=None):
         resolved = self._resolve_provider(provider)
         sid = session_id.lower() if resolved in ("codex", "agy") else session_id
-        with self._publication_guard():
-            snapshot = self.store.capture_evidence(sid, resolved)
-            cursor = self.graph.cursor(sid, resolved)
-        return sid, resolved, snapshot.event_frames(sid, resolved), cursor
+        return sid, resolved, self._read_graph_batch(sid, resolved)
 
     @workflow_operation
     def _commit_neograph_snapshot(self, sid, provider, proposal, base_version, through,
@@ -1460,8 +1499,9 @@ class SelfDirectEngine:
         if self.settings.local_only:
             return {"ok": False, "error": "local_only",
                     "message": "LLM graph updates are unavailable in local-only mode."}
-        sid, resolved_provider, frames, cursor = self._prepare_neograph_update(
+        sid, resolved_provider, read = self._prepare_neograph_update(
             session_id, provider, _deadline=_deadline, cancel_event=cancel_event)
+        cursor = read.cursor
         api_key = self.settings.resolve_api_key() or ""
         if not api_key:
             return {"ok": False, "error": "no_api_key",
@@ -1469,23 +1509,16 @@ class SelfDirectEngine:
         if self.neograph is None:
             return {"ok": False, "error": "neograph_missing",
                     "message": "pip install neograph-engine first."}
-        if not frames:
+        if not read.total:
             return {"ok": False, "error": "no_events",
                     "message": "Nothing to extract; sync_session first."}
-        start = cursor["processed_through_order"] + 1 if cursor["graph_version"] else 0
-        pending = frames[start:]
-        if not pending:
+        if read.start >= read.total or (not read.frames and read.blocked is None):
             return {"ok": True, "status": "up_to_date", "graph_cursor_after": cursor}
-        batch, size = [], 0
-        for frame in pending[:100]:
-            cost = len(frame["text"]) + len(frame["chunk_id"]) + 80
-            if size + cost > 95000:
-                break
-            batch.append(mask_value(frame))
-            size += cost
+        pending = read.total - read.start
+        batch = [mask_value(frame) for frame in read.frames]
         if not batch:
             return {"ok": False, "error": "graph_event_too_large",
-                    "chunk_id": pending[0]["chunk_id"], "graph_cursor_after": cursor,
+                    "chunk_id": read.blocked["chunk_id"], "graph_cursor_after": cursor,
                     "message": "The next complete event exceeds the graph input budget; no text was truncated."}
         proposal_result: dict[str, Any] = {}
 
@@ -1514,7 +1547,7 @@ class SelfDirectEngine:
         pipeline["batch_events"] = len(batch)
         applied = pipeline.get("apply_result", {}).get("status") == "applied"
         pipeline["ok"] = applied
-        pipeline["remaining_events"] = len(pending) - (len(batch) if applied else 0)
+        pipeline["remaining_events"] = pending - (len(batch) if applied else 0)
         return pipeline
 
     @detached_operation
