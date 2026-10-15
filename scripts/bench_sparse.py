@@ -520,6 +520,32 @@ class Prototype(SparseIndex):
         self._sessions: dict[str, int] = {}
         self._kinds = {"turn": 0, "tool_call": 1, "tool_result": 2, "policy": 3, "meta": 4}
 
+    # ---- exact bm25 statistics --------------------------------------------------------------------------------------
+    # FTS5 leaves nTotalRow and the total token count (the "averages" record, row 1 of chunks_fts_data) untouched when a
+    # contentless_delete row is deleted, so bm25() (idf and average document length) drifts away from the layout that
+    # stores its content. ``exact`` takes the deleted documents out of that record, in the transaction of the delete and
+    # before its first FTS5 write (FTS5 keeps its own copy of the totals once it has written, and saves it at commit).
+    def _retire(self, rowids: list[int]) -> None:
+        if not rowids or not self.SPEC.get("exact"):
+            return
+        rows = tokens = 0
+        for start in range(0, len(rowids), 500):
+            batch = rowids[start:start + 500]
+            for _id, sz in self._conn.execute("SELECT id, sz FROM chunks_fts_docsize WHERE id IN (" + ",".join("?" * len(batch)) + ")", batch):
+                rows += 1
+                tokens += _varints(sz)[0]
+        block = self._conn.execute("SELECT block FROM chunks_fts_data WHERE id=1").fetchone()[0]
+        n, t = _varints(block)
+        self._conn.execute("UPDATE chunks_fts_data SET block=? WHERE id=1", (_varint(n - rows) + _varint(t - tokens),))
+
+    def _rowids(self, ids) -> list[int]:
+        out = []
+        col = "doc_rowid" if self.SPEC["map"] == "brief" else "rowid"
+        for start in range(0, len(ids), 500):
+            batch = list(ids[start:start + 500])
+            out += [r[0] for r in self._conn.execute(f"SELECT {col} FROM chunk_rows WHERE chunk_id IN (" + ",".join("?" * len(batch)) + ")", batch)]
+        return out
+
     # ---- helpers --------------------------------------------------------------------------------------------------
     def _session_no(self, session_id: str, create: bool) -> int | None:
         no = self._sessions.get(session_id)
@@ -565,19 +591,30 @@ class Prototype(SparseIndex):
 
     def upsert(self, chunk_id, session_id, kind, text) -> None:
         with self._conn:
+            self._conn.execute("BEGIN")
+            self._retire(self._rowids([chunk_id]))
             self._drop(chunk_id)
             self._add(chunk_id, session_id, kind, text)
             self._conn.commit()
 
     def delete_ids(self, ids) -> None:
+        ids = list(ids)
         with self._conn:
+            self._conn.execute("BEGIN")
+            self._retire(self._rowids(ids))
             for cid in ids:
                 self._drop(cid)
             self._conn.commit()
 
     def upsert_many(self, chunks) -> None:
+        latest: dict[str, object] = {}
+        for chunk in chunks:                       # the last of a repeated id wins, at its own position
+            latest.pop(chunk.chunk_id, None)
+            latest[chunk.chunk_id] = chunk
         with self._conn:
-            for chunk in chunks:
+            self._conn.execute("BEGIN")
+            self._retire(self._rowids(list(latest)))
+            for chunk in latest.values():
                 self._drop(chunk.chunk_id)
                 self._add(chunk.chunk_id, chunk.session_id, chunk.kind, chunk.text)
             self._conn.commit()
@@ -611,6 +648,34 @@ class Prototype(SparseIndex):
         return out
 
 
+def _varints(blob: bytes) -> list[int]:
+    out, i = [], 0
+    while i < len(blob):
+        v = 0
+        for k in range(9):
+            c = blob[i]
+            i += 1
+            if k == 8:
+                v = (v << 8) | c
+                break
+            v = (v << 7) | (c & 0x7F)
+            if not c & 0x80:
+                break
+        out.append(v)
+    return out
+
+
+def _varint(v: int) -> bytes:
+    if v < 0x80:
+        return bytes([v])
+    groups = []
+    while v:
+        groups.append(v & 0x7F)
+        v >>= 7
+    groups.reverse()
+    return bytes([g | 0x80 for g in groups[:-1]] + [groups[-1]])
+
+
 def _proto(**spec):
     return type("Proto", (Prototype,), {"SPEC": spec})
 
@@ -631,10 +696,14 @@ CANDIDATES: dict[str, dict] = {
     "f1p4": dict(cls=_proto(map="rowid"), page=4096, pgsz=4000, note="(f1) + FTS5 leaf page size pgsz=4000"),
     "f1b8": dict(cls=_proto(map="rowid"), page=8192, note="(f1) with 8 KiB pages"),
     "f1b16": dict(cls=_proto(map="rowid"), page=16384, note="(f1) with 16 KiB pages"),
+    "cx": dict(cls=_proto(map="brief", exact=True), page=4096, note="(c) + exact bm25 statistics (averages record corrected on delete)"),
+    "f2": dict(cls=_proto(map="rowid", exact=True), page=4096, note="(f1) + exact bm25 statistics (averages record corrected on delete)"),
+    "f2b16": dict(cls=_proto(map="rowid", exact=True), page=16384, note="(f2) with 16 KiB pages"),
     "f1cs0": dict(cls=_proto(map="rowid", columnsize=0), page=4096, note="(f1) + columnsize=0 (no docsize table; bm25 expected to fail)"),
 }
 for _key in ("f1p16", "f1p4"):
-    CANDIDATES[_key]["cls"] = _proto(map="rowid", pgsz=CANDIDATES[_key]["pgsz"])
+    CANDIDATES[_key]["cls"] = _proto(map="rowid", exact=True, pgsz=CANDIDATES[_key]["pgsz"])
+    CANDIDATES[_key]["note"] += " (exact statistics)"
 
 
 def make_index(spec: dict, path: Path):
@@ -709,7 +778,11 @@ def compare(reference: list[dict], other: list[dict], queries: list[dict], toler
         worst = max((abs(x[1] - y[1]) / max(1.0, abs(x[1])) for x, y in zip(a["hits"], b["hits"])), default=0.0)
         if worst > tolerance:
             diffs.append({"i": i, "cls": q["cls"], "q": q["q"], "cause": "score", "worst_rel": worst})
-    return {"queries": len(queries), "divergent": len(diffs), "divergences": diffs[:40]}
+    census: dict[str, int] = {}
+    for d in diffs:
+        key = f"{d['cls']}:{d['cause'].split(':')[0]}"
+        census[key] = census.get(key, 0) + 1
+    return {"queries": len(queries), "divergent": len(diffs), "census": census, "divergences": diffs[:40]}
 
 
 def latency(results: list[dict], queries: list[dict]) -> dict:
@@ -736,10 +809,15 @@ def measure(name: str, profile: str, events: int, work: Path, out: dict, *, quer
     ref_dir.mkdir(parents=True, exist_ok=True)
     ref_path = lambda stage: ref_dir / f"{profile}-{events}-{stage}.json"      # noqa: E731
     corpus = Corpus(profile, events)
-    index = make_index(spec, db)
     rec: dict = {"candidate": name, "note": spec["note"], "profile": profile, "events": events,
                  "sqlite": sqlite3.sqlite_version, "checkpoints": []}
     out[f"{name}/{profile}/{events}"] = rec
+    try:
+        index = make_index(spec, db)
+    except sqlite3.Error as exc:
+        rec["build"] = {"events": 0, "file_bytes": 0, "bytes_per_event": 0, "upsert_seconds": 0, "error": f"{type(exc).__name__}: {exc}"}
+        db.unlink(missing_ok=True)
+        return
     t_upsert = t_total = 0.0
     done = 0
     wall = time.perf_counter()
@@ -812,6 +890,15 @@ def measure(name: str, profile: str, events: int, work: Path, out: dict, *, quer
         except sqlite3.Error as exc:
             rec["integrity_check"]["fts5"] = f"{type(exc).__name__}: {exc}"
         rec["integrity_check"]["fts5_seconds"] = round(time.perf_counter() - t, 1)
+        index._conn.commit()
+        rec["freelist"] = {"pages": index._conn.execute("PRAGMA freelist_count").fetchone()[0],
+                           "page_count": index._conn.execute("PRAGMA page_count").fetchone()[0],
+                           "page_size": index._conn.execute("PRAGMA page_size").fetchone()[0]}
+        before = file_bytes(db)
+        t = time.perf_counter()
+        index._conn.execute("VACUUM")
+        rec["vacuum"] = {"seconds": round(time.perf_counter() - t, 1), "before": before, "after": file_bytes(db),
+                         "bytes_per_event": round(file_bytes(db) / index.count(), 1)}
         before = file_bytes(db)
         t = time.perf_counter()
         index._conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')")
@@ -824,9 +911,8 @@ def measure(name: str, profile: str, events: int, work: Path, out: dict, *, quer
         before = file_bytes(db)
         t = time.perf_counter()
         index._conn.execute("VACUUM")
-        rec["vacuum"] = {"seconds": round(time.perf_counter() - t, 1), "before": before, "after": file_bytes(db),
-                         "bytes_per_event": round(file_bytes(db) / index.count(), 1)}
-        t = time.perf_counter()
+        rec["optimize_vacuum"] = {"seconds": round(time.perf_counter() - t, 1), "before": before, "after": file_bytes(db),
+                                  "bytes_per_event": round(file_bytes(db) / index.count(), 1)}
         rec["dbstat_final"] = dbstat(index._conn)
     index._conn.close()
     db.unlink(missing_ok=True)
@@ -866,6 +952,29 @@ def corpus_stats(profile: str, events: int) -> dict:
             "sessions": len(corpus.sessions), "singletons": sum(1 for v in df.values() if v == 1)}
 
 
+def summary(rec: dict) -> str:
+    b = rec["build"]
+    if b.get("error"):
+        return f"{rec['candidate']:6s} {rec['profile']:5s} cannot be built: {b['error']}  ({rec['note']})"
+    lines = [f"{rec['candidate']:6s} {rec['profile']:5s} {rec['events']:>7d} events  sqlite {rec['sqlite']}  {b['file_bytes'] / 1e6:9.1f} MB  "
+             f"{b['bytes_per_event']:9.1f} B/event  upsert {b['upsert_seconds']:7.1f} s  ({rec['note']})"]
+    for key in ("parity_pre", "parity_post_ops", "parity_after_optimize"):
+        if key in rec:
+            p = rec[key]
+            lines.append(f"       {key}: {p['divergent']}/{p['queries']} queries diverge" + (f" {p['census']}" if p["divergent"] else ""))
+    if "latency" in rec:
+        lines.append("       latency p50/p95 ms: " + "  ".join(f"{c}={v['p50_ms']}/{v['p95_ms']}" for c, v in rec["latency"].items()))
+    if "ops" in rec:
+        o = rec["ops"]
+        lines.append(f"       delete_ids({o['events']}) {o['delete_ids_seconds']} s, re-upsert {o['reupsert_seconds']} s")
+    if "optimize" in rec:
+        o, v, ov = rec["optimize"], rec["vacuum"], rec["optimize_vacuum"]
+        lines.append(f"       vacuum {v['seconds']} s -> {v['after'] / 1e6:.1f} MB; optimize {o['seconds']} s {o['before'] / 1e6:.1f} -> {o['after'] / 1e6:.1f} MB; "
+                     f"then vacuum {ov['seconds']} s -> {ov['after'] / 1e6:.1f} MB; freelist {rec['freelist']['pages']}/{rec['freelist']['page_count']} pages; "
+                     f"integrity {rec['integrity_check']['pragma']} {rec['integrity_check']['seconds']} s, fts5 {rec['integrity_check']['fts5']}")
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", choices=sorted(PROFILES), default="codex")
@@ -897,7 +1006,7 @@ def main(argv=None) -> int:
         for name in args.candidate.split(","):
             measure(name, args.profile, args.events, work, out, queries_n=args.queries,
                     stages=set(args.stages.split(",")) - {""}, ref_root=Path(args.tmpdir) / "ref")
-            print(json.dumps(out[f"{name}/{args.profile}/{args.events}"], indent=1), flush=True)
+            print(summary(out[f"{name}/{args.profile}/{args.events}"]), flush=True)
             if args.out:
                 Path(args.out).write_text(json.dumps(out, indent=1))
     finally:
