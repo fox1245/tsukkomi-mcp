@@ -153,10 +153,10 @@ def test_a_session_of_50000_events_converges_in_few_calls(tmp_path, monkeypatch)
 
 def test_real_time_budgets_make_progress_and_return_inside_the_budget(tmp_path, monkeypatch):
     """The same convergence on the real clock (no counting tricks): only what any machine must satisfy is asserted."""
-    world = World(tmp_path, monkeypatch, "codex", seed=5, count=20000, partial=False)
+    world = World(tmp_path, monkeypatch, "codex", seed=5, count=30000, partial=False)      # about 2.5 s one-shot
     try:
         engine = world.engine("real")
-        budget, previous, calls = 3.0, 0, 0
+        budget, previous, calls = 2.0, 0, 0
         while True:
             calls += 1
             started = time.monotonic()
@@ -168,6 +168,7 @@ def test_real_time_budgets_make_progress_and_return_inside_the_budget(tmp_path, 
                 break
             assert calls < 40
         assert previous == world.path.stat().st_size and info["coverage"]["complete"] is False   # parse errors in the mix
+        assert calls >= 2                                       # it did not fit in one call, and every call kept its slice
     finally:
         world.close()
 

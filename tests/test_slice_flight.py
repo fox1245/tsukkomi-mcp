@@ -19,6 +19,8 @@ from self_directing_mcp.codex import parse as codex_parser
 from self_directing_mcp.index import ingest
 from self_directing_mcp.index.ingest import FlightBusy, SlicePolicy
 from self_directing_mcp.request_control import IndexBusy, RequestControl, RequestStopped, request_scope
+from slicing_support import forced
+from test_slice_equivalence import BIG
 from test_reliability import SID, call, message, write, session as reliability_session  # noqa: F401
 
 
@@ -32,10 +34,12 @@ def session(reliability_session):          # noqa: F811
 
 
 class Leader:
-    """A sync of the session paused inside its parse, holding the flight until ``release`` is set."""
+    """A sync of the session paused inside its parse, holding the flight until ``release`` is set. With ``sliced`` it is a
+    request with a deadline whose parse stops after 10 records: the leader of a session that is being synced in slices."""
 
-    def __init__(self, engine, path, monkeypatch):
+    def __init__(self, engine, path, monkeypatch, sliced=False):
         write(path, [message(f"event {n}") for n in range(40)], "a")
+        self.sliced = sliced
         self.entered, self.release, self.parses = threading.Event(), threading.Event(), []
         original = codex_parser.parse_session_chunks
 
@@ -47,7 +51,11 @@ class Leader:
 
         monkeypatch.setattr(codex_parser, "parse_session_chunks", paused)
         self.pool = ThreadPoolExecutor(2)
-        self.result = self.pool.submit(engine.sync_session, session_id=SID, embed=False, derived=False)
+        options = {}
+        if sliced:
+            engine.slice_policy = forced(10)
+            options["_deadline"] = time.monotonic() + BIG
+        self.result = self.pool.submit(engine.sync_session, session_id=SID, embed=False, derived=False, **options)
         assert self.entered.wait(5)
 
     def finish(self):
@@ -57,10 +65,12 @@ class Leader:
         return outcome
 
 
-def test_a_second_audit_waits_a_bounded_time_and_reports_sync_in_progress(session, monkeypatch):
+@pytest.mark.parametrize("sliced", [False, True])
+def test_a_second_audit_waits_a_bounded_time_and_reports_sync_in_progress(session, monkeypatch, sliced):
     engine, path = session
     engine.upsert_contracts([{"id": "no-wipe", "type": "must_not", "scope": "tool_call", "regex": "rm -rf"}])
-    leader = Leader(engine, path, monkeypatch)
+    leader = Leader(engine, path, monkeypatch, sliced=sliced)
+    engine.slice_policy = None                                          # the waiter's own sync is not forced to stop
     started = time.monotonic()
     answer = engine.audit_session(SID, _deadline=started + 1.2)         # waits 0.25 * 1.2 s = 0.3 s for the leader
     waited = time.monotonic() - started
@@ -73,8 +83,14 @@ def test_a_second_audit_waits_a_bounded_time_and_reports_sync_in_progress(sessio
         assert leader.parses == [0]                                      # nobody else parsed: no duplicate work
     finally:
         info = leader.finish()
-    assert info["ok"] and info["total_chunks"] == 41
-    assert leader.parses == [0]
+    assert info["ok"] and leader.parses == [0]
+    if sliced:
+        assert info["sync"]["state"] == "partial" and info["new_chunks"] == 10      # the leader published its slice
+        engine.slice_policy = None
+        assert engine.sync_session(session_id=SID, embed=False, _deadline=time.monotonic() + BIG)["sync"]["state"] == "complete"
+        assert leader.parses == [0, info["byte_offset"]]                 # the rest was parsed once, from the cursor
+    else:
+        assert info["total_chunks"] == 41
     assert engine.audit_session(SID)["verdict"] == "clean"                # and the next call finds everything indexed
 
 

@@ -244,3 +244,34 @@ def test_known_limit_a_subagent_file_whose_records_name_different_agents(tmp_pat
         finally:
             engine.close()
     assert texts["one-shot"] == texts["sliced"]
+
+
+@pytest.mark.parametrize("provider", ["codex", "omp", "claude", "grokbot"])
+def test_a_session_that_grows_between_slices_equals_the_one_shot_sync_of_the_final_file(tmp_path, monkeypatch, provider):
+    """Cold slices, then appends (one of them ending inside a record), more slices: the mixture of the two things the
+    index does with a growing file, against a single sync of the finished file."""
+    world = World(tmp_path, monkeypatch, provider, seed=12, count=260, partial=False)
+    try:
+        data = world.path.read_bytes()
+        ends = [i + 1 for i, byte in enumerate(data) if byte == 0x0A]      # the end of every record
+        first, second = ends[len(ends) // 3], ends[2 * len(ends) // 3] - 17           # the second cut is inside a record
+        one, sliced = world.engine("one-shot"), world.engine("sliced")
+        one.sync_session(**world.sync_args(), derived=False)
+        expected = snapshot(one, provider, world.sid)
+        rng = random.Random(21)
+        for stage, size in enumerate((first, second, len(data))):
+            world.path.write_bytes(data[:size])
+            for _ in range(rng.randint(2, 5) if size < len(data) else 1000):
+                sliced.slice_policy = forced(rng.choice([2, 5, 11]), cap_bytes=rng.choice([None, 1500, 6000]))
+                info = sliced.sync_session(**world.sync_args(), derived=False, _deadline=time.monotonic() + BIG)
+                if info["sync"]["state"] == "complete":
+                    break
+            if stage < 2:
+                assert info["coverage"]["pending_bytes"] >= 0 and info["coverage"]["complete"] is False
+        done = snapshot(sliced, provider, world.sid)
+        no_mtime = lambda b: b[:2] + b[3:]       # noqa: E731  (this test rewrites the file itself)
+        assert (done.events, done.cursor, no_mtime(done.blocks), done.metrics) == \
+            (expected.events, expected.cursor, no_mtime(expected.blocks), expected.metrics)
+        assert done.generation == expected.generation == 1
+    finally:
+        world.close()

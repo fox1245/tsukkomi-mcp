@@ -236,10 +236,12 @@ def test_a_killed_sliced_sync_leaves_an_index_that_verifies_and_completes(tmp_pa
         reference.sync_session(**world.sync_args(), derived=False)
         expected = snapshot(reference, provider, world.sid)
         no_mtime = lambda b: None if b is None else b[:2] + b[3:]       # noqa: E731
-        rng, killed_between_slices = random.Random(3), 0
+        rng, killed_between_slices, records = random.Random(3), 0, world.path.read_bytes().count(b"\n")
         for trial in range(trials):
-            index, finished, errors = kill_child(tmp_path, world, after_start=rng.randint(2, 12), delay=rng.uniform(0, 0.03),
-                                                 cap=rng.choice([30, 120, 400]), name=f"crash-{trial}")
+            cap = rng.choice([20, 60, 150])
+            after = rng.randint(2, max(2, min(12, records // cap - 3)))      # a slice that really begins before the end
+            index, finished, errors = kill_child(tmp_path, world, after_start=after, delay=rng.uniform(0, 0.03),
+                                                 cap=cap, name=f"crash-{trial}")
             assert finished or not errors.strip(), errors            # a child that was killed never reported a failure
             # Open the survivor in this process: a hot journal (a commit that was in flight) is rolled back by SQLite here.
             survivor = SelfDirectEngine(Settings(_env_file=None, local_only=True, openrouter_api_key_file=None,
