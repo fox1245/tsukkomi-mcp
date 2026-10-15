@@ -12,9 +12,22 @@ from self_directing_mcp.index.native import NativeVectorStore
 from self_directing_mcp.request_control import check_request, publication, request_operation
 
 
+class DenseBackendError(RuntimeError):
+    """A dense backend that was selected explicitly cannot do its work (server unreachable, extension missing, index
+    built for another dimension or embedding policy). Never answered by switching to another backend."""
+
+
 class VectorIndex(ABC):
+    #: Reads and writes cross a process or network boundary (a database server). The command hooks skip the optional
+    #: derived-index work for such a backend (``hook_policy.wants_derived_work``), so an outage cannot hide an audit.
+    remote = False
+
     def refresh(self) -> None:
         """SQLite reads are current automatically; in-memory backends override this."""
+
+    def describe(self) -> dict:
+        """Backend facts for ``audit_status`` (never a secret); empty for the local file backends."""
+        return {}
 
     @abstractmethod
     def ids(self) -> set[str]: ...
@@ -110,7 +123,7 @@ class NumpyVectorIndex(VectorIndex):
 
     @request_operation
     def search(self, query: np.ndarray, top_k: int = 20, allowed_ids: set[str] | None = None) -> list[tuple[str, float]]:
-        if not self._ids or self._mat is None:
+        if not self._ids or self._mat is None or top_k <= 0:      # a negative top_k sliced off the tail, not nothing
             return []
         q = np.asarray(query, dtype=np.float64).reshape(-1)
         positions = []
@@ -177,13 +190,22 @@ class SqliteVectorIndex(NativeVectorStore, VectorIndex):
 
 def build_vector_index(
     index_dir: Path, dim: int = 1024, *, backend: str = "sqlite-vector",
-    extension_path: Path | None = None,
+    extension_path: Path | None = None, dsn: str = "", schema: str = "tsukkomi", hnsw: bool = False,
+    policy: str | None = None,
 ) -> tuple[VectorIndex, str]:
-    """Use the selected backend. Native loading failures never select NumPy."""
+    """Use the selected backend. Native loading failures never select NumPy.
+
+    ``index_dir`` stays a local directory for every backend (a pgvector index keeps it empty: its presence is what
+    tells a local-only process sharing the index directory that vector cleanup is owed to a server). ``dsn`` (a libpq
+    connection string, already read from its private file), ``schema``, ``hnsw`` and ``policy`` (the embedding
+    cache-key prefix recorded in the database) are for ``pgvector`` only."""
     index_dir = Path(index_dir)
-    if backend not in ("sqlite-vector", "numpy"):
+    if backend not in ("sqlite-vector", "numpy", "pgvector"):
         raise ValueError(f"Unknown dense backend: {backend}")
     index_dir.mkdir(parents=True, exist_ok=True)
+    if backend == "pgvector":
+        from self_directing_mcp.index.pgvector import PgVectorIndex      # psycopg is not imported before a query runs
+        return PgVectorIndex(dsn, dim=dim, schema=schema, hnsw=hnsw, policy=policy), "pgvector"
     if backend == "numpy":
         return NumpyVectorIndex(dim=dim, persist_path=index_dir / "dense_numpy.npz"), "numpy"
     return SqliteVectorIndex(index_dir / "dense.sqlite", dim=dim, extension_path=extension_path), "sqlite-vector"

@@ -55,7 +55,7 @@ from self_directing_mcp.index.ingest import (
     capture_for_cursor, coverage_from_capture, ingest_session,
 )
 from self_directing_mcp.index.sparse import SparseIndex
-from self_directing_mcp.index.vector import build_vector_index
+from self_directing_mcp.index.vector import DenseBackendError, build_vector_index
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.retrieve.checks import regex_search
 from self_directing_mcp.retrieve.hybrid import HybridRetriever, hits_to_schema
@@ -408,9 +408,12 @@ class SelfDirectEngine:
                 dim=s.embedding_dim,
                 base_url=s.embedding_base_url,
             )
+            policy = self.embedder.cache_key[:16]
+            remote = ({"dsn": s.resolve_pgvector_dsn(), "schema": s.pgvector_schema, "hnsw": s.pgvector_hnsw,
+                       "policy": policy} if s.dense_backend == "pgvector" else {})
             self.dense, self.dense_backend = build_vector_index(
-                index_dir / ("vectors-v2-" + self.embedder.cache_key[:16]), dim=s.embedding_dim,
-                backend=s.dense_backend, extension_path=s.sqlite_vector_path)
+                index_dir / ("vectors-v2-" + policy), dim=s.embedding_dim,
+                backend=s.dense_backend, extension_path=s.sqlite_vector_path, **remote)
         self.sparse = SparseIndex(index_dir / "sparse.sqlite")
         self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes,
                                   defer_derived=self.defer_derived, journal=self._journal_policy())
@@ -2188,8 +2191,15 @@ class SelfDirectEngine:
         self.ensure_ready()
         assert self.store and self.sparse
         s = self.settings
+        dense_count, dense_error = 0, None
         if self.dense is not None:
-            self.dense.refresh()
+            try:
+                self.dense.refresh()
+                dense_count = self.dense.count()
+            except DenseBackendError as exc:
+                # A selected backend that cannot answer (an unreachable database server). Reported, never replaced:
+                # the audit state does not depend on it, and a dense or hybrid search raises the same error.
+                dense_count, dense_error = None, str(exc)
         status: dict[str, Any] = {
             "ok": True,
             "orchestration_backend": "neograph-engine",
@@ -2201,7 +2211,7 @@ class SelfDirectEngine:
             "session_provider": s.resolve_session_provider(),
             "index_dir": str(Path(s.index_dir).resolve()),
             "dense_backend": self.dense_backend,
-            "dense_count": self.dense.count() if self.dense is not None else 0,
+            "dense_count": dense_count,
             "vector_extension_version": getattr(self.dense, "extension_version", None),
             "vector_compute_backend": getattr(self.dense, "compute_backend", None),
             "embedder": type(self.embedder).__name__ if self.embedder else None,
@@ -2219,6 +2229,13 @@ class SelfDirectEngine:
             status["degraded_flags"].append("embedder_fake_fallback")
         if self.dense_backend == "numpy":
             status["degraded_flags"].append("dense_numpy_fallback")
+        if self.dense is not None and self.dense.describe():
+            status["dense_info"] = self.dense.describe()
+            if status["dense_info"].get("tls") is False and status["dense_info"].get("loopback") is False:
+                status["degraded_flags"].append("dense_remote_without_tls")     # a non-loopback server over plaintext
+        if dense_error is not None:
+            status["dense_error"] = dense_error
+            status["degraded_flags"].append("dense_backend_unavailable")
         raw_contracts, _contract_token = self.contracts.capture()
         with self.store._read_boundary():
             record = self.store.cursor_record(session_id, provider) if session_id else None

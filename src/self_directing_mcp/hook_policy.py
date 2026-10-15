@@ -94,8 +94,11 @@ def wants_derived_work(engine: SelfDirectEngine) -> bool:
 
     A local-only engine (what command hooks run) has only the sparse index, which a search repairs on demand, so the
     hook publishes just the canonical events its audit reads and skips the full-text writes (a synchronous commit of
-    their own). An engine with an embedder restores cached vectors during a sync, so it keeps doing that work."""
-    return not engine.settings.local_only
+    their own). An engine with an embedder restores cached vectors during a sync, so it keeps doing that work, except
+    for a dense index on a database server (``SELF_DIRECT_DENSE_BACKEND=pgvector``): a hook judges from the canonical
+    events and never waits for, or fails on, a network round trip; the next ``sync_session`` of the server
+    (a derived sync) materializes the vectors it lacks."""
+    return not engine.settings.local_only and engine.settings.dense_backend != "pgvector"
 
 
 def read_obligations(engine: SelfDirectEngine, provider: str, session_id: str, path: str | None) -> dict:
