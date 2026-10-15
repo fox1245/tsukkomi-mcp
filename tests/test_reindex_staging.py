@@ -342,6 +342,20 @@ def test_a_source_that_grew_since_is_continued_not_restarted(pair):
     converges(p)
 
 
+def test_a_source_cut_back_below_the_staged_range_discards_the_spool(pair):
+    p = pair()
+    through = reindex_of(p.stage(cap=30, calls=3))["staged_through"]
+    data = p.world.path.read_bytes()
+    cut = data.rindex(b"\n", 0, through // 2) + 1                     # a record boundary well inside the staged range
+    assert 0 < cut < through
+    p.world.path.write_bytes(data[:cut])
+    p.reason = "source_changed"
+    restarted = p.stage(cap=30)
+    staged = assert_restarted(p, restarted, "source_shrunk")
+    assert staged["staged_through"] <= cut and staged["target_bytes"] <= cut        # from byte 0, of what is left
+    converges(p)
+
+
 def test_a_target_parser_version_that_moved_on_discards_the_old_spool(pair, monkeypatch):
     p = pair()
     one = reindex_of(p.stage(cap=30))

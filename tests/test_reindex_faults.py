@@ -177,7 +177,10 @@ CHILD = textwrap.dedent('''
         Spool.finish = die
     engine = SelfDirectEngine(Settings(_env_file=None, local_only=True, openrouter_api_key_file=None,
                                        index_dir=spec["index"], **spec["paths"]))
+    log = open(spec["log"], "a", buffering=1) if spec.get("log") else None
     for number in range(100000):
+        if log:
+            log.write(f"start {number}\\n")
         engine.slice_policy = forced(spec["caps"][number % len(spec["caps"])])
         info = engine.sync_session(session_id=spec["sid"], provider=spec["provider"], path=spec["path"], embed=False,
                                    derived=False, _deadline=time.monotonic() + 1e9)
@@ -204,6 +207,38 @@ def kill_at(tmp_path, p, engine, point, at=3):
     child = subprocess.run([sys.executable, "-I", "-B", str(script), str(tmp_path / f"{point}.json"), str(ROOT / "src"),
                             str(ROOT / "tests")], capture_output=True, timeout=300)
     return child.returncode, child.stderr.decode()[-1500:]
+
+
+def kill_while_staging(tmp_path, p, engine, *, after_start, delay, name):
+    """Run the staging of ``engine``'s index in a subprocess and SIGKILL it ``delay`` seconds after its ``after_start``-th call
+    began (so: in the middle of a parse, a spool write or a sync, wherever that lands). Returns (index, finished, stderr)."""
+    index = engine.settings.index_dir
+    engine.close()
+    p.world.engines.remove(engine)
+    log = tmp_path / f"{name}.log"
+    log.write_text("")
+    spec = {"index": str(index), "point": "none", "at": 0, "caps": list(CAPS), "sid": p.sid, "provider": p.provider,
+            "path": str(p.world.path), "log": str(log),
+            "paths": {key: ([str(item) for item in value] if isinstance(value, list) else str(value))
+                      for key, value in p.world.paths.items()}}
+    (tmp_path / f"{name}.json").write_text(json.dumps(spec))
+    script = tmp_path / "child.py"
+    script.write_text(CHILD)
+    child = subprocess.Popen([sys.executable, "-I", "-B", str(script), str(tmp_path / f"{name}.json"), str(ROOT / "src"),
+                              str(ROOT / "tests")], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and child.poll() is None:
+            if f"start {after_start}\n" in log.read_text():
+                time.sleep(delay)
+                break
+            time.sleep(0.001)
+    finally:
+        finished = child.poll() is not None
+        if not finished:
+            child.kill()                                  # SIGKILL (TerminateProcess on Windows): no cleanup runs
+        child.wait(timeout=30)
+    return index, finished, child.stderr.read().decode()[-1500:]
 
 
 def survivor_of(p, index):
@@ -283,3 +318,30 @@ def fresh_engine_for(p, name):
     p.world.path.write_bytes(edited)
     engine.store.cache_vectors("synthetic-model", [("text-hash-1", [0.5, 1.0, -0.5])])
     return engine
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the kill is a POSIX SIGKILL in this test")
+def test_a_staging_process_killed_at_random_moments_leaves_the_old_index_and_a_spool_that_resumes(tmp_path, monkeypatch):
+    """Not at a chosen step: killed 0 to 30 ms into a call that was chosen at random, so the file may end inside a row frame,
+    between frames, after a trailer or in the middle of the sync. Whatever it left, the index is the old one and the next
+    sync resumes the spool or starts over, and publishes the same re-index."""
+    import random
+    p = Pair(tmp_path, monkeypatch, "codex", "parser", seed=5, count=400)
+    try:
+        expected = p.expected()
+        rng = random.Random(3)
+        spools = []
+        for trial in range(4):
+            victim = fresh_engine(p, f"victim-{trial}")
+            before = index_dump(victim)
+            index, finished, errors = kill_while_staging(tmp_path, p, victim, after_start=rng.randint(4, 14),
+                                                         delay=rng.uniform(0, 0.03), name=f"kill-{trial}")
+            assert not finished, errors                       # still staging when it was killed
+            survivor = survivor_of(p, index)
+            assert integrity_ok(index) and index_dump(survivor) == before
+            spools.append(len(spool_files(survivor)))
+            staged_until_published(p.world, survivor, (50, 200, 1000))        # resumes it, or starts over
+            assert canonical(survivor, "codex", p.sid) == expected and not spool_files(survivor)
+        assert max(spools) == 1                                # a kill did leave a spool behind to resume
+    finally:
+        p.close()
