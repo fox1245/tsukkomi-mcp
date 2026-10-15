@@ -845,7 +845,7 @@ The sparse search index (SQLite FTS5, BM25) is derived data: the canonical store
 
 | corpus (100,000 events) | legacy | compact | smaller | build, legacy / compact |
 |---|---|---|---|---|
-| Codex-like, 5.6 KB of text per event | 918.8 MB (9,188 B per event) | **269.1 MB** (2,691 B per event) | **70.7 %** | 95 s / 90 s |
+| Codex-like, 5.6 KB of text per event | 918.8 MB (9,188 B per event) | **269.1 MB** (2,691 B per event) | **70.7 %** | 95 s / 89 s |
 | OMP-like, 1.6 KB of text per event | 321.3 MB (3,213 B per event) | **98.0 MB** (980 B per event) | **69.5 %** | 28 s / 27 s |
 
 (`mask_secrets` alone takes 58 s of the Codex-like and 14 s of the OMP-like build in either format.)
@@ -857,7 +857,7 @@ Size and build time are linear in the number of events (20,000 to 100,000 checke
 - FTS5 does not take a deleted row out of its BM25 statistics (document count, total tokens) in a contentless table, so after a delete the scores drift from an index that never held the row (158 to 162 of 200 queries diverged in the benchmark). The compact format corrects the statistics record in the transaction of the delete, from the stored document sizes, and proves the mechanism on the running SQLite before it opens a file (`compact_support`).
 - Tokenization is unchanged. Two cheaper variants were measured and rejected because they change results: `detail=column` drops term positions, which turns every hyphenated or `snake_case` query (a quoted token that tokenizes into several terms is a phrase) into an error and makes every term frequency 1 (170 to 177 of 200 queries differ), and `tokenize='unicode61'` without the porter stemmer is no smaller (the dictionary dominates) and changes stemming (68 of 200 differ).
 
-**Speed.** A search with a session filter is 7 to 30 times faster than before, because it no longer reads the large stored rows; the others are as fast or a little faster. p50 / p95 in milliseconds at 100,000 Codex-like events: a global frequent term 13.2 / 25.2 legacy, 13.0 / 24.4 compact; `session_id` 181.8 / 232.7 and 5.6 / 7.8; with `allowed_ids` (what `search_history` always passes) 197.9 / 397.6 and 14.9 / 36.1. Deleting and re-inserting 1,000 events takes 0.5 + 1.5 s in both; `PRAGMA integrity_check` takes 2.8 s instead of 6.2 s. `VACUUM` and the FTS5 `optimize` command do not pay: together they shrank the compact file by 4 % in about 8 seconds, with the file locked.
+**Speed.** A search with a session filter is 7 to 30 times faster than before, because it no longer reads the large stored rows; the others are as fast or a little faster. p50 / p95 in milliseconds at 100,000 Codex-like events: a global frequent term 13.2 / 25.2 legacy, 12.7 / 24.6 compact; `session_id` 181.8 / 232.7 and 5.3 / 8.0; with `allowed_ids` (what `search_history` always passes) 197.9 / 397.6 and 14.6 / 34.8. Deleting 1,000 events and inserting them again takes 0.5 s + 1.5 s legacy and 0.8 s + 1.3 s compact; `PRAGMA integrity_check` takes 2.8 s instead of 6.2 s. `VACUUM` and the FTS5 `optimize` command do not pay: together they shrank the compact file by 4 % in about 8 seconds, with the file locked.
 
 **What the file holds.** No text, masked or raw: the masked text is tokenized and only the lower-case, stemmed terms and their positions are kept. That is strictly less than the legacy file held (see the [masking contract](SECURITY.md#masking-contract)).
 
