@@ -33,6 +33,18 @@ def scenario(tmp_path):
 
     same("build")
     assert compact.search(SECRET.rsplit("-", 1)[-1]) == []                        # masking before tokenizing
+    other = CompactSparseIndex(compact.db_path)                                    # a second writer is locked out from the start
+    other._conn.execute("PRAGMA busy_timeout=20")
+    try:
+        with compact._write():
+            try:
+                other.delete_ids([docs[0].chunk_id])
+                locked = False
+            except sqlite3.OperationalError:
+                locked = True
+        assert locked, "a second writer got in while a write transaction was open"
+    finally:
+        other._conn.close()
     both("delete_ids", [d.chunk_id for d in docs[::6]])
     same("deletes")
     both("upsert_many", [d._replace(text=d.text + " zeta rewritten") for d in docs[:50:2]])
@@ -129,6 +141,23 @@ def clear_keeps_statistics(monkeypatch):
     monkeypatch.setattr(CompactSparseIndex, "clear", clear)
 
 
+def deferred_write_lock(monkeypatch):
+    from contextlib import contextmanager
+    from self_directing_mcp.request_control import publication
+
+    @contextmanager
+    def write(self):
+        self._conn.execute("BEGIN")                  # the lock is taken at the first write, after the statistics were read
+        try:
+            yield
+            with publication():
+                self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+    monkeypatch.setattr(CompactSparseIndex, "_write", write)
+
+
 def first_of_a_repeated_id_wins(monkeypatch):
     def upsert_many(self, chunks):
         latest = {}
@@ -144,7 +173,7 @@ def first_of_a_repeated_id_wins(monkeypatch):
 
 MUTATIONS = [stale_statistics, missed_fts_delete, missed_delete, old_version_kept, wrong_rowid_mapping, masking_skipped,
              session_filter_ignored, allowed_ids_ignored, top_k_ignored, ties_reversed, clear_keeps_statistics,
-             first_of_a_repeated_id_wins]
+             first_of_a_repeated_id_wins, deferred_write_lock]
 
 
 @pytest.mark.parametrize("mutation", MUTATIONS, ids=lambda m: m.__name__)

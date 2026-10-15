@@ -197,6 +197,61 @@ def test_an_allow_list_search_that_gives_up_lazy_lookups_answers_the_same(tmp_pa
     assert assert_same_results(legacy, compact, with_allowed, "mixed") >= 5
 
 
+def test_concurrent_writers_keep_the_statistics_exact(tmp_path):
+    """Two connections write the same file at once (two processes of one index in real life): the statistics record is read
+    and corrected inside the write lock, so no update of it is lost."""
+    import threading
+    docs = corpus(240, seed=11)
+    path = tmp_path / "shared.sqlite"
+    CompactSparseIndex(path)._conn.close()
+    errors = []
+
+    def writer(mine):
+        index = CompactSparseIndex(path)
+        rng = random.Random(len(mine))
+        try:
+            for round_ in range(12):
+                index.upsert_many(mine[round_ * 10:(round_ + 1) * 10])
+                victims = [d.chunk_id for d in rng.sample(mine[:(round_ + 1) * 10], 4)]
+                index.delete_ids(victims)
+                index.upsert_many([d for d in mine if d.chunk_id in victims][:2])
+        except BaseException as exc:         # noqa: BLE001 - reported below, never swallowed
+            errors.append(exc)
+        finally:
+            index._conn.close()
+
+    threads = [threading.Thread(target=writer, args=(docs[start::2],)) for start in (0, 1)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors
+    final = CompactSparseIndex(path)
+    try:
+        report = final.verify_statistics()
+        assert report["ok"], report
+        assert report["documents"] == final.count() == len(final.ids()) > 100
+    finally:
+        final._conn.close()
+
+
+def test_a_write_transaction_holds_the_write_lock_from_its_start(tmp_path):
+    """The statistics are read and corrected inside the transaction, so another writer must be locked out from the first
+    statement on, not only from the first write (a deferred BEGIN would let it read the same totals and overwrite them)."""
+    docs = corpus(40)
+    _legacy, compact = pair(tmp_path, docs)
+    other = CompactSparseIndex(compact.db_path)
+    other._conn.execute("PRAGMA busy_timeout=20")
+    try:
+        with compact._write():
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                other.delete_ids([docs[0].chunk_id])
+        other.delete_ids([docs[0].chunk_id])                          # free again once the first transaction is over
+        assert other.verify_statistics()["ok"] and compact.verify_statistics()["ok"]
+    finally:
+        other._conn.close()
+
+
 def test_the_search_is_driven_by_the_fts_scan(tmp_path):
     docs = corpus(80)
     _legacy, compact = pair(tmp_path, docs)
