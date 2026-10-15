@@ -11,6 +11,7 @@ This skill provides step-by-step instructions to install, configure, verify, and
 
 `self-directing-mcp` is an MCP server designed to audit and constrain agent behavior against explicit rules, obligations, and session histories. It provides 16 specialized tools:
 - **Contract & Action Auditing**: `check_action`, `audit_session`, `upsert_contracts`, `list_contracts`, `revoke_contract`
+- **Portable contracts**: `list_contract_candidates` (read-only), `adopt_contracts` (needs the user's own message as `source_event_id`), `export_contracts`
 - **Checklists & Activity Tracking**: `update_checklist`, `get_checklist`, `analyze_activity`
 - **Session History & Retrieval**: `search_history`, `get_chunk`, `sync_session`, `audit_status`
 - **GraphRAG & Knowledge Topology**: `run_neograph_update`, `graph_next_batch`, `graph_submit_batch`, `propose_graph_update`, `commit_graph_update`
