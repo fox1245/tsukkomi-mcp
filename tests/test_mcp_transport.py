@@ -53,7 +53,13 @@ def test_stdio_contract_to_preflight(tmp_path):
                 assert all(v["coverage"]["complete"] is True for v in values)
                 assert values[0]["contracts_snapshot"] == values[1]["contracts_snapshot"]
                 status = await client.call_tool("audit_status", {"session_id": sid})
-                assert json.loads(status.content[0].text)["session"]["chunk_count"] == 1
+                status = json.loads(status.content[0].text)
+                assert status["session"]["chunk_count"] == 1
+                # The request statistics travel with the answer (see tests/test_server_ops.py for what they count).
+                tools = status["ops"]["tools"]
+                assert tools["check_action"]["calls"] == 2 and tools["check_action"]["outcomes"]["ok"] == 2
+                assert tools["upsert_contracts"]["calls"] == 1 and tools["audit_status"]["calls"] == 1
+                assert status["ops"]["workers"]["abandoned_now"] == 0
     asyncio.run(asyncio.wait_for(scenario(), timeout=30))
 
 

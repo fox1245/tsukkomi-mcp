@@ -197,6 +197,12 @@ Heavy tool calls run at most SELF_DIRECT_MAX_CONCURRENT_CALLS (default 4) at a t
 expires while queued returns request_deadline and never started. update_checklist returns
 status checklist_conflict, with nothing saved, after three conflicting evaluation attempts; retry.
 
+A deadline-bound check_action or audit_session gives its sync 60 % of the time left (engine.SYNC_BUDGET_SHARE). If that
+runs out while the request is live, the stored index is judged and coverage.issues carries sync_deadline: a must_not match
+is still a violation, nothing else is better than unknown, and the request's own deadline, a cancellation and index_busy
+still end the request as before. audit_status returns the process's request statistics as ops (in memory, closed names,
+no session content), even when the engine is busy.
+
 ## Codex event coverage and parser upgrades
 
 The Codex parser supports world_state, token_usage_record, compacted, and native
