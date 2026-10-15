@@ -22,8 +22,10 @@ Grok reply shapes (command hooks, ``docs/10-hooks.md`` of its user guide), all J
 """
 from __future__ import annotations
 
+from contextlib import closing
 import os
 import sys
+import time
 
 from self_directing_mcp.agy_hook_state import (  # noqa: F401  (re-exported for the fallback script)
     AUDIT_UNAVAILABLE, CHECK_FAILED, DEFAULT_MODE, MODES, HookState, high_risk_match, resolve_contracts_path,
@@ -46,9 +48,52 @@ def resolve_mode(environ=None) -> str:
     return value if value in MODES else DEFAULT_MODE
 
 
+MARK_RETENTION_SEC = 90 * 24 * 3600
+
+
 class GrokHookState(HookState):
     def __init__(self, index_dir) -> None:
         super().__init__(index_dir, STATE_FILE)
+
+    def _connect(self):
+        conn = super()._connect()
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS transcript_marks (session_id TEXT PRIMARY KEY, size INTEGER NOT NULL,"
+                         " updated_at REAL NOT NULL, reset_at REAL, reset_from INTEGER, reset_to INTEGER)")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    def observe_transcript(self, session_id: str, size: int) -> dict | None:
+        """Remember how large the session's ``updates.jsonl`` was at this hook call.
+
+        Grok appends to it. A file that is smaller than at an earlier call was rewritten (a rewind, a reset or a
+        compaction rewrote the history): what it no longer holds cannot be judged, and the absence of an old call is
+        not compliance. Returns ``{"from": bytes, "to": bytes, "at": epoch}`` once the shrink was seen (and at every
+        later call of that session: the evidence stays gone), else None. A state that cannot be read claims nothing.
+        """
+        now = time.time()
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute("SELECT size, reset_at, reset_from, reset_to FROM transcript_marks"
+                                       " WHERE session_id=?", (session_id,)).fetchone()
+                    previous, at, first, last = (None, None, None, None) if row is None else tuple(row)
+                    if previous is not None and size < previous:          # shrunk: remember the first time and size
+                        at, first, last = (now, previous, size) if at is None else (at, first, size)
+                    if row is None or size != previous or last != (row[3] if row else None):
+                        conn.execute("INSERT OR REPLACE INTO transcript_marks VALUES (?,?,?,?,?,?)",
+                                     (session_id, size, now, at, first, last))
+                    conn.execute("DELETE FROM transcript_marks WHERE updated_at<?", (now - MARK_RETENTION_SEC,))
+                    conn.execute("COMMIT")
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+                return None if at is None else {"from": first, "to": last, "at": at}
+        except Exception:
+            return None
 
 
 def _tool_context(event: str, text: str) -> dict:

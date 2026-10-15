@@ -22,7 +22,7 @@ from self_directing_mcp import settings_core
 from self_directing_mcp.config import Settings, hook_settings
 from self_directing_mcp.settings_core import FIELDS, load_hook_settings
 
-ENV_PREFIXES = ("SELF_DIRECT_", "CODEX_", "CLAUDE_", "OPENROUTER_")
+ENV_PREFIXES = ("SELF_DIRECT_", "CODEX_", "CLAUDE_", "GROK_", "OPENROUTER_")
 
 
 @pytest.fixture
@@ -100,6 +100,7 @@ def test_the_shadow_every_values_both_readers_reject(world, text):
 def test_literal_choices_match_the_model():
     for name, choices in (("agy_enforcement", settings_core.ENFORCEMENT_MODES),
                           ("claude_enforcement", settings_core.ENFORCEMENT_MODES),
+                          ("grok_enforcement", settings_core.ENFORCEMENT_MODES),
                           ("session_provider", settings_core.SESSION_PROVIDERS),
                           ("dense_backend", settings_core.DENSE_BACKENDS),
                           ("graph_extractor", settings_core.GRAPH_EXTRACTORS),
@@ -171,6 +172,7 @@ def test_the_accessors_agree(world):
     assert light.resolve_agy_app_data_dirs() == ref.resolve_agy_app_data_dirs()
     assert light.resolve_grokbot_transcripts_dirs() == ref.resolve_grokbot_transcripts_dirs()
     assert light.resolve_claude_projects_dir() == ref.resolve_claude_projects_dir()
+    assert light.resolve_grok_sessions_dir() == ref.resolve_grok_sessions_dir()
     assert light.resolve_sessions_dir() == ref.resolve_sessions_dir()
     assert light.resolve_omp_sessions_dir() == ref.resolve_omp_sessions_dir()
     assert light.resolve_session_provider() == ref.resolve_session_provider()
@@ -195,7 +197,9 @@ STR_OR_LISTS = ["/a;/b", '["/a"]', '"quoted"', "[1]", "5", "true", "null", '{"a"
                 '["/a", "/b"]', "  ", '["a", 1]', "1.5", "false"]
 CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Advisory", "", " advisory", "bogus", "ENFORCED"],
            "claude_enforcement": ["confirmed_only", "advisory", "enforced", "Enforced", "", "advisory ", "bogus"],
-           "session_provider": ["codex", "grokbot", "omp", "agy", "claude", "Codex", "", "cursor", "claude "],
+           "grok_enforcement": ["confirmed_only", "advisory", "enforced", "ENFORCED", "", " enforced", "bogus"],
+           "session_provider": ["codex", "grokbot", "omp", "agy", "claude", "grok", "Codex", "", "cursor", "claude ",
+                                "Grok", "grok "],
            "dense_backend": ["sqlite-vector", "numpy", "pgvector", "NumPy", "PGVECTOR", "Pgvector", "", "sqlite_vector", "faiss",
                              "pg-vector", "pgvector ", "postgres"],
            "graph_extractor": ["openrouter", "host", "Host", "HOST", "OpenRouter", "OPENROUTER", "", " host", "host ",
@@ -219,6 +223,7 @@ KIND_VALUES = {"bool": BOOLS, "int": INTS, "float": FLOATS, "path": PATHS, "list
                "shadow_every": SHADOW_EVERY, "pathsep": PATHSEP}
 FIELD_KINDS = {
     "codex_sessions_dir": "path", "omp_sessions_dir": "path", "claude_projects_dir": "path", "index_dir": "path",
+    "grok_sessions_dir": "path",
     "contracts_path": "path", "sqlite_vector_path": "path", "openrouter_api_key_file": "path", "pgvector_dsn_file": "path",
     "agy_app_data_dirs": "list", "grokbot_transcripts_dir": "mixed", "contract_bundle_paths": "pathsep",
     "use_fake_embedder": "bool", "local_only": "bool", "seed_example_contracts": "bool", "pgvector_hnsw": "bool",
@@ -301,6 +306,7 @@ def test_environment_beats_codex_variable_beats_toml_beats_default(world):
 def test_environment_beats_toml_for_every_path_field(world):
     toml(world, "[paths]\n" + "\n".join([
         'index_dir = "ti"', 'contracts_path = "tc.json"', 'claude_projects_dir = "tp"', 'omp_sessions_dir = "to"',
+        'grok_sessions_dir = "tgs"',
         'agy_app_data_dirs = ["ta", "tb"]', 'grokbot_transcripts_dir = ["tg1", "tg2"]',
         'contract_bundle_paths = ["tb1.json", "/tb2.json"]',
         'sqlite_vector_path = "tv.so"', 'openrouter_api_key_file = "tk.env"', 'pgvector_dsn_file = "tp.dsn"']) + "\n")
@@ -397,7 +403,11 @@ def random_world(rng: random.Random, world) -> str:
     if rng.random() < 0.3:
         world["monkeypatch"].setenv("CLAUDE_CONFIG_DIR", rng.choice(PATHS))
         parts.append("CLAUDE_CONFIG_DIR")
-    keys = rng.sample(["index_dir", "contracts_path", "claude_projects_dir", "omp_sessions_dir", "codex_sessions_dir",
+    if rng.random() < 0.3:
+        world["monkeypatch"].setenv("GROK_HOME", rng.choice(PATHS))
+        parts.append("GROK_HOME")
+    keys = rng.sample(["index_dir", "contracts_path", "claude_projects_dir", "grok_sessions_dir", "omp_sessions_dir",
+                       "codex_sessions_dir",
                        "sqlite_vector_path", "openrouter_api_key_file", "pgvector_dsn_file", "agy_app_data_dirs",
                        "grokbot_transcripts_dir", "contract_bundle_paths"], rng.randint(0, 6))
     lines = ["[paths]"]

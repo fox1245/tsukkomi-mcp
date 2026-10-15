@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import sys
 from typing import Any, TYPE_CHECKING
 
@@ -47,6 +48,9 @@ TRANSCRIPT_LAGS = ("Grok's transcript does not contain the final assistant messa
                    "message obligations cannot be verified (does not block stopping).")
 SUBAGENT_HISTORY = ("A subagent's own history is not consulted for this call; "
                     "history-dependent obligations stay unverified.")
+REWRITTEN = ("The Grok transcript of this session shrank (a rewind, reset or compaction rewrote its history): what it no "
+             "longer holds cannot be judged, so history-dependent contracts are unverified and the absence of an old "
+             "call is not compliance.")
 _FINAL_MESSAGE_SCOPES = ("message", "any")     # what the unflushed final assistant text could still satisfy
 TURN_END = "end_turn"
 _TAIL_BYTES = 262144
@@ -163,6 +167,15 @@ def _transcript_lags(path: str, last_message: str | None) -> bool:
 
 # --- handlers (host-neutral decisions; ``render`` produces Grok's JSON) ---------------------------------------
 
+def _rewritten(engine: SelfDirectEngine, call: HookCall, path: str) -> dict | None:
+    """Whether this session's ``updates.jsonl`` was ever seen to shrink (see ``GrokHookState.observe_transcript``)."""
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return None                      # the engine reports an unreadable transcript as incomplete coverage
+    return GrokHookState(engine.settings.index_dir).observe_transcript(call.session_id, size)
+
+
 def _native_hint(call: HookCall) -> str:
     canonical = grok_tools.canonical_call(call.tool_name, call.tool_input)
     return " (" + grok_tools.describe(call.tool_name, canonical.name) + ")" if canonical.mapped else ""
@@ -179,13 +192,23 @@ def handle_pre_tool_use(engine: SelfDirectEngine, call: HookCall, path: str | No
         if _mode(engine) == "advisory":      # advisory never denies, whatever the source of the finding
             return {"decision": "allow", "notice": "ADVISORY (not compliance): " + workflow["reason"]}
         return {"decision": workflow["decision"], "reason": workflow["reason"]}
+    rewritten = _rewritten(engine, call, path) is not None if path else False
     adjust = None
-    if call.subagent_type is not None:
-        adjust = lambda audit, obligations: hook_policy.demote_history_findings(audit, obligations, SUBAGENT_HISTORY)
+    if rewritten or call.subagent_type is not None:
+        def adjust(audit, obligations):
+            # A confirmed miss of a history-dependent contract rests on evidence that is gone (or never seen): unknown.
+            if rewritten:
+                audit = hook_policy.demote_history_findings(audit, obligations, REWRITTEN)
+            if call.subagent_type is not None:
+                audit = hook_policy.demote_history_findings(audit, obligations, SUBAGENT_HISTORY)
+            return audit
     judged = hook_policy.judge_action(engine, PROVIDER, call.session_id, path, call.tool_name, call.tool_input,
                                       _mode(engine), adjust=adjust)
-    if judged is None or judged.silent:
+    if judged is None:
         return {"decision": "allow"}
+    if judged.silent:
+        # No contract objected, but on a rewritten history that is not a compliance verdict: say so to the model.
+        return {"decision": "allow", "context": REWRITTEN} if rewritten and _mode(engine) != "advisory" else {"decision": "allow"}
     reason = judged.reason + _native_hint(call)
     if judged.warn:
         # The model is told right away (PreToolUse additionalContext); the user has no channel on an allow.
@@ -221,6 +244,10 @@ def handle_stop(engine: SelfDirectEngine, call: HookCall, path: str) -> dict[str
     if not obligations["contracts"] and not obligations["has_checklist"]:
         return {"decision": "allow"}
     notes, misses = hook_policy.checkpoint(engine, PROVIDER, sid, path, obligations, "Grok")
+    if _rewritten(engine, call, path) is not None:
+        # Evidence that is gone confirms nothing: no continuation, and a clean checkpoint is not compliance.
+        misses = []
+        notes.append(REWRITTEN)
     if any(rule.scope in _FINAL_MESSAGE_SCOPES for rule, _f in misses) and _transcript_lags(path, call.last_message):
         # Earlier tool calls and results are on disk; only the final text can still satisfy these obligations.
         misses = [(rule, f) for rule, f in misses if rule.scope not in _FINAL_MESSAGE_SCOPES]
