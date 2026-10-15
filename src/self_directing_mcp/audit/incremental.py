@@ -56,6 +56,15 @@ STATE_VERSION = 1
 # the full evaluator alone would have answered in time into a timeout.
 SHADOW_SECONDS_PER_EVENT = 30e-6
 
+# A comparison never takes the last part of a request's time budget: this much (at most a quarter of what is left) stays
+# for answering from the evaluation that was already made (payload, authority checks, the state write). A forced second pass
+# that does not finish within the rest is dropped and the answer of the first pass stands, unverified.
+FINISH_RESERVE_SEC = 1.0
+
+
+def comparison_reserve(remaining: float) -> float:
+    return min(FINISH_RESERVE_SEC, 0.25 * max(remaining, 0.0))
+
 EVIDENCE_LIMIT = 20
 EXCEPTION_MAX_HITS = 512
 EXCEPTION_MAX_CHARS = 262_144
@@ -860,7 +869,8 @@ def _shadow_affordable(events) -> bool:
     control = current_request()
     if control is None or control.deadline is None:
         return True
-    return control.deadline - time.monotonic() > events * SHADOW_SECONDS_PER_EVENT * 1.5 + 0.5
+    remaining = control.deadline - time.monotonic()
+    return remaining - comparison_reserve(remaining) > events * SHADOW_SECONDS_PER_EVENT * 1.5 + 0.5
 
 
 def _shadow_sample(session_id, offset, active, every) -> bool:

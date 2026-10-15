@@ -5,7 +5,7 @@ from typing import Any, Literal, TYPE_CHECKING
 from functools import wraps
 from threading import Condition, RLock
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
 import copy
@@ -89,6 +89,16 @@ def detached_operation(method):
         with self._components():
             return method(self, *args, **kwargs)
     return wrapped
+
+def background_operation(method):
+    """A background worker's operation: it never reopens an engine that was closed (``detached_operation`` would)."""
+    @request_operation
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._components(reopen=False):
+            return method(self, *args, **kwargs)
+    return wrapped
+
 
 def workflow_operation(method):
     """Own component lifetime without discarding observed workflow cleanup outcomes."""
@@ -239,17 +249,21 @@ class SelfDirectEngine:
             self._lock.release()
 
     @contextmanager
-    def _components(self):
-        # Refcount lifetime without retaining either publication lock over CPU/I/O.
-        worker = self._shadow_worker
-        if worker is not None:
-            worker.preempt()      # a request outranks the idle comparison: it stops at its next cooperative check
+    def _components(self, reopen=True):
+        # Refcount lifetime without retaining either publication lock over CPU/I/O. ``reopen=False``: a background worker's
+        # operation, which must not initialize an engine that was closed.
         with self._publication_guard():
-            if self._closing:
+            if self._closing or not (reopen or self._ready):
                 raise IndexBusy()
             self.ensure_ready()
             self._active_operations += 1
         try:
+            worker = self._shadow_worker
+            if worker is not None:
+                # A request outranks the idle comparison: it stops at its next cooperative check. After the count above, so
+                # that a job that publishes its cancel event and then asks whether the engine is idle sees this request, and a
+                # job that published it earlier is cancelled here (done in this order on both sides, no request is missed).
+                worker.preempt()
             yield
         finally:
             with self._lifetime:
@@ -663,6 +677,16 @@ class SelfDirectEngine:
                 "source_generation": None, "index_generation": None, "verification": "unavailable",
                 "reason": failure}
 
+    @staticmethod
+    def _comparison_scope():
+        """The time share of a pass that only verifies an answer already in hand: it ends ``comparison_reserve`` before the
+        request's own deadline, so a verification that does not finish leaves time to return the answer it was verifying."""
+        control = current_request()
+        if control is None or control.deadline is None:
+            return nullcontext()
+        remaining = control.deadline - time.monotonic()
+        return request_scope(deadline=control.deadline - incremental.comparison_reserve(remaining))
+
     def _audit(self, session_id, provider, proposed=None, path=None, verify="full", escalated=None, idle=False):
         started = time.perf_counter()
         provider = self._resolve_provider(provider)
@@ -718,137 +742,165 @@ class SelfDirectEngine:
         applies = None if planned is None else (lambda contract_id: contract_id in by_id
                                                 and action_applies(by_id[contract_id], planned))
         every = shadow_policy.parse_every(self.settings.audit_shadow_every)    # None: adaptive; else the fixed legacy rate
-        force, retried, late = None, False, {}
-        for attempt in range(4):    # normal pass; a retry; a pass the finished answer asked to compare; a full comparison
-            with self._publication_guard(), self.store._read_boundary():
-                metadata_token = self.store.state_token(sid, provider)
-                if metadata_token != refreshed["_metadata_token"] and "metadata_changed_before_capture" not in coverage["issues"]:
-                    coverage["complete"] = False
-                    coverage["issues"].append("metadata_changed_before_capture")
-                plan = None
-                if history:
-                    # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
-                    needs, link_calls = audit_needs(active, planned)
-                    minimum = self.settings.audit_incremental_min_events
-                    if use_plan and minimum and self.store.session_metrics(sid, provider)[0] < minimum:
-                        # A short session: one full evaluation costs less than keeping, rebuilding and
-                        # shadow-checking monitor states. Nothing is stored; the answer is the reference one.
-                        use_plan = False
-                        report.update(mode="full", below_min_events=minimum)
-                    if use_plan:
-                        report = {key: value for key, value in report.items() if key in ("retry", "incremental_mismatch")}
-                        try:
-                            plan = incremental.AuditPlan.prepare(
-                                self.store, session_id=sid, provider=provider, active=active, planned=planned,
-                                needs=needs, link_calls=link_calls, shadow_every=every, force_full=force_full,
-                                report=report, premise_rules=premise_rules, force=force, idle=idle)
-                        except (RequestStopped, IndexBusy):
-                            raise
-                        except Exception as exc:  # the cache could not even be read: evaluate everything in full
-                            plan = None
-                            report.update(mode="full", fallback={"*": "prepare_failed:" + type(exc).__name__})
-                    if plan is not None:
-                        evidence = AuditEventSnapshot(sid, provider, tuple(plan.events), plan.count)
+        force, retried, late, fallback = None, False, {}, None
+        passes = ExitStack()
+        try:
+            for attempt in range(4):    # normal pass; a retry; a pass the finished answer asked to compare; a full comparison
+                passes.close()          # the reserve of the pass before it ends with that pass
+                if fallback is not None:
+                    passes.enter_context(self._comparison_scope())
+                with self._publication_guard(), self.store._read_boundary():
+                    metadata_token = self.store.state_token(sid, provider)
+                    if metadata_token != refreshed["_metadata_token"] and "metadata_changed_before_capture" not in coverage["issues"]:
+                        coverage["complete"] = False
+                        coverage["issues"].append("metadata_changed_before_capture")
+                    plan = None
+                    if history:
+                        # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
+                        needs, link_calls = audit_needs(active, planned)
+                        minimum = self.settings.audit_incremental_min_events
+                        if use_plan and minimum and self.store.session_metrics(sid, provider)[0] < minimum:
+                            # A short session: one full evaluation costs less than keeping, rebuilding and
+                            # shadow-checking monitor states. Nothing is stored; the answer is the reference one.
+                            use_plan = False
+                            report.update(mode="full", below_min_events=minimum)
+                        if use_plan:
+                            report = {key: value for key, value in report.items()
+                                      if key in ("retry", "incremental_mismatch", "mismatch_not_recorded")}
+                            try:
+                                plan = incremental.AuditPlan.prepare(
+                                    self.store, session_id=sid, provider=provider, active=active, planned=planned,
+                                    needs=needs, link_calls=link_calls, shadow_every=every, force_full=force_full,
+                                    report=report, premise_rules=premise_rules, force=force, idle=idle)
+                            except (RequestStopped, IndexBusy):
+                                raise
+                            except Exception as exc:  # the cache could not even be read: evaluate everything in full
+                                plan = None
+                                report.update(mode="full", fallback={"*": "prepare_failed:" + type(exc).__name__})
+                        if plan is not None:
+                            evidence = AuditEventSnapshot(sid, provider, tuple(plan.events), plan.count)
+                        else:
+                            evidence = self.store.capture_audit_events(sid, provider, needs, link_calls=link_calls)
                     else:
-                        evidence = self.store.capture_audit_events(sid, provider, needs, link_calls=link_calls)
-                else:
-                    evidence = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
-                receipt_token = self._receipt_token(sid, provider)
-                if (provider == "agy" and receipt_token != refreshed["_receipt_token"]
-                        and "receipts_changed_before_capture" not in coverage["issues"]):
-                    coverage["complete"] = False
-                    coverage["issues"].append("receipts_changed_before_capture")
-            _mark_growth(coverage, observation)
-            reference = None
-            if plan is not None and plan.shadow:
-                reference = AuditEventSnapshot(sid, provider, tuple(plan.reference), len(plan.reference))
-                reference_coverage = copy.deepcopy(coverage)
-            try:
-                # The actual native stages, model decoding and regex evaluation own no
-                # engine lease, shared SQLite handle or open read transaction.
-                result = run_audit(session_id=sid, contracts=contracts, store=evidence,
-                                   provider=provider, proposed=planned, coverage=coverage, plan=plan)
-            except incremental.PlanRetry as retry:
-                # A summary could not hold some input: those rules run on the full evaluator in a second pass, and
-                # the limit is remembered so later audits do not fail the same way.
-                force_full = retry.ids
-                report = {"retry": {"rules": sorted(retry.ids), "reason": retry.reason}}
+                        evidence = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
+                    receipt_token = self._receipt_token(sid, provider)
+                    if (provider == "agy" and receipt_token != refreshed["_receipt_token"]
+                            and "receipts_changed_before_capture" not in coverage["issues"]):
+                        coverage["complete"] = False
+                        coverage["issues"].append("receipts_changed_before_capture")
+                _mark_growth(coverage, observation)
+                reference = None
+                if plan is not None and plan.shadow:
+                    reference = AuditEventSnapshot(sid, provider, tuple(plan.reference), len(plan.reference))
+                    reference_coverage = copy.deepcopy(coverage)
                 try:
-                    with self._publication_guard():
-                        if retry.plan is not None:
-                            self.store.save_audit_states(sid, provider, retry.plan.digest,
-                                                         retry.plan.overflow_rows(), retry.plan.snapshot)
-                        if retry.drop:
-                            self.store.drop_audit_states(sid, provider, sorted(retry.ids))
-                        if retry.health:
-                            self.store.record_audit_health(sid, provider, incremental.EVALUATOR_VERSION,
-                                                           [*sorted(retry.ids), "#facts"], retry.health, retry.reason)
-                except (sqlite3.Error, OSError):
-                    pass
-                if retried:
-                    raise
-                retried = True
-                continue
-            mismatch, scoped = [], plan is not None and plan.shadow and not plan.comparison.full
-            if reference is not None:
-                # Shadow: the full evaluator over the same events (for a scoped comparison, over the compared contracts
-                # alone). It is the answer whenever the two differ.
-                subject = [rule for rule in contracts if rule.id in plan.comparison.scope] if scoped else contracts
-                full = run_audit(session_id=sid, contracts=subject, store=reference, provider=provider,
-                                 proposed=planned, coverage=reference_coverage)
-                timed_out = sorted({item.contract_id for item in full.findings if item.reason == REGEX_TIMEOUT})
-                if timed_out:
-                    # A time limit is not a result: the full evaluator could not finish these contracts in its budget, so
-                    # its (unknown) answer stands and the incremental state of those contracts is not trusted either.
-                    # This is not a mismatch of the incremental path and disables nothing. (A scoped reference holds
-                    # only some contracts: the incremental answer stands, unverified.)
-                    if not scoped:
-                        result = full
-                    report["shadow_skipped"] = "reference_regex_timeout"
-                    report["regex_timeout"] = timed_out
-                    for contract_id in timed_out:
-                        if contract_id in plan.monitors:
-                            plan.monitors[contract_id].timed_out = True
-                            plan.timeouts.add(contract_id)
-                    report["shadow"] = False
-                    reference = None
-                else:
-                    mismatch = incremental.compare(result, full, only=plan.comparison.scope if scoped else None)
-                if mismatch:
-                    ids = (sorted({item.contract_id for item in full.findings} & set(plan.monitors))
-                           if mismatch == ["#audit"] else sorted(set(mismatch)))
-                    report["incremental_mismatch"] = ids
-                    flagged = {item.contract_id for item in full.findings
-                               if item.verdict in shadow_policy.FLAGGED and item.contract_id in plan.monitors
-                               and (applies is None or applies(item.contract_id))}
-                    self._record_mismatch(sid, provider, plan, ids, variant, request_key, idle, flagged)
-                    if scoped:
-                        # A partial reference cannot be the answer: the contracts that differ now run on the full
-                        # evaluator (their health row), and a full comparison decides this request.
-                        force = shadow_policy.Comparison().add("mismatch")
-                        continue
-                    result = full
+                    # The actual native stages, model decoding and regex evaluation own no
+                    # engine lease, shared SQLite handle or open read transaction.
+                    result = run_audit(session_id=sid, contracts=contracts, store=evidence,
+                                       provider=provider, proposed=planned, coverage=coverage, plan=plan)
+                except incremental.PlanRetry as retry:
+                    # A summary could not hold some input: those rules run on the full evaluator in a second pass, and
+                    # the limit is remembered so later audits do not fail the same way.
+                    force_full = retry.ids
+                    report = {"retry": {"rules": sorted(retry.ids), "reason": retry.reason}}
+                    try:
+                        with self._publication_guard():
+                            if retry.plan is not None:
+                                self.store.save_audit_states(sid, provider, retry.plan.digest,
+                                                             retry.plan.overflow_rows(), retry.plan.snapshot)
+                            if retry.drop:
+                                self.store.drop_audit_states(sid, provider, sorted(retry.ids))
+                            if retry.health:
+                                self.store.record_audit_health(sid, provider, incremental.EVALUATOR_VERSION,
+                                                               [*sorted(retry.ids), "#facts"], retry.health, retry.reason)
+                    except (sqlite3.Error, OSError):
+                        pass
+                    if retried:
+                        raise
+                    retried = True
+                    continue
+                mismatch, scoped = [], plan is not None and plan.shadow and not plan.comparison.full
                 if reference is not None:
-                    report["shadow_compared"] = True
-            if plan is not None and not mismatch:
-                # Comparisons that only the finished answer can call for: a violation (a wrong block), a violation that
-                # turned clean (a missed one), a high-risk contract whose summary changed.
-                late = plan.late_reasons(result, request_key, applies)
-                wanted = {reason: ids for reason, ids in late.items() if ids and not plan.comparison.covers(ids)}
-                if wanted and plan.schedule is not None and not idle:
-                    if shadow_policy.memo_covers(plan.schedule, plan.state_key(), request_key, result):
-                        report["shadow_skipped"] = "verified_before"
-                        late = {}
-                    elif attempt < 3 and incremental._shadow_affordable(plan.count):
-                        force = shadow_policy.Comparison()
-                        for reason, ids in wanted.items():
-                            force.add(reason, ids)
-                        continue
+                    # Shadow: the full evaluator over the same events (for a scoped comparison, over the compared contracts
+                    # alone). It is the answer whenever the two differ.
+                    subject = [rule for rule in contracts if rule.id in plan.comparison.scope] if scoped else contracts
+                    full = run_audit(session_id=sid, contracts=subject, store=reference, provider=provider,
+                                     proposed=planned, coverage=reference_coverage)
+                    timed_out = sorted({item.contract_id for item in full.findings if item.reason == REGEX_TIMEOUT})
+                    if timed_out:
+                        # A time limit is not a result: the full evaluator could not finish these contracts in its budget, so
+                        # its (unknown) answer stands and the incremental state of those contracts is not trusted either.
+                        # This is not a mismatch of the incremental path and disables nothing. (A scoped reference holds
+                        # only some contracts: the incremental answer stands, unverified.)
+                        if not scoped:
+                            result = full
+                        report["shadow_skipped"] = "reference_regex_timeout"
+                        report["regex_timeout"] = timed_out
+                        for contract_id in timed_out:
+                            if contract_id in plan.monitors:
+                                plan.monitors[contract_id].timed_out = True
+                                plan.timeouts.add(contract_id)
+                        report["shadow"] = False
+                        reference = None
                     else:
-                        report.setdefault("shadow_skipped", "deadline")
-            break
-        else:
-            raise RuntimeError("audit passes exhausted")
+                        mismatch = incremental.compare(result, full, only=plan.comparison.scope if scoped else None)
+                    if mismatch:
+                        ids = (sorted({item.contract_id for item in full.findings} & set(plan.monitors))
+                               if mismatch == ["#audit"] else sorted(set(mismatch)))
+                        report["incremental_mismatch"] = ids
+                        flagged = {item.contract_id for item in full.findings
+                                   if item.verdict in shadow_policy.FLAGGED and item.contract_id in plan.monitors
+                                   and (applies is None or applies(item.contract_id))}
+                        # The incremental answers so far are known to be wrong: there is nothing to fall back to. Recording
+                        # the difference is not part of the verification, so it does not run in its time share.
+                        fallback = None
+                        passes.close()
+                        self._record_mismatch(sid, provider, plan, ids, variant, request_key, idle, flagged, report)
+                        if scoped:
+                            # A partial reference cannot be the answer: the contracts that differ now run on the full
+                            # evaluator (their health row), and a full comparison decides this request.
+                            force = shadow_policy.Comparison().add("mismatch")
+                            continue
+                        result = full
+                    if reference is not None:
+                        report["shadow_compared"] = True
+                if plan is not None and not mismatch:
+                    # Comparisons that only the finished answer can call for: a violation (a wrong block), a violation that
+                    # turned clean (a missed one), a high-risk contract whose summary changed.
+                    late = plan.late_reasons(result, request_key, applies)
+                    wanted = {reason: ids for reason, ids in late.items() if ids and not plan.comparison.covers(ids)}
+                    if wanted and plan.schedule is not None and not idle:
+                        wanted_ids = set().union(*wanted.values())
+                        if shadow_policy.memo_covers(plan.schedule, plan.state_key(), request_key, result, wanted_ids):
+                            report["shadow_skipped"] = "verified_before"
+                            late = {}
+                        elif attempt < 3 and incremental._shadow_affordable(plan.count):
+                            force = shadow_policy.Comparison()
+                            for reason, ids in wanted.items():
+                                force.add(reason, ids)
+                            # This answer stands, unverified, if the forced pass cannot finish (see the handler below).
+                            fallback = (result, copy.deepcopy(result.coverage), plan, dict(report), metadata_token,
+                                        receipt_token, late)
+                            continue
+                        else:
+                            report.setdefault("shadow_skipped", "deadline")
+                break
+            else:
+                raise RuntimeError("audit passes exhausted")
+        except (RequestStopped, IndexBusy) as stopped:
+            passes.close()                  # leave the time share of the forced pass before anything else runs
+            if fallback is None:
+                raise
+            # The pass that was to verify the answer could not finish (its share of the time budget ran out, or the index was
+            # busy): the answer of the pass before it stands, unverified. A verification that ran out of time must never turn
+            # into a lost answer. A cancelled request, or one past its own deadline, has no answer to give: it raises here.
+            check_request()
+            result, saved_coverage, plan, report, metadata_token, receipt_token, late = fallback
+            result.coverage = saved_coverage    # the pass after it may have added issues to the lists the result shared
+            report["shadow_skipped"] = "busy" if isinstance(stopped, IndexBusy) else "deadline"
+            mismatch = []
+        finally:
+            passes.close()
         ran = bool(report.get("shadow_compared"))
         schedule_after = None
         if plan is not None and plan.schedule is not None and not mismatch:
@@ -859,12 +911,15 @@ class SelfDirectEngine:
             unverified = set() if (ran and plan.comparison.covers(flips)) else flips
             flagged = {item.contract_id for item in result.findings if item.verdict in shadow_policy.FLAGGED
                        and item.contract_id in plan.monitors and (applies is None or applies(item.contract_id))}
-            memoized = ran and any(late.values())
+            # A compared input is remembered only when every contract a late reason asked for was compared: a scoped
+            # comparison of one contract (a high-risk one) says nothing about a violation of another.
+            late_ids = set().union(*late.values())
+            memoized = ran and bool(late_ids) and plan.comparison.covers(late_ids)
             schedule_after = shadow_policy.settle(
                 plan.schedule, outcome="match" if ran else None, full_scope=ran and plan.comparison.full,
                 key=request_key, flagged=flagged, kept=unverified, at=datetime.now(timezone.utc).isoformat(),
                 offset=plan.snapshot["offset"], state_key=plan.state_key() if memoized else None,
-                result=result if memoized else None)
+                result=result if memoized else None, memo_ids=late_ids if memoized else None)
             if plan.schedule_loaded is not None and schedule_after.dump() == plan.schedule_loaded:
                 schedule_after = None       # nothing to write back
         payload = result.model_dump(mode="json")
@@ -968,35 +1023,46 @@ class SelfDirectEngine:
         # Leave the guard before the long work: the fast verdict rested on evidence only a full scan can vouch for.
         return self._audit(session_id, provider, proposed=proposed, path=path, verify="full", escalated=reason, idle=idle)
 
-    def _record_mismatch(self, sid, provider, plan, ids, variant, request_key, idle, flagged=frozenset()):
+    def _record_mismatch(self, sid, provider, plan, ids, variant, request_key, idle, flagged=frozenset(), report=None):
         """A comparison found a difference: disable the incremental path of the contracts that differ, reset the schedule
         to 1/4 and record the range of earlier requests that were answered without a comparison (a range for review,
-        never a claim about what those answers were)."""
+        never a claim about what those answers were). All of it is one transaction, so a contract is never left disabled
+        without the reset and the range that go with it; if it cannot be written the answer still stands (the full
+        evaluator's) and the report says so."""
         offset = plan.snapshot["offset"]
         worker = self._shadow_worker
         schedule = plan.schedule
-        since = worker.since_match(provider, sid, variant) if worker is not None else None
-        review = None
         reasons = plan.comparison.reasons
         source = "idle" if idle else "sampled" if reasons == ["sampled"] else "forced:" + ",".join(
             reason for reason in reasons if reason != "sampled")
-        if schedule is not None and (since is not None if worker is not None else schedule.last_match_offset != offset):
-            review = {"source": source, "since_at": (since or {}).get("since_at") or schedule.last_match_at,
-                      "since_offset": schedule.last_match_offset, "until_offset": offset,
-                      "requests": since["requests"] if since else None, "contracts": ids,
-                      "detail": "answers given from incremental state since the last matching comparison"}
+        review, after = None, None
+        if schedule is not None:
+            after = shadow_policy.settle(schedule, outcome="mismatch", full_scope=True, key=request_key,
+                                         flagged=set(flagged), kept=set(), at=datetime.now(timezone.utc).isoformat(),
+                                         offset=offset)
+            since = worker.since_match(provider, sid) if worker is not None else None
+            # A resident engine counts the requests it answered since the last match, if it was running at that time; for what
+            # came before (a restart, a hook process) only the persisted cursor of that match is left.
+            counted = worker is not None and worker.ledger_covers(schedule.last_match_at)
+            if since is not None or (not counted and schedule.last_match_offset != offset):
+                since_at = (since["since_at"] if counted and since else None) or schedule.last_match_at
+                detail = "answers given from incremental state since the last matching comparison"
+                if not counted:
+                    detail += "; requests answered before this process started are not in the count"
+                review = {"source": source, "since_at": since_at or (since or {}).get("since_at"),
+                          "since_offset": schedule.last_match_offset, "until_offset": offset,
+                          "requests": since["requests"] if since else None, "contracts": ids, "detail": detail}
         try:
             with self._publication_guard():
-                self.store.record_audit_health(
-                    sid, provider, incremental.EVALUATOR_VERSION, [*ids, "#facts"], "incremental_mismatch",
-                    f"incremental result differed from the full evaluator at byte {offset}")
-                if schedule is not None:
-                    after = shadow_policy.settle(schedule, outcome="mismatch", full_scope=True, key=request_key,
-                                                 flagged=set(flagged), kept=set(),
-                                                 at=datetime.now(timezone.utc).isoformat(), offset=offset)
-                    self.store.record_shadow_mismatch(sid, provider, after, review)
-        except (sqlite3.Error, OSError):
-            pass
+                self.store.record_incremental_mismatch(
+                    sid, provider, incremental.EVALUATOR_VERSION, [*ids, "#facts"],
+                    f"incremental result differed from the full evaluator at byte {offset}", after, review)
+        except (RequestStopped, IndexBusy):
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            if report is not None:
+                report["mismatch_not_recorded"] = type(exc).__name__
+            return
         if worker is not None:
             worker.note(provider, sid, plan.snapshot.get("path"), variant, None, offset, "mismatch")
 
@@ -1021,7 +1087,7 @@ class SelfDirectEngine:
         """
         return self._audit(session_id, provider, proposed=action, path=path, verify=_check_verify(verify))
 
-    @detached_operation
+    @background_operation
     def verify_incremental(self, session_id: str, provider: str | None = None, path: str | None = None,
                            action: dict[str, Any] | None = None, variant: str = "audit") -> dict[str, Any]:
         """The idle comparison of a resident engine (``shadow_worker``): audit the latest state of a session and compare
@@ -1031,7 +1097,8 @@ class SelfDirectEngine:
                               verify="fast", idle=True)
         report = payload.get("incremental") or {}
         return {"ok": True, "compared": bool(report.get("shadow_compared")),
-                "mismatch": list(report.get("incremental_mismatch") or ()), "skipped": report.get("shadow_skipped")}
+                "mismatch": list(report.get("incremental_mismatch") or ()), "skipped": report.get("shadow_skipped"),
+                "mode": report.get("mode"), "not_recorded": report.get("mismatch_not_recorded")}
 
     @detached_operation
     def get_chunk(self, chunk_id: str) -> dict[str, Any]:

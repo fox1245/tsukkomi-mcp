@@ -89,6 +89,9 @@ class ShadowState:
     flags: dict = field(default_factory=dict)       # request key -> contract ids judged violation/suspicious last time
     memo: dict | None = None                # the last forced comparison that matched (see ``memo_covers``)
     reset_reason: str | None = None
+    # The request kinds (keys of ``flags``) this writer changed since it read the state. Not persisted: a writer that saves
+    # while another saved since it read must not erase that other writer's flags (see ``merge_flags``).
+    touched: frozenset = field(default=frozenset(), repr=False, compare=False)
 
     def dump(self) -> dict:
         return {"premise": self.premise, "rate_index": self.rate_index, "streak": self.streak, "warmup": self.warmup,
@@ -98,12 +101,27 @@ class ShadowState:
 
     @classmethod
     def load(cls, epoch: int, data: dict) -> "ShadowState":
-        """An unreadable row is the same as no row (the caller treats ``ValueError`` that way)."""
-        state = cls(epoch=int(epoch), premise=dict(data["premise"]), rate_index=int(data["rate_index"]),
-                    streak=int(data["streak"]), warmup=int(data["warmup"]), compared=int(data["compared"]),
-                    last_match_at=data.get("last_match_at"), last_match_offset=data.get("last_match_offset"),
-                    flags={str(k): [str(i) for i in v] for k, v in dict(data.get("flags") or {}).items()},
-                    memo=data.get("memo"), reset_reason=data.get("reset_reason"))
+        """A row that cannot be read (damaged, or written for other constants) raises ``ValueError``, ``TypeError`` or
+        ``KeyError``; the caller treats that as ``unreadable``, which a fresh state replaces."""
+        if not isinstance(data, dict):
+            raise ValueError("shadow state is not an object")
+        numbers = [data[name] for name in ("rate_index", "streak", "warmup", "compared")]
+        if not all(type(number) is int for number in numbers):
+            raise ValueError("shadow state numbers must be integers")
+        flags = data.get("flags", {})
+        if not isinstance(flags, dict) or not all(isinstance(v, list) and all(isinstance(i, str) for i in v)
+                                                  for v in flags.values()):
+            raise ValueError("shadow state flags")
+        memo = data.get("memo")
+        if memo is not None and not _valid_memo(memo):
+            raise ValueError("shadow state memo")
+        at, offset = data.get("last_match_at"), data.get("last_match_offset")
+        if not (at is None or isinstance(at, str)) or not (offset is None or type(offset) is int):
+            raise ValueError("shadow state last match")
+        state = cls(epoch=int(epoch), premise=dict(data["premise"]), rate_index=numbers[0], streak=numbers[1],
+                    warmup=numbers[2], compared=numbers[3], last_match_at=at, last_match_offset=offset,
+                    flags={str(k): list(v) for k, v in flags.items()}, memo=memo,
+                    reset_reason=data.get("reset_reason"))
         if not 0 <= state.rate_index < len(RATE_DENOMINATORS) or min(state.streak, state.warmup, state.compared) < 0:
             raise ValueError("shadow state out of range")
         return state
@@ -117,6 +135,12 @@ class ShadowState:
     def copy(self) -> "ShadowState":
         return replace(self, premise=dict(self.premise), flags={k: list(v) for k, v in self.flags.items()},
                        memo=dict(self.memo) if self.memo else None)
+
+
+def _valid_memo(memo) -> bool:
+    return (isinstance(memo, dict) and isinstance(memo.get("state"), list) and isinstance(memo.get("request"), str)
+            and isinstance(memo.get("result"), str)
+            and (memo.get("ids") is None or (isinstance(memo["ids"], list) and all(isinstance(i, str) for i in memo["ids"]))))
 
 
 def digest(*parts) -> str:
@@ -182,21 +206,41 @@ def result_digest(result) -> str:
     return digest({k: dumped[k] for k in ("verdict", "findings", "notes", "coverage", "contracts_snapshot", "session_id")})
 
 
-def memo_covers(state, state_key, key, result) -> bool:
-    """True when this very input was already compared with the reference and matched: same stored events, same contracts,
-    same request, same incremental answer. The reference is deterministic, so comparing again could not find anything."""
+def memo_covers(state, state_key, key, result, ids=None) -> bool:
+    """True when this very input was already compared with the reference and matched: same stored events, same request kind,
+    same incremental answer, and (``ids``) every contract that is now asked for was among those compared. The reference is
+    deterministic, so comparing again could not find anything."""
     memo = state.memo
-    return bool(memo) and memo.get("state") == list(state_key) and memo.get("request") == key \
-        and memo.get("result") == result_digest(result)
+    if not memo or memo.get("state") != list(state_key) or memo.get("request") != key \
+            or memo.get("result") != result_digest(result):
+        return False
+    return ids is None or set(ids) <= set(memo.get("ids") or ())
 
 
-def settle(state, *, outcome, full_scope, key, flagged, kept, at, offset, state_key=None, result=None, premise=None):
+def merge_flags(stored, mine, touched) -> dict:
+    """The flags to store when a writer saves, given the flags already stored (another writer may have saved since this one
+    read the state): the stored flags, with the entries of the request kinds this writer handled replaced by its own. A
+    writer that handled none of them (``touched`` empty) keeps its own flags."""
+    if not touched:
+        return {k: list(v) for k, v in mine.items()}
+    out = {k: list(v) for k, v in (stored or {}).items() if k not in touched}
+    for key in touched:
+        if mine.get(key):
+            out[key] = list(mine[key])          # appended last: the dict keeps the most recent kinds
+    while len(out) > FLAG_REQUESTS:
+        del out[next(iter(out))]
+    return out
+
+
+def settle(state, *, outcome, full_scope, key, flagged, kept, at, offset, state_key=None, result=None, premise=None,
+           memo_ids=None):
     """The state after a request.
 
     ``outcome``: ``"match"`` or ``"mismatch"`` for a comparison that ran, ``"skipped"`` or ``None`` for one that did not.
     ``full_scope``: the comparison covered every contract (only these count towards the schedule).
     ``flagged``: ids the answer judged violation/suspicious; ``kept``: flipped ids whose forced comparison did not run (so
-    the next request still sees the flip)."""
+    the next request still sees the flip). ``state_key`` and ``result`` (with ``memo_ids``, the contracts that comparison
+    covered) remember a forced comparison that matched, see ``memo_covers``."""
     new = state.copy()
     if outcome == "mismatch":
         return ShadowState(epoch=new.epoch + 1, premise=dict(new.premise), reset_reason="mismatch",
@@ -211,7 +255,10 @@ def settle(state, *, outcome, full_scope, key, flagged, kept, at, offset, state_
                 new.rate_index, new.streak = new.rate_index + 1, 0
         if state_key is not None and result is not None:
             new.memo = {"state": list(state_key), "request": key, "result": result_digest(result)}
+            if memo_ids is not None:
+                new.memo["ids"] = sorted(memo_ids)
     new.flags = _flags(new.flags, key, flagged | set(kept))
+    new.touched = new.touched | {key}               # the flags of this request kind are this writer's to write
     return new
 
 

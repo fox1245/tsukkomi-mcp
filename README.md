@@ -491,8 +491,15 @@ evaluation, which remains the reference. The audit still runs through the native
     (`incremental.shadow_scope`: a reference evaluation of those contracts alone), so a high-risk contract in the session
     makes no unrelated request compare anything and does not make the other contracts dearer; a scoped comparison does not count
     towards the rate below, and a scoped mismatch is settled by a full comparison in the same request. These three are not repeated for
-    an input that was already compared and matched (the same stored events, contracts, request and incremental answer:
-    `shadow_skipped: "verified_before"`): the reference is deterministic, so a repeat could find nothing.
+    an input that was already compared and matched (the same stored events, contracts, request and incremental answer, with every
+    contract asked for among those compared: `shadow_skipped: "verified_before"`): the reference is deterministic, so a repeat
+    could find nothing. A comparison that did not run (no time) is not remembered as done. A violation, a flip or a changed
+    high-risk summary is only known once the first pass has answered, so the comparison it calls for is a second pass over the same
+    request. That pass gets the time that is left minus a reserve (a quarter of it, at most one second), and no comparison is started
+    unless its estimated cost fits in what is left after that reserve; if the pass cannot finish, because that time is up or the index
+    is busy, the answer of the first pass is returned unverified (`shadow_skipped: "deadline"` or
+    `"busy"`), the violation stays remembered for the next request of that kind, and no answer is lost. A request that was cancelled,
+    or is past its own deadline, is still an error.
   - **Sampled, for everything else, at an adaptive rate.** The rate starts at 1/4 and halves (1/8, 1/16, 1/32) after
     every 8 consecutive comparisons that actually ran, covered every contract and matched; the floor is 1/32. The 4 comparisons of the
     warm-up count towards that streak, so the 1/4 stage of a new session is the 4 sampled matches that follow them. The rate returns to 1/4
@@ -501,8 +508,11 @@ evaluation, which remains the reference. The audit still runs through the native
     reset it. A comparison that was skipped for lack of time is no match and does not interrupt the streak. The draw is a hash of
     the schedule state and the cursor, so it is deterministic and reproducible. The schedule is kept per session and provider in
     `audit_shadow_state`, written with the monitor states (a resident engine holds it with them), so a restarted process continues
-    it; a row that cannot be read (damaged, or written for other constants) only means "start again at 1/4 with the warm-up", which
-    compares more, never less. The action-check and the audit variants keep monitor states of their own, so the first request of
+    it; a row that cannot be read (damaged, written for other constants, or with any invalid field, the remembered comparison
+    included) only means "start again at 1/4 with the warm-up", which compares more, never less. Parallel requests cannot undo a
+    reset: an older epoch never replaces a newer one, in the table or in the memory a resident engine holds (and a reset another
+    process stored wins over the older schedule a resident engine still holds); two writers of the same epoch keep each other's
+    remembered violations, each replacing only the entries of the request kinds it handled. The action-check and the audit variants keep monitor states of their own, so the first request of
     each variant is a rebuild and owes the warm-up again.
   - **These constants are not the roundtable's, on purpose.** Issue #18 R2 asked for 1/4 down to 1/64, halving after 32 matches and a
     warm-up of 8. The review chair changed that to the constants above after measuring the policy functions themselves
@@ -531,8 +541,19 @@ evaluation, which remains the reference. The audit still runs through the native
     time; it never blocks a request (a request that arrives cancels the running job at its next cooperative check, and the session stays
     pending). On a mismatch the contract's incremental path is disabled, the rate returns to 1/4 and the requests answered since the
     last match are recorded as a range that **needs review** (`audit_review_ranges`, reported by `audit_status`; a mismatch found by
-    a request records one too, with the count of unverified requests known only to a resident engine). It does not retroactively guarantee
-    earlier responses: a match says the latest state agrees with the full evaluator, nothing about the answers given before it.
+    a request records one too). The three changes are one transaction, all or none, and not undone by a cancellation that arrives
+    meanwhile; if the index cannot be written the answer is still the full evaluator's and the report says
+    `incremental.mismatch_not_recorded`, the session stays pending and the next comparison finds the difference again. The range
+    starts at the persisted last match, so it is recorded after a restart too; the count of requests in doubt (of both kinds) is
+    known only to a resident engine that was running at the last match, and the detail of the range says when it is not. A job that a
+    request cancelled is not a failure and is retried as soon as the engine is idle; a job that ran out of its own budget, found the
+    index busy, failed or could not compare backs off for 30 seconds, doubling to 15 minutes, and sessions are tried in turn, so one
+    that keeps failing cannot starve the others; a session whose contracts all run on the full evaluator has nothing left to verify and is
+    dropped. The worker never reopens an engine that was closed. The job reads the events under the index's file lock like a request
+    (while it reads them, not while it evaluates), and only requests to its own engine cancel it: a request of *another process*
+    that arrives meanwhile (a hook process that does not use the daemon) waits up to `SELF_DIRECT_LOCK_WAIT_TIMEOUT_SEC` (1 second) and is
+    then answered `index_busy`, which a hook treats as unknown. It does not retroactively guarantee earlier responses: a match says
+    the latest state agrees with the full evaluator, nothing about the answers given before it.
   - **What this does not promise.** Not every response equals the full evaluation. An answer that is wrongly **clean** passes between
     two comparisons unnoticed; a violation, a violation that turns clean and a high-risk contract are checked in the request that
     carries them, a silent miss is not. Fault injection (`scripts/measure_shadow_detection.py`: a monitor that ignores forbidden

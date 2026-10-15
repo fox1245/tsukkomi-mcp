@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 import json
 import sqlite3
 
+from self_directing_mcp.audit.shadow import merge_flags
+
 SCHEMA = """
             -- The adaptive shadow-comparison schedule of a session (audit/shadow.py): one small JSON row. ``epoch`` is
             -- bumped on every reset and an older epoch never overwrites a newer one.
@@ -52,10 +54,27 @@ def load(conn, provider, session_id):
     return row[0], data if isinstance(data, dict) else None
 
 
-def write(conn, provider, session_id, epoch, state, now=None):
-    """Inside an open write transaction."""
-    conn.execute(_UPSERT, (provider, session_id, epoch, json.dumps(state, separators=(",", ":")),
-                           now or datetime.now(timezone.utc).isoformat()))
+def write(conn, provider, session_id, epoch, state, now=None, touched=()):
+    """Inside an open write transaction; returns whether the row was written.
+
+    A writer of an older epoch than the stored one is refused (a reset happened since it read). One of the same epoch may
+    have read before another writer saved: ``touched`` names the request kinds it handled, and the flags of all the others
+    are kept as stored, so that two parallel requests of different kinds do not erase each other's flags."""
+    if touched:
+        row = conn.execute("SELECT epoch,state FROM audit_shadow_state WHERE provider=? AND session_id=?",
+                           (provider, session_id)).fetchone()
+        if row is not None:
+            if row[0] > epoch:
+                return False
+            if row[0] == epoch:
+                try:
+                    stored = json.loads(row[1]).get("flags")
+                except (ValueError, AttributeError):
+                    stored = None
+                state = {**state, "flags": merge_flags(stored, state.get("flags") or {}, touched)}
+    cursor = conn.execute(_UPSERT, (provider, session_id, epoch, json.dumps(state, separators=(",", ":")),
+                                    now or datetime.now(timezone.utc).isoformat()))
+    return cursor.rowcount > 0
 
 
 def add_range(conn, provider, session_id, *, source, since_at, since_offset, until_offset, requests, contracts, detail,

@@ -27,6 +27,8 @@ What makes that safe (the argument the tests check):
 """
 from __future__ import annotations
 
+from self_directing_mcp.audit.shadow import merge_flags
+
 # A flush empties the buffer; these bound what a process that never commits again can collect in the meantime.
 MAX_ENTRIES = 2048
 MAX_BYTES = 16 * 1024 * 1024      # of held monitor-state text
@@ -43,9 +45,10 @@ class DerivedBuffer:
         # (receipts database path, session_id) -> the receipts digest the index was last built on (AGY "indexed" marker).
         # It lives in another database than the rows above, so ``agy_receipts.ReceiptStore`` writes it, not the store.
         self.markers: dict[tuple[str, str], str] = {}
-        # (provider, session_id) -> (epoch, state dict): the adaptive shadow-comparison schedule (audit/shadow.py). It names its
-        # own premise and epoch, so no lineage check is needed when it is written.
-        self.shadows: dict[tuple[str, str], tuple[int, dict]] = {}
+        # (provider, session_id) -> (epoch, state dict, request kinds touched since the last flush): the adaptive
+        # shadow-comparison schedule (audit/shadow.py). It names its own premise and epoch, so no lineage check is needed
+        # when it is written; the epoch guard of the table applies here as well (an older epoch never replaces a newer one).
+        self.shadows: dict[tuple[str, str], tuple[int, dict, frozenset]] = {}
 
     def __len__(self) -> int:
         # ``list(...)`` is one atomic step: another thread may be holding a row while this one only asks "anything?".
@@ -53,17 +56,34 @@ class DerivedBuffer:
                 + len(self.shadows))
 
     # -- shadow-comparison schedules ----------------------------------------------------------------------------
-    def hold_shadow(self, provider, session_id, epoch, state) -> None:
-        self.shadows[(provider, session_id)] = (epoch, state)
+    def hold_shadow(self, provider, session_id, epoch, state, touched=frozenset()) -> bool:
+        """Hold a schedule unless a newer epoch is held. A writer of the held epoch keeps the flags of the request kinds it did
+        not handle (another request may have saved since it read), exactly as the table does; returns whether it was held."""
+        key = (provider, session_id)
+        held = self.shadows.get(key)
+        if held is not None:
+            if held[0] > epoch:
+                return False
+            if held[0] == epoch:
+                state = {**state, "flags": merge_flags(held[1].get("flags"), state.get("flags") or {}, touched)} \
+                    if touched else state
+                touched = frozenset(touched) | held[2]
+            else:
+                touched = frozenset(touched)
+        self.shadows[key] = (epoch, state, frozenset(touched))
+        return True
 
     def shadow_for(self, provider, session_id):
-        return self.shadows.get((provider, session_id))
+        """``(epoch, state dict)`` of the held schedule, or ``None``."""
+        held = self.shadows.get((provider, session_id))
+        return None if held is None else (held[0], held[1])
 
     def drop_shadow(self, provider, session_id) -> None:
         self.shadows.pop((provider, session_id), None)
 
-    def drain_shadows(self) -> list[tuple[str, str, int, dict]]:
-        taken = [(provider, session, epoch, state) for (provider, session), (epoch, state) in self.shadows.items()]
+    def drain_shadows(self) -> list[tuple[str, str, int, dict, frozenset]]:
+        taken = [(provider, session, epoch, state, touched)
+                 for (provider, session), (epoch, state, touched) in self.shadows.items()]
         self.shadows = {}
         return taken
 

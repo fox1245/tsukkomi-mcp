@@ -298,7 +298,10 @@ def _to_shadow_every(name: str, text: str):
     """``adaptive`` (any case, surrounding whitespace allowed) or a non-negative integer."""
     if text.strip(_WHITESPACE).lower() == "adaptive":
         return "adaptive"
-    return _to_int(name, text, 0)
+    try:
+        return _to_int(name, text, 0)
+    except ValueError:
+        raise _bad(name, "non-negative integer or 'adaptive'") from None
 
 
 def _literal(choices: tuple[str, ...]) -> Callable[[str, str], str]:

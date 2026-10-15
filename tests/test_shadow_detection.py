@@ -65,16 +65,23 @@ def test_with_only_the_forced_comparisons_a_silent_miss_is_never_noticed(tmp_pat
 
 
 def test_the_simulation_of_the_schedule_agrees_with_the_numbers_the_documentation_quotes():
-    """``--simulate`` and ``--share`` play the schedule alone; the README quotes their output."""
+    """``--simulate`` and ``--share`` play the schedule alone; the README quotes their output. The draw is a hash, so the
+    numbers are deterministic: the windows below are a few percent wide around them (a change of a constant, of the floor or
+    of the draw moves them out; the expected medians of a geometric wait are ln 2 times the interval: 22 at 1/32, 11 at 1/16)."""
     floor = [measure.simulate_missed(seed, "adaptive", True, 0)["requests"] for seed in range(600)]
     fixed = [measure.simulate_missed(seed, 16, False, 9)["requests"] for seed in range(600)]
     cold = [measure.simulate_missed(seed, "adaptive", False, 3)["requests"] for seed in range(100)]
-    assert 15 <= statistics.median(floor) <= 32 and 8 <= statistics.median(fixed) <= 14      # 1/32 at the floor, 1/16 before
+    after_warmup = [measure.simulate_missed(seed, "adaptive", False, 9)["requests"] for seed in range(600)]
+    assert 19 <= statistics.median(floor) <= 23 and 28 <= statistics.mean(floor) <= 34 and max(floor) <= 260     # 1/32 at the floor
+    assert 9 <= statistics.median(fixed) <= 13 and 13 <= statistics.mean(fixed) <= 18                            # 1/16 before
+    assert 2 <= statistics.median(after_warmup) <= 4 and statistics.mean(after_warmup) < 6                       # 1/4 just after the warm-up
     assert cold == [1] * 100                                   # inside the warm-up the first request is compared
     share = measure.share_of_requests(20)
-    assert share["10"] > 45 and share["100"] > 10 and share["2000"] < 6 and share["5000"] < 5
+    assert 52 <= share["10"] <= 58 and 15 <= share["100"] <= 19 and 8 <= share["300"] <= 10 and 4.4 <= share["1000"] <= 5.6
+    assert 3.7 <= share["2000"] <= 4.5 and 3.3 <= share["5000"] <= 3.9          # below the 5% a p95 sees after about 1,000 requests
     old = measure.share_of_requests(20, 16)
-    assert 4 < old["1000"] < 9 and old["10"] < 30                  # 1 in 16, plus the rebuild at the first request
+    assert 15 <= old["10"] <= 18 and 6.2 <= old["1000"] <= 6.8 and 6.0 <= old["5000"] <= 6.6       # 1 in 16, plus the first request
     cost = measure.session_cost(10, "adaptive", (300,))["300"]
     previous = measure.session_cost(10, 16, (300,))["300"]
-    assert cost["comparisons"] > previous["comparisons"] > 5       # a young session compares more than 1 in 16 did
+    assert 24 <= cost["comparisons"] <= 28 and 17 <= previous["comparisons"] <= 21     # a young session compares more than 1 in 16 did
+    assert 11 <= cost["unnoticed"] <= 17 and 12 <= previous["unnoticed"] <= 18

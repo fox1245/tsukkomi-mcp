@@ -495,6 +495,9 @@ def test_a_scoped_mismatch_returns_the_full_result_and_disables_the_contract(lab
     payload = box.check("deploy now")
     assert payload["incremental"]["incremental_mismatch"] == ["tests-first"]
     assert next(f for f in payload["findings"] if f["contract_id"] == "tests-first")["verdict"] == "violation"
+    # the answer is the whole reference one, not the partial one of the compared contract alone
+    assert sorted(f["contract_id"] for f in payload["findings"]) == ["no-deploy", "no-wipe", "tests-first"]
+    assert payload["applicable_contracts"] == 3
     again = box.check("deploy now")
     assert again["incremental"]["fallback"]["tests-first"] == "health:incremental_mismatch"
     status = box.status()
@@ -623,12 +626,13 @@ def test_one_pending_job_per_session_and_one_running_at_a_time(lab, draw, monkey
     for name in ("x", "y"):                                          # two more sessions
         worker.note("codex", "session-" + name, None, "audit", None, 1, "unverified")
     assert worker.snapshot()["pending_sessions"] == 3
-    running, peak, jobs = [], [0], []
+    running, peak, jobs, threads = [], [0], [], set()
     real = first.engine.verify_incremental
 
     def watched(session_id, **kwargs):
         running.append(1)
         peak[0] = max(peak[0], len(running))
+        threads.add(threading.get_ident())
         jobs.append((session_id, kwargs.get("variant")))
         time.sleep(0.02)
         try:
@@ -647,6 +651,7 @@ def test_one_pending_job_per_session_and_one_running_at_a_time(lab, draw, monkey
     finally:
         worker.stop()
     assert peak[0] == 1 and worker.snapshot()["pending_sessions"] == 0
+    assert len(threads) == 1 and threading.get_ident() not in threads             # one thread, and not the test's own
     assert sorted(session for session, _ in jobs if session != SID) == ["session-x", "session-y"]     # once each
     assert sorted(v for session, v in jobs if session == SID) == ["audit", "check"]
 
