@@ -187,6 +187,7 @@ class Engines:
         self._engines: dict[str, object] = {}
         self._creating: dict[str, threading.Lock] = {}
         self._workers: dict[str, object] = {}
+        self._shadow_workers: dict[str, object] = {}
         self._log = log
 
     def get(self, settings):
@@ -218,9 +219,13 @@ class Engines:
         if self._factory is not None:
             return
         from self_directing_mcp.integrity_worker import start_integrity_worker
+        from self_directing_mcp.shadow_worker import start_shadow_worker
         worker = start_integrity_worker(engine)
         if worker is not None:
             self._workers[key] = worker
+        shadow = start_shadow_worker(engine)       # the idle comparison of incremental audits (resident engines only)
+        if shadow is not None:
+            self._shadow_workers[key] = shadow
 
     def __len__(self) -> int:
         return len(self._engines)
@@ -244,7 +249,10 @@ class Engines:
             engines, self._engines = list(self._engines.items()), {}
         for key, engine in engines:
             worker = self._workers.pop(key, None)
+            shadow = self._shadow_workers.pop(key, None)
             try:
+                if shadow is not None:
+                    shadow.stop(timeout=2.0)
                 if worker is not None:
                     worker.stop(timeout=2.0)
                 engine.close()

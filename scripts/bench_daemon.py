@@ -179,14 +179,19 @@ def measure_hooks(lab: Lab, args, log=print) -> dict:
             cell = {name: {"wall_ms": bench.summarize(bag["wall"]), "cpu_ms": bench.summarize(bag["cpu"]),
                            "peak_rss_mb": bench.summarize(bag["rss"], 1), "decisions": bag["labels"],
                            "failed_open": bag["failed"]} for name, bag in samples.items()}
+            for name, bag in samples.items():
+                cell[name]["wall_ms"]["p99"] = round(bench.percentile(bag["wall"], 0.99), 1)
             cell["daemon"]["daemon_side_ms"] = bench.summarize(side_ms, 2)
+            cell["daemon"]["daemon_side_ms"]["p99"] = round(bench.percentile(side_ms, 0.99), 2) if side_ms else None
             cell["daemon"]["daemon_run_ms"] = bench.summarize(run_ms, 2)
             cell["daemon"]["daemon_overhead_ms"] = bench.summarize(overhead_ms, 2)
             report[host][key] = cell
-            log(f"  {host:6s} {key:22s} standalone wall p50/p95 {cell['standalone']['wall_ms']['p50']:7.1f}/"
-                f"{cell['standalone']['wall_ms']['p95']:7.1f} ms | daemon wall p50/p95 {cell['daemon']['wall_ms']['p50']:6.1f}/"
-                f"{cell['daemon']['wall_ms']['p95']:6.1f} ms, daemon-side p50/p95 {cell['daemon']['daemon_side_ms']['p50']}/"
-                f"{cell['daemon']['daemon_side_ms']['p95']} ms, client rss max {cell['daemon']['peak_rss_mb']['max']} MB "
+            log(f"  {host:6s} {key:22s} standalone wall p50/p95/p99 {cell['standalone']['wall_ms']['p50']:7.1f}/"
+                f"{cell['standalone']['wall_ms']['p95']:7.1f}/{cell['standalone']['wall_ms']['p99']:7.1f} ms | daemon wall "
+                f"p50/p95/p99 {cell['daemon']['wall_ms']['p50']:6.1f}/{cell['daemon']['wall_ms']['p95']:6.1f}/"
+                f"{cell['daemon']['wall_ms']['p99']:6.1f} ms, daemon-side p50/p95/p99 {cell['daemon']['daemon_side_ms']['p50']}/"
+                f"{cell['daemon']['daemon_side_ms']['p95']}/{cell['daemon']['daemon_side_ms']['p99']} ms, client rss max "
+                f"{cell['daemon']['peak_rss_mb']['max']} MB "
                 f"{samples['daemon']['labels']}{'  FAILED OPEN' if samples['daemon']['failed'] else ''}")
     return report
 

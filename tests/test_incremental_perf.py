@@ -11,6 +11,9 @@ from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
 from test_reliability import SID, call, message, result, write
 
+# These tests measure the delta path alone (shadow_every=0): no warm-up comparisons after a rebuild.
+pytestmark = pytest.mark.usefixtures("no_forced_comparisons")
+
 RULES = [
     {"id": "no-delete", "type": "must_not", "scope": "tool_call", "regex": r"rm\s+-rf"},
     {"id": "tests-first", "type": "must", "scope": "tool_call", "regex": "npm test", "before_regex": "deploy",

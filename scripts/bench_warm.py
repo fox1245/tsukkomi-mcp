@@ -7,9 +7,12 @@ process, with one ``SelfDirectEngine`` kept between requests (what the daemon do
 contracts, payloads and sandbox of ``bench_hooks.py`` and runs under an isolated HOME, index and config file; it
 never reads a user's sessions, indexes or credentials.
 
-Per cell (host x event x bytes appended before each request) it reports the wall time p50 / p95 / min of
-``claude_hooks.run_hook`` / ``agy_hooks.run_hook``, and how many durable SQLite commits a request made (an ``fsync``
-each: on this class of machine 10 to 25 ms, which is most of what is left once the CPU work is gone). With
+Per cell (host x event x bytes appended before each request) it reports the wall time p50 / p95 / p99 / min of
+``claude_hooks.run_hook`` / ``agy_hooks.run_hook``, how many durable SQLite commits a request made (an ``fsync``
+each: on this class of machine 10 to 25 ms, which is most of what is left once the CPU work is gone) and how many shadow
+comparisons ran (each is a full evaluation more: the requests that carry one are the p95 and p99 of a cell). ``--warmup N``
+sets the untimed requests before a cell; the adaptive shadow schedule compares the first 4 requests after a rebuild and
+then a sample that starts at 1/4 and thins out, so ``--warmup 12`` times a session past the forced comparisons. With
 ``--profile`` it also prints a ``cProfile`` of one cell; with ``--spans`` the inclusive wall time of the stages the
 judgement is made of (per request, so the numbers add up to the request time where the spans do not nest).
 
@@ -79,6 +82,22 @@ def count_commits() -> None:
         return connection
 
     sqlite3.connect = connect
+
+
+# --- shadow comparisons ------------------------------------------------------------------------------------------
+COMPARES = {"n": 0}
+
+
+def count_compares() -> None:
+    """Count the comparisons of the incremental result with the full evaluator (``incremental.compare``), which is what
+    makes a request dearer by a full evaluation: how many of a cell's requests carry one explains its p95 and p99."""
+    from self_directing_mcp.audit import incremental
+    real = incremental.compare
+
+    def counted(*args, **kwargs):
+        COMPARES["n"] += 1
+        return real(*args, **kwargs)
+    incremental.compare = counted
 
 
 # --- wall-clock spans ----------------------------------------------------------------------------------------------
@@ -218,7 +237,11 @@ def main(argv=None) -> int:
                              "tens or hundreds of events; the generator writes 64 steps at a time)")
     parser.add_argument("--append-bytes", default="0,4096", help="bytes appended before each request, comma list")
     parser.add_argument("--defer", action="store_true", help="build the engine as the daemon does (defer_derived=True)")
-    parser.add_argument("--shadow-every", type=int, help="SELF_DIRECT_AUDIT_SHADOW_EVERY (default: the setting's default)")
+    parser.add_argument("--shadow-every", help="SELF_DIRECT_AUDIT_SHADOW_EVERY: adaptive or an integer (default: the "
+                                               "setting's default)")
+    parser.add_argument("--warmup", type=int, default=3,
+                        help="untimed requests per cell before the timed ones (default 3). The adaptive shadow schedule "
+                             "compares the first 4 requests after a rebuild; --warmup 12 times a session past that")
     parser.add_argument("--min-events", type=int, help="SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS")
     parser.add_argument("--tmpdir", help="directory for the index and the sessions (e.g. a RAM disk)")
     parser.add_argument("--only", default="", help="comma list of host:event cells (default: all four)")
@@ -230,6 +253,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     appends = [int(value) for value in args.append_bytes.split(",")]
     count_commits()
+    count_compares()
     lab = Lab(args)
     load_start = loadavg()
     spans_installed = False
@@ -240,7 +264,7 @@ def main(argv=None) -> int:
         for host, event in CELLS:
             if args.only and f"{host}:{event}" not in args.only.split(","):
                 continue
-            for _ in range(3):                                   # the first requests build the index and warm the caches
+            for _ in range(args.warmup):                         # the first requests build the index and warm the caches
                 lab.request(host, event, 0)
             report.setdefault("events", {})[f"{host}:{event}"] = lab.events(host)   # the session at the start of this cell
             for append in appends:
@@ -253,6 +277,7 @@ def main(argv=None) -> int:
                         spans_installed = True
                     SPANS.clear()
                 COMMITS["n"] = 0
+                COMPARES["n"] = 0
                 samples = []
                 for _ in range(args.runs):
                     if profiler is not None:
@@ -262,10 +287,13 @@ def main(argv=None) -> int:
                         profiler.disable()
                     samples.append(elapsed)
                 cell = {"p50": round(statistics.median(samples), 2), "p95": round(bench.percentile(samples, 0.95), 2),
-                        "min": round(min(samples), 2), "commits_per_request": round(COMMITS["n"] / args.runs, 2)}
+                        "p99": round(bench.percentile(samples, 0.99), 2),
+                        "min": round(min(samples), 2), "commits_per_request": round(COMMITS["n"] / args.runs, 2),
+                        "comparisons": COMPARES["n"]}
                 report["cells"][key] = cell
-                print(f"{key:26s} p50 {cell['p50']:7.1f}  p95 {cell['p95']:7.1f}  min {cell['min']:7.1f} ms   "
-                      f"durable commits/request {cell['commits_per_request']:4.1f}", flush=True)
+                print(f"{key:26s} p50 {cell['p50']:7.1f}  p95 {cell['p95']:7.1f}  p99 {cell['p99']:7.1f}  min {cell['min']:7.1f} ms   "
+                      f"durable commits/request {cell['commits_per_request']:4.1f}  shadow comparisons {cell['comparisons']}",
+                      flush=True)
                 if profiler is not None:
                     for order in ("cumulative", "tottime"):
                         stream = io.StringIO()
@@ -290,8 +318,9 @@ def main(argv=None) -> int:
     if args.out:
         args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
     if args.markdown:
-        lines = ["| cell | p50 ms | p95 ms | min ms | durable commits / request |", "|---|---|---|---|---|"]
-        lines += [f"| {key} | {c['p50']} | {c['p95']} | {c['min']} | {c['commits_per_request']} |"
+        lines = ["| cell | p50 ms | p95 ms | p99 ms | min ms | durable commits / request | shadow comparisons |",
+                 "|---|---|---|---|---|---|---|"]
+        lines += [f"| {key} | {c['p50']} | {c['p95']} | {c['p99']} | {c['min']} | {c['commits_per_request']} | {c['comparisons']} |"
                   for key, c in report["cells"].items()]
         args.markdown.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0
