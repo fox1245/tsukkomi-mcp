@@ -6,7 +6,9 @@ say, and the switches that restore the all-or-nothing sync.
   slice q that was observed, and the index equals the one-shot index. The same calls with slicing off make no progress.
 * Verdicts. A partial prefix never yields ``clean`` (and never ``judged_prefix``), a forbidden call in it is a violation,
   a proposed prohibited action is a violation whatever the backlog, an obligation stays unknown.
-* Switches. ``off``, no finite deadline, a compressed source, and every reindex keep the all-or-nothing behaviour.
+* Switches. ``off``, no finite deadline and a compressed source keep the all-or-nothing behaviour. A reindex is not sliced
+  into the index either: its capture is whole, an interrupted one leaves the old index, and the rows it parsed wait in a
+  spool until one commit publishes them (``tests/test_reindex_*.py``).
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ from self_directing_mcp import session_events
 from self_directing_mcp.codex import parse as codex_parser
 from self_directing_mcp.index.ingest import SlicePolicy
 from self_directing_mcp.request_control import RequestControl, RequestStopped, request_scope
-from slicing_support import Tick, World, forced, integrity_ok, snapshot
+from slicing_support import HARD, Tick, World, forced, integrity_ok, scripted_deadline, snapshot
 from test_append_capture import _AppendOnFirstFstat
 from test_reliability import SID, call, message, session as reliability_session, write  # noqa: F401
 from test_slice_equivalence import BIG
@@ -31,9 +33,10 @@ FAR = lambda: time.monotonic() + BIG    # noqa: E731
 
 class Allowance(RequestControl):
     """A request that is over (``request_deadline``) after ``limit`` cooperative checks: a deadline that does not depend on
-    the speed of the machine. Its real deadline is a few seconds away, which is what the soft deadline is computed from."""
+    the speed of the machine. Its real deadline is an hour away (``scripted_deadline`` says what the soft deadline of a slice
+    is then): a real one a few seconds away would stop a call on a slow machine before the count does."""
 
-    def __init__(self, limit, seconds=3.0):
+    def __init__(self, limit, seconds=HARD):
         super().__init__(deadline=time.monotonic() + seconds)
         self.calls, self.limit = 0, limit
 
@@ -83,6 +86,7 @@ def test_repeated_calls_that_made_no_progress_now_converge(tmp_path, monkeypatch
     """Four calls that each run out of time. Before: nothing is kept, and the fifth starts from zero. Now: each keeps a slice."""
     world = big_world(tmp_path, monkeypatch)
     try:
+        scripted_deadline(monkeypatch, 3.0)                  # Allowance is an hour from its deadline: the slices are Tick's
         sizes = {}
         for mode in ("off", "auto"):
             engine = world.engine(mode, sync_slicing=mode)
@@ -105,6 +109,9 @@ def test_repeated_calls_that_made_no_progress_now_converge(tmp_path, monkeypatch
 
 
 def test_a_session_of_50000_events_converges_in_few_calls(tmp_path, monkeypatch):
+    """Slices cut by a scripted clock (0.3 s a look), so they are the same on every machine, and no wall clock decides
+    anything (the hard deadline is an hour away): that every call comes back inside its budget is what the real-clock test
+    below asserts, scaled to the speed of the machine."""
     world = big_world(tmp_path, monkeypatch)
     try:
         one, sliced = world.engine("one-shot"), world.engine("sliced")
@@ -114,14 +121,12 @@ def test_a_session_of_50000_events_converges_in_few_calls(tmp_path, monkeypatch)
         expected = snapshot(one, "codex", world.sid)
         assert len(expected.events) > 45_000
         size = world.path.stat().st_size
+        deadline = scripted_deadline(monkeypatch, 3.0)          # the soft deadline of a request of 3 seconds
         tick, reports, previous = Tick(0.3), [], 0
         for _ in range(60):
             sliced.slice_policy = SlicePolicy(clock=tick)       # the production minimums; time moves 0.3 s per look
-            started = time.monotonic()
-            info = sliced.sync_session(**world.sync_args(), derived=False, _deadline=time.monotonic() + 3.0)
-            elapsed = time.monotonic() - started
+            info = sliced.sync_session(**world.sync_args(), derived=False, _deadline=deadline())
             sync = info["sync"]
-            assert elapsed < 3.0 + 0.5                          # inside the budget, with a stated tolerance
             assert sync["indexed_through"] > previous           # strictly further every call
             assert sync["target_bytes"] == size and 0 < sync["progress"] <= 1
             previous = sync["indexed_through"]
@@ -152,23 +157,49 @@ def test_a_session_of_50000_events_converges_in_few_calls(tmp_path, monkeypatch)
 
 
 def test_real_time_budgets_make_progress_and_return_inside_the_budget(tmp_path, monkeypatch):
-    """The same convergence on the real clock (no counting tricks): only what any machine must satisfy is asserted."""
+    """The same convergence on the real clock (no counting tricks): only what any machine must satisfy is asserted.
+
+    A budget in seconds that was written down on one machine is too long for a faster one (the sync finishes in one call) and
+    too short for a slower one (a sanitizer build, a loaded runner: the smallest slice, 1 MiB, takes longer than the budget
+    and the hard deadline stops every call). So the budget is a share of the seconds the one-shot sync of this session takes
+    HERE. A call the hard deadline stopped all the same (``RequestStopped``) is a lost response: what it committed stays
+    committed, so the next call is judged by the cursor in the index, and no more than two may be lost."""
     world = World(tmp_path, monkeypatch, "codex", seed=5, count=30000, partial=False)      # about 2.5 s one-shot
     try:
+        one = world.engine("one-shot")
+        started = time.monotonic()
+        one.sync_session(**world.sync_args(), derived=False)
+        one_shot = time.monotonic() - started
+        expected = snapshot(one, "codex", world.sid)
         engine = world.engine("real")
-        budget, previous, calls = 2.0, 0, 0
+        budget = max(0.5, 0.8 * one_shot)
+        previous, calls, lost = 0, 0, 0
         while True:
             calls += 1
+            assert calls < 40
             started = time.monotonic()
-            info = engine.sync_session(**world.sync_args(), derived=False, _deadline=started + budget)
-            assert time.monotonic() - started < budget + 0.25
+            try:
+                info = engine.sync_session(**world.sync_args(), derived=False, _deadline=started + budget)
+            except RequestStopped as stopped:
+                assert stopped.reason == "request_deadline"
+                lost += 1
+                assert lost <= 2
+                record = engine.store.cursor_record(world.sid, "codex")
+                assert (record["byte_offset"] if record else 0) >= previous       # nothing that was committed is gone
+                previous = record["byte_offset"] if record else 0
+                continue
+            assert time.monotonic() - started < budget * 1.2 + 0.25               # inside the budget, with a tolerance
             assert info["sync"]["indexed_through"] > previous
             previous = info["sync"]["indexed_through"]
             if info["sync"]["state"] == "complete":
                 break
-            assert calls < 40
         assert previous == world.path.stat().st_size and info["coverage"]["complete"] is False   # parse errors in the mix
-        assert calls >= 2                                       # it did not fit in one call, and every call kept its slice
+        if budget < one_shot:
+            assert calls >= 2                                   # it did not fit in one call, and every call kept its slice
+        done = snapshot(engine, "codex", world.sid)
+        assert (done.events, done.cursor, done.blocks[:2] + done.blocks[3:], done.metrics) == \
+            (expected.events, expected.cursor, expected.blocks[:2] + expected.blocks[3:], expected.metrics)
+        print(f"\none-shot {one_shot:.1f} s, budget {budget:.1f} s: {calls} calls, {lost} lost")
     finally:
         world.close()
 
@@ -342,7 +373,7 @@ def reindex_world(tmp_path, monkeypatch):
     return world, engine, snapshot(engine, "codex", world.sid)
 
 
-def test_a_parser_update_is_never_sliced_and_an_interrupted_reindex_keeps_the_old_index(tmp_path, monkeypatch):
+def test_a_parser_update_is_captured_whole_and_an_interrupted_reindex_keeps_the_old_index(tmp_path, monkeypatch):
     world, engine, before = reindex_world(tmp_path, monkeypatch)
     try:
         control = Tripwire()
@@ -356,8 +387,10 @@ def test_a_parser_update_is_never_sliced_and_an_interrupted_reindex_keeps_the_ol
         assert windows == [None]                              # the stored parser version is known: no cut capture at all
         assert (after.events, after.cursor, after.blocks, after.metrics, after.versions) == \
             (before.events, before.cursor, before.blocks, before.metrics, before.versions)      # nothing of it was kept
+        engine.slice_policy = None                            # the settings alone decide: with a far deadline it fits one call
         info = engine.sync_session(**world.sync_args(), derived=False, _deadline=FAR())
         assert info["reindexed"] is True and info["sync"]["state"] == "complete"
+        assert info["sync"]["reindex"]["state"] == "committed"
         assert snapshot(engine, "codex", world.sid).versions != before.versions
     finally:
         world.close()
@@ -379,6 +412,7 @@ def test_a_changed_source_found_after_a_cut_capture_is_reindexed_whole(tmp_path,
         after = snapshot(engine, "codex", world.sid)
         assert (after.events, after.cursor, after.blocks, after.metrics) == \
             (before.events, before.cursor, before.blocks, before.metrics)
+        engine.slice_policy = None
         info = engine.sync_session(**world.sync_args(), derived=False, _deadline=FAR())
         assert info["reindexed"] is True and info["reindex_reason"] == "source_changed" and info["sync"]["state"] == "complete"
     finally:
@@ -400,7 +434,7 @@ def test_an_append_to_an_indexed_session_may_be_sliced_and_keeps_the_events_it_h
         world.close()
 
 
-def test_a_receipt_change_that_forces_a_reindex_is_never_sliced_either(tmp_path, monkeypatch):
+def test_a_receipt_change_that_forces_a_reindex_is_captured_whole_too(tmp_path, monkeypatch):
     """AGY: the reindex is decided after the capture (a changed hook receipt of an indexed result), so a cut capture is
     discarded for a whole one, and an interrupted reindex leaves the old events in place."""
     from self_directing_mcp.agy_receipts import ReceiptStore
@@ -429,6 +463,7 @@ def test_a_receipt_change_that_forces_a_reindex_is_never_sliced_either(tmp_path,
         assert windows[0] is not None and windows[-1] is None            # cut, found to need a reindex, observed whole
         after = snapshot(engine, "agy", world.sid)
         assert (after.events, after.cursor, after.metrics, after.agy) == (before.events, before.cursor, before.metrics, before.agy)
+        engine.slice_policy = None
         info = engine.sync_session(**world.sync_args(), derived=False, _deadline=FAR())
         assert info["reindexed"] is True and info["reindex_reason"] == "hook_receipts_changed"
         assert info["sync"]["state"] == "complete"

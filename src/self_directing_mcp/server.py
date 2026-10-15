@@ -197,13 +197,15 @@ class _Trace:
 
 def _unfinished_sync(result):
     """Why a result's evidence is less than wanted, by its coverage: ``"sync_deadline"`` (the refresh ran out of its share of
-    the time) or ``"sync_in_progress"`` (the session's sync is partway: a committed prefix, or another request writing it),
-    else None."""
+    the time), ``"reindex_ready_to_commit"`` (a re-index is staged whole and waits for a call that has the time to commit it)
+    or ``"sync_in_progress"`` (the session's sync is partway: a committed prefix, a re-index being staged, or another request
+    writing it), else None."""
     coverage = result.get("coverage") if isinstance(result, dict) else None
     issues = coverage.get("issues") if isinstance(coverage, dict) else None
     if not isinstance(issues, (list, tuple)):
         return None
-    return next((reason for reason in ("sync_deadline", "sync_in_progress") if reason in issues), None)
+    return next((reason for reason in ("sync_deadline", "reindex_ready_to_commit", "sync_in_progress")
+                 if reason in issues), None)
 
 
 def _collect_worker_exception(worker):

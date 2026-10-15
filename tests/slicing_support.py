@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 import random
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from self_directing_mcp import journal
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
+from self_directing_mcp.index import ingest
 from self_directing_mcp.index.ingest import SlicePolicy
 from test_claude_hooks import SID as CLAUDE_SID, STEM, assistant, human, text, tool_result, use
 from test_reliability import SID as CODEX_SID, call, message, result
@@ -448,3 +450,19 @@ class Tick:
     def __call__(self) -> float:
         self.now += self.step
         return self.now
+
+
+HARD = 3600.0      # seconds: a hard deadline that no run of a test gets anywhere near
+
+
+def scripted_deadline(monkeypatch, nominal):
+    """The hard deadline of a call whose slices are cut by a scripted clock (``Tick``), and the soft one such a call has.
+
+    A slice's soft deadline is a share of the time the request has left on the REAL clock (``ingest.SYNC_SHARE``), so with a
+    real deadline of ``nominal`` seconds a slow machine (a sanitizer build is three to four times slower, a loaded runner
+    more) can run out of the hard deadline before the script has cut the slice, and the test fails on the speed of the
+    machine, not on what it checks. Here the hard deadline is an hour away (``HARD``) and ``SYNC_SHARE`` is scaled by
+    ``nominal / HARD``: the soft deadline is the one a request of ``nominal`` seconds has (0.5 * nominal / 1.3 seconds of
+    scripted time) and no wall clock decides anything. Returns the function that gives the deadline of one call."""
+    monkeypatch.setattr(ingest, "SYNC_SHARE", ingest.SYNC_SHARE * nominal / HARD)
+    return lambda: time.monotonic() + HARD

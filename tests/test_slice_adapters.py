@@ -164,3 +164,35 @@ def test_an_incomplete_response_with_the_new_reason_is_classified_like_any_other
     decision, reason, _warn = hook_policy.classify(server._incomplete_response("sync_in_progress"), mode)
     assert decision == ("deny" if mode == "enforced" else "allow") and len(reason) < 200
     assert "unverified" in reason.lower() or "incomplete" in reason.lower() or "ADVISORY" in reason
+
+
+# --- a re-index that is staged or waits for its commit (roundtable 8, PR3) ---------------------------------------------
+
+def test_the_codex_hook_prints_the_issues_of_a_staged_reindex_and_of_one_that_waits_for_its_commit(tmp_path, monkeypatch):
+    from reindex_support import Pair
+    from self_directing_mcp.index import ingest
+    p = Pair(tmp_path, monkeypatch, "codex")
+    try:
+        p.staged.upsert_contracts([dict(TESTS_FIRST, provider="codex")])      # applies to the proposed action below
+        p.stage(cap=20)
+        p.staged.slice_policy = forced(20)
+        for expected in ("sync_in_progress", "reindex_ready_to_commit"):
+            if expected == "reindex_ready_to_commit":
+                monkeypatch.setattr(ingest, "COMMIT_SECONDS_PER_ROW", 10.0)
+                p.staged.slice_policy = None            # the settings decide: everything is staged, the commit cannot fit
+            response = handle_hook(p.staged, "PreToolUse", p.sid, str(p.world.path), "shell", {"command": "deploy now"},
+                                   _deadline=time.monotonic() + 60)
+            text = response["hookSpecificOutput"]["additionalContext"]
+            facts = json.loads(text[len(PREFIX):])
+            assert set(response) == {"hookSpecificOutput"} and text.startswith(PREFIX) and len(text) < 900
+            assert facts["verdict"] == "unknown" and facts["coverage_complete"] is False
+            assert expected in facts["issues"] and "parser_outdated" in facts["issues"]
+            assert "judged_through_byte" not in facts
+    finally:
+        p.close()
+
+
+def test_the_omp_extension_keeps_the_issues_of_a_staged_reindex():
+    keep = ts_reason_filter()
+    assert keep.fullmatch("sync_in_progress") and keep.fullmatch("reindex_ready_to_commit")
+    assert request_stats.fold("reindex_ready_to_commit", request_stats.REASONS) == "reindex_ready_to_commit"

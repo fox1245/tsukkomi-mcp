@@ -7,6 +7,8 @@
   compared with the one-shot index.
 * Crash. A subprocess slices a session and is killed with SIGKILL at several moments (while a commit is in flight among
   them); the index must verify and a later sync must complete and equal the one-shot index.
+* A stop right after a commit. The request that runs out of time (or is cancelled) at the first check after a slice was
+  committed loses its answer and nothing else: the slice stays, and the next call goes on from the cursor.
 """
 from __future__ import annotations
 
@@ -21,10 +23,13 @@ from pathlib import Path
 import pytest
 
 from self_directing_mcp import journal
+from self_directing_mcp.codex import parse as codex_parser
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
+from self_directing_mcp.index import ingest
 from self_directing_mcp.request_control import RequestControl, RequestStopped, request_scope
 from slicing_support import PROVIDERS, World, forced, integrity_ok, snapshot
+from test_slice_convergence import Tripwire
 from test_slice_equivalence import BIG, expected_cursor_hash
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -238,8 +243,10 @@ def test_a_killed_sliced_sync_leaves_an_index_that_verifies_and_completes(tmp_pa
         no_mtime = lambda b: None if b is None else b[:2] + b[3:]       # noqa: E731
         rng, killed_between_slices, records = random.Random(3), 0, world.path.read_bytes().count(b"\n")
         for trial in range(trials):
-            cap = rng.choice([20, 60, 150])
-            after = rng.randint(2, max(2, min(12, records // cap - 3)))      # a slice that really begins before the end
+            # A kill 0 to 30 ms after a call began must find the sync unfinished (and not only on the machine this was written
+            # on): small slices, so that dozens of calls (each a few milliseconds) are left after the aimed one, and an early one.
+            cap = rng.choice([10, 20, 40])
+            after = rng.randint(2, max(2, min(8, records // cap - 3)))       # a slice that really begins before the end
             index, finished, errors = kill_child(tmp_path, world, after_start=after, delay=rng.uniform(0, 0.03),
                                                  cap=cap, name=f"crash-{trial}")
             assert finished or not errors.strip(), errors            # a child that was killed never reported a failure
@@ -262,5 +269,56 @@ def test_a_killed_sliced_sync_leaves_an_index_that_verifies_and_completes(tmp_pa
                 (expected.events, expected.cursor, no_mtime(expected.blocks), expected.metrics)
             killed_between_slices += cursor is not None and not finished
         assert killed_between_slices >= 1      # a kill landed after a slice was committed and before the sync was done
+    finally:
+        world.close()
+
+
+# --- a stop right after a slice was committed ------------------------------------------------------------------------
+
+@pytest.mark.parametrize("which", ["first", "last"])
+def test_a_stop_right_after_a_slice_was_committed_loses_the_response_not_the_slice(tmp_path, monkeypatch, which):
+    """The commit of a slice is a transaction that returned. A request that runs out of time (or is cancelled) at the very
+    next cooperative check gets no answer, but the slice stays published: the cursor moved, its events are in, the index
+    verifies, and the next call parses on from that cursor (never from byte 0) to the index the one-shot sync makes.
+    ``which``: the first slice of the sync, or the last one (the sync was complete and only its answer is lost)."""
+    world = World(tmp_path, monkeypatch, "codex", seed=7, count=400, partial=False)
+    try:
+        reference = world.engine("reference")
+        reference.sync_session(**world.sync_args(), derived=False)
+        expected = snapshot(reference, "codex", world.sid)
+        size = world.path.stat().st_size
+        engine = world.engine("stopped")
+        control, parses, committed = Tripwire(), [], []
+        commit, parse = ingest.SessionStore.commit_events, codex_parser.parse_session_chunks
+
+        def committing(self, *args, **kwargs):
+            commit(self, *args, **kwargs)
+            committed.append(kwargs["offset"])
+            control.armed = which == "first" or kwargs["offset"] >= size       # from now on every look at the clock is a stop
+
+        def parsing(*args, **kwargs):
+            parses.append(kwargs.get("start_byte", 0))
+            return parse(*args, **kwargs)
+
+        monkeypatch.setattr(ingest.SessionStore, "commit_events", committing)
+        monkeypatch.setattr(codex_parser, "parse_session_chunks", parsing)
+        with pytest.raises(RequestStopped) as stopped:
+            for _ in range(500):
+                engine.slice_policy = forced(60)
+                with request_scope(control):
+                    engine.sync_session(**world.sync_args(), derived=False)
+        assert stopped.value.reason == "request_deadline"
+        assert integrity_ok(engine.settings.index_dir)
+        kept = snapshot(engine, "codex", world.sid)
+        assert kept.events and kept.events == expected.events[:len(kept.events)]            # the slices are in, in order
+        assert kept.cursor[1] == committed[-1] and (committed[-1] == size) == (which == "last")
+        assert (len(committed) == 1) == (which == "first")
+        resumed = len(parses)
+        sync_all(world, engine, caps=(100, 250))                                           # the next calls, without a stop
+        assert all(start >= kept.cursor[1] for start in parses[resumed:])                  # nothing was parsed twice
+        done = snapshot(engine, "codex", world.sid)
+        assert (done.events, done.cursor, done.blocks, done.metrics) == \
+            (expected.events, expected.cursor, expected.blocks, expected.metrics)
+        assert integrity_ok(engine.settings.index_dir)
     finally:
         world.close()

@@ -172,8 +172,9 @@ class Settings(SettingsAccessors, BaseSettings):
         default=settings_core.DEFAULT_SYNC_SLICING,
         description="A sync that cannot finish inside its request budget publishes the records it parsed (a slice, ending "
                     "at a record boundary) and the next call continues from there. 'auto': for requests with a finite "
-                    "deadline and plain session files, never over an existing index; 'off': the all-or-nothing sync of "
-                    "before. SELF_DIRECT_SYNC_SLICING.",
+                    "deadline and plain session files (a re-index is staged in a spool and published by one commit, never "
+                    "in pieces over an existing index); 'off': the all-or-nothing sync of before. "
+                    "SELF_DIRECT_SYNC_SLICING.",
     )
     sync_slice_bytes: int = Field(
         default=settings_core.DEFAULT_SYNC_SLICE_BYTES, ge=1,
