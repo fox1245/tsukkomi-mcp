@@ -213,7 +213,9 @@ class FakeServer:
             return FakeResult([])
         if sql.startswith("SELECT chunk_id, 1.0 - "):
             query = params["q"].array()
-            allowed = set(params["ids"]) if "ids" in params else None
+            allowed = None
+            if "blob" in params:                                  # the filter: ids joined by chr(31), plus the odd ones
+                allowed = set(filter(None, params["blob"].split("\x1f"))) | set(params["odd"])
             scored = []
             for cid, vector in self.rows.items():
                 if allowed is not None and cid not in allowed:

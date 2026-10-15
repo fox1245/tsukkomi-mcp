@@ -122,6 +122,7 @@ class TcpProxy:
 
         self._socket_module, self._threading = socket, threading
         self.target = (target_host, target_port)
+        self.delay = 0.0
         self.port = 0
         self._listener = None
         self._connections: list = []
@@ -154,13 +155,14 @@ class TcpProxy:
             for source, sink in ((client, upstream), (upstream, client)):
                 self._threading.Thread(target=self._pump, args=(source, sink), daemon=True).start()
 
-    @staticmethod
-    def _pump(source, sink) -> None:
+    def _pump(self, source, sink) -> None:
         try:
             while True:
                 data = source.recv(65536)
                 if not data:
                     break
+                if self.delay:
+                    time.sleep(self.delay)          # an emulated one-way network delay (latency only, bandwidth is not limited)
                 sink.sendall(data)
         except OSError:
             pass

@@ -37,6 +37,7 @@ import importlib.util
 import math
 import os
 import random
+import re
 import struct
 import threading
 import time
@@ -63,6 +64,7 @@ CONNECT_TIMEOUT_SEC = 10
 SEQ_SCAN_ID_RATIO = 3           # a filter of at least 1/3 of the table is scanned, not looked up id by id (see search)
 MIN_HNSW_EXTENSION = (0, 5, 0)  # the first pgvector release with HNSW indexes
 SECURE_SSLMODE = "verify-full"
+ID_SEPARATOR = "\x1f"                  # joins a large filter into one text parameter (see _filter_parameters)
 IDLE_IN_TRANSACTION_MS = 120_000    # the server drops a session this long idle inside a transaction
 APPLICATION_NAME = "tsukkomi-mcp"
 ENVIRONMENT_HINT = ("SELF_DIRECT_PGVECTOR_DSN_FILE (a private file with one libpq connection string) or the libpq "
@@ -116,6 +118,9 @@ def _version_tuple(text) -> tuple[int, ...]:
         digits = "".join(ch for ch in piece if ch.isdigit())
         parts.append(int(digits) if digits else 0)
     return tuple(parts) or (0,)
+
+
+_REDACT = re.compile(r"'(?:\[[^']*\]|\{[^']*\})'(?:::\w+(?:\[\])?)?")     # the vector or the id list a plan prints as a literal
 
 
 def _quote(name: str) -> str:
@@ -240,7 +245,7 @@ class PgVectorIndex(VectorIndex):
     remote = True
 
     def __init__(self, dsn: str = "", dim: int = 1024, *, schema: str = DEFAULT_PGVECTOR_SCHEMA, hnsw: bool = False,
-                 policy: str | None = None, driver=None) -> None:
+                 policy: str | None = None, driver=None, hnsw_ef_search: int | None = None) -> None:
         check_request()
         if not isinstance(dim, int) or isinstance(dim, bool) or not 1 <= dim <= MAX_DIM:
             raise ValueError(f"pgvector supports vector dimensions 1..{MAX_DIM}")
@@ -250,6 +255,10 @@ class PgVectorIndex(VectorIndex):
         if policy is not None and (not isinstance(policy, str) or not policy or len(policy) > 128
                                    or not policy.isprintable()):
             raise ValueError("The embedding policy tag must be a short printable string")
+        if hnsw_ef_search is not None and (not isinstance(hnsw_ef_search, int) or isinstance(hnsw_ef_search, bool)
+                                           or not 1 <= hnsw_ef_search <= 1000):
+            raise ValueError("hnsw_ef_search must be an integer 1..1000 (or None for max(40, 2 * top_k))")
+        self.hnsw_ef_search = hnsw_ef_search       # programmatic only (the benchmark); not a setting
         self.dim = dim
         self.schema = check_pgvector_schema(schema)
         self.hnsw = bool(hnsw)
@@ -677,13 +686,37 @@ class PgVectorIndex(VectorIndex):
     def _lookup_ids(cls, ids) -> list[str]:
         """Ids to be looked up or deleted: the distinct ones that could be stored. An id that could not have been stored is
         simply absent (as in the other backends), not an error."""
+        items = ids if isinstance(ids, (set, frozenset)) else dict.fromkeys(ids)           # distinct
+        if not items:
+            return []
+        try:                                                    # the common case in a few C-speed passes, however large
+            joined = "".join(items)                             # TypeError: an element that is not a str
+            joined.encode("utf-8")                              # UnicodeEncodeError: a lone surrogate
+            lengths = list(map(len, items))
+        except (TypeError, UnicodeEncodeError):
+            pass
+        else:
+            if "\x00" not in joined and min(lengths) >= 1 and max(lengths) <= MAX_ID_CHARS:
+                check_request()
+                return list(items)
         found: dict[str, None] = {}
-        for position, item_id in enumerate(ids):
+        for position, item_id in enumerate(items):
             if not position & 1023:
                 check_request()             # cooperative stop, without a check per id of a very large filter
             if cls._storable(item_id):
                 found[item_id] = None
         return list(found)
+
+    @staticmethod
+    def _filter_parameters(allowed: list[str]) -> tuple[str, list[str]]:
+        """A filter as ``(blob, odd)``: the ids joined by ``ID_SEPARATOR`` into ONE text parameter, which the server splits with
+        ``string_to_array``, and the few ids that contain the separator, as an array. A 50 000-id filter costs about 12 ms to
+        send this way and about 42 ms as a ``text[]`` parameter (psycopg dumps an array element by element)."""
+        blob = ID_SEPARATOR.join(allowed)
+        if blob.count(ID_SEPARATOR) == len(allowed) - 1:
+            return blob, []
+        plain = [item for item in allowed if ID_SEPARATOR not in item]
+        return ID_SEPARATOR.join(plain), [item for item in allowed if ID_SEPARATOR in item]
 
     def _pack(self, vector) -> bytes:
         array = np.asarray(vector, dtype=np.float32)
@@ -773,7 +806,8 @@ class PgVectorIndex(VectorIndex):
         allowed = None if allowed_ids is None else self._lookup_ids(allowed_ids)
         probe = self._driver.vector(self._pack(query))
         approximate = self.hnsw and allowed is None
-        where = "" if allowed is None else "WHERE chunk_id = ANY(%(ids)b) "
+        where = ("" if allowed is None else
+                 "WHERE chunk_id = ANY(string_to_array(%(blob)s::text, chr(31)) || %(odd)b::text[]) ")
         # ``ORDER BY distance, chunk_id`` is the exact scan with a deterministic tie-break (it cannot use an HNSW index);
         # ``ORDER BY distance`` alone is what the approximate index serves.
         order = "embedding <=> %(q)b::vector" + ("" if approximate else ', chunk_id COLLATE "C"')
@@ -781,10 +815,11 @@ class PgVectorIndex(VectorIndex):
                      f"ORDER BY {order} LIMIT %(k)s")
         params = {"q": probe, "k": int(top_k)}
         if allowed is not None:
-            params["ids"] = allowed
+            params["blob"], params["odd"] = self._filter_parameters(allowed)
         before = []
         if approximate:
-            before.append(("SELECT set_config('hnsw.ef_search', %s, false)", (str(min(1000, max(40, 2 * int(top_k)))),)))
+            ef = self.hnsw_ef_search or min(1000, max(40, 2 * int(top_k)))
+            before.append(("SELECT set_config('hnsw.ef_search', %s, false)", (str(ef),)))
         return statement, params, before, approximate, allowed
 
     def _scan_wanted(self, approximate: bool, allowed) -> bool:
@@ -832,7 +867,7 @@ class PgVectorIndex(VectorIndex):
                     connection.execute(sql, values)
                 cursor = connection.execute(*statements[-1])
             self._noted(armed.fetchone())
-            return [row[0] for row in cursor.fetchall()]
+            return [_REDACT.sub("'...'", row[0]) for row in cursor.fetchall()]
         return self._run(operation)
 
     @request_operation

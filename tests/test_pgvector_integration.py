@@ -195,6 +195,24 @@ def test_the_filter_is_applied_before_the_top_k_for_empty_one_and_many_ids(make_
     assert len(index.search(query, 10_000)) == 6000 and index.search(query, 0) == [] and index.search(query, -1) == []
 
 
+def test_ids_that_contain_the_filter_separator_are_filtered_exactly(make_index):
+    index = make_index(4)
+    ids = ["plain", "a\x1fb", "\x1f", "tail\x1f", "\x1fhead", "other"]
+    vectors = normalized_vectors(len(ids), 4, 12)
+    index.upsert_many(list(zip(ids, vectors)))
+    for allowed in ({"a\x1fb"}, {"\x1f"}, {"tail\x1f", "plain"}, {"\x1fhead", "a\x1fb", "plain"}, set(ids), {"plain", "nope\x1f"}):
+        got = {cid for cid, _ in index.search(vectors[0], 10, allowed)}
+        assert got == allowed & set(ids), allowed
+
+
+def test_a_plan_shows_neither_the_query_vector_nor_the_ids(make_index, pgvector_server, pg_schema):
+    index = make_index(16)
+    ids, matrix = fill(index, 200, 16, seed=1)
+    plan = "\n".join(index.explain(matrix[0], 5, set(ids[:50])))
+    assert "Limit" in plan and "chunk_vectors" in plan
+    assert ids[0] not in plan and "[0." not in plan and "[-0." not in plan and "{c0" not in plan
+
+
 def test_a_very_large_filter_is_answered_exactly(make_index, pgvector_server, pg_schema):
     index = make_index(16)
     ids, matrix = fill(index, 20_000, 16, seed=6)

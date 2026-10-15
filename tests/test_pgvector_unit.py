@@ -194,9 +194,10 @@ def test_search_filters_before_the_limit_and_breaks_ties_by_id_in_byte_order():
     index.upsert_many([(f"c{n}", unit(seed=n)) for n in range(6)])
     index.search(unit(seed=3), 4, {"c1", "c2", "c3"})
     sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, 1.0 -")][-1]
-    assert sql.index("WHERE chunk_id = ANY(%(ids)b)") < sql.index("ORDER BY") < sql.index("LIMIT")
+    assert sql.index("WHERE chunk_id = ANY(string_to_array(%(blob)s::text, chr(31)) || %(odd)b::text[])") < sql.index("ORDER BY") < sql.index("LIMIT")
     assert 'ORDER BY embedding <=> %(q)b::vector, chunk_id COLLATE "C" LIMIT' in sql
-    assert sorted(params["ids"]) == ["c1", "c2", "c3"] and params["k"] == 4
+    assert sorted(params["blob"].split("\x1f")) == ["c1", "c2", "c3"] and params["odd"] == [] and params["k"] == 4
+    assert "c1" not in sql and "c2" not in sql                       # ids travel as parameters, never inside the text
     hits = index.search(unit(seed=3), 4, {"c1", "c2", "c3"})
     assert [cid for cid, _ in hits][0] == "c3" and hits[0][1] == pytest.approx(1.0, abs=1e-6)
     assert all(isinstance(score, float) for _cid, score in hits)
@@ -601,3 +602,26 @@ def test_the_connection_libpq_made_is_checked_too():
     index, _driver, _server = make(info=FakeInfo("/var/run/postgresql"))
     index.count()
     assert index.describe()["loopback"] is True and index.describe()["tls"] is False
+
+
+def test_a_filter_travels_as_one_text_parameter_and_separator_ids_as_an_array():
+    index, driver, server = make()
+    odd = "has\x1fseparator"
+    index.upsert_many([("a", unit(seed=1)), ("b", unit(seed=2)), (odd, unit(seed=3))])
+    hits = index.search(unit(seed=3), 5, {"a", odd})
+    assert {cid for cid, _ in hits} == {"a", odd}
+    _sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, 1.0 -")][-1]
+    assert params["blob"] == "a" and params["odd"] == [odd]
+    assert PgVectorIndex._filter_parameters(["x", "y", "z"]) == ("x\x1fy\x1fz", [])
+    assert PgVectorIndex._filter_parameters([]) == ("", [])
+    assert PgVectorIndex._filter_parameters(["a\x1fb"]) == ("", ["a\x1fb"])
+
+
+@pytest.mark.parametrize("ids, kept", [
+    ({"a", "b"}, {"a", "b"}), (["a", "a", "b"], {"a", "b"}), ((n for n in ["x", "y"]), {"x", "y"}),
+    ({"a", None, 3, b"x", "", "ok", "a\x00b", "\ud800", "x" * (MAX_ID_CHARS + 1), "y" * MAX_ID_CHARS}, {"a", "ok", "y" * MAX_ID_CHARS}),
+    (frozenset({"p"}), {"p"}), (set(), set()),
+])
+def test_lookup_ids_keeps_exactly_the_ids_that_could_be_stored(ids, kept):
+    found = PgVectorIndex._lookup_ids(ids)
+    assert set(found) == kept and len(found) == len(kept)
