@@ -183,6 +183,18 @@ def test_the_format_marker_and_foreign_files(tmp_path):
         CompactSparseIndex(wrong)
 
 
+def test_an_allow_list_search_that_gives_up_lazy_lookups_answers_the_same(tmp_path, monkeypatch):
+    docs = corpus(300)
+    legacy, compact = pair(tmp_path, docs)
+    with_allowed = [q for q in queries(docs) if q.get("allowed_ids") is not None and q.get("session_id") is None]
+    assert len(with_allowed) >= 10
+    assert assert_same_results(legacy, compact, with_allowed, "lazy") >= 5
+    monkeypatch.setattr(sparse_module, "LAZY_LOOKUPS", 2)           # every such search falls back to the joined query
+    assert assert_same_results(legacy, compact, with_allowed, "joined fallback") >= 5
+    monkeypatch.setattr(sparse_module, "LAZY_LOOKUPS", 40)          # some finish lazily, some fall back
+    assert assert_same_results(legacy, compact, with_allowed, "mixed") >= 5
+
+
 def test_the_search_is_driven_by_the_fts_scan(tmp_path):
     docs = corpus(80)
     _legacy, compact = pair(tmp_path, docs)

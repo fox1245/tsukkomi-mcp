@@ -13,6 +13,7 @@ LEGACY_FILE = "sparse.sqlite"          # the first format: FTS5 table that store
 COMPACT_FILE = "sparse-v2.sqlite"      # the compact format: FTS5 contentless table, nothing but the inverted index
 COMPACT_FORMAT = "compact-1"           # the value of sparse_meta.format in a compact file
 COMPACT_MIN_SQLITE = (3, 43, 0)        # FTS5 contentless_delete
+LAZY_LOOKUPS = 4000                    # compact search with an allow list: rows resolved one by one before the joined query takes over
 
 
 def _fts_query(raw: str) -> str:
@@ -463,6 +464,9 @@ class CompactSparseIndex(SparseIndex):
                 self._add(chunk.chunk_id, chunk.session_id, chunk.kind, chunk.text, local)
 
     # ---- reads ------------------------------------------------------------------------------------------------------
+    # Every search ranks by (bm25 score, rowid): ties come out in ascending rowid, which is the order the legacy table's
+    # query returns them in (rowids are assigned in write order in both formats). The FTS5 scan drives each query; the
+    # chunk map is only consulted for the rows that are needed.
     @request_operation
     def search(
         self,
@@ -473,18 +477,62 @@ class CompactSparseIndex(SparseIndex):
         allowed_ids: set[str] | None = None,
     ) -> list[tuple[str, float, int]]:
         q = _fts_query(query)
-        sql = ("SELECT r.chunk_id AS chunk_id, bm25(chunks_fts) AS score "
-               "FROM chunks_fts CROSS JOIN chunk_rows AS r ON r.rowid = chunks_fts.rowid "   # the FTS5 scan drives; rowid is r's key
-               "WHERE chunks_fts MATCH ?")
-        args: list = [q]
+        if allowed_ids is not None and not allowed_ids:
+            return []
         if session_id:
             row = self._conn.execute("SELECT session_no FROM sparse_sessions WHERE session_id=?", (session_id,)).fetchone()
             if row is None:
                 return []
+            return self._search_joined(q, top_k, row[0], allowed_ids)
+        if allowed_ids is None:
+            return self._search_top(q, top_k)
+        found = self._search_lazy(q, top_k, allowed_ids)
+        return found if found is not None else self._search_joined(q, top_k, None, allowed_ids)
+
+    def _search_top(self, q: str, top_k: int) -> list[tuple[str, float, int]]:
+        """No filter: rank first, then look up the ids of the ``top_k`` rows only."""
+        cur = self._conn.execute(
+            "SELECT r.chunk_id AS chunk_id, s.score AS score FROM (SELECT rowid AS rid, bm25(chunks_fts) AS score FROM chunks_fts "
+            "WHERE chunks_fts MATCH ? ORDER BY score, rowid LIMIT ?) AS s CROSS JOIN chunk_rows AS r ON r.rowid = s.rid "
+            "ORDER BY s.score, s.rid", (q, top_k))
+        with closing(cur):
+            out = []
+            for row in cur:
+                check_request()
+                out.append((row["chunk_id"], float(-row["score"]), len(out) + 1))
+            return out
+
+    def _search_lazy(self, q: str, top_k: int, allowed_ids: set[str]) -> list[tuple[str, float, int]] | None:
+        """An allow list (what the engine always passes: the ids of the searched scope): walk the ranking and look up one
+        id at a time until ``top_k`` allowed ones are found. Gives up (None) after ``LAZY_LOOKUPS`` rows without being
+        done, which is what a short allow list over a frequent term looks like; the joined query is better there."""
+        out: list[tuple[str, float, int]] = []
+        scanned = 0
+        cur = self._conn.execute("SELECT rowid, bm25(chunks_fts) AS score FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY score, rowid", (q,))
+        with closing(cur):
+            for rowid, score in cur:
+                check_request()
+                scanned += 1
+                if scanned > LAZY_LOOKUPS:
+                    return None
+                found = self._conn.execute("SELECT chunk_id FROM chunk_rows WHERE rowid=?", (rowid,)).fetchone()
+                if found is None or found[0] not in allowed_ids:      # a document without a map row is unreachable, as in the join
+                    continue
+                chunk_id = found[0]
+                out.append((chunk_id, float(-score), len(out) + 1))
+                if len(out) >= top_k:
+                    break
+        return out
+
+    def _search_joined(self, q: str, top_k: int, session_no: int | None, allowed_ids: set[str] | None) -> list[tuple[str, float, int]]:
+        """A session filter (or a short allow list): the chunk map is joined to every match before ranking."""
+        sql = ("SELECT r.chunk_id AS chunk_id, bm25(chunks_fts) AS score "
+               "FROM chunks_fts CROSS JOIN chunk_rows AS r ON r.rowid = chunks_fts.rowid "   # the FTS5 scan drives; rowid is r's key
+               "WHERE chunks_fts MATCH ?")
+        args: list = [q]
+        if session_no is not None:
             sql += " AND r.session_no = ?"
-            args.append(row[0])
-        # Ties rank in ascending rowid, which is the order the legacy table's query returns them in (rowids are assigned in
-        # write order in both formats).
+            args.append(session_no)
         sql += " ORDER BY score, chunks_fts.rowid LIMIT ?"
         args.append(-1 if allowed_ids is not None else top_k)
         cur = self._conn.execute(sql, args)

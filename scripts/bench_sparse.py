@@ -43,7 +43,7 @@ from typing import NamedTuple
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "src"))     # this checkout, whatever is installed
 
-from self_directing_mcp.index.sparse import SparseIndex, _fts_query    # noqa: E402
+from self_directing_mcp.index.sparse import CompactSparseIndex, SparseIndex, _fts_query    # noqa: E402
 from self_directing_mcp.security.mask import mask_secrets               # noqa: E402
 
 BATCH = 500
@@ -699,6 +699,7 @@ CANDIDATES: dict[str, dict] = {
     "cx": dict(cls=_proto(map="brief", exact=True), page=4096, note="(c) + exact bm25 statistics (averages record corrected on delete)"),
     "f2": dict(cls=_proto(map="rowid", exact=True), page=4096, note="(f1) + exact bm25 statistics (averages record corrected on delete)"),
     "f2b16": dict(cls=_proto(map="rowid", exact=True), page=16384, note="(f2) with 16 KiB pages"),
+    "p": dict(cls=CompactSparseIndex, page=4096, note="the shipped compact format (index/sparse.py CompactSparseIndex)"),
     "f1cs0": dict(cls=_proto(map="rowid", columnsize=0), page=4096, note="(f1) + columnsize=0 (no docsize table; bm25 expected to fail)"),
 }
 for _key in ("f1p16", "f1p4"):
