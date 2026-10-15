@@ -21,7 +21,7 @@ from self_directing_mcp.request_control import (
 )
 EVENTS = ("UserPromptSubmit", "PreToolUse", "Stop")
 _READ_TOOLS = {"read", "read_file", "list", "list_files", "glob", "search", "get",
-               "view_image", "get_chunk", "list_contracts", "get_checklist", "audit_status",
+               "view_image", "get_chunk", "list_contracts", "list_contract_candidates", "get_checklist", "audit_status",
                "search_history", "help", "ls"}
 _SELF_READS = _READ_TOOLS | {"audit_session", "check_action", "sync_session"}
 _REQUIREMENT_SIGNALS = (
