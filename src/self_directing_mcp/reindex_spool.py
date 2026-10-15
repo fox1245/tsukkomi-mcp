@@ -17,9 +17,11 @@ frame is ``[length][crc32][payload]`` (the crc covers the length too); the first
 and ``fsync``-ed first and the trailer after them, so a trailer on disk names rows that are on disk. The progress is the last
 valid trailer; whatever follows it is a torn tail and is cut off the next time the file is opened.
 
-Single writer: ``fcntl.flock`` (POSIX) or ``msvcrt.locking`` of one byte far beyond the data (Windows; not exercised in this
-repository's own runs, see the README), held while the file is open. The per-session flight of ``index.ingest`` already keeps
-one process's threads apart. A spool that cannot be validated is discarded, never repaired; the index is never touched.
+Single writer: ``fcntl.flock`` (POSIX) or ``msvcrt.locking`` of one byte far beyond the data (Windows), held while the file
+is open and never waited for. The Windows lock is taken and released by the smoke tests that run there, but the contended case
+(a second process meeting it) is tested on POSIX only, and it has not been tried on Windows by hand (README, "Re-indexing").
+The per-session flight of ``index.ingest`` already keeps one process's threads apart. A spool that cannot be validated is
+discarded, never repaired; the index is never touched.
 """
 from __future__ import annotations
 
