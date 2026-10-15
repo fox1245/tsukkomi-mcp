@@ -17,7 +17,7 @@ from self_directing_mcp.engine import SelfDirectEngine
 PATH_FIELDS = (
     "index_dir", "codex_sessions_dir", "omp_sessions_dir",
     "grokbot_transcripts_dir", "agy_app_data_dirs", "contracts_path",
-    "sqlite_vector_path", "openrouter_api_key_file",
+    "sqlite_vector_path", "openrouter_api_key_file", "pgvector_dsn_file",
 )
 ARRAY_FIELDS = {"grokbot_transcripts_dir", "agy_app_data_dirs"}
 CONFIG_ERRORS = (ValueError, OSError, SettingsError)

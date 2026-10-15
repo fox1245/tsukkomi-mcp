@@ -27,6 +27,7 @@ import json
 import math
 import os
 import re
+import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,8 @@ API_KEY_ENV = "OPENROUTER_API_KEY"
 
 ENFORCEMENT_MODES = ("confirmed_only", "advisory", "enforced")
 SESSION_PROVIDERS = ("codex", "grokbot", "omp", "agy", "claude")
-DENSE_BACKENDS = ("sqlite-vector", "numpy")
+DENSE_BACKENDS = ("sqlite-vector", "numpy", "pgvector")
+REMOTE_DENSE_BACKENDS = ("pgvector",)        # a database server: never on the hook path (hook_policy.wants_derived_work)
 DAEMON_MODES = ("off", "on")
 SQLITE_JOURNAL_MODES = ("auto", "delete")    # journal.py validates the same two values
 GRAPH_EXTRACTORS = ("openrouter", "host")    # who extracts for run_neograph_update: an OpenRouter model, or only the host agent
@@ -50,6 +52,7 @@ PROJECT_CONTRACT_MODES = ("candidates", "off")   # contract_bundles: discover th
 DEFAULT_ENFORCEMENT = "confirmed_only"
 DEFAULT_SESSION_PROVIDER = "codex"
 DEFAULT_DENSE_BACKEND = "sqlite-vector"
+DEFAULT_PGVECTOR_SCHEMA = "tsukkomi"
 DEFAULT_DAEMON = "off"
 DEFAULT_GRAPH_EXTRACTOR = "openrouter"
 DEFAULT_SQLITE_JOURNAL = "delete"            # "auto" is opt-in until the commit benchmark says otherwise (README, "SQLite journal")
@@ -81,7 +84,8 @@ AGY_APP_DATA_NAMES = ("antigravity", "antigravity-cli", "antigravity-ide")
 
 PATH_FIELDS = frozenset({
     "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
-    "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file", "contract_bundle_paths",
+    "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file", "pgvector_dsn_file",
+    "contract_bundle_paths",
 })
 
 
@@ -145,6 +149,61 @@ def default_sqlite_vector_path(root: Path | None = None) -> Path | None:
             if cand.is_file():
                 return cand.resolve()
     return None
+
+
+# --- pgvector: schema name and connection-string file ------------------------------------------------------------
+
+_PGVECTOR_SCHEMA = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
+PGVECTOR_DSN_FILE_MAX_BYTES = 4096
+
+
+def check_pgvector_schema(name: object) -> str:
+    """A PostgreSQL schema name this project will create and quote: ASCII letters, digits and underscore, at most 63
+    characters, not starting with a digit, and not in the reserved ``pg_*`` / ``information_schema`` namespaces."""
+    if (not isinstance(name, str) or not _PGVECTOR_SCHEMA.fullmatch(name) or name.lower().startswith("pg_")
+            or name.lower() == "information_schema"):
+        raise ValueError("pgvector schema must be 1-63 ASCII letters, digits or underscores, not starting with a digit, "
+                         "and not pg_* or information_schema")
+    return name
+
+
+def read_pgvector_dsn_file(path: Path) -> str:
+    """The single-line libpq connection string (``host=... dbname=...`` or a ``postgresql://`` URI) in ``path``.
+
+    The connection string is a secret (it may carry a password), so it is accepted only from a file, never from a
+    setting value. The file must be a regular file; on POSIX it must not be readable or writable by group or others
+    (``chmod 600``), like libpq's own password file; Windows relies on the file's ACL, which is not inspected here.
+    Nothing from the file is ever put into an error message."""
+    source = Path(path).expanduser()
+    try:
+        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))   # a FIFO must not block
+    except OSError:
+        raise ValueError("The pgvector connection-string file cannot be opened; check SELF_DIRECT_PGVECTOR_DSN_FILE") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("The pgvector connection-string file must be a regular file")
+        if os.name == "posix" and info.st_mode & 0o077:
+            raise ValueError("The pgvector connection-string file is readable by group or others; "
+                             "run chmod 600 on it (it may contain a password)")
+        if info.st_size > PGVECTOR_DSN_FILE_MAX_BYTES:
+            raise ValueError("The pgvector connection-string file is larger than "
+                             f"{PGVECTOR_DSN_FILE_MAX_BYTES} bytes; it must hold one connection string")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(PGVECTOR_DSN_FILE_MAX_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > PGVECTOR_DSN_FILE_MAX_BYTES:
+        raise ValueError(f"The pgvector connection-string file is larger than {PGVECTOR_DSN_FILE_MAX_BYTES} bytes; "
+                         "it must hold one connection string")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise ValueError("The pgvector connection-string file is not UTF-8 text") from None
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) != 1 or "\x00" in text:
+        raise ValueError("The pgvector connection-string file must hold exactly one connection string on one line")
+    return lines[0].strip()
 
 
 # --- sources shared by both readers ---------------------------------------------------------------------------
@@ -220,6 +279,16 @@ class SettingsAccessors:
                 raise ValueError("Configured OpenRouter key file has no OPENROUTER_API_KEY")
             return key.strip()
         return self.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
+
+    def resolve_pgvector_dsn(self) -> str:
+        """The libpq connection string from ``pgvector_dsn_file``, or ``""`` to use the libpq environment alone
+        (``PGHOST``, ``PGSERVICE``, ``PGPASSFILE``...). Raises ``ValueError`` without echoing the file's content."""
+        if os.environ.get("SELF_DIRECT_PGVECTOR_DSN"):
+            raise ValueError("SELF_DIRECT_PGVECTOR_DSN is not a setting: a connection string is a secret and is read only "
+                             "from a private file (SELF_DIRECT_PGVECTOR_DSN_FILE, chmod 600) or the libpq environment")
+        if self.pgvector_dsn_file is None:
+            return ""
+        return read_pgvector_dsn_file(self.pgvector_dsn_file)
 
     def resolve_sessions_dir(self) -> Path:
         return Path(self.codex_sessions_dir)
@@ -317,6 +386,13 @@ def _to_shadow_every(name: str, text: str):
         raise _bad(name, "non-negative integer or 'adaptive'") from None
 
 
+def _to_schema(name: str, text: str) -> str:
+    try:
+        return check_pgvector_schema(text)
+    except ValueError:
+        raise _bad(name, "PostgreSQL schema name") from None
+
+
 def _literal(choices: tuple[str, ...]) -> Callable[[str, str], str]:
     def convert(name: str, text: str) -> str:
         if text not in choices:
@@ -408,6 +484,9 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("local_only", lambda name, text: _to_bool(name, text), _static(False)),
     FieldSpec("dense_backend", _literal(DENSE_BACKENDS), _static(DEFAULT_DENSE_BACKEND)),
     FieldSpec("sqlite_vector_path", _path, default_sqlite_vector_path),
+    FieldSpec("pgvector_dsn_file", _path, _static(None)),
+    FieldSpec("pgvector_schema", lambda name, text: _to_schema(name, text), _static(DEFAULT_PGVECTOR_SCHEMA)),
+    FieldSpec("pgvector_hnsw", lambda name, text: _to_bool(name, text), _static(False)),
     FieldSpec("openrouter_api_key_file", _path, _static(None)),
     FieldSpec("seed_example_contracts", lambda name, text: _to_bool(name, text), _static(False)),
     FieldSpec("lock_wait_timeout_sec", lambda name, text: _to_float(name, text, positive=True),

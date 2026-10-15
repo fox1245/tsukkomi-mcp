@@ -19,6 +19,8 @@ agy_app_data_dirs = [
 # Optional overrides. Omit contracts_path to use index_dir/contracts.json.
 # contracts_path = "rules/contracts.json"
 # sqlite_vector_path = "native/vector.so"
+# A file holding one libpq connection string (a secret: chmod 600), for SELF_DIRECT_DENSE_BACKEND=pgvector.
+# pgvector_dsn_file = "../credentials/pgvector.dsn"
 # openrouter_api_key_file = "../credentials/openrouter.env"
 # The selected key file remains authoritative: missing/keyless files fail closed.
 # Do not put OPENROUTER_API_KEY or another credential value in this TOML.

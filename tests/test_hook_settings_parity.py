@@ -127,6 +127,19 @@ def test_the_graph_extractor_setting_is_read_the_same_way_and_unknown_values_are
             Settings(_env_file=None)
 
 
+def test_the_pgvector_settings_default_off_and_read_the_same_way(world):
+    for settings in (hook_settings(), load_hook_settings()):
+        assert settings.dense_backend == "sqlite-vector" and settings.pgvector_dsn_file is None
+        assert settings.pgvector_schema == "tsukkomi" and settings.pgvector_hnsw is False
+        assert settings.resolve_pgvector_dsn() == ""
+    put(world, SELF_DIRECT_DENSE_BACKEND="pgvector", SELF_DIRECT_PGVECTOR_SCHEMA="Archive_2", SELF_DIRECT_PGVECTOR_HNSW="true",
+        SELF_DIRECT_PGVECTOR_DSN_FILE=str(world["tmp"] / "dsn.txt"))
+    agree("pgvector settings")
+    for settings in (hook_settings(), load_hook_settings()):
+        assert (settings.dense_backend, settings.pgvector_schema, settings.pgvector_hnsw) == ("pgvector", "Archive_2", True)
+        assert settings.pgvector_dsn_file == world["tmp"] / "dsn.txt"
+
+
 def test_the_hook_reader_never_reads_the_working_directory_env_file(world):
     settings = load_hook_settings()
     assert settings.index_dir != Path("/decoy") and settings.claude_enforcement == "confirmed_only"
@@ -183,7 +196,8 @@ STR_OR_LISTS = ["/a;/b", '["/a"]', '"quoted"', "[1]", "5", "true", "null", '{"a"
 CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Advisory", "", " advisory", "bogus", "ENFORCED"],
            "claude_enforcement": ["confirmed_only", "advisory", "enforced", "Enforced", "", "advisory ", "bogus"],
            "session_provider": ["codex", "grokbot", "omp", "agy", "claude", "Codex", "", "cursor", "claude "],
-           "dense_backend": ["sqlite-vector", "numpy", "NumPy", "", "sqlite_vector", "faiss"],
+           "dense_backend": ["sqlite-vector", "numpy", "pgvector", "NumPy", "PGVECTOR", "Pgvector", "", "sqlite_vector", "faiss",
+                             "pg-vector", "pgvector ", "postgres"],
            "graph_extractor": ["openrouter", "host", "Host", "HOST", "OpenRouter", "OPENROUTER", "", " host", "host ",
                                "open_router", "open-router", "local", "none", "true", "1", "host\n"],
            "daemon": ["off", "on", "On", "ON", "", " on", "on ", "auto", "true", "1", "false", "Off"],
@@ -205,9 +219,9 @@ KIND_VALUES = {"bool": BOOLS, "int": INTS, "float": FLOATS, "path": PATHS, "list
                "shadow_every": SHADOW_EVERY, "pathsep": PATHSEP}
 FIELD_KINDS = {
     "codex_sessions_dir": "path", "omp_sessions_dir": "path", "claude_projects_dir": "path", "index_dir": "path",
-    "contracts_path": "path", "sqlite_vector_path": "path", "openrouter_api_key_file": "path",
+    "contracts_path": "path", "sqlite_vector_path": "path", "openrouter_api_key_file": "path", "pgvector_dsn_file": "path",
     "agy_app_data_dirs": "list", "grokbot_transcripts_dir": "mixed", "contract_bundle_paths": "pathsep",
-    "use_fake_embedder": "bool", "local_only": "bool", "seed_example_contracts": "bool",
+    "use_fake_embedder": "bool", "local_only": "bool", "seed_example_contracts": "bool", "pgvector_hnsw": "bool",
     "embedding_dim": "int", "max_concurrent_calls": "int", "max_decompressed_session_bytes": "int", "rrf_k": "int",
     "retrieve_top_k": "int", "search_top_k": "int",
     "lock_wait_timeout_sec": "float", "audit_timeout_sec": "float", "request_timeout_sec": "float",
@@ -218,7 +232,11 @@ FIELD_KINDS = {
     "audit_incremental": "bool", "audit_shadow_every": "shadow_every", "audit_shadow_idle_sec": "float",
     "audit_incremental_min_events": "int", "sync_slice_bytes": "int",
 }
-FREE_TEXT = {"embedding_model": ["m", "", " spaced model ", "a/b:c"], "embedding_base_url": ["http://x", "", "u r l"],
+# SELF_DIRECT_PGVECTOR_SCHEMA: ASCII letters, digits, underscore; at most 63; no leading digit; not pg_* or information_schema.
+PGVECTOR_SCHEMAS = ["tsukkomi", "a_b1", "Tsukkomi", "_x", "x", "public", "x" * 63, "x" * 64, "1abc", "", " tsukkomi", "tsukkomi ",
+                    "x y", "a;b", 'a"b', "a-b", "a$b", "schema\u00e9", "pg_catalog", "PG_x", "pgx", "information_schema",
+                    "Information_Schema", "tsukkomi\n", "a.b", "\u0661a"]
+FREE_TEXT = {"pgvector_schema": PGVECTOR_SCHEMAS, "embedding_model": ["m", "", " spaced model ", "a/b:c"], "embedding_base_url": ["http://x", "", "u r l"],
              "openrouter_api_key": ["k", "", " k ", "sk-synthetic"]}
 
 
@@ -240,6 +258,17 @@ def test_each_environment_variable_agrees(world, name, value):
     variable = "OPENROUTER_API_KEY" if name == "openrouter_api_key" else "SELF_DIRECT_" + name.upper()
     put(world, **{variable: value})
     agree(f"{variable}={value!r}")
+
+
+@pytest.mark.parametrize("name", PGVECTOR_SCHEMAS)
+def test_the_pgvector_schema_rule_is_one_function(world, name):
+    put(world, SELF_DIRECT_PGVECTOR_SCHEMA=name)
+    try:
+        settings_core.check_pgvector_schema(name)
+        accepted = True
+    except ValueError:
+        accepted = False
+    assert (outcome(hook_settings)[0] == "ok") is accepted and (outcome(load_hook_settings)[0] == "ok") is accepted
 
 
 def test_every_field_is_exercised_by_the_single_variable_cases():
@@ -274,11 +303,11 @@ def test_environment_beats_toml_for_every_path_field(world):
         'index_dir = "ti"', 'contracts_path = "tc.json"', 'claude_projects_dir = "tp"', 'omp_sessions_dir = "to"',
         'agy_app_data_dirs = ["ta", "tb"]', 'grokbot_transcripts_dir = ["tg1", "tg2"]',
         'contract_bundle_paths = ["tb1.json", "/tb2.json"]',
-        'sqlite_vector_path = "tv.so"', 'openrouter_api_key_file = "tk.env"']) + "\n")
+        'sqlite_vector_path = "tv.so"', 'openrouter_api_key_file = "tk.env"', 'pgvector_dsn_file = "tp.dsn"']) + "\n")
     agree("toml only")
     put(world, SELF_DIRECT_INDEX_DIR=str(world["tmp"] / "ei"), SELF_DIRECT_AGY_APP_DATA_DIRS='["/ea"]',
         SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR="/eg", SELF_DIRECT_SQLITE_VECTOR_PATH="/ev.so",
-        SELF_DIRECT_CONTRACT_BUNDLE_PATHS="/ec.json")
+        SELF_DIRECT_PGVECTOR_DSN_FILE="/ep.dsn", SELF_DIRECT_CONTRACT_BUNDLE_PATHS="/ec.json")
     agree("env over toml")
     assert load_hook_settings().contract_bundle_paths == [Path("/ec.json")]
 
@@ -369,7 +398,7 @@ def random_world(rng: random.Random, world) -> str:
         world["monkeypatch"].setenv("CLAUDE_CONFIG_DIR", rng.choice(PATHS))
         parts.append("CLAUDE_CONFIG_DIR")
     keys = rng.sample(["index_dir", "contracts_path", "claude_projects_dir", "omp_sessions_dir", "codex_sessions_dir",
-                       "sqlite_vector_path", "openrouter_api_key_file", "agy_app_data_dirs",
+                       "sqlite_vector_path", "openrouter_api_key_file", "pgvector_dsn_file", "agy_app_data_dirs",
                        "grokbot_transcripts_dir", "contract_bundle_paths"], rng.randint(0, 6))
     lines = ["[paths]"]
     for key in keys:

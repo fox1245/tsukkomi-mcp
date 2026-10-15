@@ -56,7 +56,7 @@ from self_directing_mcp.index.ingest import (
     capture_for_cursor, coverage_from_capture, ingest_session,
 )
 from self_directing_mcp.index.sparse import SparseIndex, count_sparse_file, open_sparse_index, sparse_file
-from self_directing_mcp.index.vector import build_vector_index
+from self_directing_mcp.index.vector import DenseBackendError, build_vector_index
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.retrieve.checks import regex_search
 from self_directing_mcp.retrieve.hybrid import HybridRetriever, hits_to_schema
@@ -412,9 +412,12 @@ class SelfDirectEngine:
                 dim=s.embedding_dim,
                 base_url=s.embedding_base_url,
             )
+            policy = self.embedder.cache_key[:16]
+            remote = ({"dsn": s.resolve_pgvector_dsn(), "schema": s.pgvector_schema, "hnsw": s.pgvector_hnsw,
+                       "policy": policy} if s.dense_backend == "pgvector" else {})
             self.dense, self.dense_backend = build_vector_index(
-                index_dir / ("vectors-v2-" + self.embedder.cache_key[:16]), dim=s.embedding_dim,
-                backend=s.dense_backend, extension_path=s.sqlite_vector_path)
+                index_dir / ("vectors-v2-" + policy), dim=s.embedding_dim,
+                backend=s.dense_backend, extension_path=s.sqlite_vector_path, **remote)
         self.sparse, self.sparse_resolution = open_sparse_index(index_dir, getattr(s, "sparse_format", "auto"))
         self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes,
                                   defer_derived=self.defer_derived, journal=self._journal_policy())
@@ -565,6 +568,10 @@ class SelfDirectEngine:
         except AmbiguousSessionSource as exc:
             return {"ok": False, "error": "ambiguous_session_source", "message": str(exc), "provider": resolved_provider,
                     "session_id": exc.session_id, "indexed_path": exc.indexed_path, "requested_path": exc.requested_path}
+        except DenseBackendError as exc:
+            # The selected dense backend (a database server) cannot answer. The canonical events were published before the
+            # dense step and the journal keeps what it still owes, so the next sync resumes; nothing is substituted.
+            return self._dense_backend_error(exc, resolved_provider)
         except CompressedSourceError as exc:
             # An unreadable .zst source (missing module, corrupt or truncated frame, size mismatch, over the limit):
             # visible, nothing indexed or published, coverage stays incomplete.
@@ -661,8 +668,11 @@ class SelfDirectEngine:
                     results = [RRFResult(chunk_id=cid, ranking_score=score, dense_rank=None,
                                          sparse_rank=rank, sparse_score=score) for cid, score, rank in rows]
                 else:
-                    results = self.retriever.retrieve(query, top_k=k, session_id=session_id, mode=mode,
-                                                      provider=provider, query_vector=prepared_query)
+                    try:
+                        results = self.retriever.retrieve(query, top_k=k, session_id=session_id, mode=mode,
+                                                          provider=provider, query_vector=prepared_query)
+                    except DenseBackendError as exc:
+                        return self._dense_backend_error(exc, provider)     # never a sparse-only answer in its place
                     snapshot = self.store.capture_evidence(session_id, provider, history=False,
                                                           anchors=(row.chunk_id for row in results))
             hits = hits_to_schema(results, snapshot.get_chunk)
@@ -678,6 +688,11 @@ class SelfDirectEngine:
                 "Call audit_session — contracts/regex are authoritative."
             ),
         }
+
+    def _dense_backend_error(self, exc: DenseBackendError, provider) -> dict[str, Any]:
+        """The answer of a call whose dense backend is selected but cannot work: the error, its repair, no substitute."""
+        return {"ok": False, "error": "dense_backend_unavailable", "dense_backend": self.dense_backend,
+                "message": str(exc), "provider": provider}
 
     def _repair_sparse_for_search(self, session_id, provider):
         """Materialize deferred canonical evidence before searching its derived view.
@@ -2575,8 +2590,15 @@ class SelfDirectEngine:
         self.ensure_ready()
         assert self.store and self.sparse
         s = self.settings
+        dense_count, dense_error = 0, None
         if self.dense is not None:
-            self.dense.refresh()
+            try:
+                self.dense.refresh()
+                dense_count = self.dense.count()
+            except DenseBackendError as exc:
+                # A selected backend that cannot answer (an unreachable database server). Reported, never replaced:
+                # the audit state does not depend on it, and a dense or hybrid search raises the same error.
+                dense_count, dense_error = None, str(exc)
         status: dict[str, Any] = {
             "ok": True,
             "orchestration_backend": "neograph-engine",
@@ -2588,7 +2610,7 @@ class SelfDirectEngine:
             "session_provider": s.resolve_session_provider(),
             "index_dir": str(Path(s.index_dir).resolve()),
             "dense_backend": self.dense_backend,
-            "dense_count": self.dense.count() if self.dense is not None else 0,
+            "dense_count": dense_count,
             "vector_extension_version": getattr(self.dense, "extension_version", None),
             "vector_compute_backend": getattr(self.dense, "compute_backend", None),
             "embedder": type(self.embedder).__name__ if self.embedder else None,
@@ -2609,6 +2631,13 @@ class SelfDirectEngine:
             status["degraded_flags"].append("embedder_fake_fallback")
         if self.dense_backend == "numpy":
             status["degraded_flags"].append("dense_numpy_fallback")
+        if self.dense is not None and self.dense.describe():
+            status["dense_info"] = self.dense.describe()
+            if status["dense_info"].get("tls") is False and status["dense_info"].get("loopback") is False:
+                status["degraded_flags"].append("dense_remote_without_tls")     # a non-loopback server over plaintext
+        if dense_error is not None:
+            status["dense_error"] = dense_error
+            status["degraded_flags"].append("dense_backend_unavailable")
         raw_contracts, _contract_token = self.contracts.capture()
         with self.store._read_boundary():
             record = self.store.cursor_record(session_id, provider) if session_id else None
@@ -2642,6 +2671,9 @@ class SelfDirectEngine:
                 if self.store is not None:
                     self.store.close()                  # checkpoints meta.sqlite's log (if any), then closes
                 for component in (self.sparse, self.dense, self.graph):
+                    if component is not None and getattr(component, "remote", False):
+                        component.close()               # a server connection is closed under the index's own lock
+                        continue
                     connection = getattr(component, "_conn", None)
                     if connection is not None:
                         connection.close()

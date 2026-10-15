@@ -56,8 +56,25 @@ class Settings(SettingsAccessors, BaseSettings):
     embedding_base_url: str = settings_core.DEFAULT_EMBEDDING_BASE_URL
     use_fake_embedder: bool = False
     local_only: bool = False
-    dense_backend: Literal["sqlite-vector", "numpy"] = settings_core.DEFAULT_DENSE_BACKEND
+    dense_backend: Literal["sqlite-vector", "numpy", "pgvector"] = settings_core.DEFAULT_DENSE_BACKEND
     sqlite_vector_path: Path | None = Field(default_factory=_default_sqlite_vector_path)
+    pgvector_dsn_file: Path | None = Field(
+        default=None,
+        description="File with one libpq connection string (a secret: it may hold a password) for the pgvector dense "
+                    "backend; it must not be readable by group or others. Unset: only the standard libpq environment "
+                    "(PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSFILE, PGSERVICE) selects the server. Its content is never "
+                    "logged or echoed. SELF_DIRECT_PGVECTOR_DSN_FILE.",
+    )
+    pgvector_schema: str = Field(
+        default=settings_core.DEFAULT_PGVECTOR_SCHEMA,
+        description="PostgreSQL schema holding the dense index (chunk_vectors and tsukkomi_meta). "
+                    "SELF_DIRECT_PGVECTOR_SCHEMA.",
+    )
+    pgvector_hnsw: bool = Field(
+        default=False,
+        description="Also keep an approximate (HNSW, cosine) index and use it for unfiltered searches. Off by default: "
+                    "the exact scan is the semantic reference. SELF_DIRECT_PGVECTOR_HNSW.",
+    )
     openrouter_api_key_file: Path | None = Field(
         default=None,
         description="Authorized dotenv file containing OPENROUTER_API_KEY; never log its contents",
@@ -190,6 +207,14 @@ class Settings(SettingsAccessors, BaseSettings):
                     "SQLite can use it, else legacy, shown in audit_status (sparse_format, degraded_flags). The file of "
                     "the format that is not used is never read for results, modified or deleted. SELF_DIRECT_SPARSE_FORMAT.",
     )
+
+    @field_validator("pgvector_schema")
+    @classmethod
+    def _schema_name(cls, value):
+        try:
+            return settings_core.check_pgvector_schema(value)
+        except ValueError:
+            raise ValueError("invalid PostgreSQL schema name for pgvector_schema") from None
 
     project_contracts: Literal["candidates", "off"] = Field(
         default=settings_core.DEFAULT_PROJECT_CONTRACTS,
