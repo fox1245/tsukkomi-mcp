@@ -36,13 +36,20 @@ _UPSERT = (
 
 
 def load(conn, provider, session_id):
-    """``(epoch, state dict)`` or ``None`` (no row, or one that cannot be read)."""
+    """``(epoch, state dict)``; ``None`` when there is no row (or it cannot be read at all). The dict is ``None`` when the
+    row's text is not a JSON object: its epoch is still known, so that a fresh state can supersede it."""
     try:
         row = conn.execute("SELECT epoch,state FROM audit_shadow_state WHERE provider=? AND session_id=?",
                            (provider, session_id)).fetchone()
-        return None if row is None else (row[0], json.loads(row[1]))
-    except (sqlite3.Error, ValueError):
+    except sqlite3.Error:
         return None
+    if row is None:
+        return None
+    try:
+        data = json.loads(row[1])
+    except ValueError:
+        return row[0], None
+    return row[0], data if isinstance(data, dict) else None
 
 
 def write(conn, provider, session_id, epoch, state, now=None):

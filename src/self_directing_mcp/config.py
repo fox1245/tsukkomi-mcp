@@ -124,10 +124,10 @@ class Settings(SettingsAccessors, BaseSettings):
         default=settings_core.DEFAULT_AUDIT_SHADOW_EVERY,
         description="How often the full evaluator also runs beside the incremental one and the two are compared (see "
                     "README, 'Incremental audits'). 'adaptive' (default): the rate starts at 1/4 and halves after every "
-                    "32 consecutive matching comparisons down to 1/64, and returns to 1/4 when the contracts, the parser "
+                    "8 consecutive matching comparisons down to 1/32, and returns to 1/4 when the contracts, the parser "
                     "or evaluator version, the session generation or a mismatch change the premise; comparisons are also "
-                    "forced after a rebuild, for a violation/suspicious finding, when a violation turns clean and for a "
-                    "high-risk contract. An integer pins the fixed legacy rate and switches adaptation off: 1 compares "
+                    "forced after a rebuild and for the next 4 compared requests, for a violation/suspicious finding, "
+                    "when a violation turns clean and for a high-risk contract. An integer pins the fixed legacy rate and switches adaptation off: 1 compares "
                     "every audit, 0 only the forced comparisons, N about one audit in N. A mismatch returns the full "
                     "result and disables incremental evaluation of that contract in that session until the evaluator "
                     "version changes. SELF_DIRECT_AUDIT_SHADOW_EVERY.",

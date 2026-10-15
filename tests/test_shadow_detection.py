@@ -54,7 +54,7 @@ def test_a_missed_violation_is_noticed_by_sampling_and_the_wrong_answers_are_cou
     for group in (cold, floor, fixed):
         assert all(item["requests"] is not None for item in group), group
         assert all(item["wrong"] == item["requests"] - 1 for item in group)         # every earlier answer was wrong
-    # The trade the policy makes, in numbers: at the floor (1/64) the defect stays unnoticed longer than under 1/16.
+    # The trade the policy makes, in numbers: at the floor (1/32) the defect stays unnoticed longer than under 1/16.
     assert statistics.mean(item["requests"] for item in floor) > statistics.mean(item["requests"] for item in fixed)
 
 
@@ -69,7 +69,12 @@ def test_the_simulation_of_the_schedule_agrees_with_the_numbers_the_documentatio
     floor = [measure.simulate_missed(seed, "adaptive", True, 0)["requests"] for seed in range(600)]
     fixed = [measure.simulate_missed(seed, 16, False, 9)["requests"] for seed in range(600)]
     cold = [measure.simulate_missed(seed, "adaptive", False, 3)["requests"] for seed in range(100)]
-    assert 30 <= statistics.median(floor) <= 60 and 8 <= statistics.median(fixed) <= 14
+    assert 15 <= statistics.median(floor) <= 32 and 8 <= statistics.median(fixed) <= 14      # 1/32 at the floor, 1/16 before
     assert cold == [1] * 100                                   # inside the warm-up the first request is compared
     share = measure.share_of_requests(20)
-    assert share["10"] > 80 and share["100"] > 25 and share["2000"] < 8 and share["5000"] < 5
+    assert share["10"] > 45 and share["100"] > 10 and share["2000"] < 6 and share["5000"] < 5
+    old = measure.share_of_requests(20, 16)
+    assert 4 < old["1000"] < 9 and old["10"] < 30                  # 1 in 16, plus the rebuild at the first request
+    cost = measure.session_cost(10, "adaptive", (300,))["300"]
+    previous = measure.session_cost(10, 16, (300,))["300"]
+    assert cost["comparisons"] > previous["comparisons"] > 5       # a young session compares more than 1 in 16 did

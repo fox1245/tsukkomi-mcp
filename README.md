@@ -292,7 +292,7 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_INTEGRITY_FAST_RECENT_BLOCKS`, `SELF_DIRECT_INTEGRITY_FAST_SAMPLE_BLOCKS` | `4`, `8` | Fast (hook-time) source verification: the latest complete 1 MiB blocks and the random sample compared with their stored digests. `0` for either disables that part (the tail block is always compared). See [Source integrity](#source-integrity-full-and-fast-verification). |
 | `SELF_DIRECT_INTEGRITY_FULL_VERIFY_INTERVAL_SEC` | `300` | A fast check is allowed only this long after the last verification of every block; then the next check is full. `0`: always full. |
 | `SELF_DIRECT_INTEGRITY_BACKGROUND_VERIFY`, `SELF_DIRECT_INTEGRITY_BACKGROUND_IDLE_SEC`, `SELF_DIRECT_INTEGRITY_BACKGROUND_MAX_SCANS` | `true`, `2`, `1` | Resident servers verify watched sources in full on one background thread after this much idleness; at most this many scans per wake-up. Hook processes never do background work. |
-| `SELF_DIRECT_AUDIT_SHADOW_EVERY`, `SELF_DIRECT_AUDIT_SHADOW_IDLE_SEC` | `adaptive`, `2` | How incremental audits are compared with the full evaluator: `adaptive` (rate 1/4 down to 1/64 plus forced comparisons) or an integer that pins the fixed rate (`1` every audit, `0` only the forced comparisons, `N` about one in `N`); resident servers compare the latest state of a session after this many idle seconds (`0` off). See [Incremental audits](#incremental-audits). |
+| `SELF_DIRECT_AUDIT_SHADOW_EVERY`, `SELF_DIRECT_AUDIT_SHADOW_IDLE_SEC` | `adaptive`, `2` | How incremental audits are compared with the full evaluator: `adaptive` (rate 1/4 down to 1/32 plus forced comparisons) or an integer that pins the fixed rate (`1` every audit, `0` only the forced comparisons, `N` about one in `N`); resident servers compare the latest state of a session after this many idle seconds (`0` off). See [Incremental audits](#incremental-audits). |
 | `SELF_DIRECT_MAX_DECOMPRESSED_SESSION_BYTES` | `4294967296` | **New in 0.6.0.** Largest decompressed size a `.jsonl.zst` Codex session may declare; larger files are refused as `zstd_too_large`. |
 | `SELF_DIRECT_RETRIEVE_TOP_K`, `SELF_DIRECT_SEARCH_TOP_K`, `SELF_DIRECT_RRF_K` | `20`, `10`, `60` | Retrieval tuning. |
 | `SELF_DIRECT_SEED_EXAMPLE_CONTRACTS` | `false` | Seed disabled demonstration contracts. |
@@ -481,7 +481,7 @@ evaluation, which remains the reference. The audit still runs through the native
   evaluated in full in that session until the evaluator version changes, and the schedule below starts again at 1/4. The
   comparison is skipped (`incremental.shadow_skipped: "deadline"`) when the request's remaining time budget could not cover
   the full evaluation. Which requests are compared (`incremental.shadow_reasons` says why):
-  - **Forced, whatever the rate.** `rebuild`, `premise`, `warmup`: a state was rebuilt in this request, and for the first 8 compared
+  - **Forced, whatever the rate.** `rebuild`, `premise`, `warmup`: a state was rebuilt in this request, and for the first 4 compared
     requests after a rebuild or a change of premise (below), the session is compared in full. `violation`: the incremental
     answer holds a `violation` or `suspicious` finding of a contract it decides (a wrong block is the costly error; for an action check
     only the contracts that apply to the action count, since only those can block it). `flip`: a contract that the previous request
@@ -493,15 +493,33 @@ evaluation, which remains the reference. The audit still runs through the native
     towards the rate below, and a scoped mismatch is settled by a full comparison in the same request. These three are not repeated for
     an input that was already compared and matched (the same stored events, contracts, request and incremental answer:
     `shadow_skipped: "verified_before"`): the reference is deterministic, so a repeat could find nothing.
-  - **Sampled, for everything else, at an adaptive rate.** The rate starts at 1/4 and halves (1/8, 1/16, 1/32, 1/64) after
-    every 32 consecutive comparisons that actually ran, covered every contract and matched; the floor is 1/64. It returns to 1/4
+  - **Sampled, for everything else, at an adaptive rate.** The rate starts at 1/4 and halves (1/8, 1/16, 1/32) after
+    every 8 consecutive comparisons that actually ran, covered every contract and matched; the floor is 1/32. The 4 comparisons of the
+    warm-up count towards that streak, so the 1/4 stage of a new session is the 4 sampled matches that follow them. The rate returns to 1/4
     only when a premise of the verification changes (`incremental.shadow_reset` names it): the contract set or one contract's
     revision, the parser or evaluator version, the session generation (a reindex or a rewrite) or a mismatch. A normal append does not
     reset it. A comparison that was skipped for lack of time is no match and does not interrupt the streak. The draw is a hash of
     the schedule state and the cursor, so it is deterministic and reproducible. The schedule is kept per session and provider in
     `audit_shadow_state`, written with the monitor states (a resident engine holds it with them), so a restarted process continues
-    it; an unreadable row only means "start again at 1/4 with the warm-up", which compares more, never less. The action-check and the
-    audit variants keep monitor states of their own, so the first request of each variant is a rebuild and owes the warm-up again.
+    it; a row that cannot be read (damaged, or written for other constants) only means "start again at 1/4 with the warm-up", which
+    compares more, never less. The action-check and the audit variants keep monitor states of their own, so the first request of
+    each variant is a rebuild and owes the warm-up again.
+  - **These constants are not the roundtable's, on purpose.** Issue #18 R2 asked for 1/4 down to 1/64, halving after 32 matches and a
+    warm-up of 8. The review chair changed that to the constants above after measuring the policy functions themselves
+    (`scripts/measure_shadow_detection.py --share`, `--session` and `--simulate`, 300 seeds and 20,000 draws of a synthetic session;
+    `--constants 4,8,16,32,64/32/8` replays the original ones). With the original constants a session compared more of its requests than
+    the fixed 1 in 16 until it had run about 2,000 requests, so no p95 got lower in a session of a few hundred requests. Share of the
+    requests compared after 10 / 100 / 300 / 1,000 / 2,000 / 5,000 requests: the fixed 1 in 16 (plus its rebuild at the first request)
+    15.3% / 7.2% / 6.6% / 6.4% / 6.3% / 6.3%, the original
+    constants 85.1% / 30.5% / 18.8% / 10.0% / 6.5% / 3.5%, the constants as built
+    54.8% / 16.8% / 8.9% / 4.9% / 4.0% / 3.5%. Comparisons in a session of 300 / 1,000 / 3,000
+    requests, and the mean number of requests a missed violation stays unnoticed in it (starting at ten times spread over the session):
+    1 in 16 19 / 63 / 188 and 15 / 16 / 16; original constants
+    57 / 100 / 146 and 6 / 14 / 38; as built 27 / 49 / 112 and
+    15 / 26 / 30. A floor of 1/64 (1.6% of the requests) buys no percentile: it is still above the 1% a p99 sees, and it doubles
+    the time a silently missed violation goes unnoticed at the floor (45 / 188 / 627 requests, against 22 / 95 / 269 at 1/32); 1/32 (3.1%) is
+    below the 5% a p95 sees, which is the point of an adaptive floor. The constants are `audit.shadow.RATE_DENOMINATORS`, `HALVE_AFTER` and
+    `WARMUP_REQUESTS`.
   - **Settings.** `SELF_DIRECT_AUDIT_SHADOW_EVERY` is `adaptive` by default. An integer pins the previous fixed behaviour and switches
     adaptation off, the forced comparisons stay: `1` compares every audit (the test suite does), `0` only the forced comparisons,
     `N` about one audit in `N` (`16` was the previous default). `audit_status` reports the policy, the schedule of a session
@@ -518,25 +536,31 @@ evaluation, which remains the reference. The audit still runs through the native
   - **What this does not promise.** Not every response equals the full evaluation. An answer that is wrongly **clean** passes between
     two comparisons unnoticed; a violation, a violation that turns clean and a high-risk contract are checked in the request that
     carries them, a silent miss is not. Fault injection (`scripts/measure_shadow_detection.py`: a monitor that ignores forbidden
-    events, 200 seeds of a synthetic Codex session with five contracts; requests counted from the one that carries the violation,
-    1 = noticed in it) gives, as median / p95 / max requests until the defect was noticed, and the wrong answers returned before that
-    are one fewer:
+    events, in a synthetic Codex session with five contracts; requests counted from the one that carries the violation,
+    1 = noticed in it) gives, as median / p95 / max requests until the defect was noticed (the wrong answers returned before that
+    are one fewer). Engine runs use 200 seeds; `--simulate` plays the schedule alone for 20,000 draws, which is what the tails need:
 
-    | defect | previous fixed 1/16 | adaptive, in the warm-up (request 3) | adaptive, just after it (request 9) | adaptive, at the floor 1/64 |
-    |---|---|---|---|---|
-    | a violation the monitor misses (answers `clean`) | 11.5 / 53 / 92 | 1 / 1 / 1 | 3 / 11 / 23 | 42.5 / 179 / 471 |
-    | a block the full evaluator would not give (`violation` for `clean`) | 12 / 46 / 92 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
-    | a violation that turns clean | 10 / 41 / 88 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
-    | a high-risk obligation that wrongly says `clean` | 12 / 52 / 113 | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+    | a violation the monitor misses (answers `clean`) | previous fixed 1/16 | adaptive, engine | adaptive, `--simulate` |
+    |---|---|---|---|
+    | in the warm-up (request 3) | not applicable | 1 / 1 / 1 | 1 / 1 / 1 |
+    | just after it (request 9) | 11.5 / 53 / 92 | 3 / 12 / 36 | 3 / 11 / 64 (1/16: 11 / 47 / 138) |
+    | request 40 | 10.5 / 47 / 123 | 5 / 23 / 47 | 6 / 23 / 73 |
+    | at the floor (1/32) | not applicable | 19.5 / 77 / 155 | 22 / 95 / 269 |
 
-    The last three rows do not depend on the rate (the 200 seeds ran from a cold start; `tests/test_shadow_detection.py` repeats them at the floor and with `SELF_DIRECT_AUDIT_SHADOW_EVERY=0`).
-    The adaptive schedule trades a longer worst case for a lower steady cost: after a long clean streak a silently missed
-    violation is noticed after 45 requests at the median, 188 at p95 and 627 at most (`--simulate`, 20,000 draws of the same
-    schedule), against 11, 47 and 138 under 1/16, and every request in between returns the wrong `clean`. It also compares
-    *more* than 1/16 did at first: the share of a session's requests that are compared is 85% over the first 10, 31% over 100, 19% over
-    300, 10% over 1,000 and 6.5% over 2,000 requests (`--share`), and falls below the 6.25% of 1/16 only after about 2,000 requests with an
-    unchanged premise (4.8% over 3,000, 3.5% over 5,000, 1.6% at the floor). The constants are `audit.shadow.RATE_DENOMINATORS`,
-    `HALVE_AFTER` and `WARMUP_REQUESTS`.
+    | other defects, noticed in the request that carries them | previous fixed 1/16 | adaptive, cold start (20 seeds) | adaptive, at the floor (20 seeds) |
+    |---|---|---|---|
+    | a block the full evaluator would not give (`violation` for `clean`) | 12 / 46 / 92 | 1 / 1 / 1 | 1 / 1 / 1 |
+    | a violation that turns clean | 10 / 41 / 88 | 1 / 1 / 1 | 1 / 1 / 1 |
+    | a high-risk obligation that wrongly says `clean` | 12 / 52 / 113 | 1 / 1 / 1 | 1 / 1 / 1 |
+
+    (The previous-1/16 column is the earlier run of the same harness against the commit this work started from, 200 seeds; the
+    fixed schedule is the same code in the merged tree. `tests/test_shadow_detection.py` repeats the forced rows at the floor and
+    with `SELF_DIRECT_AUDIT_SHADOW_EVERY=0`.) The adaptive schedule trades a longer worst case for a lower steady cost: after a long
+    clean streak a silently missed violation is noticed after 22 / 95 / 269 requests (median / p95 / max) where 1 in 16 needs
+    11 / 47 / 138, and every request in between returns the wrong `clean`. It still compares *more* than 1 in 16 did in a young
+    session (54.8% of the first 10 requests, 16.8% of the first 100, 8.9% of the first 300) and falls below the 6.25% of 1/16
+    after about 600 requests (4.9% over 1,000, 4.0% over 2,000, 3.5% over 5,000; 3.1% at the floor), where the original
+    constants needed about 2,000.
 - **Small sessions.** A session with fewer than `SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS` stored events (default 500)
   is evaluated in full and no state is kept (`incremental.mode: "full"`, `below_min_events`). Below that size one full
   evaluation costs less than storing states, rebuilding them and shadow-checking the rebuild; on the scripted evaluation
@@ -1127,58 +1151,64 @@ For a resident engine keeping state costs the same as keeping none up to about 2
 
 ### Shadow comparison cost
 
-A shadow comparison runs the full evaluator beside the incremental one (see [Incremental audits](#incremental-audits)). It is the largest cost the warm path has left, and the requests that carry one are the p95 and p99 of a cell: the fixed 1 in 16 compared more than the 5% a p95 leaves out. The tables repeat the cells above with `scripts/bench_warm.py --runs 30` (10 contracts, 1 MB sessions), **before** (the fixed 1 in 16, the commit this work started from) and **after** (the adaptive schedule), as the median of three interleaved rounds. Each entry is `p50 / p95 / p99 ms [shadow comparisons among the cell's 30 requests]`. *Default schedule* is the benchmark's usual 3 untimed requests per cell; *past the warm-up* is `--warmup 12`. The machine was busier than for the measurements above, so absolute values are higher than in those tables; before and after ran in the same rounds, interleaved.
+A shadow comparison runs the full evaluator beside the incremental one (see [Incremental audits](#incremental-audits)). It is the largest cost the warm path has left, and the requests that carry one are the p95 and p99 of a cell. The tables repeat the cells above with `scripts/bench_warm.py --runs 30` (10 contracts, 1 MB sessions), **before** (`main` at the merge of PR #21: the fixed 1 in 16, journal mode at its default `delete`) and **after** (the adaptive schedule with the constants above), as the median of three interleaved rounds. Each entry is `p50 / p95 / p99 ms [shadow comparisons among the cell's 30 requests]`. *Default schedule* is the benchmark's usual 3 untimed requests per cell; *past the warm-up* is `--warmup 12`. Every run was started alone, one after the other, with no test suite or mutation run on the machine; the load average was 2.7 to 4.7 during them (other work was running; the tables further up were measured at 2.7 to 3.8), and before and after ran in the same rounds, interleaved.
 
-
-**Daemon engine (`--defer`), load average 5.2 to 7.3:**
-
-| Cell | before: fixed 1/16 | after, default schedule | after, past the warm-up |
-|---|---|---|---|
-| Claude Code `PreToolUse`, nothing appended | 27.4 / 41.8 / 51 [30] | 4.6 / 25.4 / 35 [5] | 4.0 / 4.7 / 5 [0] |
-| Claude Code `PreToolUse`, 4 KB appended | 33.6 / 62.0 / 66 [3] | 32.3 / 55.1 / 57 [4] | 31.7 / 51.0 / 56 [4] |
-| Claude Code `Stop`, nothing appended | 10.9 / 15.5 / 16 [0] | 10.1 / 63.3 / 65 [5] | 10.1 / 14.0 / 15 [0] |
-| Claude Code `Stop`, 4 KB appended | 38.3 / 46.0 / 87 [1] | 36.4 / 92.5 / 93 [4] | 40.5 / 86.6 / 94 [4] |
-| AGY `PreToolUse`, nothing appended | 47.4 / 62.2 / 69 [0] | 47.1 / 89.0 / 98 [5] | 55.4 / 61.5 / 64 [0] |
-| AGY `PreToolUse`, 4 KB appended | 76.8 / 95.5 / 132 [1] | 79.2 / 116.3 / 128 [9] | 87.8 / 136.3 / 137 [9] |
-| AGY `Stop`, nothing appended | 17.3 / 22.6 / 34 [0] | 17.1 / 97.8 / 114 [5] | 15.8 / 18.7 / 32 [0] |
-| AGY `Stop`, 4 KB appended | 44.1 / 52.0 / 57 [0] | 46.0 / 156.2 / 158 [5] | 47.3 / 140.9 / 158 [5] |
-
-**Synchronous engine (a one-shot hook process's), load average 5.6 to 8.0:**
+**Daemon engine (`--defer`), load average 3.2 to 4.2:**
 
 | Cell | before: fixed 1/16 | after, default schedule | after, past the warm-up |
 |---|---|---|---|
-| Claude Code `PreToolUse`, nothing appended | 29.7 / 49.3 / 52 [30] | 4.4 / 47.2 / 60 [5] | 4.8 / 6.4 / 7 [0] |
-| Claude Code `PreToolUse`, 4 KB appended | 54.5 / 78.9 / 96 [3] | 55.5 / 78.6 / 83 [4] | 49.1 / 72.1 / 90 [4] |
-| Claude Code `Stop`, nothing appended | 54.0 / 63.5 / 65 [0] | 55.4 / 131.1 / 136 [5] | 56.3 / 62.3 / 63 [0] |
-| Claude Code `Stop`, 4 KB appended | 87.9 / 107.1 / 155 [1] | 87.2 / 148.5 / 158 [4] | 80.0 / 126.9 / 135 [4] |
-| AGY `PreToolUse`, nothing appended | 76.4 / 86.8 / 95 [0] | 74.3 / 138.6 / 149 [5] | 75.1 / 85.6 / 86 [0] |
-| AGY `PreToolUse`, 4 KB appended | 129.9 / 157.4 / 178 [1] | 135.1 / 188.7 / 190 [9] | 124.7 / 165.5 / 177 [9] |
-| AGY `Stop`, nothing appended | 16.8 / 21.3 / 30 [0] | 19.5 / 128.4 / 130 [5] | 16.4 / 23.3 / 26 [0] |
-| AGY `Stop`, 4 KB appended | 71.1 / 88.6 / 116 [0] | 69.2 / 172.2 / 211 [5] | 66.7 / 168.9 / 176 [5] |
+| Claude Code `PreToolUse`, nothing appended | 26.8 / 42.7 / 45 [30] | 4.6 / 6.1 / 31 [1] | 5.7 / 7.3 / 8 [0] |
+| Claude Code `PreToolUse`, 4 KB appended | 14.9 / 38.9 / 39 [3] | 16.5 / 39.0 / 46 [7] | 16.3 / 39.2 / 42 [7] |
+| Claude Code `Stop`, nothing appended | 12.8 / 15.3 / 19 [0] | 11.5 / 17.1 / 54 [1] | 11.1 / 14.1 / 15 [0] |
+| Claude Code `Stop`, 4 KB appended | 22.6 / 28.8 / 62 [1] | 23.2 / 79.2 / 82 [5] | 21.2 / 74.1 / 82 [5] |
+| AGY `PreToolUse`, nothing appended | 24.4 / 28.4 / 29 [0] | 22.6 / 31.8 / 80 [1] | 20.4 / 25.2 / 26 [0] |
+| AGY `PreToolUse`, 4 KB appended | 36.0 / 43.8 / 71 [1] | 37.8 / 83.6 / 88 [4] | 34.6 / 71.4 / 87 [4] |
+| AGY `Stop`, nothing appended | 17.8 / 26.3 / 28 [0] | 20.6 / 27.7 / 121 [1] | 17.6 / 26.9 / 28 [0] |
+| AGY `Stop`, 4 KB appended | 29.7 / 36.9 / 37 [0] | 30.5 / 120.2 / 136 [3] | 29.8 / 123.3 / 133 [3] |
 
-Which cells still contain a comparison, and why:
+**Synchronous engine (a one-shot hook process's), load average 2.7 to 4.7:**
 
-- **Nothing appended, past the warm-up: none.** The fixed schedule compared *every* request of `Claude Code PreToolUse (nothing appended)` (the cell's offset is one the sample selects, and with nothing appended every request is at it). The adaptive draw depends on the schedule state as well as the cursor, so a repeated request is not repeatedly selected, and the cell is back at its floor.
-- **Every cell of the default column: the warm-up.** The benchmark builds the monitor states of an event kind just before it times it (the audit and the action check keep states of their own), and a rebuild owes the first 8 compared requests, so 5 of a cell's 30 requests (what is left of the warm-up) carry a forced comparison, and more in the cells that also append events. This is the policy working as decided; a session that lives for hundreds of requests pays it once per variant and per change of premise.
-- **Appended cells, past the warm-up: sampled at 1/4.** A session starts at 1/4 and needs 32 matching comparisons per step to reach 1/8, 1/16, 1/32 and 1/64, so a short session compares 4 to 9 of 30 requests where 1/16 compared 0 to 3. The p95 and p99 of such a cell are a request that carried a full evaluation, as under 1/16 when it happened to compare one, and **higher where 1/16 happened to compare none** (AGY `Stop` with 4 KB appended, daemon engine: p95 52 ms before, 156 ms with the default schedule and 141 ms past the warm-up). The adaptive schedule compares less than 1/16 only after about 2,000 requests with an unchanged premise (the share over the first 10, 100, 300, 1,000, 2,000 and 3,000 requests is 85%, 31%, 19%, 10%, 6.5% and 4.8%). These sessions have no violation, flip or high-risk contract, so no forced comparison of that kind appears here; a request that has one adds a scoped comparison of just those contracts.
-- **A resident engine writes no commit for the schedule** (`--defer`: the schedule is held with the monitor states); a synchronous engine writes it with the states when a request writes states, and in a commit of its own otherwise (the 0.2 durable commits per request of the nothing-appended cells).
+| Cell | before: fixed 1/16 | after, default schedule | after, past the warm-up |
+|---|---|---|---|
+| Claude Code `PreToolUse`, nothing appended | 26.5 / 38.9 / 40 [30] | 5.1 / 6.9 / 52 [1] | 4.9 / 6.1 / 6 [0] |
+| Claude Code `PreToolUse`, 4 KB appended | 20.1 / 45.4 / 55 [3] | 20.1 / 43.0 / 46 [7] | 22.4 / 52.9 / 60 [7] |
+| Claude Code `Stop`, nothing appended | 22.7 / 33.3 / 43 [0] | 20.3 / 25.1 / 79 [1] | 19.9 / 22.7 / 25 [0] |
+| Claude Code `Stop`, 4 KB appended | 32.0 / 60.2 / 93 [1] | 33.5 / 92.8 / 104 [5] | 29.4 / 90.2 / 116 [5] |
+| AGY `PreToolUse`, nothing appended | 29.9 / 33.3 / 33 [0] | 26.8 / 35.3 / 80 [1] | 27.3 / 32.0 / 37 [0] |
+| AGY `PreToolUse`, 4 KB appended | 44.9 / 64.2 / 90 [1] | 41.6 / 86.2 / 90 [4] | 41.8 / 86.1 / 94 [4] |
+| AGY `Stop`, nothing appended | 19.4 / 24.1 / 31 [0] | 18.4 / 33.5 / 102 [1] | 18.8 / 23.2 / 24 [0] |
+| AGY `Stop`, 4 KB appended | 42.0 / 55.6 / 57 [0] | 36.9 / 123.5 / 132 [3] | 37.5 / 108.7 / 140 [3] |
 
-The resident daemon through `scripts/bench_daemon.py --runs 30 --only hooks` (cold hook processes through a warm daemon; one run per side, load average 5.2 at the start of the run before and 4.3 after; the cells of a host share one session and one daemon engine, so the first `Stop` cells build the audit variant's states in the middle of the run). Wall time of the whole new process and the daemon-side time, p50 / p95 / p99 ms:
+What the tables show, and what they do not:
+
+- **Nothing appended: the cell the fixed sample hit on every request is fixed, and the others do not change.** The fixed schedule compared *every* request of `Claude Code PreToolUse (nothing appended)` (the cell's offset is one the sample selects, and with nothing appended every request is at it). The adaptive draw depends on the schedule state as well as the cursor, so a repeated request is not repeatedly selected: the cell goes from 26.8 to 4.6 ms at p50 and from 42.7 to 6.1 ms at p95 (daemon engine). In the default column each nothing-appended cell still holds 1 comparison among its 30 requests, the last of the 4 warm-up comparisons that the 3 untimed requests did not use up (it is the cell's p99); past the warm-up there is none.
+- **Cells that append events carry more comparisons than 1 in 16 did, in a session this young, and their p95 and p99 are a full evaluation.** A new session is compared at 1/4 until 8 comparisons have matched (the 4 of the warm-up count), at 1/8 for the next 8, and so on, so 3 to 7 of a cell's 30 requests are compared where 1 in 16 compared 0 to 3. The p95 and p99 of such a cell are a request that ran a full evaluation, as under 1 in 16 when it happened to compare one, and **higher where 1 in 16 happened to compare none** (daemon engine, p95 in ms: AGY `Stop` with 4 KB appended 36.9 → 120.2, Claude Code `Stop` with 4 KB 28.8 → 79.2, AGY `PreToolUse` with 4 KB 43.8 → 83.6). The p50 of the other cells differs by -5.1 to +2.8 ms between before and after, in both directions, which is the noise of these runs (a median of 30 requests, with other work on the machine). These sessions have no violation, flip or high-risk contract, so no forced comparison of that kind appears here; a request that has one adds a scoped comparison of just those contracts.
+- **Against the constants this replaced** (the first measurement of this schedule, 1/4 down to 1/64, halving after 32, a warm-up of 8; load 5.2 to 8.0, so only the counts compare): 5 comparisons among the 30 requests of every nothing-appended cell in the default column and 4 to 9 in the appended ones; now 1 and 3 to 7.
+- **A long window shows what the schedule is for.** The share of requests compared falls below 5%, which is what a p95 sees, after about 900 requests, and to 3.1% at the floor. Claude Code `Stop` with 4 KB appended, 1,500 requests in one session, daemon engine, median of three interleaved rounds (load average 3.2 to 5.3). The p99 is a compared request on both sides (4 to 6% of the requests are compared, so the 15 slowest of 1,500 are all comparisons):
+
+| 1,500 requests of one session | p50 / p95 / p99 ms | compared |
+|---|---|---|
+| before: fixed 1/16 | 43.7 / 200.1 / 362 | 96 (6.4%) |
+| after: adaptive | 41.2 / 74.7 / 311 | 62 (4.1%) |
+
+- **A resident engine writes no commit for the schedule** (`--defer`: the schedule is held with the monitor states). A synchronous engine writes it with the states when a request writes states, and in a commit of its own otherwise: the one compared request of a nothing-appended cell, which is why those cells show 0.03 more durable commits per request (1 in 30) in the default column and none past the warm-up.
+
+The resident daemon through `scripts/bench_daemon.py --runs 30 --only hooks` (cold hook processes through a warm daemon; one run per side, load average at the start 2.99 before and 3.83 after; the cells of a host share one session and one daemon engine, so the first `Stop` cells build the audit variant's states in the middle of the run). Wall time of the whole new process and the daemon-side time, p50 / p95 / p99 ms:
 
 | Event (new process) | through the daemon, before: wall p50 / p95 / p99 ms | after | daemon-side before: p50 / p95 / p99 ms | after |
 |---|---|---|---|---|
-| Claude Code `PreToolUse (+0 B)` | 51.0 / 70.0 / 87.2 | 28.1 / 73.7 / 77.5 | 27.87 / 40.25 / 59.72 | 6.06 / 42.54 / 52.45 |
-| Claude Code `PreToolUse (+4096 B)` | 48.3 / 63.7 / 69.7 | 55.7 / 77.4 / 94.4 | 26.31 / 43.05 / 46.85 | 32.15 / 55.77 / 70.67 |
-| Claude Code `UserPromptSubmit (+0 B)` | 22.7 / 31.0 / 32.0 | 22.1 / 27.1 / 30.2 | 0.93 / 1.16 / 1.21 | 0.92 / 1.19 / 1.76 |
-| Claude Code `UserPromptSubmit (+4096 B)` | 23.4 / 30.3 / 31.3 | 21.2 / 29.2 / 29.5 | 0.92 / 1.24 / 1.3 | 0.89 / 1.12 / 1.17 |
-| Claude Code `Stop (+0 B)` | 32.1 / 45.5 / 63.4 | 33.4 / 109.2 / 141.4 | 10.29 / 14.1 / 41.54 | 10.88 / 87.95 / 120.16 |
-| Claude Code `Stop (+4096 B)` | 50.4 / 61.9 / 103.2 | 58.6 / 137.5 / 142.9 | 27.7 / 37.96 / 80.52 | 37.27 / 110.47 / 119.61 |
-| AGY `PreToolUse (+0 B)` | 57.4 / 67.1 / 71.8 | 75.6 / 126.0 / 142.5 | 35.77 / 41.4 / 49.63 | 52.95 / 102.58 / 119.8 |
-| AGY `PreToolUse (+4096 B)` | 94.2 / 135.1 / 162.4 | 94.8 / 149.9 / 150.0 | 72.79 / 100.14 / 138.99 | 70.81 / 127.07 / 127.79 |
-| AGY `Stop (+0 B)` | 35.6 / 47.9 / 53.2 | 38.8 / 233.3 / 271.7 | 14.78 / 23.28 / 29.34 | 16.05 / 192.94 / 194.47 |
-| AGY `Stop (+4096 B)` | 65.5 / 82.8 / 89.9 | 66.9 / 186.0 / 214.2 | 43.02 / 55.76 / 59.26 | 43.4 / 160.34 / 184.23 |
+| Claude Code `PreToolUse (+0 B)` | 55.8 / 66.2 / 67.0 | 29.9 / 55.2 / 58.7 | 28.25 / 36.11 / 39.99 | 6.57 / 32.6 / 33.27 |
+| Claude Code `PreToolUse (+4096 B)` | 39.4 / 57.4 / 70.8 | 43.8 / 76.7 / 88.4 | 15.39 / 36.21 / 49.19 | 17.77 / 52.56 / 52.64 |
+| Claude Code `UserPromptSubmit (+0 B)` | 24.0 / 28.1 / 29.9 | 23.9 / 29.9 / 36.6 | 1.12 / 1.48 / 1.5 | 1.08 / 1.58 / 2.14 |
+| Claude Code `UserPromptSubmit (+4096 B)` | 25.1 / 29.7 / 38.4 | 25.6 / 29.3 / 36.2 | 1.21 / 1.55 / 1.65 | 1.13 / 1.61 / 2.39 |
+| Claude Code `Stop (+0 B)` | 36.5 / 47.6 / 51.0 | 40.0 / 106.6 / 109.8 | 11.66 / 15.34 / 21.86 | 13.88 / 81.89 / 86.03 |
+| Claude Code `Stop (+4096 B)` | 43.8 / 80.4 / 102.6 | 47.9 / 118.6 / 119.4 | 20.48 / 51.77 / 80.0 | 22.62 / 92.9 / 95.92 |
+| AGY `PreToolUse (+0 B)` | 45.5 / 53.0 / 56.4 | 48.7 / 84.3 / 93.4 | 22.91 / 27.39 / 28.16 | 24.38 / 60.19 / 67.21 |
+| AGY `PreToolUse (+4096 B)` | 56.6 / 86.0 / 123.8 | 60.9 / 106.7 / 108.6 | 33.97 / 62.78 / 98.54 | 35.54 / 83.0 / 84.32 |
+| AGY `Stop (+0 B)` | 43.8 / 58.3 / 60.7 | 43.0 / 141.8 / 148.8 | 19.38 / 28.59 / 28.78 | 18.32 / 118.44 / 119.8 |
+| AGY `Stop (+4096 B)` | 57.6 / 77.1 / 80.9 | 55.4 / 135.6 / 159.6 | 32.29 / 43.08 / 47.42 | 30.55 / 113.34 / 138.0 |
 
-It is the pattern of the in-process tables. The cell the fixed sample compared in every request (Claude Code `PreToolUse`, nothing appended) falls from 51 / 70 ms wall and 27.9 ms daemon-side at p50 to 28 / 74 ms and 6.1 ms; the cells the fixed sample never compared among these 30 requests (`Stop`, and AGY) now carry the warm-up and the 1/4 sample of a young session, so their p95 and p99 are a request that ran a full evaluation (Claude Code `Stop`, nothing appended: daemon-side p95 14.1 → 88 ms; AGY `Stop`: 23 → 193 ms). One run per side, so the p95 and p99 of 30 requests move by tens of milliseconds between runs; the number of comparisons, not the milliseconds, is what the schedule decides.
+The same pattern as above, one run per side, so the p95 and p99 of 30 requests move by tens of milliseconds between runs; the number of comparisons, not the milliseconds, is what the schedule decides. The cell the fixed sample compared in every request (Claude Code `PreToolUse`, nothing appended) falls from 55.8 to 29.9 ms wall at p50 (p95 66.2 → 55.2) and from 28.2 to 6.6 ms daemon-side at p50; the cells that append events, and `Stop` and AGY generally, now carry the warm-up and the sample of a young session in their p95 and p99 (Claude Code `Stop`, nothing appended: daemon-side p95 15.3 → 81.9 ms; AGY `Stop` with 4 KB appended: 43.1 → 113.3 ms).
 
 ### Commit benchmark
 

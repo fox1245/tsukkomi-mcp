@@ -18,19 +18,23 @@ Scenarios (each trial is one seed: another session id, other event texts, hence 
   action is a deploy.
 
 ``--every`` is the schedule: ``adaptive`` (the new default), or an integer (``16`` is the previous fixed rate). With
-``--floor`` the adaptive schedule starts at its floor (1/64) as after a long clean streak, by writing that state. Use
+``--floor`` the adaptive schedule starts at its floor (1/32) as after a long clean streak, by writing that state. Use
 ``--src`` to run the same script against another checkout (the previous fixed schedule lives in the previous code).
 
     python scripts/measure_shadow_detection.py --scenario missed --every adaptive [--floor] [--seeds 300] [--out r.json]
 
 ``--simulate`` skips the engine and plays the schedule alone (the policy functions of ``audit/shadow.py`` with the same
 hash draws, and the previous fixed draw for an integer ``--every``) for the ``missed`` scenario, which is what makes
-thousands of seeds affordable; ``--share`` prints how large a share of a clean session's requests the adaptive schedule
-compares after 10, 100, 1,000 ... requests.
+thousands of seeds affordable; ``--share`` prints how large a share of a clean session's requests the schedule (``--every``)
+compares after 10, 100, 1,000 ... requests; ``--session`` prints, for sessions of 100 to 3,000 requests, the comparisons a
+clean session makes and the mean number of requests a missed violation stays unnoticed in it. ``--constants
+4,8,16,32,64/32/8`` (denominators / halve after / warm-up) replays them with other constants, for instance the roundtable's
+original ones, which the chair replaced by 4,8,16,32/8/4 (issue #18 R2).
 """
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 from pathlib import Path
 import random
@@ -114,10 +118,14 @@ class Trial:
 
     def seed_floor(self):
         """Start the adaptive schedule at its floor, as after a long clean streak (needs the new code)."""
+        from self_directing_mcp.audit import shadow
         state = self.engine.store.load_shadow_state(self.sid, "codex")
-        state.rate_index, state.warmup = 4, 0
-        state.streak, state.compared = self.rng.randrange(32), self.rng.randrange(10_000)
+        floor = len(shadow.RATE_DENOMINATORS) - 1
+        state.rate_index, state.warmup = floor, 0
+        state.streak, state.compared = self.rng.randrange(shadow.HALVE_AFTER), self.rng.randrange(10_000)
         self.engine.store.save_shadow_state(self.sid, "codex", state)
+        # a row the schedule cannot read would silently start the trial at 1/4 instead of at the floor
+        assert self.engine.store.load_shadow_state(self.sid, "codex").rate_index == floor
 
     def close(self):
         self.engine.close()
@@ -246,53 +254,70 @@ def run_trial(scenario, seed, *, every, floor, violation_at, cap, tmp):
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def simulate_missed(seed, every, floor, violation_at, cap=20_000):
-    """The ``missed`` scenario without an engine: requests until a comparison covers the request that carries the violation."""
+def compared_requests(seed, every, floor=False, label="simulate"):
+    """Endless iterator over the requests of a clean synthetic session: ``True`` when the schedule compares the request.
+
+    ``every`` is ``"adaptive"`` (the policy functions of ``audit/shadow.py`` with their hash draws) or an integer, the
+    previous fixed schedule (a rebuild at the first request, then a hash draw per cursor)."""
     import hashlib
     from self_directing_mcp.audit import shadow
-    rng = random.Random(f"simulate/{seed}")
+    rng = random.Random(f"{label}/{seed}")
     sid = str(uuid.UUID(int=rng.getrandbits(128), version=4))
     state, _ = shadow.reconcile(None, {"contracts": "c", "parser": 3, "evaluator": 8, "generation": 1})
     if floor:
-        state.rate_index, state.warmup = 4, 0
-        state.streak, state.compared = rng.randrange(32), rng.randrange(10_000)
+        state.rate_index, state.warmup = len(shadow.RATE_DENOMINATORS) - 1, 0
+        state.streak, state.compared = rng.randrange(shadow.HALVE_AFTER), rng.randrange(10_000)
     offset = 0
-    for index in range(cap):
+    for index in itertools.count():
         offset += rng.randint(100, 600)
         if every == "adaptive":
-            forced, drawn = state.warmup > 0, shadow.sampled(state, sid, "codex", offset, None)
-        else:       # the previous fixed schedule: a rebuild at the first request, then a hash draw per cursor
-            forced = index == 0
-            drawn = int(hashlib.sha256(f"{sid}|{offset}|c:1".encode()).hexdigest()[:8], 16) % every == 0
-        if forced or drawn:
-            if index >= violation_at:
-                return {"requests": index - violation_at + 1, "wrong": index - violation_at}
-            state = shadow.settle(state, outcome="match", full_scope=True, key="audit", flagged=set(), kept=set(),
-                                  at="t", offset=offset)
+            compared = state.warmup > 0 or shadow.sampled(state, sid, "codex", offset, None)
+            if compared:
+                state = shadow.settle(state, outcome="match", full_scope=True, key="audit", flagged=set(), kept=set(),
+                                      at="t", offset=offset)
+        else:
+            compared = index == 0 or int(hashlib.sha256(f"{sid}|{offset}|c:1".encode()).hexdigest()[:8], 16) % every == 0
+        yield compared
+
+
+def simulate_missed(seed, every, floor, violation_at, cap=20_000):
+    """The ``missed`` scenario without an engine: requests until a comparison covers the request that carries the violation."""
+    for index, compared in enumerate(itertools.islice(compared_requests(seed, every, floor), cap)):
+        if compared and index >= violation_at:
+            return {"requests": index - violation_at + 1, "wrong": index - violation_at}
     return {"requests": None, "wrong": cap - violation_at}
 
 
-def share_of_requests(seeds, checkpoints=(10, 32, 100, 300, 1000, 2000, 3000, 5000)):
-    """Mean share of a clean session's requests that the adaptive schedule compared, after each number of requests."""
+def share_of_requests(seeds, every="adaptive", checkpoints=(10, 32, 100, 300, 1000, 2000, 3000, 5000)):
+    """Mean share (percent) of a clean session's requests that the schedule compared, after each number of requests."""
     import statistics
-    from self_directing_mcp.audit import shadow
     runs = []
     for seed in range(seeds):
-        rng = random.Random(f"share/{seed}")
-        sid = str(uuid.UUID(int=rng.getrandbits(128), version=4))
-        state, _ = shadow.reconcile(None, {"contracts": "c", "parser": 3, "evaluator": 8, "generation": 1})
-        offset = compared = 0
-        seen = {}
-        for index in range(1, max(checkpoints) + 1):
-            offset += rng.randint(100, 600)
-            if state.warmup > 0 or shadow.sampled(state, sid, "codex", offset, None):
-                compared += 1
-                state = shadow.settle(state, outcome="match", full_scope=True, key="audit", flagged=set(), kept=set(),
-                                      at="t", offset=offset)
+        seen, compared = {}, 0
+        for index, drawn in enumerate(itertools.islice(compared_requests(seed, every, label="share"), max(checkpoints)), 1):
+            compared += drawn
             if index in checkpoints:
                 seen[index] = compared / index
         runs.append(seen)
     return {str(c): round(100 * statistics.mean(run[c] for run in runs), 1) for c in checkpoints}
+
+
+def session_cost(seeds, every="adaptive", lengths=(100, 300, 1000, 3000)):
+    """Per session length: the mean number of comparisons in a clean session, and the mean number of requests a missed
+    violation stays unnoticed (it starts at ten evenly spread times of the session; the session's end caps the wait)."""
+    import statistics
+    out = {}
+    for length in lengths:
+        counts, waits = [], []
+        for seed in range(seeds):
+            drawn = list(itertools.islice(compared_requests(seed, every, label="session"), length))
+            counts.append(sum(drawn))
+            for k in range(10):
+                start = int((k + 0.5) * length / 10)
+                after = next((i for i in range(start, length) if drawn[i]), None)
+                waits.append(after - start + 1 if after is not None else length - start)
+        out[str(length)] = {"comparisons": round(statistics.mean(counts), 1), "unnoticed": round(statistics.mean(waits), 1)}
+    return out
 
 
 def percentile(values, fraction):
@@ -316,7 +341,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--scenario", choices=["missed", "wrong_block", "flip", "high_risk"], default="missed")
     parser.add_argument("--every", default="adaptive", help="adaptive, or an integer (the fixed rate 1/N; 0 never)")
-    parser.add_argument("--floor", action="store_true", help="start the adaptive schedule at its floor (1/64)")
+    parser.add_argument("--floor", action="store_true", help="start the adaptive schedule at its floor (1/32)")
     parser.add_argument("--violation-at", type=int, default=9,
                         help="missed: the request carrying the forbidden call (default 9, just after the warm-up); "
                              "high_risk: how many unrelated checks come first")
@@ -326,15 +351,27 @@ def main(argv=None) -> int:
     parser.add_argument("--simulate", action="store_true",
                         help="play the schedule alone (scenario missed only), no engine: thousands of seeds are cheap")
     parser.add_argument("--share", action="store_true",
-                        help="print the share of a clean session's requests the adaptive schedule compares, and stop")
+                        help="print the share of a clean session's requests the schedule compares, and stop")
+    parser.add_argument("--session", action="store_true",
+                        help="print the comparisons per clean session and the mean time a missed violation stays unnoticed")
+    parser.add_argument("--constants", help="replace the schedule's constants for this run, as DENOMINATORS/HALVE_AFTER/WARMUP, "
+                                            "e.g. 4,8,16,32,64/32/8 (the roundtable's original ones)")
     parser.add_argument("--src", type=Path, default=HERE.parent / "src", help="the src directory to import from")
     parser.add_argument("--tmpdir", help="directory for the temporary indexes (default: the system's)")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     sys.path.insert(0, str(args.src))
     every = args.every if args.every == "adaptive" else int(args.every)
+    if args.constants:
+        from self_directing_mcp.audit import shadow
+        denominators, halve, warmup = args.constants.split("/")
+        shadow.RATE_DENOMINATORS = tuple(int(item) for item in denominators.split(","))
+        shadow.HALVE_AFTER, shadow.WARMUP_REQUESTS = int(halve), int(warmup)
     if args.share:
-        print(json.dumps({"share_percent_by_requests": share_of_requests(args.seeds)}))
+        print(json.dumps({"every": args.every, "share_percent_by_requests": share_of_requests(args.seeds, every)}))
+        return 0
+    if args.session:
+        print(json.dumps({"every": args.every, "per_session_length": session_cost(args.seeds, every)}))
         return 0
     if args.simulate:
         results = [simulate_missed(seed, every, args.floor, args.violation_at)

@@ -20,14 +20,23 @@ What the policy does, and what it cannot do
      Only that contract is compared (a *scoped* comparison); the existence of a high-risk contract does not make every
      other request compare anything.
 
-2. **Sampling** for everything else. The rate starts at 1/4 and halves (1/8, 1/16, 1/32, 1/64) after every
-   ``HALVE_AFTER`` consecutive comparisons that actually ran and matched. It returns to 1/4 only when a premise of the
-   verification changes (the same list as above); an ordinary append does not reset it, and neither does a comparison
-   that was skipped for lack of time (that is no match either). The draw is a hash of the schedule state and the cursor,
-   so it is deterministic and reproducible.
+2. **Sampling** for everything else. The rate starts at 1/4 and halves (1/8, 1/16, 1/32) after every
+   ``HALVE_AFTER`` consecutive comparisons that actually ran and matched; the floor is 1/32. The warm-up comparisons
+   count towards the streak, so the 1/4 stage lasts ``HALVE_AFTER - WARMUP_REQUESTS`` sampled matches (4) after the warm-up.
+   The rate returns to 1/4 only when a premise of the verification changes (the same list as above); an ordinary append does
+   not reset it, and neither does a comparison that was skipped for lack of time (that is no match either). The draw is a
+   hash of the schedule state and the cursor, so it is deterministic and reproducible.
 
 3. ``SELF_DIRECT_AUDIT_SHADOW_EVERY`` set to an integer pins the legacy fixed rate and switches adaptation off: ``1``
    compares every audit, ``0`` only the forced ones, ``N`` about one audit in N. The forced comparisons stay.
+
+The three constants below (1/4 down to 1/32, halving after 8 matches, a warm-up of 4) are the chair's decision on issue #18
+R2 and deviate on purpose from the roundtable's text (1/4 down to 1/64, halving after 32, a warm-up of 8), on measured
+grounds. With the roundtable's constants a session compared more of its requests than the fixed 1 in 16 had until it had run
+about 2,000 requests, so no p95 got lower in a session of a few hundred requests. A floor of 1/64 (1.6% of the requests)
+buys no percentile, since it is still above the 1% a p99 sees, and it doubles the time a silently missed violation goes
+unnoticed; 1/32 (3.1%) is below the 5% a p95 sees, which is the point of an adaptive floor. The numbers are in the README
+(``Incremental audits``) and the changelog; ``scripts/measure_shadow_detection.py --simulate`` and ``--share`` reproduce them.
 
 What this does not give: a guarantee that every response equals the full evaluation. A wrongly *clean* answer can pass
 between two comparisons; the forced comparisons narrow that (a violation that disappears and a high-risk contract are
@@ -42,9 +51,9 @@ import hashlib
 import json
 
 ADAPTIVE = "adaptive"
-RATE_DENOMINATORS = (4, 8, 16, 32, 64)     # 1/4 ... 1/64, in order of decreasing rate
-HALVE_AFTER = 32                           # consecutive compared-and-matching requests before the rate halves
-WARMUP_REQUESTS = 8                        # forced comparisons after a rebuild or a change of premise
+RATE_DENOMINATORS = (4, 8, 16, 32)         # 1/4 ... 1/32, in order of decreasing rate; the last is the floor
+HALVE_AFTER = 8                            # consecutive compared-and-matching requests before the rate halves
+WARMUP_REQUESTS = 4                        # forced comparisons after a rebuild or a change of premise
 FLAG_REQUESTS = 16                         # request kinds whose flagged contracts are remembered
 FLAGGED = ("violation", "suspicious")
 
@@ -99,6 +108,12 @@ class ShadowState:
             raise ValueError("shadow state out of range")
         return state
 
+    @classmethod
+    def unreadable(cls, epoch: int) -> "ShadowState":
+        """Stands for a stored row that cannot be read. It keeps the row's epoch, so that the fresh state that replaces it
+        wins the epoch guard of the table, and has a premise no request has, so that the next request resets."""
+        return cls(epoch=int(epoch), premise={}, reset_reason="unreadable")
+
     def copy(self) -> "ShadowState":
         return replace(self, premise=dict(self.premise), flags={k: list(v) for k, v in self.flags.items()},
                        memo=dict(self.memo) if self.memo else None)
@@ -128,7 +143,8 @@ def reconcile(state, premise):
         return fresh, "new"
     if state.premise == premise:
         return state, None
-    changed = next((key for key in premise if state.premise.get(key) != premise[key]), "premise")
+    changed = ("unreadable" if not state.premise
+               else next((key for key in premise if state.premise.get(key) != premise[key]), "premise"))
     return ShadowState(epoch=state.epoch + 1, premise=dict(premise), reset_reason=changed,
                        flags={k: list(v) for k, v in state.flags.items()}), changed
 

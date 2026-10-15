@@ -117,25 +117,37 @@ def match(state, *, full=True, key="audit", offset=1):
 
 def test_a_new_session_starts_at_one_in_four_with_the_warmup_owed():
     state = fresh()
-    assert shadow.RATE_DENOMINATORS[state.rate_index] == 4 and state.warmup == shadow.WARMUP_REQUESTS == 8
+    assert shadow.RATE_DENOMINATORS[state.rate_index] == 4 and state.warmup == shadow.WARMUP_REQUESTS == 4
     assert shadow.rate_text(state, None) == "1/4"
 
 
-def test_the_rate_halves_after_every_32_matching_comparisons_down_to_the_floor():
+def test_the_rate_halves_after_every_8_matching_comparisons_down_to_the_floor():
+    """The chair's constants (issue #18 R2): 1/4 down to 1/32, halving after 8 matches, a warm-up of 4."""
+    assert shadow.RATE_DENOMINATORS == (4, 8, 16, 32) and shadow.HALVE_AFTER == 8 and shadow.WARMUP_REQUESTS == 4
     state, seen = fresh(), []
-    for number in range(1, 32 * 6 + 1):
+    for number in range(1, 8 * 6 + 1):
         state = match(state)
-        if number in (31, 32, 63, 64, 95, 96, 127, 128, 159, 160, 192):
+        if number in (7, 8, 15, 16, 23, 24, 31, 32, 47, 48):
             seen.append((number, shadow.rate_text(state, None)))
-    assert seen == [(31, "1/4"), (32, "1/8"), (63, "1/8"), (64, "1/16"), (95, "1/16"), (96, "1/32"), (127, "1/32"),
-                    (128, "1/64"), (159, "1/64"), (160, "1/64"), (192, "1/64")]       # the floor stays the floor
-    assert shadow.RATE_DENOMINATORS == (4, 8, 16, 32, 64)
+    assert seen == [(7, "1/4"), (8, "1/8"), (15, "1/8"), (16, "1/16"), (23, "1/16"), (24, "1/32"), (31, "1/32"),
+                    (32, "1/32"), (47, "1/32"), (48, "1/32")]                          # the floor stays the floor
+
+
+def test_the_warmup_matches_count_towards_the_streak():
+    """So the 1/4 stage of a new session is the 4 sampled matches after the warm-up, not 8 more."""
+    state = fresh()
+    for _ in range(shadow.WARMUP_REQUESTS):
+        state = match(state)
+    assert (state.warmup, state.streak, shadow.rate_text(state, None)) == (0, 4, "1/4")
+    for _ in range(shadow.HALVE_AFTER - shadow.WARMUP_REQUESTS):
+        state = match(state)
+    assert (state.streak, shadow.rate_text(state, None)) == (0, "1/8")
 
 
 @pytest.mark.parametrize("component,value", [("contracts", "other"), ("parser", 4), ("evaluator", 9), ("generation", 2)])
 def test_each_change_of_premise_resets_the_rate_and_the_warmup(component, value):
     state = fresh()
-    for _ in range(40):
+    for _ in range(shadow.HALVE_AFTER + 2):
         state = match(state)
     assert state.rate_index == 1 and state.warmup == 0
     same, reason = shadow.reconcile(state, dict(state.premise))
@@ -148,7 +160,7 @@ def test_each_change_of_premise_resets_the_rate_and_the_warmup(component, value)
 
 def test_a_mismatch_resets_the_rate_and_keeps_the_flags():
     state = fresh()
-    for _ in range(40):
+    for _ in range(3 * shadow.HALVE_AFTER):
         state = match(state)
     state = shadow.settle(state, outcome="match", full_scope=True, key="audit", flagged={"a"}, kept=set(), at="t", offset=1)
     after = shadow.settle(state, outcome="mismatch", full_scope=True, key="audit", flagged={"a"}, kept=set(), at="t", offset=2)
@@ -225,15 +237,17 @@ def test_the_first_requests_are_compared_then_the_draw_decides(lab, draw):
     for _ in range(12):
         report = box.report(box.audit())
         shown.append((bool(report.get("shadow_compared")), report.get("shadow_reasons")))
-    assert [compared for compared, _ in shown] == [True] * 8 + [False] * 4
-    assert "rebuild" in shown[0][1] and "premise" in shown[0][1] and all("warmup" in why for _, why in shown[:8])
+    warm = shadow.WARMUP_REQUESTS
+    assert [compared for compared, _ in shown] == [True] * warm + [False] * (12 - warm)
+    assert "rebuild" in shown[0][1] and "premise" in shown[0][1] and all("warmup" in why for _, why in shown[:warm])
     assert box.status()["session"]["forced_comparisons_left"] == 0
 
 
 def test_the_rate_halves_in_an_engine_resets_on_each_premise_and_not_on_an_append(lab, draw, monkeypatch):
     draw.value = True
     box = lab(every="adaptive")
-    for _ in range(31):
+    half = shadow.HALVE_AFTER
+    for _ in range(half - 1):
         box.audit()
     assert box.status()["session"]["rate"] == "1/4"
     box.audit()
@@ -247,17 +261,18 @@ def test_the_rate_halves_in_an_engine_resets_on_each_premise_and_not_on_an_appen
     box.engine.upsert_contracts([{"id": "added", "type": "must_not", "scope": "tool_call", "regex": "zzz", "roles": ["assistant"]}])
     report = box.report(box.audit())
     assert report["shadow_reset"] == "contracts" and box.status()["session"]["rate"] == "1/4"
-    assert "premise" in report["shadow_reasons"] and box.status()["session"]["forced_comparisons_left"] == 7
+    assert "premise" in report["shadow_reasons"]
+    assert box.status()["session"]["forced_comparisons_left"] == shadow.WARMUP_REQUESTS - 1
     # a changed revision of one contract
     draw.value = True
-    for _ in range(32):
+    for _ in range(half - 1):                              # (the request that reset the rate was the first match)
         box.audit()
     assert box.status()["session"]["rate"] == "1/8"
     box.engine.upsert_contracts([{"id": "added", "type": "must_not", "scope": "tool_call", "regex": "zzz", "roles": ["assistant"], "severity": "high"}])
     assert box.report(box.audit())["shadow_reset"] == "contracts"
     # a new evaluator version
     draw.value = True
-    for _ in range(32):
+    for _ in range(half - 1):
         box.audit()
     assert box.status()["session"]["rate"] == "1/8"
     monkeypatch.setattr(inc, "EVALUATOR_VERSION", inc.EVALUATOR_VERSION + 1)
@@ -268,13 +283,14 @@ def test_a_new_parser_or_generation_resets_the_rate(lab, draw, monkeypatch):
     from self_directing_mcp.codex import parse
     draw.value = True
     box = lab(every="adaptive")
-    for _ in range(32):
+    half = shadow.HALVE_AFTER
+    for _ in range(half):
         box.audit()
     assert box.status()["session"]["rate"] == "1/8"
     monkeypatch.setattr(parse, "PARSER_VERSION", parse.PARSER_VERSION + 1)
     report = box.report(box.audit())
     assert report["shadow_reset"] in ("parser", "generation") and box.status()["session"]["rate"] == "1/4"
-    for _ in range(32):
+    for _ in range(half - 1):
         box.audit()
     assert box.status()["session"]["rate"] == "1/8"
     # an edit of earlier bytes is a rewrite: the session gets a new generation
@@ -309,7 +325,7 @@ def test_a_comparison_skipped_for_lack_of_time_is_no_match(lab, draw, monkeypatc
 def test_the_schedule_survives_a_restart(lab, draw, defer):
     draw.value = True
     box = lab(every="adaptive", defer=defer)
-    for _ in range(35):
+    for _ in range(shadow.HALVE_AFTER + 3):
         box.audit()
     expected = box.status()["session"]
     assert expected["rate"] == "1/8" and expected["streak"] == 3
@@ -332,6 +348,26 @@ def test_an_older_epoch_never_overwrites_a_newer_one(lab, draw):
     assert store.load_shadow_state(SID, "codex").rate_index == newer.rate_index
 
 
+def test_an_unreadable_stored_schedule_is_replaced_not_kept(lab, draw):
+    """A row that cannot be read (damaged, or written for other constants) starts the schedule again at 1/4 with its warm-up,
+    and the state that replaces it is not refused by the epoch guard of the table."""
+    draw.value = False
+    box = lab(every="adaptive")
+    box.audit()
+    store = box.engine.store
+    stale = {"premise": {}, "rate_index": 99, "streak": 0, "warmup": 0, "compared": 0}       # a rate that no longer exists
+    for text in ("{not json", json.dumps(stale), "[]"):
+        epoch = store.load_shadow_state(SID, "codex").epoch + 10
+        with store._conn:
+            store._conn.execute("UPDATE audit_shadow_state SET epoch=?, state=?", (epoch, text))
+        placeholder = store.load_shadow_state(SID, "codex")
+        assert placeholder.epoch == epoch and placeholder.reset_reason == "unreadable"
+        report = box.report(box.audit())
+        assert report["shadow_reset"] == "unreadable" and "premise" in report["shadow_reasons"]
+        restored = store.load_shadow_state(SID, "codex")
+        assert restored.epoch == epoch + 1 and restored.rate_index == 0 and restored.premise     # written, and readable
+
+
 def test_every_set_to_an_integer_pins_the_legacy_rate(lab, draw):
     draw.value = False
     box = lab(every=16)
@@ -351,9 +387,10 @@ def test_every_set_to_an_integer_pins_the_legacy_rate(lab, draw):
 
 # --- the forced comparisons -------------------------------------------------------------------------------------------
 
-def settle_in(box, count=8, checks=False):
+def settle_in(box, count=None, checks=False):
     """Use up the warm-up comparisons. With ``checks`` the action-check variant is built and warmed up as well (it keeps
     monitor states of its own, so its first request is a rebuild, which owes the warm-up again)."""
+    count = shadow.WARMUP_REQUESTS if count is None else count
     for _ in range(count):
         box.audit()
     if checks:
@@ -371,7 +408,7 @@ def test_a_rebuild_forces_a_comparison_and_the_warmup_again(lab, draw):
         box.engine.store._conn.execute("DELETE FROM audit_monitor_state")
     report = box.report(box.audit())
     assert report["shadow_compared"] and "rebuild" in report["shadow_reasons"]
-    assert box.status()["session"]["forced_comparisons_left"] == 7
+    assert box.status()["session"]["forced_comparisons_left"] == shadow.WARMUP_REQUESTS - 1
     assert box.report(box.audit())["shadow_reasons"] == ["warmup"]
 
 
@@ -472,6 +509,7 @@ def test_audit_status_reports_the_policy_and_never_calls_it_a_guarantee(lab, dra
     box.audit()
     status = box.engine.audit_status()["incremental_verification"]
     assert status["policy"] == "adaptive" and status["idle_comparison"] is None and "session" not in status
+    assert status["forced_after_premise_change"] == shadow.WARMUP_REQUESTS == 4
     assert "not a proof" in status["guarantee"]
     session = box.status()["session"]
     assert session["rate"] == "1/4" and session["comparisons"] == 1 and session["last_match_offset"] is not None

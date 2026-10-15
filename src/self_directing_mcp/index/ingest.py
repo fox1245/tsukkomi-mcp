@@ -907,7 +907,9 @@ class SessionStore:
     # -- the shadow-comparison schedule and the review ranges (audit/shadow.py, index/shadow_state.py) ----------------
 
     def load_shadow_state(self, session_id, provider):
-        """The stored schedule (a held one wins in a deferring store), or ``None``."""
+        """The stored schedule (a held one wins in a deferring store), or ``None``. A row that cannot be read (damaged, or
+        written for other constants) comes back as a placeholder that keeps its epoch (``ShadowState.unreadable``): the policy
+        starts again at 1/4 with its warm-up, and the state that replaces it is not refused by the epoch guard."""
         held = self.derived.shadow_for(provider, session_id)
         if held is not None:
             return ShadowState.load(held[0], held[1])
@@ -916,8 +918,8 @@ class SessionStore:
             return None
         try:
             return ShadowState.load(found[0], found[1])
-        except (KeyError, TypeError, ValueError):
-            return None        # an unreadable schedule is no schedule: the policy starts again at 1/4
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return ShadowState.unreadable(found[0])
 
     def save_shadow_state(self, session_id, provider, state):
         """Persist a schedule: held in a deferring store (written with the next authority commit), else committed."""

@@ -11,8 +11,8 @@ Per cell (host x event x bytes appended before each request) it reports the wall
 ``claude_hooks.run_hook`` / ``agy_hooks.run_hook``, how many durable SQLite commits a request made (an ``fsync``
 each: on this class of machine 10 to 25 ms, which is most of what is left once the CPU work is gone) and how many shadow
 comparisons ran (each is a full evaluation more: the requests that carry one are the p95 and p99 of a cell). ``--warmup N``
-sets the untimed requests before a cell; the adaptive shadow schedule compares the first 8 requests after a rebuild, so
-``--warmup 12`` times a session past them. With
+sets the untimed requests before a cell; the adaptive shadow schedule compares the first 4 requests after a rebuild and
+then a sample that starts at 1/4 and thins out, so ``--warmup 12`` times a session past the forced comparisons. With
 ``--profile`` it also prints a ``cProfile`` of one cell; with ``--spans`` the inclusive wall time of the stages the
 judgement is made of (per request, so the numbers add up to the request time where the spans do not nest).
 
@@ -241,7 +241,7 @@ def main(argv=None) -> int:
                                                "setting's default)")
     parser.add_argument("--warmup", type=int, default=3,
                         help="untimed requests per cell before the timed ones (default 3). The adaptive shadow schedule "
-                             "compares the first 8 requests after a rebuild; --warmup 12 times a session past that")
+                             "compares the first 4 requests after a rebuild; --warmup 12 times a session past that")
     parser.add_argument("--min-events", type=int, help="SELF_DIRECT_AUDIT_INCREMENTAL_MIN_EVENTS")
     parser.add_argument("--tmpdir", help="directory for the index and the sessions (e.g. a RAM disk)")
     parser.add_argument("--only", default="", help="comma list of host:event cells (default: all four)")
