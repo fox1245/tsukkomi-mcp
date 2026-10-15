@@ -40,6 +40,11 @@ jobs:
           tests/test_windows_session_paths.py
           tests/test_journal.py
           tests/test_graph_host_extraction.py
+          tests/test_slice_capture.py
+          tests/test_slice_equivalence.py
+          tests/test_slice_settings.py
+          tests/test_slice_flight.py
+          tests/test_slice_adapters.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
           tests/test_codex_zstd.py
@@ -104,6 +109,13 @@ jobs:
           tests/test_shadow_schedule.py
           tests/test_shadow_detection.py
           tests/test_shadow_review.py
+          tests/test_slice_capture.py
+          tests/test_slice_equivalence.py
+          tests/test_slice_faults.py
+          tests/test_slice_convergence.py
+          tests/test_slice_settings.py
+          tests/test_slice_flight.py
+          tests/test_slice_adapters.py
           tests/test_runtime_threads.py
           --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file
 
