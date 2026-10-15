@@ -19,6 +19,9 @@ from self_directing_mcp.index.sparse import SparseFormatError, SparseIndex
 from sparse_support import sha256
 from test_reliability import SID, message, write
 
+pytestmark = pytest.mark.skipif(sparse_module.compact_support() is not None,
+                                reason=f"this SQLite cannot use the compact format: {sparse_module.compact_support()}")
+
 WORDS = ["alpha", "beta", "gamma"]
 
 

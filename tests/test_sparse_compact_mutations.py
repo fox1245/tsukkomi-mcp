@@ -12,7 +12,8 @@ from self_directing_mcp.security.mask import mask_secrets
 from sparse_support import Doc, SECRET, assert_same_results, corpus, pair, queries
 
 original = {name: getattr(CompactSparseIndex, name) for name in ("search", "_drop", "_add", "clear", "upsert_many", "delete_ids")}
-assert sparse_module.compact_support() is None      # the feature probe is cached per process: prove it before anything is broken
+pytestmark = pytest.mark.skipif(sparse_module.compact_support() is not None,       # also warms the cached feature probe before anything is broken
+                                reason=f"this SQLite cannot use the compact format: {sparse_module.compact_support()}")
 
 
 def scenario(tmp_path):

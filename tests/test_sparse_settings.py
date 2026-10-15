@@ -9,6 +9,7 @@ import pytest
 from self_directing_mcp import settings_core
 from self_directing_mcp.config import Settings, hook_settings
 from self_directing_mcp.engine import SelfDirectEngine
+from self_directing_mcp.index.sparse import compact_support
 from self_directing_mcp.settings_core import load_hook_settings
 
 
@@ -45,7 +46,13 @@ def test_an_unknown_format_is_an_error_in_both_readers_not_a_default(clean, valu
         load_hook_settings()
 
 
-@pytest.mark.parametrize("value,expected", [("legacy", "legacy"), ("compact", "compact"), ("auto", "compact")])
+SUPPORTED = compact_support() is None
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("legacy", "legacy"),
+    pytest.param("compact", "compact", marks=pytest.mark.skipif(not SUPPORTED, reason="this SQLite cannot use the compact format")),
+    ("auto", "compact" if SUPPORTED else "legacy")])
 def test_the_setting_decides_which_file_the_engine_opens(clean, tmp_path, value, expected):
     engine = SelfDirectEngine(Settings(index_dir=tmp_path / "index", sparse_format=value, use_fake_embedder=True,
                                        dense_backend="numpy", _env_file=None))

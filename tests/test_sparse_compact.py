@@ -14,6 +14,8 @@ from self_directing_mcp.index.sparse import (
 )
 from sparse_support import Doc, SECRET, assert_same_results, build, corpus, pair, queries, sha256
 
+pytestmark = pytest.mark.skipif(compact_support() is not None, reason=f"this SQLite cannot use the compact format: {compact_support()}")
+
 
 def both(legacy, compact, method, *args, **kwargs):
     getattr(legacy, method)(*args, **kwargs)
