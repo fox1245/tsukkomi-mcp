@@ -13,6 +13,7 @@ from urllib.parse import quote
 import numpy as np
 import pytest
 
+from dense_support import exact_cosine
 from pgvector_fakes import FakeDbError, FakeDriver, FakeInfo, FakeServer
 from self_directing_mcp.index import pgvector
 from self_directing_mcp.index.pgvector import (
@@ -193,7 +194,7 @@ def test_search_filters_before_the_limit_and_breaks_ties_by_id_in_byte_order():
     index, driver, server = make()
     index.upsert_many([(f"c{n}", unit(seed=n)) for n in range(6)])
     index.search(unit(seed=3), 4, {"c1", "c2", "c3"})
-    sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, embedding <=>")][-1]
+    sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, ") and " AS distance FROM " in entry[0]][-1]
     assert sql.index("WHERE chunk_id = ANY(string_to_array(%(blob)s::text, chr(31)) || %(odd)b::text[])") < sql.index("ORDER BY") < sql.index("LIMIT")
     assert 'ORDER BY distance, chunk_id COLLATE "C" LIMIT' in sql
     assert sorted(params["blob"].split("\x1f")) == ["c1", "c2", "c3"] and params["odd"] == [] and params["k"] == 4
@@ -217,30 +218,111 @@ def test_a_zero_vector_scores_zero_like_the_other_backends():
     assert scores["zero"] == 0.0 and np.isfinite(list(scores.values())).all()
 
 
-def test_the_planner_is_pushed_to_scan_when_the_filter_is_a_large_part_of_the_table():
-    index, driver, server = make(FakeServer(dim=4, reltuples=90))
-    index.upsert_many([(f"c{n}", unit(seed=n)) for n in range(9)])
-    index.search(unit(), 3, {"c1", "c2"})
-    assert arm_statements(server)[-1][1][4] == "on"           # 2 of 90: look the ids up
-    index.search(unit(), 3, {f"c{n}" for n in range(9)} | {f"x{n}" for n in range(20)})
-    assert arm_statements(server)[-1][1][4] == "on"           # 29 of 90: still looked up
-    index.search(unit(), 3, {f"c{n}" for n in range(9)} | {f"x{n}" for n in range(21)})
-    assert arm_statements(server)[-1][1][4] == "off"          # 30 of 90 (a third): one scan with a hashed filter
-    index2, _d2, server2 = make(FakeServer(dim=4))            # never analyzed: the planner decides alone
-    index2.search(unit(), 3, {"c1"})
-    assert arm_statements(server2)[-1][1][4] == "on"
+def selects(server):
+    return [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, ") and " AS distance FROM " in entry[0]]
+
+
+def filled(count, *, reltuples, dim=4, seed=0):
+    index, driver, server = make(FakeServer(dim=dim, reltuples=reltuples), dim=dim)
+    ids = [f"c{n:04d}" for n in range(count)]
+    vectors = np.stack([unit(dim, seed * 100_000 + n) for n in range(count)])
+    index.upsert_many(list(zip(ids, vectors)))
+    server.log.clear()
+    return index, driver, server, ids, vectors
+
+
+def expected_top(ids, vectors, query, k, allowed):
+    scores = exact_cosine(vectors, query)
+    pool = sorted((n for n, cid in enumerate(ids) if cid in allowed), key=lambda n: (-scores[n], ids[n]))[:k]
+    return [(ids[n], scores[n]) for n in pool]
+
+
+def test_a_filter_that_names_a_large_part_of_the_table_is_applied_after_one_unfiltered_scan_and_sends_no_ids():
+    index, _driver, server, ids, vectors = filled(100, reltuples=100)
+    query = unit(seed=3)
+    allowed = {cid for n, cid in enumerate(ids) if n % 2 == 0}                   # half of the table
+    hits = index.search(query, 5, allowed)
+    [(sql, params)] = selects(server)
+    assert "WHERE" not in sql and "blob" not in params and params["k"] == int(5 / 0.5 * 1.5) + 50
+    expected = expected_top(ids, vectors, query, 5, allowed)
+    assert [cid for cid, _ in hits] == [cid for cid, _ in expected]
+    assert [score for _cid, score in hits] == pytest.approx([score for _cid, score in expected], abs=1e-6)
+
+
+def test_the_scan_is_widened_until_enough_allowed_rows_are_in_hand_and_the_answer_stays_exact():
+    index, _driver, server, ids, vectors = filled(400, reltuples=400)
+    query = unit(seed=7)
+    scores = exact_cosine(vectors, query)
+    worst = {ids[n] for n in np.argsort(scores)[:120]}                          # the allowed rows rank last of all
+    hits = index.search(query, 10, worst)
+    assert [params["k"] for _sql, params in selects(server)] == [100, 400]      # 4 times as many rows the second time
+    expected = expected_top(ids, vectors, query, 10, worst)
+    assert [cid for cid, _ in hits] == [cid for cid, _ in expected]
+
+
+def test_a_table_smaller_than_its_statistics_is_exhausted_not_rescanned():
+    index, _driver, server, ids, vectors = filled(40, reltuples=100)
+    allowed = set(ids[:30]) | {f"x{n}" for n in range(30)}
+    hits = index.search(unit(seed=2), 10, allowed)
+    assert len(selects(server)) == 1 and len(hits) == 10
+    only_three = set(ids[:3]) | {f"x{n}" for n in range(60)}
+    server.log.clear()
+    assert len(index.search(unit(seed=2), 10, only_three)) == 3 and len(selects(server)) == 1
+
+
+def test_after_three_scans_that_were_not_enough_the_ids_are_sent_and_the_answer_is_still_exact():
+    index, _driver, server, ids, vectors = filled(2000, reltuples=2000)
+    query = unit(seed=11)
+    allowed = {ids[1500], ids[1700], ids[1999]} | {f"not-stored-{n}" for n in range(497)}      # 500 ids, 3 of them stored
+    hits = index.search(query, 5, allowed)
+    sent = selects(server)
+    assert [params["k"] for _sql, params in sent[:3]] == [80, 320, 1280] and "blob" in sent[3][1] and len(sent) == 4
+    assert {cid for cid, _ in hits} == {ids[1500], ids[1700], ids[1999]}
+    expected = expected_top(ids, vectors, query, 5, allowed)
+    assert [cid for cid, _ in hits] == [cid for cid, _ in expected]
+
+
+def test_a_small_filter_or_an_unknown_table_size_sends_the_ids():
+    index, _driver, server, ids, _vectors = filled(100, reltuples=100)
+    index.search(unit(), 5, set(ids[:10]))                                      # 10 % of the table
+    assert "blob" in selects(server)[-1][1] and len(selects(server)) == 1
+    index, _driver, server, ids, _vectors = filled(100, reltuples=-1)           # never analyzed: nothing to judge by
+    index.search(unit(), 5, set(ids))
+    assert "blob" in selects(server)[-1][1] and len(selects(server)) == 1
+
+
+def test_the_scan_after_the_filter_is_never_the_hnsw_index_and_a_bad_vector_fails_before_any_scan():
+    server = FakeServer(dim=4, reltuples=10, has_index=True)
+    index, driver, server = make(server, hnsw=True)
+    ids = [f"c{n}" for n in range(10)]
+    index.upsert_many([(cid, unit(seed=n)) for n, cid in enumerate(ids)])
+    server.log.clear()
+    index.search(unit(), 3, set(ids))
+    assert 'chunk_id COLLATE "C"' in selects(server)[0][0] and not any("hnsw.ef_search" in entry[0] for entry in server.log)
+    server.log.clear()
+    with pytest.raises(ValueError):
+        index.search([1, 2], 3, set(ids))
+    assert selects(server) == []
+
+
+def test_a_filter_without_a_length_is_accepted():
+    index, _driver, server, ids, vectors = filled(20, reltuples=20)
+    hits = index.search(unit(seed=1), 3, (cid for cid in ids[::2]))
+    assert len(hits) == 3 and all(cid in ids[::2] for cid, _ in hits)
 
 
 def test_hnsw_serves_only_unfiltered_searches():
     index, driver, server = make(FakeServer(dim=4, has_index=True), hnsw=True)
     index.upsert_many([(f"c{n}", unit(seed=n)) for n in range(4)])
     index.search(unit(), 3)
-    sql = [entry[0] for entry in server.log if entry[0].startswith("SELECT chunk_id, embedding <=>")][-1]
+    sql = [entry[0] for entry in server.log if entry[0].startswith("SELECT chunk_id, ") and " AS distance FROM " in entry[0]][-1]
     assert "chunk_id COLLATE" not in sql and any("hnsw.ef_search" in entry[0] for entry in server.log)
+    assert "embedding <=> %(q)b::vector AS distance" in sql and "+ 0" not in sql          # the index can serve this one
     server.log.clear()
     index.search(unit(), 3, {"c1", "c2"})
-    sql = [entry[0] for entry in server.log if entry[0].startswith("SELECT chunk_id, embedding <=>")][-1]
+    sql = [entry[0] for entry in server.log if entry[0].startswith("SELECT chunk_id, ") and " AS distance FROM " in entry[0]][-1]
     assert 'chunk_id COLLATE "C"' in sql and not any("hnsw.ef_search" in entry[0] for entry in server.log)
+    assert "(embedding <=> %(q)b::vector) + 0 AS distance" in sql                          # never ordered by an HNSW index
 
 
 # --- the schema ---------------------------------------------------------------------------------------------------------
@@ -610,7 +692,7 @@ def test_a_filter_travels_as_one_text_parameter_and_separator_ids_as_an_array():
     index.upsert_many([("a", unit(seed=1)), ("b", unit(seed=2)), (odd, unit(seed=3))])
     hits = index.search(unit(seed=3), 5, {"a", odd})
     assert {cid for cid, _ in hits} == {"a", odd}
-    _sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, embedding <=>")][-1]
+    _sql, params = [entry for entry in server.log if entry[0].startswith("SELECT chunk_id, ") and " AS distance FROM " in entry[0]][-1]
     assert params["blob"] == "a" and params["odd"] == [odd]
     assert PgVectorIndex._filter_parameters(["x", "y", "z"]) == ("x\x1fy\x1fz", [])
     assert PgVectorIndex._filter_parameters([]) == ("", [])

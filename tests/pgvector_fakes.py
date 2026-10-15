@@ -179,7 +179,7 @@ class FakeServer:
 
     def answer(self, connection, sql, params) -> FakeResult:
         if "set_config('statement_timeout'" in sql:
-            return FakeResult([(None, None, None, None, self.reltuples if self.reltuples >= 0 else None)])
+            return FakeResult([(None, None, self.reltuples if self.reltuples >= 0 else None)])
         if "FROM pg_extension" in sql:
             if self.extension is None:
                 return FakeResult([])
@@ -211,7 +211,7 @@ class FakeServer:
                 connection.snapshot, connection.in_transaction = dict(self.rows), True
             self.rows = {}
             return FakeResult([])
-        if sql.startswith("SELECT chunk_id, embedding <=> "):
+        if sql.startswith("SELECT chunk_id, ") and " AS distance FROM " in sql:
             query = params["q"].array()
             allowed = None
             if "blob" in params:                                  # the filter: ids joined by chr(31), plus the odd ones

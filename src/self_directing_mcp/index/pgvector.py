@@ -61,7 +61,9 @@ UPSERT_BATCH = 256              # rows per ``executemany`` round (all in the cal
 PRESENT_BATCH = 2000            # ids per ``present`` / ``delete_ids`` statement
 NO_DEADLINE_TIMEOUT_MS = 300_000    # statement and lock timeout when the caller has no request deadline
 CONNECT_TIMEOUT_SEC = 10
-SEQ_SCAN_ID_RATIO = 3           # a filter of at least 1/3 of the table is scanned, not looked up id by id (see search)
+POSTFILTER_MIN_SHARE = 0.25     # a filter naming at least this share of the table is applied after an unfiltered scan (search)
+POSTFILTER_ROUNDS = 3           # unfiltered scans a search may try, each asking for 4 times as many rows, before it sends the ids
+POSTFILTER_GROWTH = 4
 MIN_HNSW_EXTENSION = (0, 5, 0)  # the first pgvector release with HNSW indexes
 SECURE_SSLMODE = "verify-full"
 ID_SEPARATOR = "\x1f"                  # joins a large filter into one text parameter (see _filter_parameters)
@@ -268,7 +270,8 @@ class PgVectorIndex(VectorIndex):
             raise PgVectorConfigError("The pgvector dense backend has no server to connect to. Set " + ENVIRONMENT_HINT + ".")
         self._driver = driver if driver is not None else PsycopgDriver()
         self._lock = threading.RLock()
-        self._conn = None               # also what ``SelfDirectEngine.close`` closes
+        self._conn = None
+        self._peer: dict = {}           # host, port and database of the open connection, noted when it was made
         self.extension_version: str | None = None
         self.server_version: str | None = None
         self.compute_backend: str | None = None
@@ -346,30 +349,29 @@ class PgVectorIndex(VectorIndex):
         return max(1, min(int(math.ceil(remaining * 1000)), 2_147_483_647))
 
     ARM = ("SELECT set_config('statement_timeout', %s, %s), set_config('lock_timeout', %s, %s), "
-           "set_config('enable_indexscan', %s, %s), set_config('enable_bitmapscan', %s, %s), "
            "(SELECT c.reltuples::bigint FROM pg_class c WHERE c.oid = to_regclass(%s))")
 
-    def _arm_parameters(self, timeout_ms: int | None, local: bool, scan: bool) -> tuple:
-        """The time the request has left, and whether the planner may look rows up by index (it may not when ``scan``)."""
-        value, flag = str(self._timeout_ms(timeout_ms)), "off" if scan else "on"
-        return (value, local, value, local, flag, local, flag, local, self._table)
+    def _arm_parameters(self, timeout_ms: int | None, local: bool) -> tuple:
+        """The time the request has left, for both limits (``SET LOCAL`` in a transaction, the session for a read)."""
+        value = str(self._timeout_ms(timeout_ms))
+        return (value, local, value, local, self._table)
 
     def _noted(self, row) -> int | None:
-        rows = row[4] if row is not None else None
+        rows = row[2] if row is not None else None
         self._table_rows = rows if rows is not None and rows >= 0 else None
         return self._table_rows
 
-    def _arm(self, connection, timeout_ms: int | None = None, *, scan: bool = False) -> int | None:
+    def _arm(self, connection, timeout_ms: int | None = None) -> int | None:
         """Bind the remaining request time to the statements of the open transaction (``SET LOCAL``). Returns the
         planner's row count of the table, ``None`` before its first ANALYZE."""
-        return self._noted(connection.execute(self.ARM, self._arm_parameters(timeout_ms, True, scan)).fetchone())
+        return self._noted(connection.execute(self.ARM, self._arm_parameters(timeout_ms, True)).fetchone())
 
-    def _read(self, connection, statement: str, params=None, *, scan: bool = False, before: Sequence = ()):
+    def _read(self, connection, statement: str, params=None, *, before: Sequence = ()):
         """One read on an autocommit connection, armed with the time left, in a single network round trip.
 
         ``before`` are further statements (``(sql, params)``) queued ahead of it, in the same round trip."""
         with self._driver.pipeline(connection):
-            armed = connection.execute(self.ARM, self._arm_parameters(None, False, scan))
+            armed = connection.execute(self.ARM, self._arm_parameters(None, False))
             for sql, values in before:
                 connection.execute(sql, values)
             cursor = connection.execute(statement, params)
@@ -444,6 +446,9 @@ class PgVectorIndex(VectorIndex):
             with suppress(Exception):
                 connection.close()
             raise
+        info = getattr(connection, "info", None)
+        self._peer = {"host": getattr(info, "host", None), "port": getattr(info, "port", None),
+                      "dbname": getattr(info, "dbname", None)}
         self._conn = connection
         return connection
 
@@ -803,12 +808,12 @@ class PgVectorIndex(VectorIndex):
                                    (doomed[start:start + PRESENT_BATCH],))
         self._run(operation, write=True)
 
-    def _plan(self, query, top_k: int, allowed_ids):
-        """The statement a search runs: ``(statement, params, before, approximate, allowed)``; ``allowed`` is the sanitized
-        filter (``None`` for no filter, an empty list when nothing can match)."""
+    def _plan(self, query, top_k: int, allowed_ids, *, exact: bool = False):
+        """The statement a search runs: ``(statement, params, before, allowed)``; ``allowed`` is the sanitized filter
+        (``None`` for no filter, an empty list when nothing can match). ``exact`` never uses the HNSW index."""
         allowed = None if allowed_ids is None else self._lookup_ids(allowed_ids)
         probe = self._driver.vector(self._pack(query))
-        approximate = self.hnsw and allowed is None
+        approximate = self.hnsw and allowed is None and not exact
         where = ("" if allowed is None else
                  "WHERE chunk_id = ANY(string_to_array(%(blob)s::text, chr(31)) || %(odd)b::text[]) ")
         # ``ORDER BY distance, chunk_id`` is the exact scan with a deterministic tie-break (it cannot use an HNSW index);
@@ -816,42 +821,25 @@ class PgVectorIndex(VectorIndex):
         # server computes it once per row (``1.0 - (a <=> b)`` in the select list made it twice, 16 % slower at 50 000 rows);
         # the score is ``1 - distance``, computed here.
         order = "distance" + ("" if approximate else ', chunk_id COLLATE "C"')
-        statement = (f"SELECT chunk_id, embedding <=> %(q)b::vector AS distance FROM {self._table} {where}"
+        # ``+ 0`` keeps an exact search off an HNSW index that happens to exist: with it the planner may order by the index
+        # (it trusts it) and apply the id filter to what the index returns, which is approximate and can return fewer than
+        # ``top_k`` rows. The sort key no longer matches the index's operator, so only the table and its primary key are used.
+        distance = "embedding <=> %(q)b::vector" if approximate else "(embedding <=> %(q)b::vector) + 0"
+        statement = (f"SELECT chunk_id, {distance} AS distance FROM {self._table} {where}"
                      f"ORDER BY {order} LIMIT %(k)s")
         params = {"q": probe, "k": int(top_k)}
         if allowed is not None:
             params["blob"], params["odd"] = self._filter_parameters(allowed)
         before = []
         if approximate:
-            # pgvector's own default (40) gave a recall@20 of 0.83 at 300 000 clustered vectors, 100 gave 0.95 for 0.3 ms more
+            # pgvector's own default (40) gave a recall@20 of 0.81 at 300 000 clustered vectors, 100 gave 0.91 for 0.2 ms more
             # (README, "pgvector numbers")
             ef = self.hnsw_ef_search or min(1000, max(100, 4 * int(top_k)))
             before.append(("SELECT set_config('hnsw.ef_search', %s, false)", (str(ef),)))
-        return statement, params, before, approximate, allowed
+        return statement, params, before, allowed
 
-    def _scan_wanted(self, approximate: bool, allowed) -> bool:
-        """Whether the planner should scan the table (hashed filter) instead of looking the filter's ids up one by one.
-
-        The planner prices a lookup per id too low when the filter is a large part of the table: at 50 000 rows one scan
-        with a hashed filter took 0.57 times as long as the planner's id-by-id lookups for a filter of every row, and as
-        long for a third of them (README, "pgvector numbers"). The table's row count is the one the previous read noted
-        (none before the first ANALYZE: then the planner decides alone)."""
-        rows = self._table_rows
-        return bool(not approximate and allowed is not None and rows is not None
-                    and len(allowed) * SEQ_SCAN_ID_RATIO >= rows)
-
-    @request_operation
-    def search(self, query, top_k: int = 20, allowed_ids: set[str] | None = None) -> list[tuple[str, float]]:
-        check_request()
-        if top_k <= 0:
-            return []
-        statement, params, before, approximate, allowed = self._plan(query, top_k, allowed_ids)
-        if allowed is not None and not allowed:
-            return []
-
-        def operation(connection):
-            return self._read(connection, statement, params, scan=self._scan_wanted(approximate, allowed), before=before)
-        rows = self._run(operation)
+    @staticmethod
+    def _scored(rows) -> list[tuple[str, float]]:
         out = []
         for item_id, distance in rows:
             check_request()
@@ -859,17 +847,60 @@ class PgVectorIndex(VectorIndex):
             out.append((item_id, 1.0 - float(distance) if distance is not None and math.isfinite(distance) else 0.0))
         return out
 
+    def _search_after_scan(self, query, top_k: int, allowed_ids, table_rows: int):
+        """A filter that names a large part of the table, applied after an unfiltered exact scan: the top ``m`` rows of the
+        whole table are fetched and the ids that are not allowed are dropped here, with ``m`` grown until ``top_k`` allowed
+        rows are in hand or the table is exhausted. That is exact (an allowed row ranked above the last one found is among
+        the ``m`` rows) and it sends no ids. Returns ``None`` after ``POSTFILTER_ROUNDS`` scans that were not enough (the
+        filter was not as large a part of the table as it looked): the caller then sends the ids.
+
+        The ids are not sent for a filter that names a quarter of the table or more because sending them costs more than the
+        scan: with 65-character ids a hashed filter made the scan 4 times slower at 100 000 rows, and looking 50 000 ids up
+        took 146 ms against 72 ms for the scan (README, "pgvector numbers")."""
+        allowed = allowed_ids if isinstance(allowed_ids, (set, frozenset)) else set(allowed_ids)
+        share = max(0.05, min(1.0, len(allowed) / max(1, table_rows)))
+        limit = int(top_k / share * 1.5) + 50
+        for _round in range(POSTFILTER_ROUNDS):
+            check_request()
+            statement, params, _before, _allowed = self._plan(query, limit, None, exact=True)
+            rows = self._run(lambda connection: self._read(connection, statement, params))
+            hits = [row for row in rows if row[0] in allowed]
+            if len(hits) >= top_k or len(rows) < limit:         # enough, or the whole table has been seen
+                return self._scored(hits[:top_k])
+            limit *= POSTFILTER_GROWTH
+        return None
+
+    @request_operation
+    def search(self, query, top_k: int = 20, allowed_ids: set[str] | None = None) -> list[tuple[str, float]]:
+        check_request()
+        if top_k <= 0:
+            return []
+        if allowed_ids is not None:
+            if not hasattr(allowed_ids, "__len__"):
+                allowed_ids = set(allowed_ids)
+            if len(allowed_ids) == 0:
+                return []
+            rows = self._table_rows                              # the planner's count, noted by the previous read
+            if rows and len(allowed_ids) >= POSTFILTER_MIN_SHARE * rows:
+                self._pack(query)                                # a bad vector is an error before any scan
+                found = self._search_after_scan(query, int(top_k), allowed_ids, rows)
+                if found is not None:
+                    return found
+        statement, params, before, allowed = self._plan(query, top_k, allowed_ids)
+        if allowed is not None and not allowed:
+            return []
+        return self._scored(self._run(lambda connection: self._read(connection, statement, params, before=before)))
+
     @request_operation
     def explain(self, query, top_k: int = 20, allowed_ids: set[str] | None = None) -> list[str]:
-        """The server's plan (``EXPLAIN``, no execution) for the statement ``search`` would run: what an operator checks to
-        see whether the HNSW index, an index lookup of the filter or a scan serves a search."""
-        statement, params, before, approximate, allowed = self._plan(query, top_k, allowed_ids)
+        """The server's plan (``EXPLAIN``, no execution) for the statement ``search`` sends with its ids (an index lookup of
+        the filter, or the HNSW index for no filter): what an operator checks to see how a search is served."""
+        statement, params, before, _allowed = self._plan(query, top_k, allowed_ids)
 
         def operation(connection):
-            scan = self._scan_wanted(approximate, allowed)
             statements = list(before) + [("EXPLAIN " + statement, params)]
             with self._driver.pipeline(connection):
-                armed = connection.execute(self.ARM, self._arm_parameters(None, False, scan))
+                armed = connection.execute(self.ARM, self._arm_parameters(None, False))
                 for sql, values in statements[:-1]:
                     connection.execute(sql, values)
                 cursor = connection.execute(*statements[-1])
@@ -886,18 +917,21 @@ class PgVectorIndex(VectorIndex):
     # -- status ----------------------------------------------------------------------------------------------------------
 
     def describe(self) -> dict:
-        """What ``audit_status`` shows: no user, no password, no connection options."""
+        """What ``audit_status`` shows: no user, no password, no connection options. It reads what was noted when the
+        connection was made, never the connection itself, which another thread may be using."""
         try:
             parsed = self._parsed()
         except PgVectorConfigError:
             parsed = {}
-        env = os.environ
-        connection = self._conn
-        info = getattr(connection, "info", None) if connection is not None else None
-        host = getattr(info, "host", None) or parsed.get("host") or env.get("PGHOST")
-        port = getattr(info, "port", None) or parsed.get("port") or env.get("PGPORT") or 5432
-        database = getattr(info, "dbname", None) or parsed.get("dbname") or env.get("PGDATABASE")
-        return {"backend": "pgvector", "host": host, "port": int(port), "database": database, "schema": self.schema,
+        env, peer = os.environ, self._peer
+        host = peer.get("host") or parsed.get("host") or env.get("PGHOST")
+        port = peer.get("port") or parsed.get("port") or env.get("PGPORT") or 5432
+        database = peer.get("dbname") or parsed.get("dbname") or env.get("PGDATABASE")
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            port = str(port)                    # several hosts: "5432,5433"
+        return {"backend": "pgvector", "host": host, "port": port, "database": database, "schema": self.schema,
                 "extension_version": self.extension_version, "server_version": self.server_version,
                 "dimension": self.dim, "policy": self.policy, "hnsw": self.hnsw, "tls": self._tls,
-                "loopback": _is_loopback(host), "connected": connection is not None}
+                "loopback": _is_loopback(host), "connected": self._conn is not None}

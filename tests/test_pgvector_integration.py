@@ -213,6 +213,38 @@ def test_a_plan_shows_neither_the_query_vector_nor_the_ids(make_index, pgvector_
     assert ids[0] not in plan and "[0." not in plan and "[-0." not in plan and "{c0" not in plan
 
 
+def test_both_ways_of_applying_a_filter_give_the_same_answer(make_index, pgvector_server, pg_schema):
+    """A filter that names a quarter of the table or more is applied after an unfiltered scan (no ids are sent); a smaller
+    one, or an unknown table size, sends the ids. Same hits, same order, same scores."""
+    index = make_index(16)
+    ids, matrix = fill(index, 8000, 16, seed=21)
+    pgvector_server.execute(f"ANALYZE {table(pg_schema)}")
+    rng = np.random.default_rng(3)
+    for size in (2000, 4000, 7999, 8000):
+        allowed = {ids[n] for n in rng.choice(len(ids), size=size, replace=False)} | {"unknown-id-1", "unknown-id-2"}
+        query = normalized_vectors(1, 16, size)[0]
+        index.count()                                                     # notes the planner's row count
+        sent_ids = []
+        original = index._plan
+
+        def spy(*args, _original=original, **kwargs):
+            plan = _original(*args, **kwargs)
+            sent_ids.append("blob" in plan[1])
+            return plan
+        index._plan = spy
+        after_scan = index.search(query, 20, allowed)
+        index._table_rows = None                                          # forget the size: the ids are sent
+        with_ids = index.search(query, 20, allowed)
+        index._plan = original
+        assert sent_ids == [False, True], sent_ids
+        assert [cid for cid, _ in after_scan] == [cid for cid, _ in with_ids]
+        assert [score for _cid, score in after_scan] == pytest.approx([score for _cid, score in with_ids], abs=1e-9)
+    worst = {ids[n] for n in np.argsort(exact_cosine(matrix, query))[:3000]}      # the allowed rows rank last: the scan widens
+    index.count()
+    scores = exact_cosine(matrix, query)
+    assert_same_topk(index.search(query, 20, worst), ids, scores, 20, allowed=worst, label="widened scan")
+
+
 def test_a_very_large_filter_is_answered_exactly(make_index, pgvector_server, pg_schema):
     index = make_index(16)
     ids, matrix = fill(index, 20_000, 16, seed=6)
@@ -570,6 +602,16 @@ def test_an_hnsw_index_can_be_built_on_demand_for_an_existing_table(make_index, 
     assert "chunk_vectors_embedding_hnsw" in names
     with_hnsw = make_index(16, hnsw=True)                                 # an existing index is adopted, not rebuilt
     assert with_hnsw.count() == 500
+    # an index object that did not ask for HNSW stays exact, however the planner would like to use the index that exists
+    ids, matrix = make_ids(500), normalized_vectors(500, 16, 3)
+    pgvector_server.execute(f"ANALYZE {table(pg_schema)}")
+    for seed in range(5):
+        query = normalized_vectors(1, 16, 70 + seed)[0]
+        scores = exact_cosine(matrix, query)
+        assert_same_topk(index.search(query, 20), ids, scores, 20, label="exact beside an HNSW index")
+        allowed = {ids[n] for n in range(0, 500, 3)}
+        assert_same_topk(index.search(query, 20, allowed), ids, scores, 20, allowed=allowed, label="filtered beside an index")
+        assert "hnsw" not in "\n".join(index.explain(query, 20)) and "hnsw" not in "\n".join(index.explain(query, 20, allowed))
 
 
 # --- a real stop, last: the container is restarted afterwards ------------------------------------------------------------
