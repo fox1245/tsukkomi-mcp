@@ -99,14 +99,15 @@ class AuditEvidenceSnapshot:
         return [item.model_dump(mode="json") for item in ChecklistDocument.model_validate_json(self.checklist_raw).items]
 
     def event_frames(self, session_id, provider):
-        frames = []
-        for order, chunk in enumerate(self.list_chunks(session_id, provider)):
-            meta = chunk.meta
-            frames.append({"chunk_id": chunk.chunk_id, "order": order, "kind": chunk.kind,
-                           "text": chunk.text, "timestamp": chunk.timestamp,
-                           "tool_name": meta.get("tool_name"), "success": meta.get("success"),
-                           "error_text": meta.get("error") or meta.get("error_text")})
-        return frames
+        return [_event_frame(order, chunk) for order, chunk in enumerate(self.list_chunks(session_id, provider))]
+
+
+def _event_frame(order, chunk):
+    """The one shape of a normalized event row: what time-series analysis and the graph batches read."""
+    meta = chunk.meta or {}
+    return {"chunk_id": chunk.chunk_id, "order": order, "kind": chunk.kind, "text": chunk.text,
+            "timestamp": chunk.timestamp, "tool_name": meta.get("tool_name"), "success": meta.get("success"),
+            "error_text": meta.get("error") or meta.get("error_text")}
 
 
 _BATCH = 500
@@ -1288,21 +1289,40 @@ class SessionStore:
         rows = self._conn.execute(
             """SELECT data FROM session_events WHERE provider=? AND session_id=?
                ORDER BY byte_start, sub_index""", (provider, session_id))
-        frames = []
-        for order, row in enumerate(rows):
-            chunk = Chunk.model_validate_json(row["data"])
-            meta = chunk.meta or {}
-            frames.append({
-                "chunk_id": chunk.chunk_id,
-                "order": order,
-                "kind": chunk.kind,
-                "text": chunk.text,
-                "timestamp": chunk.timestamp,
-                "tool_name": meta.get("tool_name"),
-                "success": meta.get("success"),
-                "error_text": meta.get("error") or meta.get("error_text"),
-            })
-        return frames
+        return [_event_frame(order, Chunk.model_validate_json(row["data"])) for order, row in enumerate(rows)]
+
+    def event_frames_range(self, session_id, provider, start, max_events, max_chars=None, *, cost=None):
+        """``event_frames(session_id, provider)[start:]``, cut after a batch: the same frames with the same ``order``
+        numbering, but only the rows of the batch are read and parsed, however long the session is.
+
+        Frames are taken in event order from ``start`` while there are at most ``max_events`` of them and, when
+        ``max_chars`` is given, their summed ``cost(frame)`` (default: the length of the text) stays within it. The
+        first frame that would not fit is returned as ``blocked`` and never cut; with no frame taken it is the
+        event that alone exceeds the budget. Returns ``(frames, blocked)``; ``blocked`` is ``None`` when the batch
+        ended by count or at the end of the session. The ``start`` rows before the batch are stepped over in the
+        ``events_session`` index and their data is not read. One read boundary covers the whole read.
+        """
+        if start < 0 or max_events < 1:
+            raise ValueError("start must be >= 0 and max_events >= 1")
+        cost = cost or (lambda frame: len(frame["text"]))
+        check_request()
+        with self._read_boundary():
+            rows = self._conn.execute(
+                "SELECT data FROM session_events WHERE provider=? AND session_id=?"
+                " ORDER BY byte_start, sub_index LIMIT ? OFFSET ?", (provider, session_id, max_events, start))
+            frames, size = [], 0
+            try:
+                for order, row in enumerate(rows, start):
+                    check_request()
+                    frame = _event_frame(order, Chunk.model_validate_json(row["data"]))
+                    spent = size + cost(frame)
+                    if max_chars is not None and spent > max_chars:
+                        return frames, frame
+                    size = spent
+                    frames.append(frame)
+            finally:
+                rows.close()       # a batch cut short leaves unread rows; release the statement inside the boundary
+            return frames, None
 
     def checklist_items(self, session_id, provider):
         """Load checklist items for stalled-requirement analysis (best effort)."""

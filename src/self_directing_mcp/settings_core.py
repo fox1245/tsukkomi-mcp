@@ -42,11 +42,13 @@ SESSION_PROVIDERS = ("codex", "grokbot", "omp", "agy", "claude")
 DENSE_BACKENDS = ("sqlite-vector", "numpy")
 DAEMON_MODES = ("off", "on")
 SQLITE_JOURNAL_MODES = ("auto", "delete")    # journal.py validates the same two values
+GRAPH_EXTRACTORS = ("openrouter", "host")    # who extracts for run_neograph_update: an OpenRouter model, or only the host agent
 
 DEFAULT_ENFORCEMENT = "confirmed_only"
 DEFAULT_SESSION_PROVIDER = "codex"
 DEFAULT_DENSE_BACKEND = "sqlite-vector"
 DEFAULT_DAEMON = "off"
+DEFAULT_GRAPH_EXTRACTOR = "openrouter"
 DEFAULT_SQLITE_JOURNAL = "delete"            # "auto" is opt-in until the commit benchmark says otherwise (README, "SQLite journal")
 DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 DEFAULT_EMBEDDING_DIM = 1024
@@ -389,6 +391,7 @@ FIELDS: tuple[FieldSpec, ...] = (
               _static(DEFAULT_REQUEST_TIMEOUT_SEC)),
     FieldSpec("graph_update_timeout_sec", lambda name, text: _to_float(name, text, positive=True, finite=True),
               _static(DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC)),
+    FieldSpec("graph_extractor", _literal(GRAPH_EXTRACTORS), _static(DEFAULT_GRAPH_EXTRACTOR)),
     FieldSpec("max_tool_timeout_sec", lambda name, text: _to_float(name, text, positive=True),
               _static(DEFAULT_MAX_TOOL_TIMEOUT_SEC)),
     FieldSpec("max_concurrent_calls", lambda name, text: _to_int(name, text, 1), _static(DEFAULT_MAX_CONCURRENT_CALLS)),
