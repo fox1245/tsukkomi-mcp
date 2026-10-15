@@ -1,6 +1,6 @@
 # Tsukkomi MCP (ツッコミ)
 
-> A deterministic governance and evidence server for autonomous coding agents, version 0.6.0.
+> A deterministic governance and evidence server for autonomous coding agents, version 0.7.0.
 > The distribution is `tsukkomi-mcp`; the Python package is `self_directing_mcp`.
 
 ## Overview
@@ -32,6 +32,21 @@ Every check returns one of four verdicts: `clean`, `violation`, `suspicious` or 
 ```
 
 Session evidence stays on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter. The canonical index keeps raw text so audits see the truth; everything that leaves it (tool results, errors, hook output, logs, remote payloads) is masked for known secret patterns, and the workflow classifier refuses context in which a secret pattern is found. See the [masking contract](SECURITY.md#masking-contract), [SECURITY.md](SECURITY.md) and [Verification scope](#verification-scope).
+
+## What is new in 0.7.0
+
+Version 0.7.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly makes big sessions converge under the request deadlines. It was found by reproducing the report that timeouts also happen without an external model; the design record is [#26](https://github.com/fox1245/tsukkomi-mcp/issues/26).
+
+- **A sync that cannot finish keeps its progress.** A request whose budget (8 s for hooks, `audit_session` and `check_action`; 45 s for the other tools) is too short for a cold or appended source stops at a record boundary and publishes the prefix it parsed; the next call continues. A 300,000-event synthetic session that never converged now converges in 5 calls. See "Large sessions and deadlines".
+- **A re-index keeps its progress without touching the index that exists.** A parser-version bump, a changed source or changed AGY receipts are staged in a spool next to the index and published by one ordinary commit; an interrupted re-index leaves the old events, anchors and vectors as they were.
+- **An audit of a big session converges.** A slice is sized by what judging it costs, a comparison never takes the answer with it, and a resident server finishes what a deadline cut.
+- **A sync that runs out of time no longer takes the judgement with it.** The stored index is judged with `sync_deadline` or `sync_in_progress` in the coverage issues: nothing is `clean`, a confirmed `must_not` match is still a `violation`.
+- **`audit_status.ops` and `audit_status.evaluation`** say how each tool's requests ended and how far a session's monitor states lag, even while the engine is busy.
+- **Host-side GraphRAG extraction** (`graph_next_batch`, `graph_submit_batch`, `SELF_DIRECT_GRAPH_EXTRACTOR=host`) and an O(batch) read of a graph batch.
+- **Incremental contract audits, source integrity and the adaptive shadow comparison** (see their sections), an opt-in resident daemon (`SELF_DIRECT_DAEMON=on`) and an opt-in write-ahead journal (`SELF_DIRECT_SQLITE_JOURNAL=auto`).
+- **Two quadratic costs removed.** SQLite planned `chunk_id IN (...)` lookups as a scan of the whole session; a derived pass over 150,000 events went from 64 s to 7.7 s and appending 100,000 events to a session of 100,000 from 12.7 s to 3.4 s.
+
+---
 
 ## What is new in 0.6.0
 
@@ -1011,6 +1026,17 @@ A parser upgrade (the AGY parser moved to version 8 and the Claude Code parser t
 `tests/test_reindex_spool.py`, `test_reindex_equivalence.py`, `test_reindex_staging.py`, `test_reindex_faults.py` (a stop at every cooperative check of a Codex re-index and at a sample of the others, a process that is killed after the row frames, after the trailer, with the spool complete, inside the commit transaction and after the commit, and a request that is stopped right after a spooled slice or after the commit) and `test_reindex_convergence.py` (a 150,000-event session with budgets of about 4 and 8 seconds on the development machine; on any other they are multiples of the time the one-shot re-index took there, so that a sanitizer build, which is three to four times slower, gives the same answer) pin all of this on synthetic sessions.
 
 `scripts/bench_eval_converge.py` measures what follows the sync, the judging: repeated `audit_session` calls under a budget of 8 or 45 seconds on synthetic sessions of 150,000 and 300,000 events, for a cold session and for one that is indexed but has no monitor state, with two, six and eighteen contracts (`--tool check` repeats `check_action` for a gated action instead, and the scenarios `cold+idle` and `synced+idle` give a resident server's idle comparison its turn after every call that did not complete); it reports the calls needed (K), the seconds of every call (a call the deadline cut is marked `x`), whether every call stayed inside its budget, and whether the final answer equals the unbounded one-shot answer, finding for finding. It resets the cost model before every run (the first request of a freshly started server) and also runs on a checkout without it, which is how the numbers of a change are compared with those before it. `tests/test_eval_converges.py` runs the same questions in virtual time (a price in seconds for parsing a record, folding an event, running the full evaluator; the deadlines read that clock), so that the calls, the stops and the answers do not depend on the machine. `tests/test_eval_reindex.py` pins how this fits with a staged re-index: a staged slice never reads the sizing numbers, the appended slice of the same session afterwards is cost-limited, and a request that stops while it stages is not noted to the idle comparison (scripted clocks, no wall clock).
+
+---
+
+## Upgrading to 0.7.0
+
+1. **Restart every process that uses the index** (Codex, OMP, AGY, Claude Code, any manual `python -m self_directing_mcp`). A running process keeps the old code in memory.
+2. **Reinstall the package, do not copy files.** `regex>=2024.11.6` is a new dependency, and the console entry points now point at `self_directing_mcp.entry:main`. An editable checkout needs `pip install -e .` again; a wheel needs `--reinstall`.
+3. **Parser and evaluator bumps are lazy.** The AGY parser is version 8 and the Claude Code parser version 3 (Codex 3 and OMP 8 did not change): a session of those providers is re-parsed on its first touch, and a re-index that does not fit one request is staged in `<index dir>/reindex/` (a spool with the session text, mode 0600, deleted when done) and published by one commit; `sync_session` with a larger `timeout_ms` finishes one that is ready. The evaluator version is 8: the first audit of a session builds its monitor states again, and `audit_status.evaluation` shows the lag.
+4. **Existing indexes are preserved.** No migration beyond new tables created on open. Take a copy of the index directory before the first start if the index is irreplaceable.
+5. **New defaults to know.** `SELF_DIRECT_SYNC_SLICING=auto` (a request with a deadline publishes partial progress; `off` restores the all-or-nothing sync) and `SELF_DIRECT_SYNC_SLICE_BYTES=67108864`. The daemon and the write-ahead journal stay off.
+6. **Re-verify.** `audit_status` on every host: `ops` and `evaluation` are present, `degraded_flags` is empty. For Codex run `python scripts/install_codex.py --verify`.
 
 ---
 
