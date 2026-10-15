@@ -419,8 +419,15 @@ def snapshot(engine: SelfDirectEngine, provider: str, sid: str) -> Snapshot:
 
 
 def sparse_rows(engine: SelfDirectEngine, sid: str) -> list:
-    """The full-text index rows of one session (the derived index), in a stable order."""
+    """The full-text index rows of one session (the derived index), in a stable order. The legacy format stores the text;
+    the compact format stores none, so its rows carry the document's token count (what FTS5 recorded) in its place."""
     conn = engine.sparse._conn
+    if engine.sparse.format == "compact":
+        from self_directing_mcp.index.sparse import _read_varints
+        return [(cid, session, kind, _read_varints(size)[0]) for cid, session, kind, size in conn.execute(
+            "SELECT r.chunk_id, s.session_id, k.kind, d.sz FROM chunk_rows r JOIN sparse_sessions s USING (session_no) "
+            "JOIN sparse_kinds k USING (kind_no) JOIN chunks_fts_docsize d ON d.id = r.rowid WHERE s.session_id=? "
+            "ORDER BY r.chunk_id", (sid,)).fetchall()]
     return [tuple(r) for r in conn.execute("SELECT chunk_id,session_id,kind,text FROM chunks_fts WHERE session_id=?"
                                            " ORDER BY chunk_id", (sid,)).fetchall()]
 

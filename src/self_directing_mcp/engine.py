@@ -691,9 +691,10 @@ class SelfDirectEngine:
         if missing:
             self._fill_sparse(session_id, provider, sorted(missing))
 
-    def _fill_sparse(self, session_id, provider, ids, *, batch=SPARSE_REPAIR_BATCH, progress=None):
+    def _fill_sparse(self, session_id, provider, ids, *, batch=None, progress=None):
         """Write the sparse documents of the canonical events ``ids``, ``batch`` at a time. Returns how many were written."""
         written = 0
+        batch = batch or SPARSE_REPAIR_BATCH
         for start in range(0, len(ids), batch):
             check_request()
             with self._publication_guard():
@@ -716,7 +717,7 @@ class SelfDirectEngine:
         return written
 
     @detached_operation
-    def rebuild_sparse(self, *, budget_sec: float | None = None, batch: int = SPARSE_REPAIR_BATCH, progress=None) -> dict[str, Any]:
+    def rebuild_sparse(self, *, budget_sec: float | None = None, batch: int | None = None, progress=None) -> dict[str, Any]:
         """Materialize every canonical event the active sparse index lacks, outside a request (``python -m
         self_directing_mcp.maintenance sparse-rebuild``). Bounded (``budget_sec``), resumable and safe to interrupt: each
         batch is its own transaction and only missing events are written, so running it again continues where it stopped
@@ -724,6 +725,7 @@ class SelfDirectEngine:
         touching the legacy file; the canonical store is the only source."""
         started = time.monotonic()
         deadline = started + budget_sec if budget_sec is not None else None
+        batch = batch or SPARSE_REPAIR_BATCH
         resolution = dict(self.sparse_resolution)
         info: dict[str, Any] = {"ok": True, "format": self.sparse.format, "setting": resolution.get("setting"),
                                 "file": str(self.sparse.db_path), "state": "complete", "stopped_by": None}
