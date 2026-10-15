@@ -22,7 +22,7 @@ from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.grok_hooks import dispatch_grok_hook, failure_response, run_hook
 from self_directing_mcp.security.mask import mask_secrets
 from grok_support import (
-    FIXTURES, GROUP, OTHER, SID, agent, bash_output, call, completed, hook_payload, session_file, update, user, write,
+    FIXTURES, OTHER, SID, agent, bash_output, call, completed, hook_payload, session_file, update, user, write,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -259,6 +259,65 @@ def test_history_dependent_contracts_read_the_grok_transcript(env):
     assert decision(run(engine, failing, "PreToolUse", tool_input=action, sid=OTHER)) == "deny"
 
 
+# --- the recorded payloads --------------------------------------------------------------------------------------
+
+def test_the_recorded_hook_payloads_get_the_documented_replies(env):
+    engine, _path = env
+    sessions = engine.settings.resolve_grok_sessions_dir()
+    transcript = session_file(sessions)
+    shutil.copyfile(FIXTURES / "updates_session2.jsonl", transcript)
+    engine.upsert_contracts([{"id": "no-secret-env", "type": "must_not", "scope": "tool_call",
+                              "regex": r"\[tool_call:Read\].*secret\.env", "description": "never read secret.env"},
+                             ACK | {"auto_continue": False}])
+    replies = []
+    for line in (FIXTURES / "hook_payloads_session1.jsonl").read_text(encoding="utf-8").splitlines():
+        payload = json.loads(line)
+        event = payload["hook_event_name"]
+        if event == "SessionEnd":
+            continue                                              # not an event the installer registers
+        for key in ("transcriptPath", "transcript_path"):
+            if key in payload:
+                payload[key] = str(transcript)
+        reply = run_hook(event, payload, engine=engine)
+        replies.append((event, payload.get("toolName"), payload.get("reason"), reply))
+    assert [(e, t, r) for e, t, r, _ in replies] == [
+        ("SessionStart", None, None), ("UserPromptSubmit", None, None), ("PreToolUse", "read_file", None),
+        ("PreToolUse", "read_file", None), ("PreToolUse", "run_terminal_command", None),
+        ("PostToolUse", "read_file", None), ("PostToolUse", "run_terminal_command", None), ("Stop", None, "end_turn"),
+        ("Stop", None, "shutdown")]
+    by_index = [reply for _e, _t, _r, reply in replies]
+    assert by_index[0] == by_index[1] == by_index[5] == by_index[6] == by_index[8] == {}
+    assert by_index[2] == {"decision": "allow"}                                      # notes.txt
+    assert by_index[3]["decision"] == "deny" and "[no-secret-env]" in by_index[3]["reason"]    # secret.env
+    assert "Grok tool read_file (matched as Read)" in by_index[3]["reason"]
+    assert by_index[4] == {"decision": "allow"}                                      # echo probe-ok
+    assert "decision" not in by_index[7]                                              # the obligation is not auto_continue
+
+
+def test_dispatch_raises_where_run_hook_never_does(env):
+    engine, path = env
+    _violation(engine)
+    assert dispatch_grok_hook(hook_payload("PreToolUse", path, tool_input={"command": "run forbidden"}),
+                              "PreToolUse")["decision"] == "deny"
+    with pytest.raises(ValueError):
+        dispatch_grok_hook({"hook_event_name": "PreToolUse"}, "PreToolUse")
+    assert run_hook("PreToolUse", {"hook_event_name": "PreToolUse"})["decision"] == "allow"
+
+
+def test_the_transcript_marks_remember_the_first_shrink_and_never_forget_it(tmp_path):
+    marks = state.GrokHookState(tmp_path)
+    assert [marks.observe_transcript("a", n) for n in (100, 100, 250)] == [None, None, None]
+    first = marks.observe_transcript("a", 90)
+    assert first["from"] == 250 and first["to"] == 90
+    again = marks.observe_transcript("a", 400)                      # growing again does not clear it
+    assert (again["from"], again["at"]) == (250, first["at"])
+    assert marks.observe_transcript("a", 30)["to"] == 30 and marks.observe_transcript("a", 30)["from"] == 250
+    assert marks.observe_transcript("b", 5) is None                  # another session is unaffected
+    (tmp_path / state.STATE_FILE).unlink()
+    (tmp_path / state.STATE_FILE).mkdir()                            # unreadable state claims nothing
+    assert state.GrokHookState(tmp_path).observe_transcript("a", 1) is None
+
+
 # --- payload validation -------------------------------------------------------------------------------------
 
 def _invalid(event, **change):
@@ -456,6 +515,10 @@ def test_the_transcript_lag_check_joins_deltas_and_reads_only_the_tail(env):
     assert grok_hooks._transcript_lags(str(path), "The final answer") is False
     assert grok_hooks._transcript_lags(str(path), "The final answer, extended") is True
     assert grok_hooks._transcript_lags(str(path), None) is False and grok_hooks._transcript_lags(str(path), "  ") is False
+    # Grok clips a long message at 32,768 characters and marks the cut: only the part it kept is compared
+    assert grok_hooks._transcript_lags(str(path), "The final \u2026 [+4096 chars]") is False
+    assert grok_hooks._transcript_lags(str(path), "The other \u2026 [+4096 chars]") is True
+    assert grok_hooks._transcript_lags(str(path), "\u2026 [+9 chars]") is False
     assert grok_hooks._transcript_lags(str(path.with_name("missing.jsonl")), "x") is False
 
 

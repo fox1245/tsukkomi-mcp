@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import shutil
 
 import pytest
@@ -18,7 +17,7 @@ from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.index.ingest import current_parser_version
 from grok_support import (
-    FIXTURES, GROUP, OTHER, SID, T0, agent, annotation, bash_output, call, chunk, completed, hook_execution, rec,
+    FIXTURES, GROUP, OTHER, SID, T0, agent, annotation, bash_output, call, completed, hook_execution, rec,
     session_file, thought, update, user, write,
 )
 
@@ -222,6 +221,23 @@ def test_a_call_without_a_result_is_in_flight_or_cancelled_never_success(root, e
     sync(engine, failing, "01a00000-0000-7000-8000-000000000003")
     assert engine.audit_session("01a00000-0000-7000-8000-000000000003", provider="grok",
                                 path=str(failing))["verdict"] != "clean"
+
+
+def test_a_backgrounded_command_is_not_evidence_that_the_tests_passed(root, engine):
+    """``is_background`` is rendered as Claude's ``run_in_background``, which the success analysis already reads."""
+    engine.upsert_contracts([{"id": "tests-ok", "type": "must", "scope": "tool_call", "regex": "pytest",
+                              "requires_success": True, "provider": "grok"}])
+    path = write(session_file(root), user("run the tests"),
+                 call("c1", "run_terminal_command", {"command": "pytest -q", "is_background": True}),
+                 update("c1", "completed", "started", raw_output=bash_output(0, "started\n")))
+    sync(engine, path)
+    audit = engine.audit_session(SID, provider="grok", path=str(path))
+    assert audit["verdict"] == "unknown" and "success_unverifiable" in json.dumps(audit["findings"])
+    masked = write(session_file(root, OTHER), user("run the tests"),
+                   call("c1", "run_terminal_command", {"command": "pytest -q || true"}),
+                   update("c1", "completed", "x", raw_output=bash_output(0, "x\n")))
+    sync(engine, masked, OTHER)
+    assert engine.audit_session(OTHER, provider="grok", path=str(masked))["verdict"] == "unknown"
 
 
 def test_an_edit_result_names_the_file_and_does_not_repeat_the_diff(root):

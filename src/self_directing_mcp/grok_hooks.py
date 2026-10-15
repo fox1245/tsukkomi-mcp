@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+import re
 import sys
 from typing import Any, TYPE_CHECKING
 
@@ -54,6 +55,7 @@ REWRITTEN = ("The Grok transcript of this session shrank (a rewind, reset or com
 _FINAL_MESSAGE_SCOPES = ("message", "any")     # what the unflushed final assistant text could still satisfy
 TURN_END = "end_turn"
 _TAIL_BYTES = 262144
+_CLIPPED = re.compile(r"\s*\u2026 \[\+\d+ chars\]\s*\Z")        # "... [+N chars]", how Grok marks a clipped free-text field
 
 
 @dataclass(frozen=True)
@@ -157,12 +159,13 @@ def _transcript_lags(path: str, last_message: str | None) -> bool:
     message records of the file's tail instead of searching for one string. Without the host's copy of the message
     nothing can be compared and the audit stands on its own coverage checks.
     """
-    if not last_message or not last_message.strip():
+    message = _CLIPPED.sub("", last_message or "").strip()      # Grok clips a long message and marks the cut
+    if not message:
         return False
     seen = _assistant_text(path)
     if seen is None:
         return False                          # the engine reports an unreadable transcript as incomplete coverage
-    return last_message.strip() not in seen
+    return message not in seen
 
 
 # --- handlers (host-neutral decisions; ``render`` produces Grok's JSON) ---------------------------------------
