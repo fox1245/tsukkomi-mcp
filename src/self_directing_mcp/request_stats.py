@@ -4,7 +4,7 @@ workers a deadline left running.
 One short lock protects plain counters. Nothing here touches the engine, its lock or the index, so ``audit_status`` can
 report the numbers while the engine is busy. They live in memory only (a restart starts at zero) and carry no content:
 labels come from closed vocabularies (anything else is counted as ``other``) and the rest are integers and floats. No
-session id, path, contract text, argument or exception message ever reaches this module.
+session id, path, contract text, argument or exception message is ever stored.
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ TOOLS = (
     "sync_session", "search_history", "audit_session", "check_action", "get_chunk", "list_contracts",
     "revoke_contract", "upsert_contracts", "audit_status", "update_checklist", "get_checklist", "analyze_activity",
     "get_graph_context", "propose_graph_update", "commit_graph_update", "run_neograph_update",
+    "graph_next_batch", "graph_submit_batch",
     "workflow_status", "workflow_run_checks", "workflow_classify", "workflow_transition", "workflow_authorize",
     "workflow_execute", "codex_session_hook", "hook",
 )
