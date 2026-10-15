@@ -54,6 +54,7 @@ jobs:
           tests/test_sparse_compact.py
           tests/test_sparse_compact_mutations.py
           tests/test_sparse_formats.py
+          tests/test_sparse_orphans.py
           tests/test_sparse_settings.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
@@ -101,6 +102,7 @@ jobs:
           tests/test_sparse_compact.py
           tests/test_sparse_compact_mutations.py
           tests/test_sparse_formats.py
+          tests/test_sparse_orphans.py
           tests/test_sparse_settings.py
           tests/test_singleflight.py
           tests/test_index_concurrency.py

@@ -466,11 +466,15 @@ class CompactSparseIndex(SparseIndex):
             self._drop(self._retire([chunk_id]))
             self._add(chunk_id, session_id, kind, text, {})
 
-    def delete_ids(self, ids: list[str]) -> None:
+    def delete_ids(self, ids: list[str]) -> int:
+        """Delete the documents ``ids`` (an id that is not stored is ignored) in one transaction, keeping the statistics
+        exact. Returns how many documents were actually removed."""
         ids = list(ids)
         check_request()
         with self._write():
-            self._drop(self._retire(ids))
+            rowids = self._retire(ids)
+            self._drop(rowids)
+        return len(rowids)
 
     def upsert_many(self, chunks) -> None:
         latest: dict = {}
