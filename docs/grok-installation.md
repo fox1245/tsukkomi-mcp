@@ -124,7 +124,9 @@ Every reply is masked for known secret patterns. The exit code is 0 for all of t
 
 **A shrunk transcript is `unknown`, not compliance.** Grok's `/rewind` drops later turns from the history while file changes stay on disk. The hook remembers how large each session's `updates.jsonl` was at its previous call (`grok-hook-state.sqlite` in the index directory); once the file is smaller than before, confirmed misses of history-dependent contracts (`must`, `requires_success`, `before_regex`) become `unknown`, a clean verdict is delivered with the notice that the history was rewritten, and `Stop` does not continue the agent on evidence that is gone. The MCP audit tools judge the file as it is and cannot know that evidence was removed.
 
-**Subagents.** A `spawn_subagent` child is another session directory with its own id; v1 reads only the session the hook names. History-dependent findings for a call made inside a subagent (`subagentType` in the payload) are `unknown`, never a confirmed miss, and a subagent's `Stop` is never blocked.
+**A truncated input is `unknown`.** Grok clips a large tool input in the payload and says so (`toolInputTruncated`). A match could hide in the part that was cut (padding a command is the obvious way), so when any contract applies to the session, a truncated call is judged `unknown` whatever the visible part says: a warning in `confirmed_only`, an `ask` for a `risk: "high"` contract, a deny in `enforced`. A confirmed violation in the visible part still denies.
+
+**Subagents.** A `spawn_subagent` child is another session directory with its own id (contracts scoped to the parent's session id do not apply to the child's calls; global contracts do); v1 reads only the session the hook names. History-dependent findings for a call made inside a subagent (`subagentType` in the payload) are `unknown`, never a confirmed miss, and a subagent's `Stop` is never blocked.
 
 ---
 

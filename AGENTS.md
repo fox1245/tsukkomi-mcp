@@ -74,7 +74,7 @@ never `{}`) and exit code 2 is never used (Grok reads it as a deny); a failure a
 stderr, records `hook_health`, queues a warning for the next `PostToolUse` and exits 1; `Stop` never blocks while `stopHookActive`, at a `reason` other than
 `end_turn`, or inside a subagent; the hooks inject no context at `SessionStart`/`UserPromptSubmit` (Grok discards it)
 and offer no `updatedInput`/`updatedToolOutput` (README "Grok CLI"); a transcript that shrinks makes history-dependent
-findings `unknown`; a user turn needs Grok's `promptIndex`, so injected or replayed text can never anchor a contract.
+findings `unknown`, and so does a tool input Grok truncated (`toolInputTruncated`); a user turn needs Grok's `promptIndex`, so injected or replayed text can never anchor a contract.
 `SELF_DIRECT_GROK_ENFORCEMENT` and `--mode=` follow the same policy as the other hosts (`hook_policy`, not a fork).
 Because Grok loads Claude Code's settings file, `scripts/claude_hook.py` answers a Grok payload with silence before it
 imports anything (stdlib only, in step with `grok_ids.is_grok_payload`; `tests/test_grok_claude_bypass.py`). See

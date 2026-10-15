@@ -51,6 +51,8 @@ TRANSCRIPT_LAGS = ("Grok's transcript does not contain the final assistant messa
                    "message obligations cannot be verified (does not block stopping).")
 SUBAGENT_HISTORY = ("A subagent's own history is not consulted for this call; "
                     "history-dependent obligations stay unverified.")
+TRUNCATED_INPUT = ("Grok truncated this tool call's input in the hook payload (toolInputTruncated): part of the call "
+                   "cannot be checked against the contracts.")
 REWRITTEN = ("The Grok transcript of this session shrank (a rewind, reset or compaction rewrote its history): what it no "
              "longer holds cannot be judged, so history-dependent contracts are unverified and the absence of an old "
              "call is not compliance.")
@@ -71,6 +73,7 @@ class HookCall:
     stop_reason: str | None = None    # Stop only: end_turn (a turn end), shutdown / channel_closed (session end)
     last_message: str | None = None   # the host's own copy of the final assistant text (Stop)
     subagent_type: str | None = None  # set when the event fired inside a subagent's session
+    input_truncated: bool = False     # Grok cut the tool input in the payload (``toolInputTruncated``)
 
 
 def failure_response(event: str | None, payload: Any = None, *, reason: str = "Hook verification unavailable") -> dict:
@@ -123,7 +126,9 @@ def _validate_payload(payload: Any, event: str | None) -> HookCall:
     flags = [payload[key] for key in ("stopHookActive", "stop_hook_active") if key in payload]
     return HookCall(event, session_id, path, name, arguments, any(flag is not False for flag in flags),
                     _text(payload.get("reason")), _text(_pair(payload, "last_assistant_message", "lastAssistantMessage")),
-                    _text(payload.get("subagentType")))
+                    _text(payload.get("subagentType")),
+                    # Absent means whole; anything but a plain false counts as cut, so padding cannot hide a match.
+                    any(payload[key] is not False for key in ("toolInputTruncated", "tool_input_truncated") if key in payload))
 
 
 def _validated_path(engine: SelfDirectEngine, session_id: str, path: str) -> str:
@@ -186,6 +191,15 @@ def _native_hint(call: HookCall) -> str:
     return " (" + grok_tools.describe(call.tool_name, canonical.name) + ")" if canonical.mapped else ""
 
 
+def _unverified_input(engine: SelfDirectEngine, call: HookCall, path: str | None) -> hook_policy.Judgement:
+    """The judgement for a call whose input Grok cut: unknown for every contract, classified like any other unknown."""
+    rules = hook_policy.read_obligations(engine, PROVIDER, call.session_id, path)["contracts"]
+    audit = {"ok": True, "verdict": "unknown", "action_contracts": [rule.id for rule in rules],
+             "findings": [{"contract_id": rule.id, "verdict": "unknown", "reason": TRUNCATED_INPUT} for rule in rules[:4]]}
+    decision, reason, warn = hook_policy.classify(audit, _mode(engine), frozenset(r.id for r in rules if r.risk == "high"))
+    return hook_policy.Judgement(decision, reason, warn, audit)
+
+
 def handle_pre_tool_use(engine: SelfDirectEngine, call: HookCall, path: str | None = None) -> dict[str, Any]:
     # No read-command classifier or tool-name exemption: reads can be restricted, shell flags can mutate,
     # and names containing this server are not authority. The engine renders the call in Claude's vocabulary
@@ -211,6 +225,10 @@ def handle_pre_tool_use(engine: SelfDirectEngine, call: HookCall, path: str | No
                                       _mode(engine), adjust=adjust)
     if judged is None:
         return {"decision": "allow"}
+    if call.input_truncated and judged.decision not in ("deny", "ask", "force_ask"):
+        # The part of the input Grok cut away could hold what a contract forbids: whatever the visible part says, this
+        # is unknown (a warning, an ask for a high-risk contract, a deny when enforced), never clean.
+        judged = _unverified_input(engine, call, path)
     if judged.silent:
         # No contract objected, but on a rewritten history that is not a compliance verdict: say so to the model.
         return {"decision": "allow", "context": REWRITTEN} if rewritten and _mode(engine) != "advisory" else {"decision": "allow"}

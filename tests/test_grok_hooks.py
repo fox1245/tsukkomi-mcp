@@ -552,6 +552,48 @@ def test_a_transcript_that_only_grows_is_never_flagged(env):
         assert run(engine, path, "PreToolUse", tool_input={"command": "ls"}) == {"decision": "allow"}
 
 
+# --- a tool input that Grok cut -----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", [True, "true", 1, None])
+@pytest.mark.parametrize("mode,expected", [("advisory", "allow"), ("confirmed_only", "allow"), ("enforced", "deny")])
+def test_a_truncated_input_is_unknown_never_clean(env, mode, expected, flag):
+    engine, path = env
+    set_mode(engine, mode)
+    _clean(engine)
+    response = run(engine, path, "PreToolUse", tool_input={"command": "echo hello"}, toolInputTruncated=flag)
+    assert decision(response) == expected, response
+    if mode == "confirmed_only":
+        assert "toolInputTruncated" in response["hookSpecificOutput"]["additionalContext"]
+    if mode == "advisory":
+        assert "ADVISORY" in response["systemMessage"] and "hookSpecificOutput" not in response
+    if mode == "enforced":
+        assert "toolInputTruncated" in response["reason"]
+
+
+def test_a_truncated_input_asks_for_a_high_risk_contract_and_a_visible_violation_still_denies(env):
+    engine, path = env
+    engine.upsert_contracts([{"id": "risky", "type": "must_not", "scope": "tool_call", "provider": "grok",
+                              "regex": "git push", "risk": "high"}])
+    asked = run(engine, path, "PreToolUse", tool_input={"command": "echo hello"}, toolInputTruncated=True)
+    assert asked["decision"] == "ask" and "[risky]" in asked["reason"]
+    denied = run(engine, path, "PreToolUse", tool_input={"command": "git push origin main"}, toolInputTruncated=True)
+    assert denied["decision"] == "deny"
+
+
+def test_a_whole_input_is_unaffected_and_no_contract_means_no_warning(env):
+    engine, path = env
+    assert run(engine, path, "PreToolUse", tool_input={"command": "echo hello"}, toolInputTruncated=True) == {
+        "decision": "allow"}                                               # nothing to hide from: no contract applies
+    _clean(engine)
+    for flag in (False, None):
+        payload = hook_payload("PreToolUse", path, tool_input={"command": "echo ok"})
+        if flag is None:
+            payload.pop("toolInputTruncated")
+        else:
+            payload["toolInputTruncated"] = flag
+        assert run_hook("PreToolUse", payload, engine=engine) == {"decision": "allow"}
+
+
 # --- bookkeeping events -------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("event", ["UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SessionStart"])
