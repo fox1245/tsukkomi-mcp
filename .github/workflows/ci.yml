@@ -39,6 +39,7 @@ jobs:
           tests/test_workflow_jev.py
           tests/test_windows_session_paths.py
           tests/test_journal.py
+          tests/test_commit_identity.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
           tests/test_codex_zstd.py
@@ -139,3 +140,19 @@ jobs:
             bench-hooks.md
           if-no-files-found: ignore
           retention-days: 30
+
+  identity:
+    # A public repository keeps the author and committer address of every commit for good, so only GitHub noreply
+    # addresses may be committed (scripts/check_commit_identity.py never prints an address).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require GitHub noreply addresses on the new commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 scripts/check_commit_identity.py --base "$BASE_SHA" --head "$HEAD_SHA"
