@@ -168,6 +168,19 @@ class Settings(SettingsAccessors, BaseSettings):
                     "fixed Windows drive), the rollback journal everywhere else; 'delete': the rollback journal everywhere. "
                     "Always synchronous=FULL. SELF_DIRECT_SQLITE_JOURNAL.",
     )
+    sync_slicing: Literal["auto", "off"] = Field(
+        default=settings_core.DEFAULT_SYNC_SLICING,
+        description="A sync that cannot finish inside its request budget publishes the records it parsed (a slice, ending "
+                    "at a record boundary) and the next call continues from there. 'auto': for requests with a finite "
+                    "deadline and plain session files, never over an existing index; 'off': the all-or-nothing sync of "
+                    "before. SELF_DIRECT_SYNC_SLICING.",
+    )
+    sync_slice_bytes: int = Field(
+        default=settings_core.DEFAULT_SYNC_SLICE_BYTES, ge=1,
+        description="A slice observes (hashes, parses) at most this many bytes of a plain session file past the "
+                    "indexed offset, to the end of a record (at least one whole record). Bounds the capture of a source "
+                    "that is far from indexed. SELF_DIRECT_SYNC_SLICE_BYTES.",
+    )
 
     @field_validator("audit_shadow_every", mode="before")
     @classmethod

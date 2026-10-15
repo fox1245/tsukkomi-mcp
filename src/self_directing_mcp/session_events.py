@@ -15,6 +15,7 @@ from self_directing_mcp import source_blocks
 from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES, is_compressed, open_source
 from self_directing_mcp.schemas import Chunk
 from self_directing_mcp.request_control import check_request
+from self_directing_mcp.slice_budget import current_slice
 from self_directing_mcp.source_blocks import BlockScan, FastFallback
 from self_directing_mcp.tool_payload import as_text  # noqa: F401  (shared with the hook-side text builders)
 
@@ -30,6 +31,7 @@ def _stamp(stat) -> tuple[int, ...]:
 
 _BLOCK = 1024 * 1024
 _TAIL_WINDOW = 64 * 1024  # bytes before ``length`` that later stages re-read instead of the whole prefix
+_SLICE_SCAN = 64 * 1024  # bytes read per step when looking for the record boundary a limited capture ends at
 
 
 class SourceChanged(ValueError):
@@ -75,10 +77,17 @@ class SourceObservation:
         self.fast_checked: dict | None = None  # {"tail": bool, "recent": [..], "sampled": [..]} for mode "fast"
         self.scanned_at: str | None = None  # when the scan finished (set by the index layer, UTC ISO-8601)
         self.lag_sec: float | None = None  # how far past its deadline a forced full scan was
+        self.limited_from: int | None = None  # the size the file had when this capture was cut short (see _slice_length)
 
     @property
     def identity(self) -> tuple[int, int]:
         return self.stamp[0], self.stamp[1]
+
+    @property
+    def target_end(self) -> int:
+        """How far a sync of this source goes: the last record boundary observed, or, when the capture was cut short
+        (``limited_from``), the size of the file it was cut from (a trailing unfinished record included)."""
+        return self.complete_end if self.limited_from is None else max(self.complete_end, self.limited_from)
 
     @property
     def generation(self) -> str:
@@ -114,6 +123,23 @@ class SourceObservation:
                 remaining -= len(block)
         self._checkpoints[offset] = (digest, lines)
         return digest, lines
+
+    def _read_into(self, digest, begin: int, end: int) -> None:
+        """Feed ``digest`` the file's bytes ``[begin, end)``: a second look at part of what the capture saw."""
+        if begin < 0 or end > self.length:
+            raise SourceChanged("source truncated during read")
+        with self._open() as stream:
+            if not same_identity(_identity(os.fstat(stream.fileno())), self.identity):
+                raise SourceChanged("source replaced during read")
+            stream.seek(begin)
+            remaining = end - begin
+            while remaining:
+                check_request()
+                block = stream.read(min(remaining, _BLOCK))
+                if not block:
+                    raise SourceChanged("source truncated during read")
+                digest.update(block)
+                remaining -= len(block)
 
     def prefix_digest(self, length: int) -> str:
         """Plain SHA-256 of ``[0, length)``. Free at a requested checkpoint; anywhere else a re-read."""
@@ -423,7 +449,11 @@ def _hash_prefix(stream, length, checkpoints, *, sha=True, scan=None, start=0, m
 
 
 class _ShaGuard:
-    """Consumed bytes are hashed from the SHA-256 state at ``start``; the end must match the observed prefix."""
+    """Consumed bytes are hashed from the SHA-256 state at ``start``; the end must match the observed prefix.
+
+    A parse that stops where the capture did not (a slice) is compared with what the capture saw at its end: the consumed
+    bytes plus the rest of the capture, read from the file again, must hash to the capture's digest of its last record.
+    The offset is then a verified checkpoint of the observation, so its cursor hash costs nothing more."""
 
     def __init__(self, observation, start):
         self.observation = observation
@@ -431,10 +461,19 @@ class _ShaGuard:
 
     def update(self, raw):
         self._digest.update(raw)
+        self.lines += 1     # a record is one line
 
     def finish(self, position):
-        if self._digest.hexdigest() != self.observation.prefix_digest(position):
+        observation = self.observation
+        if position in observation._checkpoints:
+            if self._digest.hexdigest() != observation.prefix_digest(position):
+                raise SourceChanged("source changed during read")
+            return
+        rest = self._digest.copy()
+        observation._read_into(rest, position, observation.complete_end)
+        if rest.hexdigest() != observation.prefix_digest(observation.complete_end):
             raise SourceChanged("source changed during read")
+        observation._checkpoints[position] = (self._digest.copy(), self.lines)
 
 
 class _BlockGuard:
@@ -480,8 +519,29 @@ class _BlockGuard:
     def finish(self, position):
         if position != self.position:
             raise SourceChanged("source changed during read")
+        if position not in self.scan.marks:
+            self._compare_with_block(position)
         expected = self.observation.mark_at(position)[0]
         if expected is not None and self.hasher.digest() != expected:
+            raise SourceChanged("source changed during read")
+
+    def _compare_with_block(self, position):
+        """A parse that stopped inside a block (a slice): the capture recorded no digest of this partial block. The rest of
+        the block is read back and the whole block compared with the capture's digest of it (the capture's last block: with
+        its digest at the last record boundary), so what was consumed is verified against the capture, not against a
+        second read of itself."""
+        observation, scan = self.observation, self.scan
+        if position == self.index * self.size:
+            return    # block aligned: the block that ended here was compared as it completed
+        end = (self.index + 1) * self.size
+        want = scan.block_digest(self.index) if end <= observation.length else None
+        if want is None:
+            end, want = observation.complete_end, observation.mark_at(observation.complete_end)[0]
+        if want is None or end <= position:
+            return
+        rest = self.hasher.copy()
+        observation._read_into(rest, position, end)
+        if rest.digest() != want:
             raise SourceChanged("source changed during read")
 
 
@@ -526,7 +586,47 @@ def _check_pass_consistency(observation, before, after, path_stamp, length):
             raise SourceChanged("source changed during preparation")
 
 
-def capture_source(path: Path, *, checkpoints=(), max_bytes=None, sha=True, blocks=False) -> SourceObservation:
+def _slice_length(stream, size: int, floor: int, cap: int) -> tuple[int, int | None]:
+    """``(length, cut_from)``: how much of a ``size``-byte plain file one slice observes.
+
+    A source that is indexed up to ``floor`` (a record boundary: the cursor) is observed at most up to ``floor +
+    cap``, rounded down to the end of the last record inside that bound. A slice always holds one whole record: when
+    none ends inside the bound, the observation ends at the first record end after it. The result behaves exactly
+    like a capture of a file that was that short (``validate_prefix`` already tolerates growth); ``cut_from`` is the
+    size the file really had. A file that fits, or whose rest is one unfinished record, is observed whole (``None``).
+    The stream is left at byte 0.
+    """
+    wanted = floor + cap
+    if size <= wanted:
+        return size, None
+    end, position = None, wanted
+    while end is None and position > floor:             # the last newline in [floor, wanted)
+        check_request()
+        begin = max(floor, position - _SLICE_SCAN)
+        stream.seek(begin)
+        found = stream.read(position - begin).rfind(b"\n")
+        if found >= 0:
+            end = begin + found + 1
+        position = begin
+    position = wanted
+    while end is None and position < size:              # none inside it: the first newline after it
+        check_request()
+        stream.seek(position)
+        data = stream.read(min(_BLOCK, size - position))
+        if not data:
+            raise SourceChanged("source truncated during read")
+        found = data.find(b"\n")
+        if found >= 0:
+            end = position + found + 1
+        position += len(data)
+    stream.seek(0)
+    if end is None or end >= size:
+        return size, None
+    return end, size
+
+
+def capture_source(path: Path, *, checkpoints=(), max_bytes=None, sha=True, blocks=False,
+                   window=None) -> SourceObservation:
     """Observe the first ``size`` bytes of a possibly growing source in one streaming pass.
 
     Bytes are hashed, not retained. Growth after the initial ``fstat`` is not an error; an overwrite,
@@ -534,6 +634,10 @@ def capture_source(path: Path, *, checkpoints=(), max_bytes=None, sha=True, bloc
     immutable snapshot (``max_bytes`` bounds its declared decompressed size); see ``CompressedObservation``.
     ``sha`` keeps the running SHA-256 (plain cursors); ``blocks`` collects the 1 MiB block digests
     (``source_blocks``) in the same pass. At least one of them must be requested.
+
+    ``window=(floor, cap)``: a plain source longer than ``floor + cap`` is observed only up to the end of the last
+    record inside that bound (``_slice_length``); ``limited_from`` of the observation says so. A ``.zst`` source is
+    never cut.
     """
     check_request()
     if not (sha or blocks):
@@ -543,7 +647,7 @@ def capture_source(path: Path, *, checkpoints=(), max_bytes=None, sha=True, bloc
         return _capture_compressed(path, checkpoints, max_bytes, sha, blocks)
     with path.open("rb") as stream:
         before = os.fstat(stream.fileno())
-        length = before.st_size
+        length, cut_from = (before.st_size, None) if window is None else _slice_length(stream, before.st_size, *window)
         scan = BlockScan(None, 0, source_blocks.BLOCK_SIZE) if blocks else None
         result = _hash_prefix(stream, length, checkpoints, sha=sha, scan=scan, tail_window=_TAIL_WINDOW)
         after = os.fstat(stream.fileno())
@@ -553,12 +657,12 @@ def capture_source(path: Path, *, checkpoints=(), max_bytes=None, sha=True, bloc
     # stat, so the observation keeps the path stamp.
     observation = SourceObservation(path, path_stamp, length, result.boundary, result.digest, result.states,
                                     hashlib.sha256(result.tail).hexdigest())
-    observation.blocks = scan
+    observation.blocks, observation.limited_from = scan, cut_from
     _check_pass_consistency(observation, before, after, path_stamp, length)
     return observation
 
 
-def capture_source_fast(path: Path, record, *, recent: int, samples: int, rng=None) -> SourceObservation:
+def capture_source_fast(path: Path, record, *, recent: int, samples: int, rng=None, cap=None) -> SourceObservation:
     """Observe a source without scanning its whole prefix, using the block table stored for it.
 
     Compares, in order: the file's identity, that it did not shrink, that a same-size file did not get a new
@@ -566,6 +670,8 @@ def capture_source_fast(path: Path, record, *, recent: int, samples: int, rng=No
     ``samples`` random blocks with their stored digests, and the partial tail block; then reads only what was
     appended after the table's offset. The result is an observation with ``mode == "fast"``: it vouches for the
     bytes that were compared and read, and for nothing else. Raises ``FastFallback`` whenever it cannot.
+
+    ``cap``: read at most that many bytes past the table's offset, up to the end of a record (``_slice_length``).
     """
     check_request()
     path = Path(path).resolve()
@@ -582,6 +688,9 @@ def capture_source_fast(path: Path, record, *, recent: int, samples: int, rng=No
             raise FastFallback("shrunk")
         if length == record.size and before.st_mtime_ns != record.mtime_ns:
             raise FastFallback("same_size_modified")
+        cut_from = None
+        if cap is not None:
+            length, cut_from = _slice_length(stream, length, table.covered, cap)
         picked = source_blocks.choose_blocks(table.nfull, recent, samples, rng)
         for index in picked:
             check_request()
@@ -606,7 +715,7 @@ def capture_source_fast(path: Path, record, *, recent: int, samples: int, rng=No
     path_stamp = source_stamp(path)
     observation = SourceObservation(path, path_stamp, length, result.boundary, None, {},
                                     hashlib.sha256(tail).hexdigest() if len(tail) == window else None)
-    observation.blocks, observation.mode = scan, "fast"
+    observation.blocks, observation.mode, observation.limited_from = scan, "fast", cut_from
     observation.fast_checked = {"tail": True, "recent": [i for i in picked if i >= table.nfull - max(0, recent)],
                                 "sampled": [i for i in picked if i < table.nfull - max(0, recent)]}
     _check_pass_consistency(observation, before, after, path_stamp, length)
@@ -654,6 +763,11 @@ def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, in
     Under a ``source_scope`` the read is bounded to the observed prefix and every consumed byte is hashed
     against the capture (against the SHA-256 state, or block by block when the capture holds block digests), so
     a rewrite between capture and parse is an error, not silent wrong evidence.
+
+    Under a ``slice_scope`` (``slice_budget``) the iterator that starts at the slice's offset may end early: before
+    it reads a record, once the budget says so, it stops at that record boundary. What it consumed is verified
+    against the capture exactly like a read to the end (``guard.finish``), so a prefix is never published unverified.
+    A compressed source is never cut short.
     """
     check_request()
     if start_byte < 0:
@@ -663,6 +777,9 @@ def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, in
     if observation is not None and start_byte > observation.complete_end:
         raise ValueError("cursor is not on a complete record boundary")
     size_limit = getattr(observation, "max_bytes", None)
+    budget = current_slice()
+    if budget is not None and (start_byte != budget.start_byte or size_limit is not None):
+        budget = None  # only the parse loop of the slice is bounded: not a probe of the head, nor a .zst decoder
     # A compressed source is read through a seekable decoder: forward seeks decode and discard, backward seeks
     # restart, so the cursor logic below is the same for both forms. A plain path opens as before.
     with (open_source(path) if size_limit is None else open_source(path, max_bytes=size_limit)) as stream:
@@ -689,20 +806,28 @@ def iter_raw_lines(path: Path, *, start_byte: int = 0) -> Iterator[tuple[int, in
                 remaining -= len(block)
         stream.seek(start_byte)
         position = start_byte
+        records, next_look, cut = 0, 0, False
         while True:
             check_request()
             if limit is not None and position >= limit:
                 break
+            if budget is not None and records >= next_look:
+                reason, next_look = budget.look(records, position - start_byte)
+                if reason is not None:
+                    budget.stop(reason, records, position - start_byte)
+                    cut = True
+                    break
             raw = stream.readline() if limit is None else stream.readline(limit - position)
             if not raw or not raw.endswith(b"\n"):
                 break
             start, position = position, position + len(raw)
             line_no += 1
+            records += 1
             if guard is not None:
                 guard.update(raw)
             # Invalid UTF-8 remains detectable instead of silently altering evidence.
             yield line_no, start, position, raw.decode("utf-8", errors="surrogateescape")
-    if observation is not None and position == observation.complete_end and guard is not None:
+    if observation is not None and guard is not None and (cut or position == observation.complete_end):
         guard.finish(position)
 
 

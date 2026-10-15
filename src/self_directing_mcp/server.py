@@ -195,11 +195,15 @@ class _Trace:
                      gate_wait_ms=None if self.gate_wait is None else self.gate_wait * 1000)
 
 
-def _sync_deadline(result):
-    """``"sync_deadline"`` when a result's coverage says its evidence refresh ran out of time, else None."""
+def _unfinished_sync(result):
+    """Why a result's evidence is less than wanted, by its coverage: ``"sync_deadline"`` (the refresh ran out of its share of
+    the time) or ``"sync_in_progress"`` (the session's sync is partway: a committed prefix, or another request writing it),
+    else None."""
     coverage = result.get("coverage") if isinstance(result, dict) else None
     issues = coverage.get("issues") if isinstance(coverage, dict) else None
-    return "sync_deadline" if isinstance(issues, (list, tuple)) and "sync_deadline" in issues else None
+    if not isinstance(issues, (list, tuple)):
+        return None
+    return next((reason for reason in ("sync_deadline", "sync_in_progress") if reason in issues), None)
 
 
 def _collect_worker_exception(worker):
@@ -356,7 +360,7 @@ async def _serve(trace, work, control, notes, *, heavy=True, keep=frozenset(), i
         trace.count("error")
         raise
     else:
-        degraded = notes.degraded or _sync_deadline(result)
+        degraded = notes.degraded or _unfinished_sync(result)
         trace.count("degraded" if degraded else "ok", degraded)
         return response
     trace.count("incomplete", reason)
@@ -465,6 +469,8 @@ async def sync_session(
     (overrides the default request timeout, capped by max_tool_timeout_sec).
     verify: "full" (default) verifies every block of the source; "fast" compares only its tail, latest and sampled
     blocks. The result's integrity object says which happened and when the source was last verified in full.
+    A session too large for the budget is indexed in slices: when the result's sync object says state "partial" the
+    prefix up to sync.indexed_through is committed (coverage.issues has sync_in_progress); call again to continue.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.sync_session, session_id=session_id, path=path, provider=provider, embed=embed,

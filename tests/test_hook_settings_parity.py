@@ -104,7 +104,8 @@ def test_literal_choices_match_the_model():
                           ("dense_backend", settings_core.DENSE_BACKENDS),
                           ("graph_extractor", settings_core.GRAPH_EXTRACTORS),
                           ("daemon", settings_core.DAEMON_MODES),
-                          ("sqlite_journal", settings_core.SQLITE_JOURNAL_MODES)):
+                          ("sqlite_journal", settings_core.SQLITE_JOURNAL_MODES),
+                          ("sync_slicing", settings_core.SYNC_SLICING_MODES)):
         assert typing.get_args(Settings.model_fields[name].annotation) == choices, name
 
 
@@ -184,7 +185,9 @@ CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Adviso
            "graph_extractor": ["openrouter", "host", "Host", "HOST", "OpenRouter", "OPENROUTER", "", " host", "host ",
                                "open_router", "open-router", "local", "none", "true", "1", "host\n"],
            "daemon": ["off", "on", "On", "ON", "", " on", "on ", "auto", "true", "1", "false", "Off"],
-           "sqlite_journal": ["auto", "delete", "Auto", "DELETE", "", " auto", "delete ", "wal", "off", "true", "truncate"]}
+           "sqlite_journal": ["auto", "delete", "Auto", "DELETE", "", " auto", "delete ", "wal", "off", "true", "truncate"],
+           "sync_slicing": ["auto", "off", "Auto", "OFF", "Off", "", " off", "auto ", "on", "false", "0", "true", "slice",
+                           "off\n"]}
 # SELF_DIRECT_AUDIT_SHADOW_EVERY: a non-negative integer, or "adaptive" in any case with surrounding whitespace.
 SHADOW_EVERY = [*INTS, "adaptive", "Adaptive", "ADAPTIVE", " adaptive ", "adaptive\n", "\tadaptive", "adaptiv", "adaptive!",
                 "adapt ive", "fixed", "auto", "none", "-1", "adaptive0", "0adaptive", "\u0430daptive", "adaptive\u200b"]
@@ -203,7 +206,7 @@ FIELD_KINDS = {
     "integrity_full_verify_interval_sec": "float", "integrity_background_verify": "bool",
     "integrity_background_idle_sec": "float", "integrity_background_max_scans": "int",
     "audit_incremental": "bool", "audit_shadow_every": "shadow_every", "audit_shadow_idle_sec": "float",
-    "audit_incremental_min_events": "int",
+    "audit_incremental_min_events": "int", "sync_slice_bytes": "int",
 }
 FREE_TEXT = {"embedding_model": ["m", "", " spaced model ", "a/b:c"], "embedding_base_url": ["http://x", "", "u r l"],
              "openrouter_api_key": ["k", "", " k ", "sk-synthetic"]}

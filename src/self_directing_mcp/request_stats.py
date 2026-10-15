@@ -26,10 +26,12 @@ TOOLS = (
     "workflow_status", "workflow_run_checks", "workflow_classify", "workflow_transition", "workflow_authorize",
     "workflow_execute", "codex_session_hook", "hook",
 )
-# How a request ended: answered; answered from less evidence than wanted (the sync ran out of its share of the time);
-# no answer (a deadline, a busy index, a cancellation inside the engine); the client went away; an unexpected failure.
+# How a request ended: answered; answered from less evidence than wanted (the sync ran out of its share of the time, or
+# the session's sync is still in progress: a prefix is committed, or another request is writing it); no answer (a
+# deadline, a busy index, a cancellation inside the engine); the client went away; an unexpected failure.
 OUTCOMES = ("ok", "degraded", "incomplete", "client_cancelled", "error")
-REASONS = ("request_deadline", "index_busy", "request_cancelled", "operation_timeout", "sync_deadline", OTHER)
+REASONS = ("request_deadline", "index_busy", "request_cancelled", "operation_timeout", "sync_deadline",
+           "sync_in_progress", OTHER)
 WITH_REASON = ("incomplete", "degraded")        # the outcomes that carry a reason
 BUCKETS_MS = (50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 45000)    # upper bounds, inclusive; one more bucket: +inf
 _MAX_MS = 86_400_000.0                           # a day: keeps a corrupt measurement a finite number
@@ -174,8 +176,9 @@ def collecting(notes: Notes):
 
 
 def note_degraded(reason) -> None:
-    """The engine answered from less evidence than it wanted (an evidence refresh that ran out of its share of the time).
-    Only the first reason of a request is kept; outside a dispatched request there is nobody to tell."""
+    """The engine answered from less evidence than it wanted (an evidence refresh that ran out of its share of the time,
+    or found the session still being synced by another request). Only the first reason of a request is kept; outside a
+    dispatched request there is nobody to tell."""
     notes = _notes.get()
     if notes is not None and notes.degraded is None:
         notes.degraded = fold(reason, REASONS)
