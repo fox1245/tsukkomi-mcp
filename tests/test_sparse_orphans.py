@@ -245,7 +245,7 @@ def test_a_rebuild_with_a_tiny_budget_resumes_and_the_removals_add_up(tmp_path, 
 
         removed, runs, seen = 0, [], []
         while True:
-            info = w.engine.rebuild_sparse(budget_sec=0.05, batch=4, orphan_progress=lambda *a: (seen.append(a), time.sleep(0.08)))
+            info = w.engine.rebuild_sparse(budget_sec=0.15, batch=4, orphan_progress=lambda *a: (seen.append(a), time.sleep(0.25)))
             runs.append(info)
             removed += info["orphans_removed"]
             assert info["orphans_removed"] <= 4 * 2 and w.engine.sparse.verify_statistics()["documents"] == w.engine.sparse.count()
@@ -288,7 +288,7 @@ def test_the_orphans_wait_while_events_are_still_missing_and_the_budget_covers_b
     w = world(tmp_path, monkeypatch, events=20, orphans=10)
     try:
         w.engine.sparse.delete_ids(sorted(w.canonical)[:12])                  # events the index lacks, orphans it should not hold
-        info = w.engine.rebuild_sparse(budget_sec=0.05, batch=5, progress=lambda *a: time.sleep(0.08))
+        info = w.engine.rebuild_sparse(budget_sec=0.15, batch=5, progress=lambda *a: time.sleep(0.25))
         assert info["state"] == "partial" and info["written"] == 5 and info["remaining"] == 7
         assert (info["orphans_removed"], info["orphans_remaining"]) == (0, 10)    # no deletion before the events are all written
         info = w.engine.rebuild_sparse(batch=5)
