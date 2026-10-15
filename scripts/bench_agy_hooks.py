@@ -261,6 +261,7 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     here = Path(__file__).resolve().parents[1] / "src"
     sys.path.insert(0, str(here))
+    from self_directing_mcp.journal import copy_index_dir
     trees = [("this-tree", here)] + ([("baseline", Path(args.baseline_src))] if args.baseline_src else [])
     if args.trees:
         trees = [tree for tree in trees if tree[0] in args.trees.split(",")]
@@ -276,7 +277,7 @@ def main():
             root = work / f"run-{label}-{size}MB"
             if root.exists():
                 shutil.rmtree(root)
-            shutil.copytree(pristine, root)
+            copy_index_dir(pristine, root)       # databases through the backup API, never a bare file copy
             print(f"measuring {label} at {size} MB ...", flush=True)
             report.setdefault(label, {})[size] = measure(f"{label}-{size}", src, root, work, args.repeats)
     print(json.dumps(report, indent=2))

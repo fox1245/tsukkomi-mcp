@@ -270,17 +270,30 @@ class SelfDirectEngine:
         """Write the derived rows a ``defer_derived`` engine is holding (the daemon calls it when idle). Cheap and lock-free
         when nothing is held; never raises for a busy index or a stopped request (the rows stay held for the next call)."""
         store = self.store
-        if store is None or not self._ready or not store.has_pending_derived():
+        if store is None or not self._ready:
+            return 0
+        pending = store.journal.pending is not None and store.journal.retry_due()
+        if not pending and not store.has_pending_derived():
             return 0
         try:
             with self._publication_guard():
                 if self.store is not store or not self._ready:
                     return 0                  # closed while this waited for the lease: close wrote what was held
-                from self_directing_mcp.agy_receipts import ReceiptStore
-                return (store.flush_derived()
-                        + ReceiptStore(Path(self.settings.index_dir), held=store.derived).flush_held())
+                if pending:
+                    store.retry_journal()     # a refused journal-mode switch is tried again at a quiet point
+                if not store.has_pending_derived():
+                    return 0
+                return store.flush_derived() + self._receipts(held=store.derived).flush_held()
         except (IndexBusy, RequestStopped):
             return 0
+
+    def _journal_policy(self) -> str | None:
+        """``auto`` or ``delete`` (SELF_DIRECT_SQLITE_JOURNAL); None leaves the package default to the stores."""
+        return getattr(self.settings, "sqlite_journal", None)
+
+    def _receipts(self, **kwargs):
+        from self_directing_mcp.agy_receipts import ReceiptStore
+        return ReceiptStore(Path(self.settings.index_dir), journal=self._journal_policy(), **kwargs)
 
     def _held_rows(self):
         """The buffer a ``defer_derived`` engine holds its derived rows in, or None (nothing is deferred)."""
@@ -364,7 +377,7 @@ class SelfDirectEngine:
                 backend=s.dense_backend, extension_path=s.sqlite_vector_path)
         self.sparse = SparseIndex(index_dir / "sparse.sqlite")
         self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes,
-                                  defer_derived=self.defer_derived)
+                                  defer_derived=self.defer_derived, journal=self._journal_policy())
         self.contracts = ContractStore(s.resolve_contracts_path())
         self.checklists = ChecklistStore(index_dir)
         self.graph = GraphStore(index_dir / "graph.sqlite")
@@ -532,12 +545,11 @@ class SelfDirectEngine:
     @request_operation
     def record_agy_hook(self, payload: dict[str, Any], event: str) -> None:
         """Record host hook observations separately from native transcript bytes."""
-        from self_directing_mcp.agy_receipts import ReceiptStore
         sid = payload["conversationId"].lower()
         path = agy.resolve_session_path(self.settings.resolve_agy_app_data_dirs(),
                                         session_id=sid, path=payload["transcriptPath"],
                                         require_exists=False)
-        ReceiptStore(Path(self.settings.index_dir), held=self._held_rows()).record(
+        self._receipts(held=self._held_rows()).record(
             sid, path, payload["stepIdx"], payload["toolCall"], event,
             error=payload.get("error", "") if event == "PostToolUse" else None,
             guard=self._publication_guard)
@@ -991,9 +1003,7 @@ class SelfDirectEngine:
     def _receipt_token(self, sid, provider):
         if provider != "agy":
             return None
-        from self_directing_mcp.agy_receipts import ReceiptStore
-        receipts = ReceiptStore(Path(self.settings.index_dir))
-        return receipts.authority_token(sid)
+        return self._receipts().authority_token(sid)
 
     @detached_operation
     def audit_session(self, session_id: str, provider: str | None = None, path: str | None = None) -> dict[str, Any]:
@@ -1668,6 +1678,16 @@ class SelfDirectEngine:
             info["needs_review"] = report["needs_review"]
         return info
 
+    def _journal_status(self):
+        """``(journal, journal_fallback)`` for ``audit_status``: the journal mode of each authority database, and the
+        databases that use the rollback journal because their file system is denied or unknown (a fallback is the old
+        behaviour, not a statement that the file system is safe)."""
+        databases = {"meta.sqlite": self.store.journal_report(), "agy-receipts.sqlite": self._receipts().journal_report()}
+        report = {"policy": self.store.journal_policy, "synchronous": "FULL", "databases": databases}
+        fallback = [{"database": name, "reason": entry["reason"]} for name, entry in databases.items()
+                    if entry["fallback"]]
+        return report, fallback
+
     @serialized
     def _capture_status(self, session_id=None, provider=None):
         self.ensure_ready()
@@ -1697,6 +1717,7 @@ class SelfDirectEngine:
             "index_schema": 2,
             "sparse_count": self.sparse.count(),
         }
+        status["journal"], status["journal_fallback"] = self._journal_status()
         worker = self._integrity_worker
         status["integrity_worker"] = worker.snapshot() if worker is not None else None
         if self.embedder_degraded:
@@ -1724,15 +1745,18 @@ class SelfDirectEngine:
                 if self.store is not None and self._ready and self.store.has_pending_derived():
                     try:
                         with self._publication_guard():
-                            from self_directing_mcp.agy_receipts import ReceiptStore
                             self.store.flush_derived()
-                            ReceiptStore(Path(self.settings.index_dir), held=self.store.derived).flush_held()
+                            self._receipts(held=self.store.derived).flush_held()
                     except Exception:
                         pass    # held rows are a cache; closing must not fail because they could not be written
                 if self.defer_derived:
                     from self_directing_mcp.agy_receipts import ReceiptStore
                     ReceiptStore.release(Path(self.settings.index_dir))     # the persistent receipts reader, if any
-                for component in (self.store, self.sparse, self.dense, self.graph):
+                if self._ready:
+                    self._receipts().checkpoint()       # fold a write-ahead log into the file; a no-op without one
+                if self.store is not None:
+                    self.store.close()                  # checkpoints meta.sqlite's log (if any), then closes
+                for component in (self.sparse, self.dense, self.graph):
                     connection = getattr(component, "_conn", None)
                     if connection is not None:
                         connection.close()

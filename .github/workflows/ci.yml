@@ -38,6 +38,7 @@ jobs:
           tests/test_mcp_transport.py
           tests/test_workflow_jev.py
           tests/test_windows_session_paths.py
+          tests/test_journal.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
           tests/test_codex_zstd.py
@@ -97,6 +98,8 @@ jobs:
           tests/test_claude_install.py
           tests/test_hook_import_budget.py
           tests/test_hook_settings_parity.py
+          tests/test_journal.py
+          tests/test_journal_engine.py
           tests/test_runtime_threads.py
           --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file
 

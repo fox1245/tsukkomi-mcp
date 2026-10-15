@@ -8,6 +8,7 @@ process survived.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import json
 import os
@@ -146,7 +147,13 @@ class InProcessDaemon:
     def __init__(self, runtime: Runtime, config=None, **kwargs) -> None:
         from self_directing_mcp.daemon import core
         self.runtime_area = runtime
-        self.config = config or core.DaemonConfig()
+        config = config or core.DaemonConfig()
+        if config.max_rss_mb == core.DaemonConfig().max_rss_mb:
+            # The process under test is the whole pytest process: under a sanitizer (or after a long run) its real RSS
+            # is far above the production cap, which would drain the daemon after its first request. Only a test that
+            # sets a cap itself (with a faked reader) exercises that rule.
+            config = dataclasses.replace(config, max_rss_mb=0)
+        self.config = config
         self.kwargs = kwargs
         self.runtime = None
         self.lock = None

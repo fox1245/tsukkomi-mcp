@@ -30,12 +30,11 @@ from __future__ import annotations
 import hashlib
 import json
 import random
-import shutil
 import sqlite3
 
 import pytest
 
-from self_directing_mcp import agy_hooks, agy_receipts
+from self_directing_mcp import agy_hooks, agy_receipts, journal
 from self_directing_mcp.agy import RESULT_TYPES
 from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
@@ -418,7 +417,7 @@ def fresh_snapshot(world, name):
     """The same final files, indexed from nothing: a copy of the receipts as they now stand, no ledger, no cursor."""
     index = world.tmp / name
     index.mkdir()
-    shutil.copy(world.index / "agy-receipts.sqlite", index / "agy-receipts.sqlite")
+    journal.copy_database(world.index / "agy-receipts.sqlite", index / "agy-receipts.sqlite")   # not a bare file copy: a -wal
     with sqlite3.connect(index / "agy-receipts.sqlite") as conn:
         conn.execute("DELETE FROM scan_state")
         conn.execute("DELETE FROM scan_results")

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from self_directing_mcp import journal as _journal
 from self_directing_mcp._runtime import np
 
 from self_directing_mcp.compressed_source import CompressedSourceError
@@ -304,7 +305,10 @@ def _decode_held_state(row):
 class SessionStore:
     """v2 events preserve every occurrence; legacy tables remain untouched for recovery."""
 
-    def __init__(self, db_path: Path, *, max_decompressed_bytes: int | None = None, defer_derived: bool = False):
+    def __init__(self, db_path: Path, *, max_decompressed_bytes: int | None = None, defer_derived: bool = False,
+                 journal: str | None = None):
+        """``journal``: ``"auto"`` (write-ahead logging on a verified local file system, else the rollback journal) or
+        ``"delete"``; ``None`` is ``journal.DEFAULT_POLICY``. Always ``synchronous=FULL``; see ``journal``."""
         check_request()
         self.db_path = Path(db_path)
         # A resident engine (the daemon) holds derived and advisory rows in memory and writes them with the next
@@ -314,9 +318,12 @@ class SessionStore:
         # Bound on the declared decompressed size of a .zst session source (None: compressed_source's default).
         self.max_decompressed_bytes = max_decompressed_bytes
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.journal_policy = _journal.validate_policy(_journal.DEFAULT_POLICY if journal is None else journal)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._counts = {}
+        # Before the first transaction: the mode changes only here (or at ``retry_journal``), never inside one.
+        self.journal = _journal.apply_journal(self._conn, self.db_path, self.journal_policy)
         try:
             with publication():
                 self._initialize_schema()
@@ -325,6 +332,24 @@ class SessionStore:
         except BaseException:
             self._conn.close()
             raise
+
+    def retry_journal(self) -> bool:
+        """Try again to reach the wanted journal mode after a refused switch (another connection held the file). Call
+        it from a quiet point holding the engine's lease; a connection inside a transaction is left alone. Rate-limited,
+        never raises. True when the database is in the wanted mode afterwards."""
+        if self.journal.pending is not None and self.journal.retry_due():
+            _journal.reconcile(self._conn, self.journal)
+        return self.journal.pending is None
+
+    def journal_report(self) -> dict:
+        return self.journal.report()
+
+    def close(self) -> None:
+        """Fold the write-ahead log into the main file (a no-op in the rollback-journal mode), then close. Never raises."""
+        try:
+            _journal.checkpoint(self._conn)
+        finally:
+            self._conn.close()
 
     def _initialize_schema(self):
         self._conn.executescript("""
@@ -1688,8 +1713,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                     # Every receipt anchors to a prefix digest and the ledger to a verified length: hash the capture
                     # at those offsets and none of them costs a second read of the file.
                     from self_directing_mcp.agy_receipts import ReceiptStore
-                    hint += ReceiptStore(store.db_path.parent, held=store.derived if store.defer_derived else None
-                                         ).checkpoints(sid_hint.lower(), path)
+                    hint += ReceiptStore(store.db_path.parent, held=store.derived if store.defer_derived else None,
+                                         journal=store.journal_policy).checkpoints(sid_hint.lower(), path)
             except (OSError, sqlite3.Error):
                 hint, known, record = (), None, None
         observation = _capture_observation(path, provider, known, record, hint, verify, policy,
@@ -1719,7 +1744,8 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                 from self_directing_mcp.agy_receipts import ReceiptStore
                 fallback_retries = store.agy_fallback_retries(sid) if cursor else ()
                 cursor_deps = store.receipt_deps(sid, provider, cursor["synced_at"]) if cursor else None
-                receipt_store = ReceiptStore(store.db_path.parent, held=store.derived if store.defer_derived else None)
+                receipt_store = ReceiptStore(store.db_path.parent, held=store.derived if store.defer_derived else None,
+                                             journal=store.journal_policy)
                 receipt_capture = receipt_store.read_capture(sid)
                 receipt_authority_before = receipt_store.authority_token(sid)
                 if (receipt_authority_before[0] != "present"

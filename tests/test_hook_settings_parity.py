@@ -102,7 +102,8 @@ def test_literal_choices_match_the_model():
                           ("claude_enforcement", settings_core.ENFORCEMENT_MODES),
                           ("session_provider", settings_core.SESSION_PROVIDERS),
                           ("dense_backend", settings_core.DENSE_BACKENDS),
-                          ("daemon", settings_core.DAEMON_MODES)):
+                          ("daemon", settings_core.DAEMON_MODES),
+                          ("sqlite_journal", settings_core.SQLITE_JOURNAL_MODES)):
         assert typing.get_args(Settings.model_fields[name].annotation) == choices, name
 
 
@@ -163,7 +164,8 @@ CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Adviso
            "claude_enforcement": ["confirmed_only", "advisory", "enforced", "Enforced", "", "advisory ", "bogus"],
            "session_provider": ["codex", "grokbot", "omp", "agy", "claude", "Codex", "", "cursor", "claude "],
            "dense_backend": ["sqlite-vector", "numpy", "NumPy", "", "sqlite_vector", "faiss"],
-           "daemon": ["off", "on", "On", "ON", "", " on", "on ", "auto", "true", "1", "false", "Off"]}
+           "daemon": ["off", "on", "On", "ON", "", " on", "on ", "auto", "true", "1", "false", "Off"],
+           "sqlite_journal": ["auto", "delete", "Auto", "DELETE", "", " auto", "delete ", "wal", "off", "true", "truncate"]}
 # SELF_DIRECT_AUDIT_SHADOW_EVERY: a non-negative integer, or "adaptive" in any case with surrounding whitespace.
 SHADOW_EVERY = [*INTS, "adaptive", "Adaptive", "ADAPTIVE", " adaptive ", "adaptive\n", "\tadaptive", "adaptiv", "adaptive!",
                 "adapt ive", "fixed", "auto", "none", "-1", "adaptive0", "0adaptive", "\u0430daptive", "adaptive\u200b"]
