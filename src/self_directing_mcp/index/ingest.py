@@ -1593,11 +1593,11 @@ class _Stage:
         binding = reindex_spool.SpoolBinding(
             provider=provider, session_id=sid, target_version=parser_version, base_version=cursor["parser_version"],
             base_stamp=cursor["synced_at"], hash_kind=kind, dev=observation.identity[0], ino=observation.identity[1],
-            path=str(path), size=length, head_length=head, head_hash=observation.prefix_digest(head),
+            path=str(path), size=length, head_length=head, head_hash=observation.head_digest(head),
             receipt_digest=receipt_digest)
         try:
             spool = reindex_spool.ReindexSpool.open(index_dir, binding, source_length=length,
-                                                    head_hash=observation.prefix_digest,
+                                                    head_hash=observation.head_digest,
                                                     cursor_hash=lambda offset: observation.cursor_hash(offset, kind))
         except reindex_spool.SpoolBusy:
             raise FlightBusy() from None       # another process is staging this session: judge on what is committed
@@ -2180,10 +2180,11 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             start = stage.start          # where the staged range ends: the parse continues from there
         # The parse that adds to what is stored, and a staged slice of a re-index, may stop early at their soft deadline;
         # any other re-index is all or nothing, as before.
-        budget = _new_budget(slicing, start) if (sliceable and not reindexed) or staging else None
-        chunks = RowSpool(track_calls=staging and provider == "omp")
-        uses = set()
-        try:
+        budget, chunks, uses = None, _NoRows(), set()
+        try:   # from here on whatever ends the request lets go of the spool (its lock is a file descriptor)
+            if (sliceable and not reindexed) or staging:
+                budget = _new_budget(slicing, start)
+            chunks = RowSpool(track_calls=staging and provider == "omp")
             with slice_scope(budget):
                 if cursor and not reindexed and provider != "agy" and start >= observation.complete_end:
                     offset, parsed_sid = start, sid
@@ -2294,6 +2295,10 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
                         raise
                     if staging:
                         stage.published(chunks.count)
+                    elif reindexed:
+                        # Not staged (slicing off, no deadline, a compressed source): a spool of this session that an
+                        # earlier request left is moot now.
+                        reindex_spool.ReindexSpool.discard_session(index_dir, provider, sid)
                 elif bound and observation.mode == "full":
                     # Nothing to publish, but every block was just compared: stamp the stored table.
                     stamp = observation.stamp

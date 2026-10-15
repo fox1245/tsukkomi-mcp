@@ -109,6 +109,65 @@ def test_the_row_source_has_the_interface_of_a_row_spool(tmp_path):
     spool.close()
 
 
+def test_a_row_spool_staged_and_read_back_is_what_a_row_spool_replays(tmp_path):
+    """The spool takes the text of a ``RowSpool`` as it is and brings back its rows, ids, flags, tallies (and, for OMP, the
+    earliest byte of each tool call) exactly: the commit cannot tell the two row sources apart."""
+    from self_directing_mcp.index.ingest import RowSpool
+    from self_directing_mcp.session_events import make_chunk
+    source = RowSpool(track_calls=True)
+    chunks = [
+        make_chunk("omp", "session-1", "tool_call", "[tool_call] bash", {"call_id": "c1", "tool_name": "bash"}, 1, 10, 50),
+        make_chunk("omp", "session-1", "meta", "[parse_error] bad", {"parse_error": True}, 2, 50, 60),
+        make_chunk("omp", "session-1", "meta", "[omp_event:x] caf\u00e9 \"q\" \\", {"unsupported_event": True}, 3, 60, 99),
+        make_chunk("omp", "session-1", "tool_call", "[tool_call] bash", {"call_id": "c1", "tool_name": "bash"}, 4, 99, 120),
+        make_chunk("omp", "session-1", "tool_result", "[tool_result:bash] ok", {"call_id": "c1", "success": True}, 5, 120, 150),
+    ]
+    for chunk in chunks:
+        source.append(chunk)
+    replayed = [row for batch in source.batches() for row in batch]
+    spool = open_spool(tmp_path, binding(provider="omp", session_id="session-1"))
+    assert spool.append_slice(source, 150, "prefix-150", start_offset=0)
+    staged = spool.as_row_source()
+    assert [row for batch in staged.batches(2) for row in batch] == replayed
+    assert (staged.count, staged.ids, staged.flags) == (source.count, source.ids, source.flags)
+    assert staged.tallies == source.tallies == {} and source.calls == {("c1", "bash"): 10}
+    spool.close()
+    again = open_spool(tmp_path, binding(provider="omp", session_id="session-1"))
+    assert again.calls == {("c1", "bash"): 10}
+    again.close()
+    source.close()
+
+
+def test_the_blocks_of_a_row_spool_are_its_lines(tmp_path):
+    from self_directing_mcp.index.ingest import RowSpool
+    from self_directing_mcp.session_events import make_chunk
+    source = RowSpool()
+    for n in range(50):
+        source.append(make_chunk("codex", "session-1", "turn", f"event {n} " + "x" * 200, {"role": "user"}, n, n * 300, n * 300 + 299))
+    blocks = list(source.blocks(limit=1000))
+    assert len(blocks) > 5 and sum(count for _data, count in blocks) == 50
+    assert all(isinstance(data, bytes) and data.endswith(b"\n") for data, _count in blocks)
+    assert b"".join(data for data, _count in blocks).decode().splitlines() == \
+        [json.dumps(list(row)) for batch in source.batches() for row in batch]
+    source.close()
+
+
+def test_the_index_of_a_slice_is_written_in_bounded_parts(tmp_path, monkeypatch):
+    """The ids of a slice are never one document of the size of the slice: a commit decodes them a part at a time."""
+    monkeypatch.setattr(rs, "INDEX_CHUNK", 7)
+    spool = open_spool(tmp_path)
+    flags = {f"codex:session-1:{n * 10}:0:{n:016x}": (True, False) for n in range(0, 40, 3)}
+    tallies = {f"codex:session-1:{n * 10}:0:{n:016x}": [("k", n)] for n in range(0, 40, 2)}
+    spool.append_slice(rows(0, 40), 400, "prefix-400", start_offset=0, flags=flags, tallies=tallies)
+    assert len(spool._index_frames) == 6                              # 40 ids in parts of 7
+    source = spool.as_row_source()
+    assert source.ids == {row[0] for row in rows(0, 40)} and source.flags == flags and source.tallies == tallies
+    spool.close()
+    again = open_spool(tmp_path)
+    assert len(again._index_frames) == 6 and again.as_row_source().ids == source.ids
+    again.close()
+
+
 def test_the_row_source_streams_a_frame_at_a_time(tmp_path, monkeypatch):
     monkeypatch.setattr(rs, "BLOCK_BYTES", 600)                       # a few rows per frame
     spool = open_spool(tmp_path)

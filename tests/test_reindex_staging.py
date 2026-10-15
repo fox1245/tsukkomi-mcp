@@ -48,6 +48,53 @@ def far():
     return time.monotonic() + BIG
 
 
+# --- the report -------------------------------------------------------------------------------------------------------
+
+def test_the_report_has_the_five_states_in_a_fixed_order_of_precedence():
+    from self_directing_mcp.index.ingest import REINDEX_STATES, _Stage
+
+    class Spool:
+        staged_through, rows = 700, 33
+
+    stage = _Stage()
+    stage.spool = Spool()
+    assert stage.report(1000, 1000) == {"state": "staging", "staged_through": 700, "target_bytes": 1000, "rows": 33, "reason": None}
+    stage.discarded = "prefix_changed"
+    assert stage.report(1000, 1000)["state"] == "discarded" and stage.report(1000, 1000)["reason"] == "prefix_changed"
+    stage.complete = True
+    assert stage.report(1000, 1000)["state"] == "ready_to_commit" and stage.report(1000, 1000)["reason"] == "commit_exceeds_budget"
+    stage.committed, stage.rows = True, 40
+    assert stage.report(1000, 1000) == {"state": "committed", "staged_through": 1000, "target_bytes": 1000, "rows": 40,
+                                        "reason": None}
+    stage.disabled = "disk"
+    assert stage.report(1000, 1000)["state"] == "disabled" and stage.report(1000, 1000)["reason"] == "disk"
+    assert {"staging", "discarded", "ready_to_commit", "committed", "disabled"} == set(REINDEX_STATES)
+
+
+@pytest.mark.parametrize("state,expected", [
+    ("staging", ("partial", "soft_deadline", 0.25)),
+    ("discarded", ("partial", "soft_deadline", 0.25)),
+    ("ready_to_commit", ("partial", "eof", 1.0)),
+    ("committed", ("complete", "eof", 1.0)),
+    ("disabled", ("complete", "eof", 1.0)),
+])
+def test_a_sync_is_partial_while_a_reindex_waits_whatever_the_cursor_says(state, expected):
+    from self_directing_mcp.index.ingest import _sync_report
+    from self_directing_mcp.slice_budget import SliceBudget
+
+    class Observation:
+        complete_end = 1000
+
+    budget = SliceBudget()
+    budget.stop("soft_deadline", 10, 250)
+    through = 1000 if state == "ready_to_commit" else 250
+    report = _sync_report(1000, 1000, 0, budget, Observation(),
+                          {"state": state, "staged_through": through, "target_bytes": 1000, "rows": 5, "reason": None})
+    assert (report["state"], report["stopped_by"], report["progress"]) == expected
+    assert report["indexed_through"] == 1000 and report["reindex"]["state"] == state
+    assert report["retry_after_ms"] == (500 if expected[0] == "partial" else None)
+
+
 # --- while it is staged -----------------------------------------------------------------------------------------------
 
 def test_the_first_slice_stages_and_reports(pair):
@@ -341,16 +388,20 @@ def test_a_spool_staged_for_an_upgrade_is_an_orphan_once_the_index_has_the_targe
     p = pair()
     one = reindex_of(p.stage(cap=30))
     p.stage(cap=30)
+    [spool] = spool_files(p.staged)
+    left_behind = spool.read_bytes()
     from self_directing_mcp.config import Settings
     from self_directing_mcp.engine import SelfDirectEngine
     other = SelfDirectEngine(Settings(_env_file=None, local_only=True, openrouter_api_key_file=None,
                                       index_dir=p.staged.settings.index_dir, **p.world.paths))
     p.world.engines.append(other)
     other.sync_session(**p.world.sync_args(), derived=False)
+    assert not spool_files(p.staged)             # a re-index that is published clears the spools of its session
+    spool.write_bytes(left_behind)              # ... unless that process was an older build, or died before it could
     edit_source(p.world.path)
     p.reason = "source_changed"
     restarted = p.stage(cap=30)
-    assert reindex_of(restarted)["state"] == "discarded" and reindex_of(restarted)["reason"] in ("orphan", "index_changed")
+    assert reindex_of(restarted)["state"] == "discarded" and reindex_of(restarted)["reason"] == "orphan"
     assert reindex_of(restarted)["rows"] == one["rows"]
     p.before = index_dump(p.staged)
     info = p.finish()
@@ -657,3 +708,21 @@ def test_a_spool_directory_that_cannot_be_read_turns_staging_off_for_the_request
         assert info["reindexed"] is True and info["sync"]["state"] == "complete"      # the re-index of before
     finally:
         os.chmod(directory, 0o700)
+
+
+@pytest.mark.skipif(not POSIX, reason="the lock of Windows is not exercised here")
+def test_a_request_that_fails_before_its_parse_does_not_keep_the_spool_locked(pair, monkeypatch):
+    """The lock is the file descriptor: whatever ends the request, it goes with it."""
+    p = pair()
+    p.stage(cap=30)
+    assert spool_files(p.staged)
+
+    def no_room_for_a_temporary_file(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ingest, "RowSpool", no_room_for_a_temporary_file)
+    with pytest.raises(OSError):
+        p.stage(cap=30)
+    monkeypatch.undo()
+    assert reindex_of(p.stage(cap=30))["state"] == "staging"        # not FlightBusy: nobody holds the spool
+    assert p.intact()

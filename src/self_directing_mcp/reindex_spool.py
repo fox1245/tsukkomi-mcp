@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -51,6 +52,7 @@ DIRECTORY = "reindex"
 SUFFIX = ".spool"
 HEAD_BYTES = 64 * 1024              # the head of the source whose hash binds a spool to it
 BLOCK_BYTES = 1 << 20               # about this much row text per frame
+INDEX_CHUNK = 16384                 # ids (and flags, tallies) per index frame: what a commit decodes at a time
 # Free space wanted on the index volume, per source byte, before a spool is started: twice the measured 4.2 spool bytes per
 # source byte (the commit then grows the database by about as much again while the spool still exists).
 DISK_FACTOR = 2 * 4.5
@@ -631,6 +633,19 @@ class ReindexSpool:
 
         return lines(), ids
 
+    @staticmethod
+    def _index_parts(ids, flags, tallies):
+        """The ids, flags and tallies of a slice in parts of ``INDEX_CHUNK``: no part is a document of the size of the slice."""
+        ids, flags, tallies = iter(ids), iter(flags.items()), iter(tallies.items())
+        while True:
+            part = {"ids": list(itertools.islice(ids, INDEX_CHUNK)),
+                    "flags": {cid: [bool(a), bool(b)] for cid, (a, b) in itertools.islice(flags, INDEX_CHUNK)},
+                    "tallies": {cid: [[key, number] for key, number in pairs]
+                                for cid, pairs in itertools.islice(tallies, INDEX_CHUNK)}}
+            if not (part["ids"] or part["flags"] or part["tallies"]):
+                return
+            yield part
+
     def _write_trailer(self, trailer: dict) -> None:
         self._write_frame(TRAILER + json.dumps(trailer).encode())
 
@@ -658,10 +673,10 @@ class ReindexSpool:
         os.lseek(self._fd, begin, os.SEEK_SET)
         try:
             frames, count, ids = self._write_rows(rows)
-            index = {"ids": ids,
-                     "flags": {cid: [bool(a), bool(b)] for cid, (a, b) in flags.items()},
-                     "tallies": {cid: [[key, number] for key, number in pairs] for cid, pairs in tallies.items()}}
-            index_at = self._write_frame(INDEX + json.dumps(index).encode())
+            index_at = []
+            for part in self._index_parts(ids, flags, tallies):
+                check_request()
+                index_at.append(self._write_frame(INDEX + json.dumps(part).encode()))
             meta = {"calls": [[call_id, name, byte] for (call_id, name), byte in (calls or {}).items()],
                     "deps": deps, "receipt_digest": receipt_digest}
             self._write_frame(META + json.dumps(meta).encode())
@@ -677,7 +692,7 @@ class ReindexSpool:
         self.rows += count
         self.staged_through, self.prefix_hash = end_offset, prefix_hash
         self._row_frames.extend(frames)
-        self._index_frames.append(index_at)
+        self._index_frames.extend(index_at)
         for (call_id, name), byte in (calls or {}).items():
             self.calls[(call_id, name)] = min(self.calls.get((call_id, name), byte), byte)
         if isinstance(deps, dict):
@@ -743,6 +758,13 @@ class ReindexSpool:
 
     def __exit__(self, *exc):
         self.close()
+
+    def __del__(self):
+        # The lock is the file descriptor: a spool nobody closed must not keep its session locked for this process's life.
+        try:
+            self._release()
+        except Exception:
+            pass
 
     @property
     def size(self) -> int:

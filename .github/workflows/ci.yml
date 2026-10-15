@@ -45,6 +45,9 @@ jobs:
           tests/test_slice_settings.py
           tests/test_slice_flight.py
           tests/test_slice_adapters.py
+          tests/test_reindex_spool.py
+          tests/test_reindex_equivalence.py
+          tests/test_reindex_staging.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
           tests/test_codex_zstd.py
@@ -119,6 +122,11 @@ jobs:
           tests/test_slice_settings.py
           tests/test_slice_flight.py
           tests/test_slice_adapters.py
+          tests/test_reindex_spool.py
+          tests/test_reindex_equivalence.py
+          tests/test_reindex_staging.py
+          tests/test_reindex_faults.py
+          tests/test_reindex_convergence.py
           tests/test_runtime_threads.py
           --deselect tests/test_append_capture.py::test_capture_is_bounded_hashed_and_does_not_retain_the_file
 

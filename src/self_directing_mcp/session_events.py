@@ -147,6 +147,13 @@ class SourceObservation:
             raise SourceChanged("source truncated during read")
         return self._checkpoint(length)[0].hexdigest()
 
+    def head_digest(self, length: int) -> str:
+        """SHA-256 of the first ``length`` bytes, read from the file again. Unlike ``prefix_digest`` it is not kept as a
+        checkpoint, so no parse can start from a hash state that was made for something else."""
+        digest = hashlib.sha256()
+        self._read_into(digest, 0, length)
+        return digest.hexdigest()
+
     def line_state(self, offset: int):
         """Hash state (a copy) and line count of ``[0, offset)``."""
         digest, lines = self._checkpoint(offset)

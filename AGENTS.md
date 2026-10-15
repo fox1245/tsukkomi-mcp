@@ -204,9 +204,19 @@ reports sync {state partial|complete, indexed_through, pending_bytes, target_byt
 retry_after_ms, stopped_by}, coverage.backlog_bytes and the issue sync_in_progress. retry_after_ms is a
 hint: nothing retries automatically, call again to continue. While a backlog exists the verdict is never
 clean and judged_prefix is never set: a forbidden match in the committed prefix is a violation, a proposed
-action that matches a prohibition is a violation, everything else is unknown. A reindex (parser upgrade,
-changed source, changed AGY receipts) and a .zst source are never sliced; an interrupted reindex leaves
-the previous index. A request that waits for another request's sync of the same session gives up after
+action that matches a prohibition is a violation, everything else is unknown. A .zst source is never
+sliced. A reindex (parser upgrade, changed source, changed AGY receipts) is never published in slices
+either, but it keeps its progress: the slices of its parse are staged in <index dir>/reindex/*.spool (a
+second copy of the session text: 0600 file in a 0700 directory, deleted after its commit, safe to delete
+by hand) and ONE replace commit publishes them once everything is staged and the commit (18 us a row, times
+1.5) fits the time left. The index is not touched until then: an interrupted or crashed reindex leaves
+the previous index, audits judge the previous events with parser_outdated and are never clean, and
+sync.reindex {state staging|ready_to_commit|committed|discarded|disabled, staged_through, target_bytes,
+rows, reason} says where it is. ready_to_commit (coverage issue reindex_ready_to_commit) means the commit
+did not fit: an explicit sync_session finishes it (about 1.5 million events in 45 s; a hook publishes at
+most about 160,000). A spool that no longer matches its source, receipts, parser or cursor is discarded
+and the staging restarts from byte 0; the index is never discarded with it. A request that waits for
+another request's sync of the same session gives up after
 min(1 s, a quarter of its time) with sync_in_progress (for an audit or check, a quarter of the sync's 60 % share).
 Response reasons and coverage issues are an open set: show an unknown one as an opaque string and treat it as
 unverified.
