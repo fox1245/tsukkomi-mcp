@@ -27,6 +27,8 @@ from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.request_control import (
     IndexBusy, RequestControl, RequestStopped, check_request, request_scope,
 )
+from self_directing_mcp import request_stats
+from self_directing_mcp.request_stats import STATS
 
 HOOK_INSTRUCTIONS = (
     "Local session history and explicit constraint checks, used when relevant. "
@@ -162,11 +164,42 @@ def _format_contract_errors(contracts, exc: ValidationError) -> str:
         lines.append(f"{target}.{field_path}: {msg}")
     return "Invalid contracts input; nothing was saved. " + "; ".join(lines)
 
-def _incomplete_response(reason):
-    return {"ok": False, "verdict": "unknown", "error": reason,
-            "coverage": {"complete": False, "issues": [reason]},
-            "action_executed": False, "requires_attention": True,
-            "nudge": "Local work did not complete; this is not compliance or proof of rollback."}
+def _incomplete_response(reason, trace=None):
+    payload = {"ok": False, "verdict": "unknown", "error": reason,
+               "coverage": {"complete": False, "issues": [reason]},
+               "action_executed": False, "requires_attention": True,
+               "nudge": "Local work did not complete; this is not compliance or proof of rollback."}
+    if trace is not None:     # where the time went: waiting for a heavy-call slot, then the whole request, against its budget
+        payload["timings_ms"] = trace.timings_ms()
+        payload["budget_ms"] = round(trace.budget * 1000)
+    return payload
+
+
+class _Trace:
+    """One request's clock. ``_await_request`` fills in the wait for a heavy-call slot; the dispatcher counts the request
+    once, at its response, so the response and the statistics tell the same story."""
+
+    def __init__(self, tool, budget):
+        self.tool, self.budget = tool, budget
+        self.begin = time.monotonic()
+        self.gate_wait = None           # seconds queued for a slot; None for a call that bypasses the gate
+
+    def elapsed(self):
+        return time.monotonic() - self.begin
+
+    def timings_ms(self):
+        return {"gate_wait": round((self.gate_wait or 0.0) * 1000, 1), "elapsed": round(self.elapsed() * 1000, 1)}
+
+    def count(self, outcome, reason=None):
+        STATS.record(self.tool, outcome, reason=reason, elapsed_ms=self.elapsed() * 1000,
+                     gate_wait_ms=None if self.gate_wait is None else self.gate_wait * 1000)
+
+
+def _sync_deadline(result):
+    """``"sync_deadline"`` when a result's coverage says its evidence refresh ran out of time, else None."""
+    coverage = result.get("coverage") if isinstance(result, dict) else None
+    issues = coverage.get("issues") if isinstance(coverage, dict) else None
+    return "sync_deadline" if isinstance(issues, (list, tuple)) and "sync_deadline" in issues else None
 
 
 def _collect_worker_exception(worker):
@@ -261,28 +294,73 @@ class _GateRegistry:
 _gate = _GateRegistry()
 
 
-async def _await_request(work, control, budget, heavy=True):
+async def _await_request(work, control, budget, heavy=True, trace=None):
     # Keep the actual thread task alive to collect its eventual exception.
-    slot = await _gate.acquire(control.deadline) if heavy else None
+    stats = STATS
+    slot = None
+    if heavy:
+        queued = time.monotonic()
+        try:
+            slot = await _gate.acquire(control.deadline)
+        finally:
+            if trace is not None:       # a wait that ends in a stop or a cancellation is still a wait
+                trace.gate_wait = time.monotonic() - queued
+        stats.gate_acquired(slot[0]._limit)
     started = time.monotonic()
     try:
         worker = asyncio.create_task(asyncio.to_thread(work))
     except BaseException:
         if slot is not None:
             _gate.release(slot, started)
+            stats.gate_released()
         raise
+    abandoned = False
+
+    def account(_worker):
+        if slot is not None:
+            stats.gate_released()
+        if abandoned:               # the request was answered long ago: only the worker counters hear of its end
+            stats.worker_finished_late()
+
     worker.add_done_callback(_collect_worker_exception)
     if slot is not None:
         worker.add_done_callback(lambda _w: _gate.release(slot, started))
+    worker.add_done_callback(account)
     try:
         done, _ = await asyncio.wait({worker}, timeout=max(0.0, control.deadline - time.monotonic()))
         if not done:
+            abandoned = True
+            stats.worker_abandoned()
             control.cancel("request_deadline")
             raise RequestStopped("request_deadline")
         return worker.result()
     except asyncio.CancelledError:
         control.cancel()
         raise
+
+
+async def _serve(trace, work, control, notes, *, heavy=True, keep=frozenset(), incomplete):
+    """Run ``work`` under ``control`` and answer within its deadline. The request is counted once, here, at its response:
+    ``incomplete(reason)`` builds the answer of a request that did not complete."""
+    try:
+        result = await _await_request(work, control, trace.budget, heavy, trace)
+        response = _stamp(mask_value(result, skip_keys=keep))
+    except (IndexBusy, RequestStopped) as exc:
+        reason = exc.reason
+    except TimeoutError:
+        reason = "operation_timeout"
+    except asyncio.CancelledError:
+        trace.count("client_cancelled")
+        raise
+    except Exception:
+        trace.count("error")
+        raise
+    else:
+        degraded = notes.degraded or _sync_deadline(result)
+        trace.count("degraded" if degraded else "ok", degraded)
+        return response
+    trace.count("incomplete", reason)
+    return _stamp(incomplete(reason))
 
 
 async def _dispatch(method, *args, audit=False, **kwargs):
@@ -293,9 +371,10 @@ async def _dispatch(method, *args, audit=False, **kwargs):
     if budget is None:
         budget = _engine.settings.audit_timeout_sec if audit else _engine.settings.request_timeout_sec
     control = RequestControl(deadline=time.monotonic() + budget)
+    trace, notes = _Trace(request_stats.tool_label(method), budget), request_stats.Notes()
 
     def work():
-        with request_scope(control):
+        with request_scope(control), request_stats.collecting(notes):
             check_request()
             try:
                 result = method(*args, _deadline=control.deadline,
@@ -308,12 +387,8 @@ async def _dispatch(method, *args, audit=False, **kwargs):
             check_request()
             return result
 
-    try:
-        return _stamp(mask_value(await _await_request(work, control, budget, heavy), skip_keys=keep))
-    except (IndexBusy, RequestStopped) as exc:
-        return _stamp(_incomplete_response(exc.reason))
-    except TimeoutError:
-        return _stamp(_incomplete_response("operation_timeout"))
+    return await _serve(trace, work, control, notes, heavy=heavy, keep=keep,
+                        incomplete=lambda reason: _incomplete_response(reason, trace))
 
 
 def _resolve_timeout_sec(timeout_ms: int | None, *, audit: bool) -> float:
@@ -336,21 +411,20 @@ def _resolve_timeout_sec(timeout_ms: int | None, *, audit: bool) -> float:
 async def _dispatch_hook(*args, **kwargs):
     budget = _engine.settings.audit_timeout_sec
     control = RequestControl(deadline=time.monotonic() + budget)
+    trace, notes = _Trace("hook", budget), request_stats.Notes()
     def work():
-        with request_scope(control):
+        with request_scope(control), request_stats.collecting(notes):
             check_request()
             result = handle_hook(_engine, *args, _deadline=control.deadline,
                                  cancel_event=control.cancel_event, **kwargs)
             check_request()
             return result
-    try:
-        return _stamp(mask_value(await _await_request(work, control, budget)))
-    except (IndexBusy, RequestStopped, TimeoutError) as exc:
-        reason = exc.reason if isinstance(exc, (IndexBusy, RequestStopped)) else "operation_timeout"
+    def unknown(reason):
         event = args[0]
         context = f"Self-directing audit: unknown ({reason}); do not claim compliance."
-        return _stamp({"systemMessage": context} if event == "Stop" else
-                      {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}})
+        return {"systemMessage": context} if event == "Stop" else {
+            "hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}
+    return await _serve(trace, work, control, notes, incomplete=unknown)
 
 
 
@@ -548,9 +622,15 @@ async def audit_status(session_id: str | None = None, provider: str | None = Non
     """Index health: cursor, chunk counts, degraded flags (numpy/fake embedder).
 
     Call when diagnosing sync gaps. Prefer sync_session + audit_session for the hook workflow.
+    ops: request statistics of this process (per tool: outcomes, reasons, elapsed and slot-wait histograms; abandoned
+    workers; heavy-call gate). It is in memory only, holds no session content and is attached to every answer,
+    including index_busy, because it never waits for the engine.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=True)
-    return await _dispatch(_engine.audit_status, heavy=False, session_id=session_id, provider=provider, audit=True, budget_override=budget)
+    result = await _dispatch(_engine.audit_status, heavy=False, session_id=session_id, provider=provider, audit=True, budget_override=budget)
+    if isinstance(result, dict):
+        result["ops"] = STATS.snapshot()
+    return result
 
 
 @mcp.tool()

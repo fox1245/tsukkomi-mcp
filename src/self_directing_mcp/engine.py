@@ -66,6 +66,7 @@ from self_directing_mcp.neograph_runtime import ng, graph_operation
 from self_directing_mcp.request_control import (
     IndexBusy, RequestStopped, check_request, current_request, publication, request_operation, request_scope,
 )
+from self_directing_mcp import request_stats
 
 if TYPE_CHECKING:       # the pydantic Settings model is imported lazily: command hooks pass a light settings object
     from self_directing_mcp.config import Settings
@@ -134,6 +135,19 @@ def _mark_growth(coverage, observation) -> bool:
 
 
 VERIFY_MODES = ("full", "fast")
+
+# A deadline-bound audit or action check gives its evidence refresh this share of the time it has left and keeps the rest
+# for judging; see ``_refresh_evidence``.
+SYNC_BUDGET_SHARE = 0.6
+
+
+def _request_over(control) -> bool:
+    """Whether the request's own stop (its deadline, a cancellation) has fired, as opposed to a narrower budget in it."""
+    try:
+        control.check()
+    except RequestStopped:
+        return True
+    return False
 
 
 def _check_verify(verify):
@@ -656,22 +670,40 @@ class SelfDirectEngine:
             if documents:
                 self.sparse.upsert_many(documents)
 
-    def _refresh_evidence(self, sid, provider, path=None, verify="full"):
-        """Refresh only authority; return detached coverage and its exact inputs."""
+    def _refresh_evidence(self, sid, provider, path=None, verify="full", *, sync_share=None):
+        """Refresh only authority; return detached coverage and its exact inputs.
+
+        ``sync_share``: when the request has a deadline, the sync may use that share of the time left, so that judging
+        keeps the rest. A sync that runs out of its share while the request itself is still live is handled like any
+        other failed sync: the stored index is judged, ``sync_deadline`` joins the coverage issues (nothing is clean),
+        and a confirmed ``must_not`` match is still a violation. A stop of the request (its deadline, a cancellation)
+        and a busy index propagate as before."""
         with self._publication_guard():
             record = self.store.cursor_record(sid, provider)
         failed = {}
+        request = current_request()
+        limit = None
+        if sync_share is not None and request is not None and request.deadline is not None:
+            now = time.monotonic()
+            limit = now + sync_share * max(0.0, request.deadline - now)
         try:
-            info = self._sync_session(session_id=sid, provider=provider, embed=False,
-                                      path=path if path is not None else record["path"] if record else None,
-                                      derived=False, verify=verify)
+            with request_scope(deadline=limit) if limit is not None else nullcontext():
+                info = self._sync_session(session_id=sid, provider=provider, embed=False,
+                                          path=path if path is not None else record["path"] if record else None,
+                                          derived=False, verify=verify)
             if info.get("ok"):
                 return info
             failure, failed = info.get("error", "sync_failed"), info
         except FlightBusy as busy:
             failure = busy.reason   # another request is syncing this session: judge on what it has committed so far
-        except (RequestStopped, IndexBusy):
+        except IndexBusy:
             raise
+        except RequestStopped as stopped:
+            # The share's end and the request's own stop both arrive as RequestStopped; only the request's is final.
+            if limit is None or stopped.reason != "request_deadline" or _request_over(request):
+                raise
+            failure = "sync_deadline"
+            request_stats.note_degraded(failure)
         except (OSError, ValueError) as exc:
             failure = "sync_failed:" + type(exc).__name__
         with self._publication_guard(), self.store._read_boundary():
@@ -707,7 +739,8 @@ class SelfDirectEngine:
         started = time.perf_counter()
         provider = self._resolve_provider(provider)
         sid = session_id.lower() if provider in ("codex", "agy") else session_id
-        refreshed = self._refresh_evidence(sid, provider, path, verify)
+        # The idle comparison is not a request: a refresh it cannot finish still ends it (and it backs off).
+        refreshed = self._refresh_evidence(sid, provider, path, verify, sync_share=None if idle else SYNC_BUDGET_SHARE)
         integrity = dict(refreshed.get("integrity") or {})
         if escalated:
             integrity["full_reason"] = escalated

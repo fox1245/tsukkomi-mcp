@@ -210,6 +210,12 @@ the previous index. A request that waits for another request's sync of the same 
 min(1 s, a quarter of its time) with sync_in_progress. Response reasons and coverage issues are an open
 set: show an unknown one as an opaque string and treat it as unverified.
 
+A deadline-bound check_action or audit_session gives its sync 60 % of the time left (engine.SYNC_BUDGET_SHARE). If that
+runs out while the request is live, the stored index is judged and coverage.issues carries sync_deadline: a must_not match
+is still a violation, nothing else is better than unknown, and the request's own deadline, a cancellation and index_busy
+still end the request as before. audit_status returns the process's request statistics as ops (in memory, closed names,
+no session content), even when the engine is busy.
+
 ## Codex event coverage and parser upgrades
 
 The Codex parser supports world_state, token_usage_record, compacted, and native
