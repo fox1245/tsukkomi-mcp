@@ -351,8 +351,9 @@ def verify(path: Path, desired: dict, *, python: str, script: str, mode: str, ru
     report["registered"] = report["exists"] and all(state == "ok" for state in events.values())
     report["smoke"] = smoke(python, script, mode=mode) if run and report["script_exists"] and report["python_exists"] \
         else {"ran": False}
+    ran = bool(run)        # --no-run checks the file and the paths only; a run that could not start is a failure
     report["ok"] = bool(report["registered"] and report["script_exists"] and report["python_exists"]
-                        and report["smoke"].get("ok", False))
+                        and (report["smoke"].get("ok", False) if ran else True))
     return report
 
 
