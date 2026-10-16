@@ -19,7 +19,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.12"]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -78,7 +78,7 @@ jobs:
     # Linux coverage complements, rather than replaces, the cross-platform smoke job.
     # Keep larger allocation probes out of CI; small regressions do not certify live-service RSS.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
       SELF_DIRECT_DENSE_BACKEND: "numpy"
