@@ -69,3 +69,28 @@ def test_the_candidates_are_listed(capsys):
     listed = capsys.readouterr().out
     for name in ("a ", "b16 ", "c ", "d ", "e ", "f2 ", "p "):
         assert any(line.startswith(name) for line in listed.splitlines()), name
+
+
+def test_the_korean_stage_is_seeded_and_times_exact_against_prefix_terms(tmp_path, capsys):
+    module = bench()
+    first, again = module.KoreanCorpus(600), module.KoreanCorpus(600)
+    docs = [doc for batch in first.batches() for doc in batch]
+    assert docs == [doc for batch in again.batches() for doc in batch] and len(docs) == 600
+    assert first.frequent == again.frequent and first.rare == again.rare and len(set(first.stems)) == len(first.stems) == 3000
+    assert all(len(doc.text.split()) == 40 for doc in docs) and len({doc.chunk_id for doc in docs}) == 600
+    assert all("가" <= ch <= "힣" or ch == " " for doc in docs for ch in doc.text)           # invented words, Hangul only
+    work, report = tmp_path / "work", tmp_path / "report.json"
+    assert module.main(["--stages", "korean", "--events", "600", "--tmpdir", str(work), "--out", str(report)]) == 0
+    rec = json.loads(report.read_text())["korean/600"]
+    assert list(json.loads(report.read_text())) == ["korean/600"]                          # alone, the stage runs no candidate
+    assert rec["count"] == 600 and rec["suffixes"] == 40 and set(rec["queries"]) == {
+        "frequent_exact", "frequent_prefix", "frequent_typed", "rare_exact", "rare_prefix", "rare_typed"}
+    q = rec["queries"]
+    assert q["frequent_exact"]["match"] == f'"{rec["frequent"]}"' and q["frequent_prefix"]["match"] == f'"{rec["frequent"]}"*'
+    assert q["frequent_typed"]["match"] == f'"{rec["frequent"]}을"* OR "{rec["frequent"]}"*'
+    for label in ("frequent", "rare"):
+        assert q[f"{label}_prefix"]["documents"] >= q[f"{label}_exact"]["documents"]
+        assert q[f"{label}_typed"]["documents"] == q[f"{label}_prefix"]["documents"]      # the stem is the prefix the particle form adds
+    assert q["frequent_prefix"]["documents"] > 500 > q["rare_prefix"]["documents"]
+    assert "frequent_prefix" in capsys.readouterr().out
+    assert not work.exists() or not list(work.iterdir())
