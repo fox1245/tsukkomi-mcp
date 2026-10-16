@@ -20,7 +20,8 @@ What is summarized, per contract kind (all state is bounded and JSON-serializabl
   only), so the worst verdict, the distinct reasons, the first 20 evidence items and the last trigger position
   are kept;
 * provider evidence classes: Claude's cut results and AGY's truncated fields, pending results, legacy results,
-  host-logged proposals and denials, as shared "facts" plus a few first-occurrence markers per rule.
+  host-logged proposals and denials, and the calls a Grok hook blocked (the shared ``hostblocks.HostBlocks`` join,
+  persisted whole), as shared "facts" plus a few first-occurrence markers per rule.
 
 A summary that cannot hold an input (a table over its cap, an AGY denial whose proposal lies outside the
 look-back window) raises ``NeedFull``: that rule is then evaluated by the reference and the reason is
@@ -35,7 +36,7 @@ import time
 from bisect import bisect_left
 
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES
-from self_directing_mcp.audit import runner, shellstatus
+from self_directing_mcp.audit import hostblocks, runner, shellstatus
 from self_directing_mcp.audit import shadow as shadow_module
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 from self_directing_mcp.audit import patterns as _patterns
@@ -48,8 +49,9 @@ from self_directing_mcp.security.mask import mask_secrets
 # Bump when the semantics of any evaluation changes (rules, evidence classes, evidence text); it invalidates every
 # stored state and re-enables contracts that a shadow mismatch disabled. (8: the reference evaluator shares its position
 # index, call/result tables and rare-evidence lists between rules; results are identical, but the tripwire in
-# tests/test_incremental_evaluator_guard.py asks for a bump whenever a mirrored function changes.)
-EVALUATOR_VERSION = 8
+# tests/test_incremental_evaluator_guard.py asks for a bump whenever a mirrored function changes. 9: Grok's blocked
+# calls are rejected proposals too (``runner.blocked_calls`` / ``GrokFacts``).)
+EVALUATOR_VERSION = 9
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
@@ -263,6 +265,34 @@ class ClaudeFacts(Facts):
         self.rejected = dict(data.get("rejected", {}))
 
 
+class GrokFacts(Facts):
+    """The calls a Grok hook blocked (``runner.blocked_calls`` for the whole history; the join is the same class).
+
+    The host's note and the failed result of a call meet in whichever order and in whichever run they are fed: the
+    class keeps what is still waiting for its other half, bounded, and this persists it as it is."""
+
+    needed = True
+
+    def __init__(self):
+        self.blocks = hostblocks.HostBlocks()
+
+    @property
+    def rejected(self):
+        return self.blocks.rejected     # chunk id of a blocked call -> [chunk id of the host's note, source]
+
+    def feed(self, event, pools):
+        self.blocks.feed(event)
+        if len(self.blocks.rejected) > REJECTED_MAX:
+            self.overflow = "blocked call table is full"
+
+    def dump(self):
+        return {"overflow": self.overflow, "blocks": self.blocks.dump()}
+
+    def load(self, data):
+        self.overflow = data.get("overflow")
+        self.blocks.load(data["blocks"])
+
+
 class AgyFacts(Facts):
     """RUNNING results still waiting for a final record of their step, and the proposals the Pre hook blocked."""
 
@@ -332,6 +362,8 @@ def make_facts(provider, needs=(), rules=()):
     if provider == "claude" and any(runner._reads_results(r) or r.requires_success or runner._wants_rejections(r)
                                     for r in rules):
         return ClaudeFacts()
+    if provider == "grok" and any(runner._wants_rejections(r) for r in rules):
+        return GrokFacts()
     return Facts()
 
 
@@ -343,6 +375,7 @@ class RuleMonitor:
     def __init__(self, rule, provider):
         self.rule, self.provider = rule, provider
         self.agy, self.claude = provider == "agy", provider == "claude"
+        self.refusing = provider in runner.REFUSAL_PROVIDERS       # the host's own records can tell a refused call
         self.src_id, self.from_id = rule.source_event_id, rule.applies_from_event_id
         self.roles = frozenset(rule.roles)
         self.kind = _SCOPE_KIND.get(rule.scope)
@@ -366,7 +399,7 @@ class RuleMonitor:
         self.deps = runner._dependencies(rule) if self.agy else frozenset()
         self.wants_attempts = self.agy and runner._wants_attempts(rule) and self.regex is not None
         self.track_trigger_proposals = self.agy and rule.type == "must" and self.trigger is not None
-        self.wants_rej = self.claude and runner._wants_rejections(rule) and self.regex is not None
+        self.wants_rej = self.refusing and runner._wants_rejections(rule) and self.regex is not None
         # state
         self.src = False
         self.src_user = False  # the source event was seen and is a user message

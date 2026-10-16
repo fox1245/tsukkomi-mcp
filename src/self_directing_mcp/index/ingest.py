@@ -61,7 +61,11 @@ _AGY_AUDIT_META = ("event_type", "step_index", "status", "pending", "linkage", "
                    "tool_name", "truncated_fields", "denied_action", "result_type")
 # Claude Code: a truncation notice names the tool result (``call_id``) the host cut; a tool result carries the
 # permission decision the host recorded for its call (a refused call is a rejected proposal); see audit.runner.
-_AUDIT_META = {"agy": _AGY_AUDIT_META, "claude": ("truncated_result_for", "call_id", "permission_decision")}
+# Grok: a call's tool name, a result's status and Grok's own event number, and the host's note that a hook blocked a
+# tool (its tool, its source and its number, ``evidence_origin``): what ``audit.hostblocks`` joins.
+_GROK_AUDIT_META = ("native_tool_name", "tool_status", "host_event_id", "evidence_origin", "blocked_tool", "denied_by")
+_AUDIT_META = {"agy": _AGY_AUDIT_META, "claude": ("truncated_result_for", "call_id", "permission_decision"),
+               "grok": _GROK_AUDIT_META}
 
 
 @dataclass(frozen=True)
@@ -866,8 +870,8 @@ class SessionStore:
             terms.append("json_extract(data,'$.kind') IN ('tool_call','tool_result')")
         wanted = " OR ".join(terms) if terms else "0"
         check_request()
-        # Provider evidence classes (AGY truncation, pending, legacy, denial; Claude cut results) are read
-        # with one extra packed column.
+        # Provider evidence classes (AGY truncation, pending, legacy, denial; Claude cut results; Grok blocked calls)
+        # are read with one extra packed column.
         packed_keys = _AUDIT_META.get(provider)
         extra = ("json_extract(data,'" + "','".join("$.meta." + key for key in packed_keys) + "')"
                  if packed_keys else "NULL")

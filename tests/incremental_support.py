@@ -1,7 +1,7 @@
 """Random synthetic sessions and contracts for the incremental-audit differential tests.
 
 Everything here is synthetic. ``Session`` yields slim audit events (the shape ``capture_audit_events`` returns) in the
-four evidence shapes the providers produce; ``contracts`` yields rules of every supported kind. The tests compare the
+five evidence shapes the providers produce; ``contracts`` yields rules of every supported kind. The tests compare the
 incremental monitors with the reference evaluator on the same events.
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ PATTERNS = ["alpha", "beta|gamma", "deploy", "test", "test.*ok", "^ok", "build",
 BAD_PATTERNS = ["(", "[a-", "*oops"]
 ROLES = ["assistant", "user", "tool", "runtime"]
 RESULT_TYPES = ["GENERIC", "RUN_COMMAND", "VIEW_FILE", "CODE_ACTION", "MCP_TOOL", "LIST_DIRECTORY"]
+GROK_TOOLS = ["read_file", "run_terminal_command", "grep"]
 
 
 def words(rng, low=1, high=4):
@@ -37,6 +38,9 @@ class Session:
         self.step = 0
         self.proposals: list[tuple[str, dict]] = []
         self.serial = 0
+        self.number = 0                       # Grok's own event counter
+        self.open: list[tuple[str, str]] = []  # Grok calls that have no result yet: (call id, native tool name)
+        self.owed: list[dict] = []            # Grok notes the host will write some records later
 
     def _id(self):
         self.serial += 1
@@ -57,7 +61,7 @@ class Session:
         for _ in range(count):
             start = self.offset
             self.offset += self.rng.randint(40, 400)
-            getattr(self, "_agy" if self.provider == "agy" else "_plain")(start)
+            getattr(self, {"agy": "_agy", "grok": "_grok"}.get(self.provider, "_plain"))(start)
 
     # --- codex / omp / claude shaped records ---
 
@@ -89,6 +93,63 @@ class Session:
             target = rng.choice(self.call_ids + ["toolu_elsewhere"]) if rng.random() < 0.9 else rng.choice([None, 7])
             self._add("meta", "[attachment:read_truncation_notice]", {"role": "runtime", "truncated_result_for": target},
                       0, start)
+        else:
+            self._add("policy", f"[config] {words(rng)}", {"role": "runtime"}, 0, start)
+
+    # --- Grok shaped records: calls, failed results numbered by the host, and its notes that a hook blocked a tool ---
+
+    def _next(self):
+        self.number += 1
+        return self.number
+
+    def _grok_note(self, spec, start):
+        self._add("meta", "[host_tool_outcome] blocked",
+                  {"role": "runtime", "evidence_origin": "host_tool_outcome", "host_event_id": spec["number"],
+                   "blocked_tool": spec["tool"], "denied_by": spec["source"]}, 0, start)
+
+    def _grok(self, start):
+        rng = self.rng
+        if self.owed and rng.random() < 0.3:
+            self._grok_note(self.owed.pop(rng.randrange(len(self.owed))), start)   # later than the result it names
+            return
+        choice = rng.random()
+        if choice < 0.12:
+            self._add("turn", f"[message:user] {words(rng)}", {"role": "user"}, 0, start)
+        elif choice < 0.22:
+            self._add("turn", f"[message:assistant] {words(rng)}", {"role": "assistant"}, 0, start)
+        elif choice < 0.52:
+            call_id, tool = self._call_id(), rng.choice(GROK_TOOLS)
+            self._add("tool_call", f"[tool_call:shell] {words(rng)}{rng.choice(TAILS)}",
+                      {"role": "assistant", "call_id": call_id, "tool_name": "shell", "native_tool_name": tool}, 0, start)
+            self._next()
+            self.open.append((call_id, tool))
+        elif choice < 0.84:
+            call_id, tool = (self.open.pop(rng.randrange(len(self.open))) if self.open and rng.random() < 0.85
+                             else (rng.choice(self.call_ids) if self.call_ids else None, rng.choice(GROK_TOOLS)))
+            failed = rng.random() < 0.6
+            number = self._next() if failed else None
+            meta = {"role": "tool", "call_id": call_id, "success": False if failed else rng.choice([True, None]),
+                    "tool_status": "failed" if failed else "completed"}
+            if failed and rng.random() < 0.95:
+                meta["host_event_id"] = number
+            note = None
+            if failed and rng.random() < 0.8:      # the host's note: usually the next number and the call's own tool
+                note = {"number": number + 1 if rng.random() < 0.88 else rng.choice([number, number + 2, number - 1]),
+                        "tool": tool if rng.random() < 0.9 else rng.choice(GROK_TOOLS),
+                        "source": rng.choice(["project/tsukkomi", "global/settings"])}
+                self._next()
+            if note is not None and rng.random() < 0.5:        # the file shows the note first, as every recording does
+                self._grok_note(note, start)
+                start = self.offset
+                self.offset += rng.randint(40, 400)
+                note = None
+            self._add("tool_result", f"[tool_result] {words(rng)}", meta, 0, start)
+            if note is not None:
+                self.owed.append(note)
+        elif choice < 0.88 and self.owed:
+            self._grok_note({**rng.choice(self.owed)}, start)             # a second note with a number already used
+        elif choice < 0.95:
+            self._add("meta", f"[meta] {words(rng)}", {"role": "runtime"}, 0, start)
         else:
             self._add("policy", f"[config] {words(rng)}", {"role": "runtime"}, 0, start)
 

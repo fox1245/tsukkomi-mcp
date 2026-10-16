@@ -18,7 +18,7 @@ from incremental_support import Session, contracts, proposed_action
 # These tests judge the delta path alone (shadow_every=0): no warm-up comparisons after a rebuild.
 pytestmark = pytest.mark.usefixtures("no_forced_comparisons")
 
-PROVIDERS = ["codex", "claude", "agy", "omp"]
+PROVIDERS = ["codex", "claude", "agy", "omp", "grok"]
 
 
 def gate(rules):

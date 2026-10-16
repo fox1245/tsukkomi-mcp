@@ -21,11 +21,51 @@ Rules every shape below follows:
   ``status`` (``completed`` / ``failed``) is its result, linked by ``toolCallId``. An update without a status is
   progress and is skipped. A call that never gets a result is in flight or was cancelled: it has no result event, so
   it is never success. The tool name and keys are rendered in Claude Code's vocabulary (``grok_tools``).
-* ``_x.ai/session/update`` ``hook_execution`` and ``hook_annotation`` are the host reporting on hooks (including
-  this server's own denials): skipped, never indexed. ``turn_completed`` there is runtime metadata.
+* ``_x.ai/session/update`` ``hook_execution`` is the host reporting on hooks (including this server's own denials):
+  skipped, never indexed. ``turn_completed`` there is runtime metadata. A ``hook_annotation`` is skipped too, except
+  the one kind that says a call did not run, see "A call a hook blocked" below.
 * Every other record kind is a placeholder flagged ``unsupported_event`` so coverage reports it; unknown never
   becomes clean. A malformed record is one ``parse_error`` chunk and no partial evidence.
 * A ``spawn_subagent`` child is a separate session directory: only the parent's own file is read here.
+
+A call a hook blocked
+---------------------
+When a ``PreToolUse`` hook denies a call, ``updates.jsonl`` still holds the ``tool_call`` and a ``failed``
+``tool_call_update`` whose text ("Hook denied: <reason>") comes from the hook: a tool or a message could print the same
+words, so neither is evidence that the call did not run. The host's own note of the refusal is a ``hook_annotation`` of
+kind ``tool_outcome`` ("`<tool>` blocked by <source>: <reason>"): a record Grok writes itself, not a content field that
+a model or a tool fills. It carries no call id. Four live headless runs (Grok 1.0.52, nine denials) show how it meets the
+call:
+
+* Every record has ``_meta.eventId`` = ``<session id>-<n>``, Grok's own sequence number. A denial takes four consecutive
+  numbers: the call (n), the hook's report (n + 1), the ``failed`` update (n + 2) and the annotation (n + 3).
+* The FILE order is different. In all nine denials the hook report and the annotation come BEFORE the call and its
+  update (``hook_execution, hook_annotation, tool_call, tool_call_update``), with other records between them when calls
+  run in parallel: Grok's ``_x.ai`` records are written ahead of its ACP ``session/update`` records. "The annotation
+  follows the update" is true of the event numbers, not of the file.
+
+So this parser links nothing itself. Every record stays independent of its neighbours, which makes the indexed events
+the same for any read boundary: a failed result carries ``host_event_id`` (n + 2) and the annotation becomes one small
+runtime event (``evidence_origin: host_tool_outcome``, ``host_event_id`` n + 3, ``blocked_tool``, ``denied_by``; the
+reason, which a hook wrote, is not kept). The audit joins the two (``audit.hostblocks``, one class used by both
+evaluators): a call is blocked when its ``failed`` result is numbered one less than a note that names the call's own
+tool, whichever of the records the file shows first and wherever a read ended. Whatever is not unambiguous is an attempt,
+as before.
+
+Why not decide here: the pair is in two records that a read can separate, and a parser can only wait for the other half
+by returning an earlier offset. Every read that ended inside such a window would then leave an unread tail
+(``sync_in_progress``, coverage incomplete, so a clean absence proof becomes unknown) and a note whose call never
+arrives would hold the tail for good. Looking back past the cursor would read bytes the capture guard has not vouched
+for. A follow-up event cannot carry the call id either, because in the file the note is read before the call.
+
+Only an annotation counts whose ``kind`` is ``tool_outcome`` and whose message opens with a backtick-quoted tool name and
+`` blocked by ``, in a ``_x.ai/session/update`` record of this session numbered ``<this session id>-<n>``. A message, a
+tool output, a thought or the "Hook denied:" words of the failed update are never read for it.
+
+Limits. This rests on four short recordings of one Grok version. A version that numbers or orders its records
+differently simply stops matching, and the calls stay attempts, as they were before this join existed. What could fool the
+join is a note and a failed result of the same tool that the host numbers one apart without the note being about that
+call. A call the user rejected at a permission prompt has no recorded shape here and stays an attempt.
 """
 from __future__ import annotations
 
@@ -36,6 +76,7 @@ import re
 from pathlib import Path
 
 from self_directing_mcp import grok_tools
+from self_directing_mcp.audit.hostblocks import ORIGIN as HOST_OUTCOME     # ``evidence_origin`` of a "blocked by" note
 from self_directing_mcp.codex import discover as _codex_discover
 from self_directing_mcp.grok_ids import SESSION_FILE, UUID as _UUID, valid_id  # noqa: F401
 from self_directing_mcp.session_events import has_invalid_utf8, iter_raw_lines, make_chunk, parse_error, result_success
@@ -43,14 +84,18 @@ from self_directing_mcp.tool_payload import tool_call_parts
 
 # Bumping this triggers a lazy per-session reparse on the next sync/audit of each already-indexed session.
 # v1: initial Grok CLI provider (updates.jsonl; tool names rendered by grok_tools.TOOL_MAP_VERSION 1).
-PARSER_VERSION = 1
+# v2: a ``hook_annotation`` "`<tool>` blocked by <source>: ..." is a ``host_tool_outcome`` event and a failed result
+#     carries Grok's event number (``host_event_id``), so the audit can tell a blocked call from one that ran.
+PARSER_VERSION = 2
 
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
 SESSION_UPDATE = "session/update"
 EXTENSION_UPDATE = "_x.ai/session/update"
 _REMINDER = re.compile(r"\s*<system-reminder[\s>]", re.IGNORECASE)
 _CHUNKS = {"user_message_chunk": "user", "agent_message_chunk": "assistant", "agent_thought_chunk": "thought"}
-_QUIET_EXTENSION = frozenset({"hook_execution", "hook_annotation"})     # the host reporting on hooks: not evidence
+_QUIET_EXTENSION = frozenset({"hook_execution"})     # the host reporting on hooks: not evidence
+# "`read_file` blocked by project/tsukkomi: <reason>": the tool name, then the source that blocked it (a hook's name).
+_BLOCKED = re.compile(r"`([A-Za-z0-9][A-Za-z0-9_.:-]{0,63})` blocked by ([^\n]{1,120}?)(?:: |\Z)")
 _PROGRESS = frozenset({"pending", "in_progress"})
 _USAGE_FIELDS = ("inputTokens", "outputTokens", "totalTokens", "modelCalls", "numTurns")
 
@@ -218,6 +263,11 @@ class _Event:
         self.kind, self.text, self.meta = kind, text, meta
 
 
+class _Side(_Event):
+    """An event that does not end a streamed run: a host record that sits between the deltas of one message."""
+    __slots__ = ()
+
+
 class _Part:
     """One streamed delta, not yet an event: the run it belongs to decides what it becomes."""
     __slots__ = ("flavor", "key", "text", "meta")
@@ -254,6 +304,7 @@ class _File:
     def __init__(self, sid):
         self.sid = sid
         self.run: _Run | None = None
+        self.side: list = []        # side events that arrived inside the open run: emitted right after it
 
 
 def _run_event(run: _Run) -> _Event:
@@ -387,7 +438,22 @@ def _tool_call(base, update):
                                      **extra})
 
 
-def _tool_update(base, update):
+def _host_event(params, state) -> int | None:
+    """The number Grok gave this record in its own event sequence: ``_meta.eventId`` is ``<session id>-<n>``.
+
+    Only a record of this very session counts (a replayed record names another session and has no number here), and
+    the id must be exactly ``<session id>-<digits>``; anything else is not a number to join on."""
+    envelope = params.get("_meta")
+    value = envelope.get("eventId") if isinstance(envelope, dict) else None
+    if not isinstance(value, str) or params.get("sessionId") != state.sid:
+        return None
+    prefix, _, number = value.rpartition("-")
+    if prefix != state.sid or not (number.isascii() and number.isdigit()) or len(number) > 12:
+        return None
+    return int(number)
+
+
+def _tool_update(base, update, params, state):
     call_id, status = update.get("toolCallId"), update.get("status")
     if not (isinstance(call_id, str) and call_id):
         yield _unsupported(base, "[unsupported_tool_call_update] " + _keys(update))
@@ -406,6 +472,9 @@ def _tool_update(base, update):
             "tool_status": status}
     if unsupported:
         meta["unsupported_event"] = True
+    number = _host_event(params, state) if status == "failed" else None
+    if number is not None:
+        meta["host_event_id"] = number          # what a "blocked by" note of the host is joined on (audit.hostblocks)
     if diff_paths:
         meta["diff_paths"] = diff_paths[:20]
     inner = update.get("_meta")
@@ -419,6 +488,20 @@ def _tool_update(base, update):
         if raw_output.get("truncated") is True:
             meta["output_truncated"] = True
     yield _Event("tool_result", "[tool_result] " + text, meta)
+
+
+def _annotation(base, update, params, state):
+    """The host's note that a hook blocked a call: ``hook_annotation``, kind ``tool_outcome``, whose message opens with
+    the backtick-quoted tool name and `` blocked by <source>``. Any other annotation (the ``Stop`` report, a different
+    kind, a different wording) and any note without a number of its own in this session stays unindexed."""
+    message, number = update.get("message"), _host_event(params, state)
+    found = _BLOCKED.match(message) if update.get("kind") == "tool_outcome" and isinstance(message, str) else None
+    source = found.group(2).strip() if found is not None else ""
+    if not source or number is None:
+        return
+    yield _Side("meta", "[host_tool_outcome] blocked", {
+        **base, "role": "runtime", "evidence_origin": HOST_OUTCOME, "host_event_id": number,
+        "blocked_tool": found.group(1), "denied_by": source})
 
 
 def _turn_completed(base, update):
@@ -442,13 +525,15 @@ def _items(record, state):
         elif kind == "tool_call":
             yield from _tool_call(base, update)
         elif kind == "tool_call_update":
-            yield from _tool_update(base, update)
+            yield from _tool_update(base, update, params, state)
         else:
             yield _unsupported(base, f"[unsupported_grok_event:{_label(kind) or '?'}] {_keys(update)}")
     elif method == EXTENSION_UPDATE:
         if kind in _QUIET_EXTENSION:
             return
-        if kind == "turn_completed":
+        if kind == "hook_annotation":
+            yield from _annotation(base, update, params, state)
+        elif kind == "turn_completed":
             yield from _turn_completed(base, update)
         else:
             yield _unsupported(base, f"[unsupported_grok_extension:{_label(kind) or '?'}] {_keys(update)}")
@@ -478,6 +563,10 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                                sub=0, timestamp=run.timestamp)
             chunk.line_end = run.last_line
             chunks.append(chunk)
+        for item, at, begin, finish, sub, stamp in state.side:      # after the run, so the order stays that of the file
+            chunks.append(make_chunk("grok", sid, item.kind, item.text, item.meta, at, begin, finish, sub=sub,
+                                     timestamp=stamp))
+        state.side.clear()
 
     for line, start, end, raw in iter_raw_lines(path, start_byte=start_byte):
         offset = end
@@ -497,6 +586,10 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
             continue
         sub = 0
         for item in items:
+            if isinstance(item, _Side) and state.run is not None:
+                state.side.append((item, line, start, end, sub, timestamp))    # a message goes on across this record
+                sub += 1
+                continue
             if isinstance(item, _Part):
                 run = state.run
                 if run is not None and run.key == item.key:

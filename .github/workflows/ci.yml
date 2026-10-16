@@ -61,6 +61,8 @@ jobs:
           tests/test_grok_hooks.py
           tests/test_grok_install.py
           tests/test_grok_claude_bypass.py
+          tests/test_grok_refused.py
+          tests/test_grok_host_blocks.py
           tests/test_sparse_settings.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
@@ -115,6 +117,8 @@ jobs:
           tests/test_grok_hooks.py
           tests/test_grok_install.py
           tests/test_grok_claude_bypass.py
+          tests/test_grok_refused.py
+          tests/test_grok_host_blocks.py
           tests/test_sparse_settings.py
           tests/test_singleflight.py
           tests/test_index_concurrency.py
