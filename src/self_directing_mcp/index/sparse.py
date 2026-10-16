@@ -5,6 +5,7 @@ import functools
 import re
 import sqlite3
 from pathlib import Path
+import unicodedata
 
 from self_directing_mcp.request_control import check_request, publication, request_operation
 from self_directing_mcp.security.mask import mask_secrets
@@ -16,17 +17,115 @@ COMPACT_MIN_SQLITE = (3, 43, 0)        # FTS5 contentless_delete
 LAZY_LOOKUPS = 4000                    # compact search with an allow list: rows resolved one by one before the joined query takes over
 
 
+# Characters of the scripts whose words take suffixes or are written without spaces: Hangul (syllables, jamo, compatibility
+# jamo, extended A and B), CJK ideographs (extension A, the unified block, compatibility, the supplementary planes),
+# Hiragana and Katakana (with the phonetic extensions and the halfwidth Katakana).
+_PREFIX_SCRIPT = re.compile(
+    "[\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\ua960-\ua97f\uac00-\ud7af"
+    "\ud7b0-\ud7ff\uf900-\ufaff\uff66-\uff9f\U00020000-\U0002ffff]")
+_QUERY_TOKEN = re.compile(r"[\w\-]+")
+_HANGUL_SYLLABLES = re.compile("[\uac00-\ud7a3]+")
+_PARTICLES = ("에서", "으로", "에게", "까지", "부터", "을", "를", "은", "는", "의")       # longest first
+_STEM_MIN = 2                       # syllables a stem must keep for its particle to be cut
+PREFIX_TERM_LIMIT = 8               # prefix terms in one query, the stems cut from particles included
+
+
+def _cut_particle(word: str) -> str | None:
+    """The stem of a word made of Hangul syllables only that ends in one of the listed particles, else None."""
+    if _HANGUL_SYLLABLES.fullmatch(word) is None:
+        return None
+    for particle in _PARTICLES:
+        if word.endswith(particle):
+            stem = word[:-len(particle)]
+            return stem if len(stem) >= _STEM_MIN else None
+    return None
+
+
 def _fts_query(raw: str) -> str:
-    toks = re.findall(r"[A-Za-z0-9_\-]+", raw)
-    cleaned: list[str] = []
-    for t in toks:
+    """The FTS5 MATCH string of a sparse search: quoted terms joined by `` OR ``, ``'""'`` (matches nothing) without any.
+
+    Query side only. The stored index and its tokenizer (``porter unicode61``) are unchanged, so no rebuild is needed and
+    both formats share this function; nothing heavy may be imported here (the hook processes import this module).
+
+    The query is first put in NFC (not NFKC, which folds fullwidth Latin and would change ASCII bytes), and every length
+    below is counted in NFC code points: a decomposed Hangul syllable of two jamo is one character, not two. Tokens are runs of
+    Unicode word characters, ``_`` and ``-`` (``[\\w\\-]+``), so no quote, ``*``, ``^``, ``:``, parenthesis or ``NEAR`` can reach
+    the MATCH string.
+
+    * A token without Hangul, CJK ideographs, Hiragana or Katakana becomes the exact term ``"tok"`` when it has two
+      characters or more. For ASCII this is the behaviour from before Korean queries were handled, and **the string for
+      any query made of ASCII only is byte-identical to it**: one-character tokens skipped, ``foo-bar`` and ``foo_bar``
+      kept whole (FTS5 reads them as phrases), duplicates kept, no limit on the number of terms. A non-ASCII token of
+      another script (``café``, Cyrillic, Greek) is also exact: unicode61 folds case and diacritics in the query phrase as
+      it did in the stored text, and these scripts have spaces, so no prefix is needed.
+    * Korean attaches particles and endings to a word, and unicode61 stores one token per space-separated word: the
+      text ``검색 색인을 다시`` holds ``검색``, ``색인을`` and ``다시``, so the exact term ``"색인"`` finds nothing but the
+      prefix term ``"색인"*`` finds ``색인을``. The porter stemmer leaves Hangul alone, so a prefix is the one query-side way
+      to match an inflected word. A token that contains such a character is split on ``-`` and ``_`` (unicode61 stores those
+      as separators) and each part is handled alone: an ASCII part as above (``색인_v1`` gives ``"색인"*`` and ``"v1"``), a
+      one-character part exactly (``"집"``: one-syllable nouns such as 집, 책 and 돈 exist), a longer part as ``"tok"*`` (the
+      ``*`` outside the quotes). ``v2색인`` is one part, since nothing separates it.
+    * A part made of Hangul syllables only that ends in a particle of the short list (``에서 으로 에게 까지 부터 을 를 은 는
+      의``, longest first) with a stem of at least two syllables also gets the stem as a second prefix term, never instead of
+      the word: ``색인을`` gives ``"색인을"* OR "색인"*`` (the word may be a noun that ends that way, or carry a particle
+      that is not listed). The particles ``이 가 도 로 와 과 만 에`` are not cut because they end real nouns (도로, 어린이,
+      비만, 논의). The two-syllable rule: ``가을은`` also gives ``"가을"*``, ``글을`` is not cut (its stem is one syllable).
+    * Bounds, for the terms that come from non-ASCII text only: at most ``PREFIX_TERM_LIMIT`` (8) prefix terms in a query,
+      the cut stems counted, and the words in query order get the budget before any stem; a word beyond it is an exact term.
+      The same non-ASCII word typed twice is one term. A prefix on a frequent stem costs a scan of every word that starts
+      with it, so the bound keeps one query from fanning out.
+
+    Limits, also in the README: a prefix term matches longer words as well (``색인`` finds ``색인표``), and BM25 does not rank
+    an exact word above a longer prefix match. Chinese and Japanese, and Korean text written without spaces inside
+    code-mixed runs (``v2색인``), are one stored token per unspaced run, so a query matches from the start of that run
+    only; an inner word needs ``mode="regex"``. A particle that is not in the list is not cut.
+    """
+    raw = unicodedata.normalize("NFC", raw)
+    # Slots in query order: ("a", ASCII term), ("x", exact non-ASCII word), ("p", word with a prefix-script character).
+    slots: list[tuple[str, str]] = []
+    for token in _QUERY_TOKEN.findall(raw):
         check_request()
-        if len(t) < 2:
-            continue
-        cleaned.append(f'"{t}"')
-    if not cleaned:
+        if _PREFIX_SCRIPT.search(token) is None:
+            parts = [token]
+        else:
+            parts = [part for part in re.split(r"[-_]+", token) if part]
+        for part in parts:
+            if part.isascii():
+                if len(part) >= 2:
+                    slots.append(("a", part))
+            elif _PREFIX_SCRIPT.search(part) is None:
+                if len(part) >= 2:
+                    slots.append(("x", part))
+            else:
+                slots.append(("p", part))
+    terms: list[list[str]] = []         # the terms of each slot that is kept: the word, then its stem
+    seen: set[str] = set()              # non-ASCII words already handled
+    prefixes = 0
+    heads: list[tuple[int, str]] = []   # (index in terms, word) of the words that became prefix terms
+    for kind, word in slots:
+        if kind == "a":
+            terms.append([f'"{word}"'])
+        elif word not in seen:
+            seen.add(word)
+            if kind == "p" and len(word) >= 2 and prefixes < PREFIX_TERM_LIMIT:
+                prefixes += 1
+                heads.append((len(terms), word))
+                terms.append([f'"{word}"*'])
+            else:
+                terms.append([f'"{word}"'])
+    present = {term for group in terms for term in group}
+    for index, word in heads:
+        if prefixes >= PREFIX_TERM_LIMIT:
+            break
+        stem = _cut_particle(word)
+        if stem is not None and f'"{stem}"*' not in present:
+            terms[index].append(f'"{stem}"*')
+            present.add(f'"{stem}"*')
+            prefixes += 1
+    flat = [term for group in terms for term in group]
+    if not flat:
         return '""'
-    return " OR ".join(cleaned)
+    return " OR ".join(flat)
 
 
 class SparseIndex:

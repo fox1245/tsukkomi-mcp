@@ -119,6 +119,9 @@ The compact index is also pruned: `sparse-rebuild` and a global `sparse`/`hybrid
 does not hold (orphans; `audit_status.sparse_extra_ids`). Each batch asks the store again under the publication guard right
 before it deletes, so an event published after the snapshot is never removed, and the legacy file is never written. Keep that
 second look and `tests/test_sparse_orphans.py` when changing the deletion.
+Sparse queries are built on the query side only (`_fts_query`: prefix terms for Hangul, CJK and kana words, a short
+particle list, NFC, at most 8 prefix terms). An ASCII-only query must stay byte-identical to the old builder, which
+`tests/test_sparse_korean.py` keeps as its reference; the stored index and its tokenizer are not changed for it.
 
 `SELF_DIRECT_DENSE_BACKEND=pgvector` (optional extra `tsukkomi-mcp[pgvector]`) keeps the dense index on a PostgreSQL
 server and is an opt-in data flow: chunk ids and embedding vectors, never session text, leave the machine, and vectors are

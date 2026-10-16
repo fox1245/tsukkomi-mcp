@@ -14,6 +14,12 @@ text) and measured for file size and its breakdown (``dbstat``), build time, sea
 events, ``integrity_check``, the FTS5 ``optimize`` command and ``VACUUM``; with ``--stages ops,maint,orphans`` also the cost of deleting a
 tenth of the documents in batches (what ``sparse-rebuild`` does to orphans).
 
+``--stages korean`` is a stage of its own (it builds nothing of the corpus above and runs no candidate unless other stages are
+named too): a seeded corpus of invented Korean-like words (random Hangul syllables, Zipf frequencies, about 40 particles and endings;
+never real text) written to the compact format, and the time of an exact term against a prefix term for a frequent and for a rare
+stem, which is what a Korean query costs now that ``_fts_query`` makes prefix terms (``python scripts/bench_sparse.py --stages korean
+--events 100000``).
+
     python scripts/bench_sparse.py --profile codex --events 100000 --candidate a,c,e [--out results.json]
     python scripts/bench_sparse.py --stats --profile codex --events 20000      # corpus statistics only
     python scripts/bench_sparse.py --list
@@ -472,7 +478,7 @@ class Corpus:
             add("hyphen", r.choice(hyph or words) if r.random() < 0.7 else " ".join(r.sample(hyph or words, 2)))
         for _ in range(per):
             ko = LEX.ko_stems[r.randrange(40)] + r.choice(_KO_END)
-            add("korean", ko if r.random() < 0.5 else ko + " " + r.choice(common))     # the query builder drops Hangul
+            add("korean", ko if r.random() < 0.5 else ko + " " + r.choice(common))     # prefix terms (``_fts_query``), a stem + particle too
         for _ in range(per):
             add("nomatch", r.choice(("zzqxv", "qqzzyy", "nonexistent_token_77", "xylophage-zz", "zq0042", "wwwvvv-uuu")) + str(r.randrange(10)))
         for _ in range(per):
@@ -936,6 +942,101 @@ def measure(name: str, profile: str, events: int, work: Path, out: dict, *, quer
     db.unlink(missing_ok=True)
 
 
+KO_SUFFIXES = ["", "은", "는", "이", "가", "을", "를", "에", "에서", "으로", "와", "과", "도", "만", "의", "에게", "까지", "부터", "로", "처럼",
+               "보다", "마다", "조차", "라도", "이나", "이라", "입니다", "했다", "하다", "한다", "해요", "됐다", "되는", "하는", "했던", "하고",
+               "해서", "하면", "인데", "이다"]            # 40 forms, the bare stem among them
+KO_RARE_RANK = 2000                                      # the rare probe is the stem of this frequency rank
+
+
+class KoreanCorpus:
+    """A seeded synthetic corpus of Korean-like events: ``vocabulary`` invented stems of two or three random Hangul syllables
+    with Zipf frequencies, every token a stem and one of ``KO_SUFFIXES``, 40 tokens an event. Nothing in it is real text.
+    ``frequent`` (rank 1) is in most events, ``rare`` (rank ``KO_RARE_RANK``) in a few hundred of 100,000."""
+
+    def __init__(self, events: int, *, seed: int = 40, tokens: int = 40, vocabulary: int = 3000) -> None:
+        r = random.Random(f"korean:{seed}")
+        syllables = [chr(c) for c in r.sample(range(0xAC00, 0xD7A4), 700)]
+        stems: list[str] = []
+        seen: set[str] = set()
+        while len(stems) < vocabulary:
+            length = 2 if len(stems) in (0, KO_RARE_RANK) else r.choice((2, 2, 3))
+            stem = "".join(r.choice(syllables) for _ in range(length))
+            if stem not in seen:
+                seen.add(stem)
+                stems.append(stem)
+        self.events, self.tokens, self.seed, self.stems = events, tokens, seed, stems
+        self.frequent, self.rare = stems[0], stems[KO_RARE_RANK]
+        total, self.cum = 0.0, []
+        for rank in range(1, vocabulary + 1):
+            total += 1.0 / rank
+            self.cum.append(total)
+        self.suffix_weights = [1.0 / (k + 1) for k in range(len(KO_SUFFIXES))]       # the bare stem is the most frequent form, by little
+
+    def batches(self):
+        r = random.Random(f"korean-events:{self.seed}")
+        batch = []
+        for i in range(self.events):
+            picked = r.choices(self.stems, cum_weights=self.cum, k=self.tokens)
+            ends = r.choices(KO_SUFFIXES, weights=self.suffix_weights, k=self.tokens)
+            batch.append(Doc(f"ko:{i:08d}", f"ko-session-{i // 200}", "turn", " ".join(a + b for a, b in zip(picked, ends))))
+            if len(batch) == BATCH:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+
+def measure_korean(events: int, work: Path, out: dict, *, repeat: int = 15) -> None:
+    """Exact against prefix terms for a frequent and a rare stem on a compact index of a ``KoreanCorpus``: matching documents and
+    the median / 95th percentile search time of the ranked top 20 (``_search_top``, no filter), and the whole search of a typed
+    query (a stem with a particle gives a prefix term for the word and one for its stem)."""
+    corpus = KoreanCorpus(events)
+    db = work / f"korean-{events}.sqlite"
+    index = CompactSparseIndex(db)
+    rec: dict = {"candidate": "korean", "events": events, "tokens_per_event": corpus.tokens, "vocabulary": len(corpus.stems),
+                 "suffixes": len(KO_SUFFIXES), "sqlite": sqlite3.sqlite_version, "frequent": corpus.frequent, "rare": corpus.rare}
+    out[f"korean/{events}"] = rec
+    t = time.perf_counter()
+    for batch in corpus.batches():
+        index.upsert_many(batch)
+    rec["build_seconds"] = round(time.perf_counter() - t, 2)
+    rec["file_bytes"] = file_bytes(db)
+    rec["count"] = index.count()
+
+    def documents(match: str) -> int:
+        return index._conn.execute("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?", (match,)).fetchone()[0]
+
+    def timed(call) -> dict:
+        call()
+        call()
+        times = []
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            call()
+            times.append((time.perf_counter() - t0) * 1000.0)
+        return {"p50_ms": round(percentile(times, 0.5), 3), "p95_ms": round(percentile(times, 0.95), 3)}
+
+    rec["queries"] = {}
+    for label, stem in (("frequent", corpus.frequent), ("rare", corpus.rare)):
+        for how, match in (("exact", f'"{stem}"'), ("prefix", f'"{stem}"*')):
+            rec["queries"][f"{label}_{how}"] = {"match": match, "documents": documents(match),
+                                                **timed(lambda m=match: index._search_top(m, 20))}
+        typed = stem + "을"
+        match = _fts_query(typed)
+        rec["queries"][f"{label}_typed"] = {"typed": typed, "match": match, "documents": documents(match),
+                                            **timed(lambda q=typed: index.search(q, top_k=20))}
+    index._conn.close()
+    db.unlink(missing_ok=True)
+
+
+def korean_summary(rec: dict) -> str:
+    lines = [f"korean {rec['events']:>7d} events x {rec['tokens_per_event']} tokens  sqlite {rec['sqlite']}  {rec['file_bytes'] / 1e6:9.1f} MB  "
+             f"build {rec['build_seconds']} s  ({rec['vocabulary']} invented stems, {rec['suffixes']} suffixes; frequent {rec['frequent']}, rare {rec['rare']})"]
+    for name, q in rec["queries"].items():
+        lines.append(f"       {name:15s} {q['match']:28s} {q['documents']:>7d} documents  p50/p95 {q['p50_ms']}/{q['p95_ms']} ms")
+    return "\n".join(lines)
+
+
 def mask_cost(profile: str, events: int) -> dict:
     corpus = Corpus(profile, events)
     t_mask = 0.0
@@ -1005,7 +1106,9 @@ def main(argv=None) -> int:
     ap.add_argument("--candidate", default="a", help="comma separated names (see --list); 'a' also writes the reference results")
     ap.add_argument("--queries", type=int, default=200)
     ap.add_argument("--stages", default="ops,maint", help="comma separated: ops (delete + re-upsert), maint (integrity, optimize, vacuum), "
-                    "orphans (delete a tenth of the documents in batches of 500, as sparse-rebuild does; off by default)")
+                    "orphans (delete a tenth of the documents in batches of 500, as sparse-rebuild does; off by default), "
+                    "korean (exact against prefix terms on a synthetic Korean-like corpus of --events events; off by default; alone, "
+                    "it runs no candidate)")
     ap.add_argument("--out", help="write the results as JSON")
     ap.add_argument("--tmpdir", default=DEFAULT_TMP)
     ap.add_argument("--drop-ref", action="store_true", help="also delete the reference results (<tmpdir>/ref) when done")
@@ -1026,11 +1129,17 @@ def main(argv=None) -> int:
     Path(args.tmpdir).mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="bench-sparse-", dir=args.tmpdir))
     out: dict = {}
+    stages = set(args.stages.split(",")) - {""}
     try:
-        for name in args.candidate.split(","):
+        for name in ([] if stages == {"korean"} else args.candidate.split(",")):
             measure(name, args.profile, args.events, work, out, queries_n=args.queries,
-                    stages=set(args.stages.split(",")) - {""}, ref_root=Path(args.tmpdir) / "ref")
+                    stages=stages - {"korean"}, ref_root=Path(args.tmpdir) / "ref")
             print(summary(out[f"{name}/{args.profile}/{args.events}"]), flush=True)
+            if args.out:
+                Path(args.out).write_text(json.dumps(out, indent=1))
+        if "korean" in stages:
+            measure_korean(args.events, work, out)
+            print(korean_summary(out[f"korean/{args.events}"]), flush=True)
             if args.out:
                 Path(args.out).write_text(json.dumps(out, indent=1))
     finally:
