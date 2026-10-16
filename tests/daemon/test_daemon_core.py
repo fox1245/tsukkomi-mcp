@@ -147,9 +147,11 @@ def test_a_peer_with_another_user_id_is_rejected_and_never_reaches_the_runner(in
     monkeypatch.setattr(socket.socket, "getsockopt", foreign)
     sock, _ = daemon.connect(hello=False)
     try:
-        P.write_frame(sock, P.hello_request("test", __version__))
+        # The daemon closes a rejected peer without reading it, so the write itself may already fail (a broken pipe when the
+        # close wins the race, as it does on a slow sanitizer runner); either way the peer is closed without a word.
         with pytest.raises((P.ConnectionClosed, ConnectionError, OSError)):
-            P.read_frame(sock)                                   # closed without a word
+            P.write_frame(sock, P.hello_request("test", __version__))
+            P.read_frame(sock)
     finally:
         sock.close()
     assert wait_for(lambda: daemon.daemon.stats["rejected_peer"] == 1)
@@ -170,8 +172,8 @@ def test_a_peer_whose_credentials_cannot_be_read_is_rejected(inproc, monkeypatch
     monkeypatch.setattr(socket.socket, "getsockopt", broken)
     sock, _ = daemon.connect(hello=False)
     try:
-        P.write_frame(sock, P.hello_request("test", __version__))
         with pytest.raises((P.ConnectionClosed, ConnectionError, OSError)):
+            P.write_frame(sock, P.hello_request("test", __version__))      # may fail already: see the test above
             P.read_frame(sock)
     finally:
         sock.close()

@@ -550,6 +550,16 @@ The dense half of `search_history` sits behind one interface (`index/vector.py::
 
 All three score `1 - cosine distance` (1 is identical, a zero vector scores 0), apply `allowed_ids` before the top-k, and break exact ties by id in byte order (NumPy: arbitrary inside a tie). `tests/test_dense_backend_parity.py` holds pgvector and sqlite-vector to NumPy's exact scan on the same seeded vectors, filters and write sequences: identical top-k except inside groups of exactly equal scores, scores within 1e-6 (float32 arithmetic; the largest difference seen was 2e-7).
 
+### Embedding endpoint: OpenRouter or a server of your own
+
+Vectors come from an OpenAI-compatible `POST <base url>/embeddings` call (`embed/embedder.py::OpenRouterEmbedder`; the name is historical). Three settings choose the server: `SELF_DIRECT_EMBEDDING_BASE_URL` (default `https://openrouter.ai/api/v1`), `SELF_DIRECT_EMBEDDING_MODEL` (default `qwen/qwen3-embedding-8b`) and `SELF_DIRECT_EMBEDDING_DIM` (default `1024`). Nothing in the client is specific to OpenRouter: any server that answers that call works, on a loopback address or on your network. The API key is whatever string the server expects (a server without authentication ignores it, but the setting must not be empty; see Credentials).
+
+- **OpenRouter** is the default and needs no setup beyond a key. It receives the chunk text, after secrets are masked (`mask_secrets` runs before every request), so use it only for sessions you are willing to send to that service. Without a key the engine refuses to start (there is no silent fallback to a fake embedder); `SELF_DIRECT_LOCAL_ONLY=true` is the way to run without any embedding server: no dense index at all, and `sparse` and `regex` search remain.
+- **Your own server** keeps the text on your machine or network. Start any OpenAI-compatible embedding server (llama.cpp's server with `--embedding`, vLLM, Ollama, text-embeddings-inference, ...), set the three settings to its address, model name and vector size, and leave `SELF_DIRECT_LOCAL_ONLY` off (it forbids every dense index). The request carries a `dimensions` field; a server that ignores it must return vectors of exactly `SELF_DIRECT_EMBEDDING_DIM` numbers, because a response of another size is an error, never a truncation.
+- **tsukkomi ships no model weights.** A local server needs an embedding model downloaded separately, and the right model for your languages: a multilingual one if you search Korean, Japanese, Chinese or any language the lexical index does not segment (see "Language scope" under Sparse index formats). The default model is open-weights, so the same model can run locally, but its vectors will differ slightly from OpenRouter's hosted ones.
+- **Changing the model, the dimension or the base URL starts a new embedding policy**: the vectors are written to a new index and every event is embedded again; mixed vectors are never searched. Plan for the time that takes on a large index.
+- `tests/test_embedding_endpoint.py` runs the real client against a stub server on the loopback interface (the request path, headers and body, indexing, `dense` and `hybrid` search). It proves the wiring, not the quality of any model. A smoke run with a real local model (Qwen3-Embedding-0.6B on a GPU) and a reference server script is described in [docs/local-embeddings.md](docs/local-embeddings.md); it is anecdotal, not a benchmark.
+
 ### pgvector
 
 ```bash
@@ -1039,6 +1049,22 @@ The other two formats store a word the way `unicode61` tokenizes it: one token p
   - Normalization is NFC, not NFKC, so halfwidth Katakana and fullwidth Latin are not folded into their ordinary forms. Zero-width characters (U+200B to U+200D, U+2060, U+FEFF) between two run characters are removed; an ideographic variation sequence, the Katakana middle dot and ideographic punctuation end a run.
 - **Cost.** The file is bigger than the compact one for CJK-heavy text, a second `sparse-rebuild` is needed once, and a query on a window that occurs in nearly every event costs more. Measured with `scripts/bench_sparse.py --stages cjk --events 100000` (a seeded corpus of invented Korean-like words, 43.3 MB of text; SQLite 3.53.1): compact 23.5 MB (0.54 of the text) and built in 6.0 s, CJK 35.5 MB (0.82; 1.5 times the compact file) and 11.4 s, pre-tokenization 0.04 ms an event; top-20 p50: a two-character word in 99,264 events 112 ms on the compact format (its prefix term) against 56 ms; the same word with a particle 115 ms (it returned all 99,264 events) against 14 ms (exactly the 16,743 that contain it); a rare word 0.4 against 0.2 ms; an inner piece of a longer word 0 events found against 69,409 in 35 ms; a whole three-character word 53 against 50 ms; a one-character query 99,329 of the 99,342 events that contain it (13 end a run) in 68 ms; a Latin word 1.2 ms in both.
 - **Going back, and which to use.** Set `SELF_DIRECT_SPARSE_FORMAT=compact` (or `legacy`): the older file is used as it was, untouched by the CJK format, and `sparse-v3.sqlite` stays where it is (delete it yourself if you do not want it). A process of an older version does not know the setting and ignores `sparse-v3.sqlite`. Use `cjk` when your sessions contain Korean, Chinese or Japanese text and you search for words inside compounds, inflected forms or unspaced text; stay on `compact` for English-only histories (the CJK file would be the same size and the same results) or when disk is the constraint.
+
+#### Language scope
+
+tsukkomi does **not** ship per-language analyzers (no morphological analyzer, no stemmer other than English `porter`, no dictionary): they would have to exist for every language, and a statistical stand-in (character n-grams, subword vocabularies) trades exactness for coverage. The lexical (sparse) index covers what a language-independent rule can do exactly; meaning and word forms are the job of an embedding endpoint (see "Embedding endpoint" under Dense backends).
+
+| Text | `legacy` / `compact` | `cjk` | What it cannot do |
+|---|---|---|---|
+| English | whole words, `porter` stems (`index` finds `indexed`) | the same | |
+| Other space-separated Latin text (accents folded, case folded) | whole words, exact | the same | no stemming: inflected forms are different words |
+| Korean | word start only (`색인` finds `색인을`), a short list of particles is cut | any substring of two or more characters (`회의` in `원탁회의를`) | conjugation (`만들다` against `만들었다`), synonyms |
+| Chinese, Japanese | the start of an unspaced run | any substring of two or more characters | word senses, readings, conjugation |
+| Cyrillic, Greek | whole words, exact, case folded (same rule as Latin; not covered by tests) | the same | no stemming |
+| Agglutinative or compounding languages that use spaces (Turkish, Finnish, German) | whole words, exact | the same | a stem inside a long word form or a compound |
+| Scripts written without spaces or with combining vowel signs (Thai, Lao, Khmer, Burmese, Devanagari) | **not supported** (not tested): `unicode61` keeps an unspaced run as one token and the query builder splits at combining signs, so queries do not line up with the text | **not supported** | everything lexical |
+
+Whatever the table says a lexical index cannot do (conjugated or compound forms, synonyms, another language's words for the same idea, scripts it does not segment), the way to get it is an embedding endpoint: an OpenAI-compatible server of your own (a multilingual model such as the Qwen3-Embedding family or BGE-M3; weights are downloaded separately, see [docs/local-embeddings.md](docs/local-embeddings.md)) or OpenRouter. `hybrid` search then combines the lexical and the semantic ranking. Without one, `sparse` and `regex` search remain, with the limits above.
 
 ## Resident daemon (experimental, off by default)
 
