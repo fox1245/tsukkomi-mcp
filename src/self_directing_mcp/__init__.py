@@ -1,3 +1,3 @@
 """Self-directing MCP: Codex session self-audit via index, hybrid search, and contracts."""
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
