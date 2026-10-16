@@ -538,3 +538,17 @@ def test_a_contracts_file_with_a_bad_typed_contract_is_reported_not_silently_dro
     with pytest.raises(Exception, match="contracts or checklist unavailable"):
         from self_directing_mcp.hook_policy import read_obligations
         read_obligations(claude.engine, "claude", CLAUDE_SID, str(claude.path))
+
+
+def test_a_patch_is_a_write_so_mode_read_leaves_it_alone_while_mode_any_does_not(codex_session):
+    engine, path = codex_session
+    patch = "*** Begin Patch\n*** Update File: sub/.env\n@@\n-a\n+b\n*** End Patch"
+    action = {"tool_name": "apply_patch", "arguments": patch}
+    cat = {"tool_name": "shell", "arguments": {"command": ["bash", "-lc", "cat sub/.env"]}}
+    engine.upsert_contracts([READ_ONLY])
+    assert engine.check_action(CODEX_SID, action, provider="codex", path=str(path))["verdict"] == "clean"
+    assert engine.check_action(CODEX_SID, cat, provider="codex", path=str(path))["verdict"] == "violation"
+    engine.upsert_contracts([{**GUARD, "id": "any-mode"}])
+    assert {f["contract_id"]: f["verdict"] for f in engine.check_action(CODEX_SID, action, provider="codex",
+                                                                         path=str(path))["findings"]} == {
+        "no-dotenv": "clean", "any-mode": "violation"}

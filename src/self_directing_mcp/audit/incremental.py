@@ -51,8 +51,10 @@ from self_directing_mcp.security.mask import mask_secrets
 # stored state and re-enables contracts that a shadow mismatch disabled. (8: the reference evaluator shares its position
 # index, call/result tables and rare-evidence lists between rules; results are identical, but the tripwire in
 # tests/test_incremental_evaluator_guard.py asks for a bump whenever a mirrored function changes. 9: Grok's blocked
-# calls are rejected proposals too (``runner.blocked_calls`` / ``GrokFacts``).)
-EVALUATOR_VERSION = 9
+# calls are rejected proposals too (``runner.blocked_calls`` / ``GrokFacts``). 10: the reason and basis of a typed
+# ``path_guard`` contract name the guarded path (``contract_paths.forbidden_label`` / ``verifier_basis``), and the
+# fingerprint of its saved state includes the regex derived from it; regex contracts judge and read exactly as before.)
+EVALUATOR_VERSION = 10
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
