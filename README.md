@@ -550,6 +550,16 @@ The dense half of `search_history` sits behind one interface (`index/vector.py::
 
 All three score `1 - cosine distance` (1 is identical, a zero vector scores 0), apply `allowed_ids` before the top-k, and break exact ties by id in byte order (NumPy: arbitrary inside a tie). `tests/test_dense_backend_parity.py` holds pgvector and sqlite-vector to NumPy's exact scan on the same seeded vectors, filters and write sequences: identical top-k except inside groups of exactly equal scores, scores within 1e-6 (float32 arithmetic; the largest difference seen was 2e-7).
 
+### Embedding endpoint: OpenRouter or a server of your own
+
+Vectors come from an OpenAI-compatible `POST <base url>/embeddings` call (`embed/embedder.py::OpenRouterEmbedder`; the name is historical). Three settings choose the server: `SELF_DIRECT_EMBEDDING_BASE_URL` (default `https://openrouter.ai/api/v1`), `SELF_DIRECT_EMBEDDING_MODEL` (default `qwen/qwen3-embedding-8b`) and `SELF_DIRECT_EMBEDDING_DIM` (default `1024`). Nothing in the client is specific to OpenRouter: any server that answers that call works, on a loopback address or on your network. The API key is whatever string the server expects (a server without authentication ignores it, but the setting must not be empty; see Credentials).
+
+- **OpenRouter** is the default and needs no setup beyond a key. It receives the chunk text, after secrets are masked (`mask_secrets` runs before every request), so use it only for sessions you are willing to send to that service. Without a key the engine refuses to start (there is no silent fallback to a fake embedder); `SELF_DIRECT_LOCAL_ONLY=true` is the way to run without any embedding server: no dense index at all, and `sparse` and `regex` search remain.
+- **Your own server** keeps the text on your machine or network. Start any OpenAI-compatible embedding server (llama.cpp's server with `--embedding`, vLLM, Ollama, text-embeddings-inference, ...), set the three settings to its address, model name and vector size, and leave `SELF_DIRECT_LOCAL_ONLY` off (it forbids every dense index). The request carries a `dimensions` field; a server that ignores it must return vectors of exactly `SELF_DIRECT_EMBEDDING_DIM` numbers, because a response of another size is an error, never a truncation.
+- **tsukkomi ships no model weights.** A local server needs an embedding model downloaded separately, and the right model for your languages: a multilingual one if you search Korean, Japanese, Chinese or any language the lexical index does not segment (see "Language scope" under Sparse index formats). The default model is open-weights, so the same model can run locally, but its vectors will differ slightly from OpenRouter's hosted ones.
+- **Changing the model, the dimension or the base URL starts a new embedding policy**: the vectors are written to a new index and every event is embedded again; mixed vectors are never searched. Plan for the time that takes on a large index.
+- `tests/test_embedding_endpoint.py` runs the real client against a stub server on the loopback interface (the request path, headers and body, indexing, `dense` and `hybrid` search). It proves the wiring, not the quality of any model; no real local model has been tried with tsukkomi.
+
 ### pgvector
 
 ```bash

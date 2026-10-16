@@ -58,6 +58,7 @@ jobs:
           tests/test_sparse_korean.py
           tests/test_sparse_cjk.py
           tests/test_sparse_cjk_formats.py
+          tests/test_embedding_endpoint.py
           tests/test_grok_tools.py
           tests/test_grok_provider.py
           tests/test_grok_hooks.py
