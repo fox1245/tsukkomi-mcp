@@ -62,6 +62,24 @@ only reports, a Stop blocks at most once per session and only for a confirmed
 around them. Hooks never read a project `.env`; point them at the right index with `--index-dir`, the user TOML or the settings `env`. The AGY adapter follows the same policy (`SELF_DIRECT_AGY_ENFORCEMENT`,
 default `confirmed_only`). See docs/claude-installation.md and docs/agy-installation.md.
 
+Grok CLI hooks are opt-in and separate from both installers. `python scripts/install_grok_hooks.py --print` first,
+`--apply` only when the user asks, `--verify` and `--uninstall` after. The installer owns exactly one file,
+`<grok home>/hooks/tsukkomi.json`; never make it write `~/.claude/settings.json`, `<grok home>/config.toml` or
+`trusted_folders.toml`, and never run the `grok` binary from this repository. Rules a change must keep: the provider
+reads only `<group>/<uuid>/updates.jsonl` (never `chat_history.jsonl` or `system_prompt.txt`: they hold the rendered
+system prompt); a Grok call is matched in Claude Code's vocabulary through the one map in `grok_tools.py`, applied in
+`tool_payload.tool_call_parts` so the parser and the proposed action cannot disagree (change a row, bump
+`TOOL_MAP_VERSION` and `grok.PARSER_VERSION`); every `PreToolUse` reply is explicit (`{"decision": "allow"}` at least,
+never `{}`) and exit code 2 is never used (Grok reads it as a deny); a failure allows, says so on the first line of
+stderr, records `hook_health`, queues a warning for the next `PostToolUse` and exits 1; `Stop` never blocks while `stopHookActive`, at a `reason` other than
+`end_turn`, or inside a subagent; the hooks inject no context at `SessionStart`/`UserPromptSubmit` (Grok discards it)
+and offer no `updatedInput`/`updatedToolOutput` (README "Grok CLI"); a transcript that shrinks makes history-dependent
+findings `unknown`, and so does a tool input Grok truncated (`toolInputTruncated`); a user turn needs Grok's `promptIndex`, so injected or replayed text can never anchor a contract.
+`SELF_DIRECT_GROK_ENFORCEMENT` and `--mode=` follow the same policy as the other hosts (`hook_policy`, not a fork).
+Because Grok loads Claude Code's settings file, `scripts/claude_hook.py` answers a Grok payload with silence before it
+imports anything (stdlib only, in step with `grok_ids.is_grok_payload`; `tests/test_grok_claude_bypass.py`). See
+docs/grok-installation.md.
+
 Use the official [sqliteai/sqlite-vector release](https://github.com/sqliteai/sqlite-vector/releases/tag/1.1.0)
 library directly. Python wheels and local compilation are not required: Windows uses vector.dll,
 Linux vector.so, and macOS vector.dylib. After installing Python dependencies, run:
@@ -195,7 +213,7 @@ Use check_action for actions affected by active constraints. A fresh hook result
 - unknown: resolve the relevant gap before claiming compliance; continue independent authorized work.
 - clean: limited to the returned evidence/contract snapshot; not new permission.
 
-Regex checks are primary. Search ranks are not violation evidence. Description-only contracts remain unknown. Codex hooks never auto-execute or auto-block; the opt-in OMP extension blocks only confirmed findings, and the opt-in AGY and Claude Code hooks do so by default. Example contracts are disabled by default. Set the contract fields `risk`, `auto_continue` and `when` only when the user asked for them (see the README).
+Regex checks are primary. Search ranks are not violation evidence. Description-only contracts remain unknown. Codex hooks never auto-execute or auto-block; the opt-in OMP extension blocks only confirmed findings, and the opt-in AGY, Claude Code and Grok CLI hooks do so by default. Example contracts are disabled by default. Set the contract fields `risk`, `auto_continue` and `when` only when the user asked for them (see the README).
 
 ## Coverage of growing sessions, duplicate sources and concurrency
 
@@ -317,6 +335,12 @@ redactedThinking, ttsr_injection and developer messages as runtime records, not 
 instructions or execution evidence. Among steering messages only attribution "user" is a user
 turn; agent-attributed user-role messages are runtime text, and partial steering metadata or an
 unknown attribution is rejected. Opaque payloads (image data, redacted reasoning) are never indexed.
+
+Grok parser v1 reads `updates.jsonl` (`session/update` records and the `_x.ai/session/update` `turn_completed`
+record). Contiguous message deltas become one event, thoughts a `[thinking]` placeholder, a `tool_call` and its terminal
+`tool_call_update` (linked by `toolCallId`, `failed` or a non-zero exit code is failure) a call and a result, and the
+host's `hook_execution`/`hook_annotation` (which describe this server's own denials) are skipped. Any other record kind
+is an `unsupported_event`; do not extend the quiet list without a recorded fixture.
 
 Compressed Codex rollouts (rollout-*.jsonl.zst, written by Codex CLI 0.156 for older sessions) are
 discovered and synced like plain ones. Their byte offsets, anchors and prefix hashes address the

@@ -39,7 +39,7 @@ ENV_PREFIX = "SELF_DIRECT_"
 API_KEY_ENV = "OPENROUTER_API_KEY"
 
 ENFORCEMENT_MODES = ("confirmed_only", "advisory", "enforced")
-SESSION_PROVIDERS = ("codex", "grokbot", "omp", "agy", "claude")
+SESSION_PROVIDERS = ("codex", "grokbot", "omp", "agy", "claude", "grok")
 DENSE_BACKENDS = ("sqlite-vector", "numpy", "pgvector")
 REMOTE_DENSE_BACKENDS = ("pgvector",)        # a database server: never on the hook path (hook_policy.wants_derived_work)
 DAEMON_MODES = ("off", "on")
@@ -84,7 +84,7 @@ AGY_APP_DATA_NAMES = ("antigravity", "antigravity-cli", "antigravity-ide")
 
 PATH_FIELDS = frozenset({
     "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
-    "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file", "pgvector_dsn_file",
+    "grok_sessions_dir", "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file", "pgvector_dsn_file",
     "contract_bundle_paths",
 })
 
@@ -124,6 +124,14 @@ def default_claude_projects_dir() -> Path:
     if configured:
         return Path(configured)
     return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+
+
+def default_grok_sessions_dir() -> Path:
+    # Grok CLI keeps its sessions under GROK_HOME when set (default ~/.grok); the MCP server and hooks inherit it.
+    configured = os.environ.get("SELF_DIRECT_GROK_SESSIONS_DIR")
+    if configured:
+        return Path(configured)
+    return Path(os.environ.get("GROK_HOME") or Path.home() / ".grok") / "sessions"
 
 
 def default_agy_app_data_dirs() -> list[Path]:
@@ -299,6 +307,9 @@ class SettingsAccessors:
     def resolve_claude_projects_dir(self) -> Path:
         return Path(self.claude_projects_dir)
 
+    def resolve_grok_sessions_dir(self) -> Path:
+        return Path(self.grok_sessions_dir)
+
     def resolve_agy_app_data_dirs(self) -> list[Path]:
         return [Path(root).expanduser().resolve() for root in self.agy_app_data_dirs]
 
@@ -470,9 +481,11 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("grokbot_transcripts_dir", _str_or_path_list, default_grokbot_transcripts_dir),
     FieldSpec("omp_sessions_dir", _path, default_omp_sessions_dir),
     FieldSpec("claude_projects_dir", _path, default_claude_projects_dir),
+    FieldSpec("grok_sessions_dir", _path, default_grok_sessions_dir),
     FieldSpec("agy_app_data_dirs", _path_list, default_agy_app_data_dirs),
     FieldSpec("agy_enforcement", _literal(ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
     FieldSpec("claude_enforcement", _literal(ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
+    FieldSpec("grok_enforcement", _literal(ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
     FieldSpec("session_provider", _literal(SESSION_PROVIDERS), _static(DEFAULT_SESSION_PROVIDER)),
     FieldSpec("index_dir", _path, default_index_dir),
     FieldSpec("contracts_path", _path, _static(None)),

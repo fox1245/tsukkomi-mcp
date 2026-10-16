@@ -19,7 +19,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.12"]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -55,6 +55,11 @@ jobs:
           tests/test_sparse_compact_mutations.py
           tests/test_sparse_formats.py
           tests/test_sparse_orphans.py
+          tests/test_grok_tools.py
+          tests/test_grok_provider.py
+          tests/test_grok_hooks.py
+          tests/test_grok_install.py
+          tests/test_grok_claude_bypass.py
           tests/test_sparse_settings.py
           tests/test_zstd_stream.py
           tests/test_codex_zstd_discovery.py
@@ -103,6 +108,11 @@ jobs:
           tests/test_sparse_compact_mutations.py
           tests/test_sparse_formats.py
           tests/test_sparse_orphans.py
+          tests/test_grok_tools.py
+          tests/test_grok_provider.py
+          tests/test_grok_hooks.py
+          tests/test_grok_install.py
+          tests/test_grok_claude_bypass.py
           tests/test_sparse_settings.py
           tests/test_singleflight.py
           tests/test_index_concurrency.py

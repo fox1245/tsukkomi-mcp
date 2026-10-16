@@ -12,6 +12,10 @@ Only the fields named below are prose, and only where the prose nature is confir
 from a recorded fixture. An unclassified field stays payload: it is matched exactly as before. Fields that are
 suspected but unconfirmed are listed in ``UNCONFIRMED`` and are deliberately not excluded.
 
+Grok CLI calls are rendered with Claude Code's tool names and argument keys (``grok_tools``): a contract written
+for ``[tool_call:Bash] {"command": ...}`` matches Grok's ``run_terminal_command`` too. That conversion happens
+here, for provider ``grok`` only, so every writer of the text applies it and the native name stays in the metadata.
+
 This module has no heavy imports; hook processes load it.
 """
 from __future__ import annotations
@@ -62,7 +66,17 @@ def split_prose(provider: str | None, tool_name: Any, arguments: Any) -> tuple[A
 
 
 def tool_call_parts(provider: str | None, tool_name: Any, arguments: Any, *, label: str = "tool_call") -> tuple[str, dict]:
-    """``(text, meta)`` of a tool call: ``[<label>:<name>] <payload>`` and ``{"tool_prose": {...}}`` when it had prose."""
+    """``(text, meta)`` of a tool call: ``[<label>:<name>] <payload>`` and ``{"tool_prose": {...}}`` when it had prose.
+
+    For Grok the name and keys are the Claude-canonical ones and ``meta`` also names the native call
+    (``native_tool_name``, ``native_arguments``, ``grok_tool_map``)."""
+    if provider == "grok":
+        from self_directing_mcp import grok_tools
+        call = grok_tools.canonical_call(tool_name, arguments)
+        meta = grok_tools.native_meta(call, arguments)
+        if call.prose:
+            meta["tool_prose"] = {key: value[:PROSE_CAP] for key, value in call.prose.items()}
+        return f"[{label}:{call.name}] {as_text(call.arguments)}", meta
     payload, prose = split_prose(provider, tool_name, arguments)
     meta = {"tool_prose": {key: value[:PROSE_CAP] for key, value in prose.items()}} if prose else {}
     return f"[{label}:{tool_name}] {as_text(payload)}", meta

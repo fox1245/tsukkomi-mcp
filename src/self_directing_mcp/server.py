@@ -461,7 +461,8 @@ async def sync_session(
 
     Audit/check_action refresh automatically; do not sync separately before them.
     Provide session_id or path under the configured root.
-    provider: "codex" (default), "grokbot", "omp" (OMP JSONL), "agy" or "claude" (Claude Code transcripts).
+    provider: "codex" (default), "grokbot", "omp" (OMP JSONL), "agy", "claude" (Claude Code transcripts) or
+    "grok" (Grok CLI updates.jsonl under SELF_DIRECT_GROK_SESSIONS_DIR).
     When omitted, uses SELF_DIRECT_SESSION_PROVIDER or auto-detects from path layout.
     Every event occurrence is retained; only new sanitized text hashes are embedded.
     Set embed=False for local indexing. SELF_DIRECT_LOCAL_ONLY=true disables
@@ -493,7 +494,7 @@ async def search_history(
     Use when relevant evidence is missing. Do NOT treat retrieval
     alone as compliance proof — call audit_session; contracts/regex are authoritative.
     top_k defaults from settings (search_top_k). Never treat top-1 alone as a violation.
-    provider filters the index (codex|grokbot|omp|agy|claude). Local-only supports regex/sparse, not dense/hybrid.
+    provider filters the index (codex|grokbot|omp|agy|claude|grok). Local-only supports regex/sparse, not dense/hybrid.
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.search_history,
@@ -513,7 +514,7 @@ async def audit_session(session_id: str, provider: str | None = None, path: str 
     Rules/regex are primary; hybrid is auxiliary only.
     Refreshes local JSONL first and returns coverage and a contracts snapshot.
     Unknown means evidence/verification is missing; it must not be called compliance.
-    provider filters the audit (codex|grokbot|omp|agy|claude).
+    provider filters the audit (codex|grokbot|omp|agy|claude|grok).
     timeout_ms: optional per-call budget in milliseconds for large sessions. A session too big for one call is synced
     and judged in slices over several calls; one that is indexed but has no monitor state yet
     (audit_status.evaluation.session.events_without_state) may need a larger budget for its first audit.
@@ -567,7 +568,7 @@ async def list_contract_candidates(project_dir: str | None = None, session_id: s
     Candidates are the project's .tsukkomi/contracts.json (found from the project directory up to the repository
     root, never above the user's home; off with SELF_DIRECT_PROJECT_CONTRACTS=off) and the personal bundle files
     listed in SELF_DIRECT_CONTRACT_BUNDLE_PATHS. project_dir defaults to the working directory the session's own
-    index names (Codex session_meta and Claude Code records; OMP and AGY sessions name none, so pass project_dir).
+    index names (Codex session_meta and Claude Code records; OMP, AGY and Grok sessions name none, so pass project_dir).
     Each candidate has bundle_id (the first 12 hex characters of the file's SHA-256), label, source_kind
     (project|personal), a relative or labelled path_label (never an absolute path), and each contract with a status
     against this device's contracts: new, same (identical content, written here), adopted (identical, adopted from

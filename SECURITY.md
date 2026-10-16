@@ -31,12 +31,14 @@ In scope, for example: leaking a credential or session text outside the document
 Out of scope, for example:
 
 - An attacker with write access as the same OS user to the index, contracts, hook configuration, approval directories or credential files. Those must be protected by the host.
-- Actions the hooks do not see: hosted tools that emit no `PreToolUse` event, out-of-band shell access, in-memory sessions and records not yet written to disk. The Codex hooks are advisory by design and never block. The AGY and Claude Code hooks block only what their documented mode says (by default a confirmed `violation`, and `suspicious` as a confirmation request) and fail open on their own errors.
+- Actions the hooks do not see: hosted tools that emit no `PreToolUse` event, out-of-band shell access, in-memory sessions and records not yet written to disk. The Codex hooks are advisory by design and never block. The AGY, Claude Code and Grok CLI hooks block only what their documented mode says (by default a confirmed `violation`, and `suspicious` as a confirmation request) and fail open on their own errors.
 - Vulnerabilities in dependencies or services (NeoGraph, the MCP SDK, sqlite-vector, OpenRouter, Lean, bubblewrap); report those upstream.
 
 ## Hook configuration
 
-Hosts run lifecycle hooks inside the project being edited, so anything in the working directory is content the audited agent can write. The AGY and Claude Code hooks therefore build their settings from the process environment and the user TOML only and never read a working-directory `.env`; otherwise a project `.env` could point a hook at an empty index or at `advisory` mode and turn a confirmed violation into an allow. The MCP server keeps reading `./.env` at the lowest precedence. The hook's index, contracts path and enforcement mode must be set through its environment, the user TOML or the installer's `--index-dir`. A user or process with write access to those, to the hook script or to the host settings remains out of scope (see above).
+Hosts run lifecycle hooks inside the project being edited, so anything in the working directory is content the audited agent can write. The AGY, Claude Code and Grok CLI hooks therefore build their settings from the process environment and the user TOML only and never read a working-directory `.env`; otherwise a project `.env` could point a hook at an empty index or at `advisory` mode and turn a confirmed violation into an allow. The MCP server keeps reading `./.env` at the lowest precedence. The hook's index, contracts path and enforcement mode must be set through its environment, the user TOML or the installer's `--index-dir`. A user or process with write access to those, to the hook script or to the host settings remains out of scope (see above).
+
+**Grok CLI session files.** The `grok` provider reads exactly one file per session, `<sessions dir>/<url-encoded cwd>/<session id>/updates.jsonl`, under the configured root (`SELF_DIRECT_GROK_SESSIONS_DIR`, default `$GROK_HOME/sessions` or `~/.grok/sessions`). The resolver refuses every other file name (`chat_history.jsonl` and `system_prompt.txt` hold the rendered system prompt and are never opened), a path outside the root, `..`, and any symlink or junction below the root. The agent's reasoning (`agent_thought_chunk`) is never indexed, and the host's `hook_execution` / `hook_annotation` records are skipped. `scripts/install_grok_hooks.py` writes only `<grok home>/hooks/tsukkomi.json`; it never touches `~/.claude/settings.json`, `config.toml` or `trusted_folders.toml` and never runs `grok`. A Claude Code hook that receives a Grok payload (Grok loads Claude's settings file) answers silently and writes no state.
 
 ## Masking contract
 
@@ -47,7 +49,7 @@ The index is a local evidence store, and the audit needs the truth, so what is s
 **Masked on every way out.** Text passes through `security/mask.py` (`mask_secrets` for strings, `mask_value` for JSON-like values) before it leaves the evidence store:
 
 - MCP tool results and MCP tool error text, including evidence snippets and `get_chunk` output.
-- Output of the Codex, AGY and Claude Code hooks, including injected context and fail-open warnings.
+- Output of the Codex, AGY, Claude Code and Grok CLI hooks, including injected context and fail-open warnings.
 - Server log records (messages, formatted tracebacks and stack information) through a logging filter on the root logger's handlers, and the traceback printed if the server crashes. A record whose masking itself fails is replaced by `log record withheld (masking failed)`. Error output of the Codex installer and the workflow command is masked too.
 - Text sent to OpenRouter: embedding inputs (masked before a long event is split, so a secret crossing a segment boundary is still caught), search queries, GraphRAG extraction prompts and the opt-in workflow classifier context, which is refused outright if a secret pattern is found.
 - The sparse (FTS5) search text, for rows written since 0.6.0 (both formats: see below).

@@ -19,6 +19,7 @@ _default_codex_sessions_dir = settings_core.default_codex_sessions_dir
 _default_grokbot_transcripts_dir = settings_core.default_grokbot_transcripts_dir
 _default_omp_sessions_dir = settings_core.default_omp_sessions_dir
 _default_claude_projects_dir = settings_core.default_claude_projects_dir
+_default_grok_sessions_dir = settings_core.default_grok_sessions_dir
 _default_index_dir = settings_core.default_index_dir
 
 
@@ -41,10 +42,12 @@ class Settings(SettingsAccessors, BaseSettings):
     grokbot_transcripts_dir: str | list[Path] = Field(default_factory=_default_grokbot_transcripts_dir)
     omp_sessions_dir: Path = Field(default_factory=_default_omp_sessions_dir)
     claude_projects_dir: Path = Field(default_factory=_default_claude_projects_dir)
+    grok_sessions_dir: Path = Field(default_factory=_default_grok_sessions_dir)
     agy_app_data_dirs: list[Path] = Field(default_factory=settings_core.default_agy_app_data_dirs)
     agy_enforcement: Literal["confirmed_only", "advisory", "enforced"] = settings_core.DEFAULT_ENFORCEMENT
     claude_enforcement: Literal["confirmed_only", "advisory", "enforced"] = settings_core.DEFAULT_ENFORCEMENT
-    session_provider: Literal["codex", "grokbot", "omp", "agy", "claude"] = settings_core.DEFAULT_SESSION_PROVIDER
+    grok_enforcement: Literal["confirmed_only", "advisory", "enforced"] = settings_core.DEFAULT_ENFORCEMENT
+    session_provider: Literal["codex", "grokbot", "omp", "agy", "claude", "grok"] = settings_core.DEFAULT_SESSION_PROVIDER
     index_dir: Path = Field(default_factory=_default_index_dir)
     contracts_path: Path | None = Field(
         default=None,
