@@ -20,6 +20,14 @@ never real text) written to the compact format, and the time of an exact term ag
 stem, which is what a Korean query costs now that ``_fts_query`` makes prefix terms (``python scripts/bench_sparse.py --stages korean
 --events 100000``).
 
+``--stages cjk`` is a second stage of its own: the same kind of seeded Korean-like corpus (with a Latin word in every 50th event)
+written to the compact format (``sparse-v2.sqlite``) and to the CJK format (``sparse-v3.sqlite``, each Hangul run cut into
+two-character windows), and for both the file size, the build time, the time of the pre-tokenizer, and the documents and the
+top-20 time of the queries a user types: a two-character word, a word with a particle, a rare word, the inner piece of a longer
+word, a whole three-character word, a one-character query and a Latin word. The number of documents that contain each substring
+is counted while the corpus is generated, so the table shows what each format finds and what it misses (``python
+scripts/bench_sparse.py --stages cjk --events 100000``).
+
     python scripts/bench_sparse.py --profile codex --events 100000 --candidate a,c,e [--out results.json]
     python scripts/bench_sparse.py --stats --profile codex --events 20000      # corpus statistics only
     python scripts/bench_sparse.py --list
@@ -50,7 +58,8 @@ from typing import NamedTuple
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "src"))     # this checkout, whatever is installed
 
-from self_directing_mcp.index.sparse import CompactSparseIndex, SparseIndex, _fts_query    # noqa: E402
+from self_directing_mcp.index import cjk                                                       # noqa: E402
+from self_directing_mcp.index.sparse import CjkSparseIndex, CompactSparseIndex, SparseIndex, _fts_query    # noqa: E402
 from self_directing_mcp.security.mask import mask_secrets               # noqa: E402
 
 BATCH = 500
@@ -953,7 +962,7 @@ class KoreanCorpus:
     with Zipf frequencies, every token a stem and one of ``KO_SUFFIXES``, 40 tokens an event. Nothing in it is real text.
     ``frequent`` (rank 1) is in most events, ``rare`` (rank ``KO_RARE_RANK``) in a few hundred of 100,000."""
 
-    def __init__(self, events: int, *, seed: int = 40, tokens: int = 40, vocabulary: int = 3000) -> None:
+    def __init__(self, events: int, *, seed: int = 40, tokens: int = 40, vocabulary: int = 3000, latin_every: int = 0) -> None:
         r = random.Random(f"korean:{seed}")
         syllables = [chr(c) for c in r.sample(range(0xAC00, 0xD7A4), 700)]
         stems: list[str] = []
@@ -964,7 +973,7 @@ class KoreanCorpus:
             if stem not in seen:
                 seen.add(stem)
                 stems.append(stem)
-        self.events, self.tokens, self.seed, self.stems = events, tokens, seed, stems
+        self.events, self.tokens, self.seed, self.stems, self.latin_every = events, tokens, seed, stems, latin_every
         self.frequent, self.rare = stems[0], stems[KO_RARE_RANK]
         total, self.cum = 0.0, []
         for rank in range(1, vocabulary + 1):
@@ -978,7 +987,10 @@ class KoreanCorpus:
         for i in range(self.events):
             picked = r.choices(self.stems, cum_weights=self.cum, k=self.tokens)
             ends = r.choices(KO_SUFFIXES, weights=self.suffix_weights, k=self.tokens)
-            batch.append(Doc(f"ko:{i:08d}", f"ko-session-{i // 200}", "turn", " ".join(a + b for a, b in zip(picked, ends))))
+            text = " ".join(a + b for a, b in zip(picked, ends))
+            if self.latin_every and i % self.latin_every == 0:
+                text += " index pytest"                                   # a Latin word the CJK format must leave alone
+            batch.append(Doc(f"ko:{i:08d}", f"ko-session-{i // 200}", "turn", text))
             if len(batch) == BATCH:
                 yield batch
                 batch = []
@@ -1034,6 +1046,81 @@ def korean_summary(rec: dict) -> str:
              f"build {rec['build_seconds']} s  ({rec['vocabulary']} invented stems, {rec['suffixes']} suffixes; frequent {rec['frequent']}, rare {rec['rare']})"]
     for name, q in rec["queries"].items():
         lines.append(f"       {name:15s} {q['match']:28s} {q['documents']:>7d} documents  p50/p95 {q['p50_ms']}/{q['p95_ms']} ms")
+    return "\n".join(lines)
+
+
+def cjk_probes(corpus: "KoreanCorpus") -> list[tuple[str, str]]:
+    """The queries of the ``cjk`` stage as ``(label, typed text)``: all synthetic, built from the corpus's own stems."""
+    three = next(stem for stem in corpus.stems[:40] if len(stem) == 3)
+    return [("frequent_word", corpus.frequent), ("frequent_with_particle", corpus.frequent + "을"), ("rare_word", corpus.rare),
+            ("inner_piece", three[1:]), ("whole_3_char_word", three), ("one_character", corpus.frequent[0]), ("latin_word", "index")]
+
+
+def measure_cjk(events: int, work: Path, out: dict, *, repeat: int = 15) -> None:
+    """The compact format against the CJK format on a ``KoreanCorpus``: size, build time, pre-tokenizer time, and for each probe
+    the documents that really contain it, the documents each format returns and the median / 95th percentile time of the ranked
+    top 20 (``search``, no filter). The compact format answers with the prefix terms of ``_fts_query``, the CJK format with the
+    phrase of the windows."""
+    corpus = KoreanCorpus(events, latin_every=50)
+    probes = cjk_probes(corpus)
+    truth = {label: 0 for label, _ in probes}
+    text_bytes = pretokenize_seconds = 0.0
+    paths = {"v2": work / f"cjk-v2-{events}.sqlite", "v3": work / f"cjk-v3-{events}.sqlite"}
+    indexes = {"v2": CompactSparseIndex(paths["v2"]), "v3": CjkSparseIndex(paths["v3"])}
+    rec: dict = {"candidate": "cjk", "events": events, "tokens_per_event": corpus.tokens, "vocabulary": len(corpus.stems), "sqlite": sqlite3.sqlite_version,
+                 "tokenization": cjk.TOKENIZATION, "probes": {label: typed for label, typed in probes}, "formats": {}}
+    out[f"cjk/{events}"] = rec
+    build = {"v2": 0.0, "v3": 0.0}
+    for batch in corpus.batches():
+        for doc in batch:
+            text_bytes += len(doc.text.encode())
+            for label, typed in probes:
+                truth[label] += typed in doc.text
+        t = time.perf_counter()
+        for doc in batch:
+            cjk.pretokenize(doc.text)
+        pretokenize_seconds += time.perf_counter() - t
+        for name, index in indexes.items():
+            t = time.perf_counter()
+            index.upsert_many(batch)
+            build[name] += time.perf_counter() - t
+    rec.update(text_bytes=int(text_bytes), pretokenize_ms_per_event=round(1000 * pretokenize_seconds / events, 4))
+
+    def timed(call) -> dict:
+        call()
+        call()
+        times = []
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            call()
+            times.append((time.perf_counter() - t0) * 1000.0)
+        return {"p50_ms": round(percentile(times, 0.5), 3), "p95_ms": round(percentile(times, 0.95), 3)}
+
+    for name, index in indexes.items():
+        index._conn.commit()
+        queries = {}
+        for label, typed in probes:
+            match = index._match(typed)
+            documents = index._conn.execute("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?", (match,)).fetchone()[0]
+            queries[label] = {"match": match, "documents": documents, "truth": truth[label], **timed(lambda q=typed, i=index: i.search(q, top_k=20))}
+        rec["formats"][name] = {"file_bytes": file_bytes(paths[name]), "bytes_per_text_byte": round(file_bytes(paths[name]) / text_bytes, 3),
+                                "build_seconds": round(build[name], 2), "count": index.count(), "queries": queries}
+        index._conn.close()
+        paths[name].unlink(missing_ok=True)
+
+
+def cjk_summary(rec: dict) -> str:
+    lines = [f"cjk {rec['events']:>7d} events  sqlite {rec['sqlite']}  text {rec['text_bytes'] / 1e6:.1f} MB  pre-tokenize {rec['pretokenize_ms_per_event']} ms/event  "
+             f"({rec['vocabulary']} invented stems; {rec['tokenization']})"]
+    for name, fmt in rec["formats"].items():
+        lines.append(f"       {name}: {fmt['file_bytes'] / 1e6:7.1f} MB  {fmt['bytes_per_text_byte']:.2f}x text  build {fmt['build_seconds']} s")
+    labels = list(rec["probes"])
+    for label in labels:
+        row = [f"{label:22s} {rec['probes'][label]!r:8}  contain {rec['formats']['v2']['queries'][label]['truth']:>7d}"]
+        for name, fmt in rec["formats"].items():
+            q = fmt["queries"][label]
+            row.append(f"{name} {q['documents']:>7d} docs p50/p95 {q['p50_ms']}/{q['p95_ms']} ms")
+        lines.append("       " + "   ".join(row))
     return "\n".join(lines)
 
 
@@ -1108,7 +1195,8 @@ def main(argv=None) -> int:
     ap.add_argument("--stages", default="ops,maint", help="comma separated: ops (delete + re-upsert), maint (integrity, optimize, vacuum), "
                     "orphans (delete a tenth of the documents in batches of 500, as sparse-rebuild does; off by default), "
                     "korean (exact against prefix terms on a synthetic Korean-like corpus of --events events; off by default; alone, "
-                    "it runs no candidate)")
+                    "it runs no candidate), cjk (the compact format against the CJK format on such a corpus: size, build time and "
+                    "queries; off by default; alone, it runs no candidate)")
     ap.add_argument("--out", help="write the results as JSON")
     ap.add_argument("--tmpdir", default=DEFAULT_TMP)
     ap.add_argument("--drop-ref", action="store_true", help="also delete the reference results (<tmpdir>/ref) when done")
@@ -1131,15 +1219,20 @@ def main(argv=None) -> int:
     out: dict = {}
     stages = set(args.stages.split(",")) - {""}
     try:
-        for name in ([] if stages == {"korean"} else args.candidate.split(",")):
+        for name in ([] if stages and stages <= {"korean", "cjk"} else args.candidate.split(",")):
             measure(name, args.profile, args.events, work, out, queries_n=args.queries,
-                    stages=stages - {"korean"}, ref_root=Path(args.tmpdir) / "ref")
+                    stages=stages - {"korean", "cjk"}, ref_root=Path(args.tmpdir) / "ref")
             print(summary(out[f"{name}/{args.profile}/{args.events}"]), flush=True)
             if args.out:
                 Path(args.out).write_text(json.dumps(out, indent=1))
         if "korean" in stages:
             measure_korean(args.events, work, out)
             print(korean_summary(out[f"korean/{args.events}"]), flush=True)
+            if args.out:
+                Path(args.out).write_text(json.dumps(out, indent=1))
+        if "cjk" in stages:
+            measure_cjk(args.events, work, out)
+            print(cjk_summary(out[f"cjk/{args.events}"]), flush=True)
             if args.out:
                 Path(args.out).write_text(json.dumps(out, indent=1))
     finally:

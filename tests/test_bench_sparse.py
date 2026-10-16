@@ -94,3 +94,27 @@ def test_the_korean_stage_is_seeded_and_times_exact_against_prefix_terms(tmp_pat
     assert q["frequent_prefix"]["documents"] > 500 > q["rare_prefix"]["documents"]
     assert "frequent_prefix" in capsys.readouterr().out
     assert not work.exists() or not list(work.iterdir())
+
+
+def test_the_cjk_stage_compares_the_compact_and_the_cjk_format_on_a_seeded_corpus(tmp_path, capsys):
+    module = bench()
+    first, again = module.KoreanCorpus(300, latin_every=50), module.KoreanCorpus(300, latin_every=50)
+    docs = [doc for batch in first.batches() for doc in batch]
+    assert docs == [doc for batch in again.batches() for doc in batch] and sum(doc.text.endswith(" index pytest") for doc in docs) == 6
+    plain = [doc for batch in module.KoreanCorpus(300).batches() for doc in batch]
+    assert all(doc.text == base.text + (" index pytest" if i % 50 == 0 else "") for i, (doc, base) in enumerate(zip(docs, plain)))   # the Korean stage's corpus is unchanged
+    work, report = tmp_path / "work", tmp_path / "report.json"
+    assert module.main(["--stages", "cjk", "--events", "600", "--tmpdir", str(work), "--out", str(report)]) == 0
+    assert list(json.loads(report.read_text())) == ["cjk/600"]                              # alone, the stage runs no candidate
+    rec = json.loads(report.read_text())["cjk/600"]
+    assert rec["tokenization"] == "cjk-bigram-1" and set(rec["formats"]) == {"v2", "v3"} and rec["pretokenize_ms_per_event"] > 0
+    v2, v3 = rec["formats"]["v2"], rec["formats"]["v3"]
+    assert v2["count"] == v3["count"] == 600 and v3["file_bytes"] > v2["file_bytes"]       # the honest cost: the CJK file is bigger
+    assert set(v3["queries"]) == {"frequent_word", "frequent_with_particle", "rare_word", "inner_piece", "whole_3_char_word", "one_character", "latin_word"}
+    for label, q in v3["queries"].items():
+        assert q["documents"] == q["truth"] or label == "one_character", label            # the phrase finds exactly the documents that contain it (a one-character query misses run ends)
+        assert q["documents"] >= q["truth"] or label != "one_character"
+    assert v2["queries"]["inner_piece"]["documents"] == 0 < v3["queries"]["inner_piece"]["documents"]        # what the prefix terms cannot reach
+    assert v2["queries"]["latin_word"]["documents"] == v3["queries"]["latin_word"]["documents"] == 12
+    assert "inner_piece" in capsys.readouterr().out
+    assert not work.exists() or not list(work.iterdir())
