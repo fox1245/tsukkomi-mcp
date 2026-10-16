@@ -519,7 +519,12 @@ def test_a_generated_pattern_compiles_under_both_engines_and_in_time():
         guarded = compile_contract(pattern)
         for text in (tool_call_text("claude", "Write", {"file_path": "/w/a.py", "content": "x, \"y\" cat .env\n" * 6000}),
                      tool_call_text("claude", "Bash", {"command": "cat > a <<'EOF'\n" + "type more head tail copy\n" * 400 + "EOF"}),
-                     tool_call_text("claude", "Bash", {"command": "echo " + "QUJD" * 4000 + " | base64 -d > f"})):
+                     tool_call_text("claude", "Bash", {"command": "echo " + "QUJD" * 4000 + " | base64 -d > f"}),
+                     # many newline escapes in one word (a heredoc to an interpreter, a -c string): linear, not quadratic
+                     tool_call_text("claude", "Bash", {"command": "python3 <<EOF\n" + "x\n" * 1500}),
+                     tool_call_text("claude", "Bash", {"command": "python3 -c \"" + "x\\n" * 1500 + "\""}),
+                     tool_call_text("claude", "Bash", {"command": "git" + " -a" * 200 + " status"}),
+                     "[tool_call:shell] " + "cat a; " * 3000):
             guarded.search(text)                                        # no ContractRegexTimeout inside the engine limit
 
 

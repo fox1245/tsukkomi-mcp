@@ -30,6 +30,7 @@ from semantic_support import SID as CLAUDE_SID, Claude, assistant, call, event, 
 from test_agy_parser_v6 import SID as AGY_SID, make as make_agy, user as agy_user
 from test_incremental_engine import Twin
 from test_reliability import SID as CODEX_SID, session as codex_session, write as write_codex  # noqa: F401
+from test_portable_contracts import world  # noqa: F401  (two devices with their own indexes)
 
 GUARD = {"id": "no-dotenv", "type": "must_not", "severity": "high", "description": "Never read the secrets in .env.",
          "path_guard": {"paths": [".env"], "except": [".env.example"], "modes": "any"}}
@@ -447,3 +448,54 @@ def test_narrowing_a_stored_guard_needs_a_user_anchor_and_widening_does_not(clau
     wider = {**GUARD, "path_guard": {"paths": [".env", "*.pem"], "except": [], "modes": "any"}}
     assert "pending" not in claude.upsert(wider)                                  # tightening needs no anchor
     assert claude.engine.list_contracts()["contracts"][0]["path_guard"]["paths"] == [".env", "*.pem"]
+
+
+# ------------------------------------------------------------- bundles: export, adopt, and a changed tool map
+
+def test_a_typed_contract_travels_in_a_bundle_and_is_enforced_after_adoption(world, monkeypatch):
+    from test_portable_contracts import BUNDLE, SID_A, SID_B, write_bundle
+    from self_directing_mcp import contract_bundles as cb
+    from semantic_support import bash, tool_result  # noqa: F401  (the Device helpers use them)
+    owner, adopter = world.device("a"), world.device("b")
+    project = world.project("repo")
+    owner.engine.upsert_contracts([GUARD])
+    written = owner.engine.export_contracts(BUNDLE, project_dir=str(project))
+    assert written["written"] is True and written["exported"] == ["no-dotenv"]
+    on_disk = json.loads((project / BUNDLE).read_text(encoding="utf-8"))["contracts"][0]
+    assert on_disk["path_guard"] == GUARD["path_guard"] and "regex" not in on_disk and "tool_call:" not in json.dumps(on_disk)
+    candidate = adopter.engine.list_contract_candidates(project_dir=str(project))["candidates"][0]
+    (listed,) = candidate["contracts"]
+    assert listed["status"] == "new" and listed["path_guard"] == GUARD["path_guard"] and "regex" not in listed
+    anchor = adopter.say(SID_B, "yes, adopt the team contracts")
+    result = adopter.engine.adopt_contracts(candidate["bundle_id"], anchor, project_dir=str(project))
+    assert result["ok"] and result["counts"]["adopted"] == 1
+    stored = adopter.contracts()["no-dotenv"]
+    assert stored["path_guard"] == GUARD["path_guard"] and "regex" not in stored and stored["origin"]["adopted_by_event_id"] == anchor
+    for tool, arguments, verdict in (("Read", {"file_path": "/work/.env"}, "violation"), ("Bash", {"command": "cat .env"}, "violation"),
+                                     ("Read", {"file_path": "/work/.env.example"}, "clean")):
+        checked = adopter.engine.check_action(SID_B, {"tool_name": tool, "arguments": arguments}, provider="claude",
+                                              path=str(adopter.path(SID_B)))
+        assert checked["verdict"] == verdict, (tool, checked)
+    # a later tool map changes the derived regex and nothing that identifies the contract: still "adopted", same pin
+    extra = contract_paths.ToolEntry("omp", "cat_file", contract_paths.FILE_READ, ("filename",), False, "test")
+    monkeypatch.setattr(contract_paths, "TOOL_MAP_VERSION", 2)
+    monkeypatch.setattr(contract_paths, "TOOL_ENTRIES", contract_paths.TOOL_ENTRIES + (extra,))
+    contract_paths._lower.cache_clear()
+    try:
+        again = adopter.engine.list_contract_candidates(project_dir=str(project))["candidates"][0]
+        assert again["bundle_id"] == candidate["bundle_id"] and again["contracts"][0]["status"] == "adopted"
+    finally:
+        monkeypatch.undo()
+        contract_paths._lower.cache_clear()
+    # a candidate that narrows the adopted guard is a weakening; replacing it needs replace_ids and is reported as one
+    narrower = {"id": "no-dotenv", "type": "must_not", "scope": "tool_call", "severity": "high", "description": GUARD["description"],
+                "path_guard": {"paths": [".env"], "except": [".env.example", ".env.local"], "modes": "read"}}
+    write_bundle(project, narrower)
+    changed = adopter.engine.list_contract_candidates(project_dir=str(project))["candidates"][0]
+    assert changed["contracts"][0]["status"] == "changed_since_adoption"
+    assert {item["field"] for item in changed["contracts"][0]["differences"]} == {"path_guard"}
+    refused = adopter.engine.adopt_contracts(changed["bundle_id"], anchor, project_dir=str(project))
+    assert refused["counts"]["conflicts"] == 1 and adopter.contracts()["no-dotenv"]["path_guard"]["modes"] == "any"
+    replaced = adopter.engine.adopt_contracts(changed["bundle_id"], anchor, replace_ids=["no-dotenv"], project_dir=str(project))
+    assert replaced["replaced"][0]["weakening"] is True
+    assert set(replaced["replaced"][0]["reasons"]) == {"path_guard.except added", "path_guard.modes narrowed (any -> read)"}

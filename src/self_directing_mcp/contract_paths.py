@@ -49,15 +49,21 @@ of keys named ``command``, ``cmd`` or ``CommandLine``; never at any other field 
 last name segment is a known read tool counts as that tool); a read through an unknown tool is a miss, say
 ``modes: any`` if that matters. Unknown tools are best effort and the tool map says which entries are untraced.
 
-Limits (class D: the guard does not see them; ``tests/test_contract_path_guard_semantics.py`` pins every one)
------------------------------------------------------------------------------------------------------------
-shell parsing is regex based and lexical: shell variables other than ``$HOME``/``%USERPROFILE%`` (``f=.env; cat $f``),
-``cd`` chains (``cd ~/.ssh && cat id_rsa``), globs in the command (``cat .en?``), string building in an interpreter
-(``python -c "open('.'+'env')"``), command substitution and ``eval``, a reader and its operand more than 400
-characters apart or separated by an unquoted ``;``, ``&``, ``|`` or a newline inside quotes, symbolic links and hard
-links, a program that reads a path it is not given on its command line, and a tool that is neither in the map nor
-named like a path. A path argument that merely equals the guarded name is a match: ``grep '\\.env' src/`` is flagged
-by ``read`` (the pattern looks like the file).
+Limits (class D: the guard does not see them; ``tests/test_contract_path_guard.py`` pins every one)
+-----------------------------------------------------------------------------------------------------
+Shell parsing is regex based and lexical. A shell segment is a simple command, up to ``;``, ``&``, ``|``, a backtick or
+a newline; a reader and a path word in one segment match. Not seen: shell variables other than
+``$HOME``/``%USERPROFILE%`` (``f=.env; cat $f``), ``cd`` chains (``cd ~/.ssh && cat id_rsa``), globs in the command
+(``cat .en?``), string building in an interpreter (``python -c "open('.'+'env')"``), command substitution and ``eval``,
+a separator inside quotes that ends the segment, symbolic links and hard links, a program that reads a path it is not
+given on its command line, Codex's JavaScript ``exec`` wrapper, a command that names no path, a read through a tool that
+is neither in the map nor named like a path (mode ``read``), and an absolute entry for a ``~user`` spelling. Matched on
+purpose, and so false positives: a pattern argument that equals the guarded name (``grep '\\.env' src/``), every operand
+of a reader (``cp new .env``), and a glob that starts with the name (``cat .env*``).
+
+Cost: the regex of a typed contract is generated once per process and compiled by the contract engine on first use
+(about 6 ms for mode ``any`` and 26 ms for mode ``read`` with one entry, more with more entries), and a search over a
+hostile text can still reach the engine's time limit, which makes the contract ``unknown`` for that call.
 """
 from __future__ import annotations
 
@@ -79,8 +85,10 @@ MAX_DEEP = 32                   # path segments one ``**`` can stand for (keeps 
 
 # ------------------------------------------------------------------------------------------------------- tool map
 
-FILE_READ, SEARCH, LIST, FILE_WRITE, SHELL, PATCH = "file_read", "search", "list", "file_write", "shell", "patch"
-ROLES = (FILE_READ, SEARCH, LIST, FILE_WRITE, SHELL, PATCH)
+# SEARCH: a content search (Grep); FIND: a search by file name (Glob), whose ``pattern`` is a path. Both target the path.
+FILE_READ, SEARCH, FIND, LIST, FILE_WRITE, SHELL, PATCH = (
+    "file_read", "search", "find", "list", "file_write", "shell", "patch")
+ROLES = (FILE_READ, SEARCH, FIND, LIST, FILE_WRITE, SHELL, PATCH)
 
 
 @dataclass(frozen=True)
@@ -109,7 +117,7 @@ TOOL_ENTRIES: tuple[ToolEntry, ...] = (
               "grok_tools.py row write -> Write: file_path, content"),
     ToolEntry("claude", "Grep", SEARCH, ("path", "glob"), False,
               "path: grok_tools.py row grep; glob: Claude Code's file filter, not in a fixture here"),
-    ToolEntry("claude", "Glob", SEARCH, ("path", "pattern"), False,
+    ToolEntry("claude", "Glob", FIND, ("path", "pattern"), False,
               "grok_tools.py notes that Glob needs a pattern; the keys are not in a fixture here"),
     ToolEntry("claude", "LS", LIST, ("path",), True, "grok_tools.py row list_dir -> LS: path"),
     ToolEntry("claude", "MultiEdit", FILE_WRITE, ("file_path",), False, "named by the task brief; no fixture here"),
@@ -128,7 +136,7 @@ TOOL_ENTRIES: tuple[ToolEntry, ...] = (
     ToolEntry("agy", "list_dir", LIST, ("DirectoryPath",), True,
               "tests/test_agy_parser_v7.py: list_dir{DirectoryPath}"),
     ToolEntry("agy", "grep_search", SEARCH, ("SearchPath",), False, "no fixture here"),
-    ToolEntry("agy", "find_by_name", SEARCH, ("SearchDirectory", "Pattern"), False, "no fixture here"),
+    ToolEntry("agy", "find_by_name", FIND, ("SearchDirectory", "Pattern"), False, "no fixture here"),
     # OMP
     ToolEntry("omp", "read", FILE_READ, ("path",), True,
               "tests/test_contract_fragility_file_reads.py: the OMP parser renders read{path}"),
@@ -136,7 +144,7 @@ TOOL_ENTRIES: tuple[ToolEntry, ...] = (
     ToolEntry("omp", "write", FILE_WRITE, ("path",), False, "no OMP fixture here"),
     ToolEntry("omp", "edit", FILE_WRITE, ("path",), False, "no OMP fixture here"),
     ToolEntry("omp", "grep", SEARCH, ("path",), False, "no OMP fixture here"),
-    ToolEntry("omp", "find", SEARCH, ("path",), False, "no OMP fixture here"),
+    ToolEntry("omp", "find", FIND, ("path",), False, "no OMP fixture here"),
     ToolEntry("omp", "ls", LIST, ("path",), False, "no OMP fixture here"),
     # Codex
     ToolEntry("codex", "shell", SHELL, ("command",), True,
@@ -241,30 +249,58 @@ def check_entries(field: str, entries: Any, *, required: bool) -> tuple[str, ...
 
 
 # ----------------------------------------------------------------------------------------------- globs and tokens
-# Regex building blocks. They are all single-line and read the text of a tool call, which is JSON (a backslash in a
-# path is written ``\\``; ``\n``, ``\t`` and ``\"`` are escapes) or, for a tool whose arguments are a plain string,
-# the string itself.
+# Regex building blocks. The text of a tool call is JSON (a literal backslash in a path is written ``\\``, and ``\n``, ``\t``
+# and ``\"`` are escapes) or, for a tool whose arguments are a plain string, the string itself, where a backslash is
+# only ever a separator. A path word is therefore read in one of two dialects, each with its own separators and
+# boundaries, and the lowered regex has one section per dialect (JSON contexts, plain-string contexts).
 
 Q = '"'
 _ESC = "ntrbfu" + Q + "'"                                  # what may follow a backslash in a JSON string
 _DELIMS = "\\s" + Q + "'`;&|<>(),="                        # characters that end a path word
 _G = "[^/\\\\\\s" + Q + "'`;&|<>(){},]"                    # one character that a wildcard stands for
-_S = "[/\\\\]+"                                            # a separator, / or \ (a JSON text doubles a backslash)
-_W = ("(?:[^" + _DELIMS + "\\\\]|\\\\\\\\|\\\\(?![" + _ESC + "\\\\]))")        # one character of a path word
-_WSTART = "(?:(?<![^" + _DELIMS + "])|(?<=\\\\[ntrbf]))"   # a path word starts here
-_RB = "(?![\\w.\\-@+%~/]|\\\\(?![" + _ESC + "]))"           # the token ends here: no name character, no separator
 _USER = "[^/\\\\" + Q + "'`;&|<>(),\\n]+"                  # an account name (spaces are allowed in it)
-_HOME = ("(?:~" + _G + "*"
-         "|\\$\\{?HOME\\}?(?:\\\\?[" + Q + "'])?"
-         "|\\$\\{?env:(?:USERPROFILE|HOME|HOMEPATH)\\}?(?:\\\\?[" + Q + "'])?"
-         "|%(?:USERPROFILE|HOME)%|%HOMEDRIVE%%HOMEPATH%"
-         "|/(?:home|Users)/" + _USER + "|/root|/mnt/[a-z]/Users/" + _USER + "|/[a-z]/Users/" + _USER +
-         "|[a-z]:[/\\\\]+Users[/\\\\]+" + _USER + ")")
+
+
+@dataclass(frozen=True)
+class _Dialect:
+    s: str          # a run of separators
+    dirs: str       # the directories (or ``HEAD:``, ``@``) before a name or a suffix
+    rb: str         # the token ends here: no name character and no separator follows
+    wstart: str     # a path word starts here
+    home: str       # the spellings of the home directory, with the separator after it
+
+
+def _after_escape(letters: str) -> str:
+    """Just after a JSON escape of one of ``letters`` (``\\n``): an odd run of backslashes (``\\\\n`` is a backslash and an
+    ``n``). Lookbehinds are fixed width, so runs of one and of three are covered."""
+    return "(?:(?<=[^\\\\]\\\\[" + letters + "])|(?<=[^\\\\]\\\\\\\\\\\\[" + letters + "]))"
+
+
+def _dialect(raw: bool) -> _Dialect:
+    if raw:
+        sep, rb, wstart = "[/\\\\]", "(?![\\w.\\-@+%~/\\\\])", "(?<![^" + _DELIMS + "])"
+        s = sep + "+"
+        dirs = "(?:[^" + _DELIMS + "/\\\\:@]*+(?:[/:@]|\\\\++))*"
+    else:
+        # A slash, a run of doubled backslashes (one separator, possessively), or a single backslash that does not begin a
+        # JSON escape: ``\n``, ``\t`` and ``\"`` are escapes and never separators, so a newline inside a long text ends a
+        # path word (and matching stays linear in the length of the text).
+        sep = "(?:/|(?:\\\\\\\\)++|\\\\(?![" + _ESC + "\\\\]))"
+        s = sep + "+"
+        rb = "(?![\\w.\\-@+%~/]|\\\\(?![" + _ESC + "]))"
+        wstart = "(?:(?<![^" + _DELIMS + "])|" + _after_escape("ntrbf") + ")"
+        dirs = "(?:[^" + _DELIMS + "/\\\\:@]*+(?:[/:@]|(?:\\\\\\\\)++|\\\\(?![" + _ESC + "\\\\])))*"
+    home = ("(?:~" + _G + "*"
+            "|\\$\\{?HOME\\}?(?:\\\\?[" + Q + "'])?"
+            "|\\$\\{?env:(?:USERPROFILE|HOME|HOMEPATH)\\}?(?:\\\\?[" + Q + "'])?"
+            "|%(?:USERPROFILE|HOME)%|%HOMEDRIVE%%HOMEPATH%"
+            "|/(?:home|Users)/" + _USER + "|/root|/mnt/[a-z]/Users/" + _USER + "|/[a-z]/Users/" + _USER +
+            "|[a-z]:" + s + "Users" + s + _USER + ")") + s
+    return _Dialect(s, dirs, rb, wstart, home)
+
+
+JSON_TEXT, RAW_TEXT = _dialect(False), _dialect(True)
 HOME_ROOTS = ("/home/<name>", "/Users/<name>", "/root", "/mnt/<drive>/Users/<name>", "<drive>:\\Users\\<name>")
-# The directories (or ``HEAD:``, ``@``) before a name or a suffix. Each step is a name component without separators
-# (possessive) and one separator (a run of backslashes is one, possessive again): the split of a word into steps is
-# unique, so a failing match costs one pass over the word and the engine can only back off whole components.
-_DIRS = "(?:[^" + _DELIMS + "/\\\\:@]*+(?:[/:@]|\\\\++))*"
 
 
 def _class(body: str, negate: bool) -> str:
@@ -309,7 +345,7 @@ def _segment(field: str, seg: str) -> str:
     return "".join(out)
 
 
-def _fold(field: str, segs: list[str], *, lead: bool) -> str:
+def _fold(field: str, segs: list[str], *, lead: bool, sep: str) -> str:
     """Segments joined by separators; ``**`` stands for any number of whole segments. ``lead``: a separator was just
     consumed (an anchored prefix), so a first ``**`` owns the separators after it."""
     out, owed, n = "", not lead, len(segs)
@@ -317,16 +353,16 @@ def _fold(field: str, segs: list[str], *, lead: bool) -> str:
         last = index == n - 1
         if seg == "**":
             if last:
-                out += ("(?:" + _S + _G + "+){1," + str(MAX_DEEP) + "}") if out else (
-                    _G + "+(?:" + _S + _G + "+){0," + str(MAX_DEEP) + "}")
+                out += ("(?:" + sep + _G + "+){1," + str(MAX_DEEP) + "}") if out else (
+                    _G + "+(?:" + sep + _G + "+){0," + str(MAX_DEEP) + "}")
             elif out:
-                out += "(?:" + _S + _G + "+){0," + str(MAX_DEEP) + "}"
+                out += "(?:" + sep + _G + "+){0," + str(MAX_DEEP) + "}"
             else:
-                out += "(?:" + _G + "+" + _S + "){0," + str(MAX_DEEP) + "}"
+                out += "(?:" + _G + "+" + sep + "){0," + str(MAX_DEEP) + "}"
                 owed = False
             continue
         if owed and out:
-            out += _S
+            out += sep
         out += _segment(field, seg)
         owed = True
     return out
@@ -351,15 +387,15 @@ def canonical(entry: str) -> str:
     return _normal(entry).lower()
 
 
-def compile_token(field: str, entry: str) -> Token:
+def compile_token(field: str, entry: str, dialect: _Dialect = JSON_TEXT) -> Token:
     text = _normal(entry)
     home = _HOME_ENTRY.match(text)
     if home:
-        kind, rest, prefix = "home", text[home.end():], _HOME + _S
+        kind, rest, prefix = "home", text[home.end():], dialect.home
     elif text.startswith("/"):
         kind, rest, prefix = "abs", text[1:], "(?:file://)?[/\\\\]"
     elif _DRIVE_ENTRY.match(text):
-        kind, rest, prefix = "drive", text[3:], "(?:file:///?)?" + re.escape(text[0]) + ":" + _S
+        kind, rest, prefix = "drive", text[3:], "(?:file:///?)?" + re.escape(text[0]) + ":" + dialect.s
     elif text.startswith("~"):
         raise PathGuardError(field, f"{entry!r}: write the home directory as '~/...' (or an absolute path)")
     else:
@@ -376,17 +412,17 @@ def compile_token(field: str, entry: str) -> Token:
             raise PathGuardError(field, f"{entry!r} has no literal part")
     if any(seg == "" for seg in segs):
         raise PathGuardError(field, f"{entry!r} has an empty path segment")
-    body = _fold(field, segs, lead=bool(prefix))
+    body = _fold(field, segs, lead=bool(prefix), sep=dialect.s)
     return Token(entry, kind, (prefix + body) if prefix else body)
 
 
-def _words(tokens: Sequence[Token]) -> str:
+def _words(tokens: Sequence[Token], dialect: _Dialect) -> str:
     """The alternatives for the whole path word: anchored entries from the word's start, names and suffixes after any
     directories (one scan of the directories for all of them)."""
     anchored = [t.word for t in tokens if t.kind in ("home", "abs", "drive")]
     relative = [t.word for t in tokens if t.kind in ("name", "suffix")]
     if relative:
-        anchored.append(_DIRS + "(?:" + "|".join(relative) + ")")
+        anchored.append(dialect.dirs + "(?:" + "|".join(relative) + ")")
     return "(?:" + "|".join(anchored) + ")"
 
 
@@ -416,10 +452,10 @@ READ_VERBS = (
     "sls", "copy", "copy-item", "cpi", "perl", "ruby")
 INTERPRETERS = ("python", "python2", "python3", "py", "node", "nodejs", "deno", "bun", "perl", "ruby", "php", "lua",
                 "rscript")
-_GIT_READ = "git(?:\\s+-\\S+(?:\\s+\\S+)?)*\\s+(?:show|cat-file|diff|blame|log|grep|archive)"
+_GIT_READ = "git(?:\\s+-\\S+(?:\\s+(?!-)\\S+)?)*\\s+(?:show|cat-file|diff|blame|log|grep|archive)"
 
 
-_VSTART = "(?:(?<![\\w$.\\-])|(?<=\\\\[ntr]))"          # a command word starts here
+_VSTART = "(?:(?<![\\w$.\\-])|" + _after_escape("ntr") + ")"          # a command word starts here
 
 
 def _alt_body(names: Iterable[str]) -> str:
@@ -450,8 +486,9 @@ def _shell_raw_context() -> str:
     return _TC + _alt(_shell_names()) + "\\]\\s+(?![\\[{])"
 
 
-_VERB_HEAD = _VSTART + "(?:" + _alt_body(READ_VERBS) + "|" + _GIT_READ + ")" + _RB
-_DOT_HEAD = "(?:(?<=[" + Q + "';&|(`{])|(?<=\\\\[nrt]))\\s*\\.\\s+"
+_VERB_HEAD = _VSTART + "(?:" + _alt_body(READ_VERBS) + "|" + _GIT_READ + ")" + JSON_TEXT.rb
+_VERB_HEAD_RAW = "(?<![\\w$.\\-])(?:" + _alt_body(READ_VERBS) + "|" + _GIT_READ + ")" + RAW_TEXT.rb
+_DOT_HEAD = "(?:(?<=[" + Q + "';&|(`{])|" + _after_escape("nrt") + ")\\s*\\.\\s+"
 
 
 def _reader_tails(seg: dict, group: str) -> list[str]:
@@ -462,7 +499,7 @@ def _reader_tails(seg: dict, group: str) -> list[str]:
         _VERB_HEAD + seg["item"] + "*?",                                                     # a reader, then its operand
         "(?<!<)<(?![<(])\\s*(?:\\\\?[" + Q + "'])?",                                         # < file
         _DOT_HEAD + seg["item"] + "*?",                                                      # . file
-        interp + "[^;&|`\\n" + Q + "]*?\\s-(?:[A-Za-z]*[ceEr][A-Za-z]*|-eval)\\s+" + quote + "(?:(?!(?P=" + group + "))[^\\n])*?",
+        interp + "[^;&|`\\n" + Q + "]*?\\s-(?:(?=[A-Za-z]*[ceEr])[A-Za-z]++|-eval)\\s+" + quote + "(?:(?!(?P=" + group + "))[^\\n])*?",
         interp + "[^;&|`\\n" + Q + "]*?<<-?\\s*\\\\?[" + Q + "']?\\w+\\\\?[" + Q + "']?[\\s\\S]*?",   # heredoc
     ]
 
@@ -487,31 +524,33 @@ def _shell_read_context() -> str:
     return _key_prefix("[^\\]\\n]*", _alt(_shell_keys())) + "(?:" + in_string + "|" + argv_reader + "|" + argv_inline + ")"
 
 
-def contexts(modes: str) -> list[str]:
-    """The alternatives that lead up to a path word, for one mode."""
+def contexts(modes: str) -> tuple[list[str], list[str]]:
+    """The alternatives that lead up to a path word, for one mode: ``(JSON contexts, plain-string contexts)``."""
     out: list[str] = []
+    raw: list[str] = []
     if modes == "any":
         out.append(_key_context("[^\\]\\n]*", "(?:" + _PATH_KEY + "|" + _alt_body(_shell_keys()) + ")"))
-        for entry in TOOL_ENTRIES:
-            if entry.role in (FILE_READ, SEARCH, LIST, FILE_WRITE):
-                extra = tuple(k for k in entry.keys if not re.fullmatch(_PATH_KEY, k, re.IGNORECASE))
-                if extra:
-                    out.append(_key_context(_alt([entry.name]), _alt(extra)))
-        out.append(_shell_raw_context() + "[\\s\\S]*?")
+        unusual: dict[str, set[str]] = {}
+        for entry in TOOL_ENTRIES:      # keys of a known tool that do not read like a path (a Glob's ``pattern``)
+            if entry.role in (FILE_READ, SEARCH, FIND, LIST, FILE_WRITE):
+                for key in entry.keys:
+                    if not re.fullmatch(_PATH_KEY, key, re.IGNORECASE):
+                        unusual.setdefault(key.lower(), set()).add(entry.name)
+        for key, names in sorted(unusual.items()):
+            out.append(_key_context(_alt(names), _alt([key])))
+        raw.append(_shell_raw_context() + "[\\s\\S]*?")
         patch = [e.name for e in TOOL_ENTRIES if e.role == PATCH]
-        if patch:
-            out.append(_TC + _alt(patch) + "\\][\\s\\S]*?" + _PATCH_HEADERS)
-        return out
-    groups: dict[tuple[str, ...], list[str]] = {}
-    for entry in TOOL_ENTRIES:
-        if entry.role in (FILE_READ, SEARCH) and entry.keys:
-            groups.setdefault(entry.keys, []).append(entry.name)
-    for keys, names in groups.items():
-        out.append(_key_context(_MCP + _alt(names), _alt(keys)))
+        if patch:       # a patch is a JSON string field of the call, or the whole plain-string argument
+            out.append(_TC + _alt(patch) + "\\]\\s*\\{[\\s\\S]*?" + _PATCH_HEADERS)
+            raw.append(_TC + _alt(patch) + "\\]\\s+(?![\\[{])[\\s\\S]*?" + _PATCH_HEADERS)
+        return out, raw
+    for role in (FILE_READ, SEARCH, FIND):      # one context per role: its tools, and the keys that carry its paths
+        entries = [e for e in TOOL_ENTRIES if e.role == role and e.keys]
+        out.append(_key_context(_MCP + _alt(e.name for e in entries), _alt(k for e in entries for k in e.keys)))
     out.append(_shell_read_context())
     # A plain-string argument (no JSON) is rare and short: a reader, or a ``<``, in the same line; no interpreter forms.
-    out.append(_shell_raw_context() + "[\\s\\S]*?(?:" + _VERB_HEAD + _RAW_SEG["item"] + "*?|(?<!<)<(?![<(])\\s*[" + Q + "']?)")
-    return out
+    raw.append(_shell_raw_context() + "[\\s\\S]*?(?:" + _VERB_HEAD_RAW + _RAW_SEG["item"] + "*?|(?<!<)<(?![<(])\\s*[" + Q + "']?)")
+    return out, raw
 
 
 # ------------------------------------------------------------------------------------------------------- lowering
@@ -527,13 +566,20 @@ def _compile_check(pattern: str) -> None:
                              "use fewer or plainer globs")
 
 
+def _section(contexts_: list[str], tokens: list[Token], skipped: list[Token], dialect: _Dialect) -> str:
+    """One dialect: its contexts, then a path word that a guard entry names and no ``except`` entry does."""
+    exclude = ("(?!" + _words(skipped, dialect) + dialect.rb + ")") if skipped else ""
+    return ("(?:" + "|".join(contexts_) + ")" + dialect.wstart + exclude + _words(tokens, dialect) + dialect.rb)
+
+
 @functools.lru_cache(maxsize=256)
 def _lower(paths: tuple[str, ...], excepts: tuple[str, ...], modes: str) -> str:
-    tokens = [compile_token(f"paths[{i}]", entry) for i, entry in enumerate(paths)]
-    skipped = [compile_token(f"except[{i}]", entry) for i, entry in enumerate(excepts)]
-    guard = _words(tokens)
-    exclude = ("(?!" + _words(skipped) + _RB + ")") if skipped else ""
-    pattern = "(?:" + "|".join(contexts(modes)) + ")" + _WSTART + exclude + guard + _RB
+    sections = []
+    for contexts_, dialect in zip(contexts(modes), (JSON_TEXT, RAW_TEXT)):
+        tokens = [compile_token(f"paths[{i}]", entry, dialect) for i, entry in enumerate(paths)]
+        skipped = [compile_token(f"except[{i}]", entry, dialect) for i, entry in enumerate(excepts)]
+        sections.append(_section(contexts_, tokens, skipped, dialect))
+    pattern = "|".join(sections)
     if len(pattern) > MAX_LOWERED_CHARS:
         raise PathGuardError("paths", f"the generated pattern has {len(pattern)} characters, over the limit of "
                              f"{MAX_LOWERED_CHARS}; use fewer or plainer globs (or mode 'read', which is smaller)")

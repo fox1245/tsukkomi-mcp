@@ -3,8 +3,10 @@
 This module must stay importable when the rest of the runtime is not (missing native extension, broken
 dependency): ``scripts/agy_hook.py`` uses it to answer, record ``hook_health`` and honour user-selected
 high-risk contracts after an import failure. It therefore imports nothing outside the standard library, apart
-from ``tool_payload`` (itself standard-library only, and the one builder of the tool-call text), which a copy of
-this module without its package does without: it then matches the unfiltered text, the more cautious side.
+from ``tool_payload`` (itself standard-library only, and the one builder of the tool-call text) and
+``contract_paths`` (standard library only; it lowers a stored typed ``path_guard`` to its regex), which a copy of
+this module without its package does without: it then matches the unfiltered text, and a typed high-risk contract
+always asks, the more cautious sides.
 
 Persistent state lives in ``<index_dir>/agy-hook-state.sqlite``:
 
