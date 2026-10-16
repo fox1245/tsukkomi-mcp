@@ -4,9 +4,12 @@ from collections import OrderedDict
 import json
 import hashlib
 from pathlib import Path
+import re
 import threading
+import time
 from typing import Protocol, runtime_checkable
 
+from self_directing_mcp import contract_paths
 from self_directing_mcp.audit.patterns import compile_contract
 from self_directing_mcp.schemas import ContractRule, ContractsDocument
 from self_directing_mcp.request_control import check_request, publication
@@ -46,7 +49,19 @@ def check_rule_patterns(rule: ContractRule) -> None:
     for pattern in (rule.regex, rule.before_regex, rule.exception_regex,
                     rule.when.tool_call_regex if rule.when else None):
         if pattern:
-            compile_contract(pattern)   # the syntax gate of both engines (raises re.error)
+            started = time.perf_counter()
+            try:
+                compile_contract(pattern)   # the syntax gate of both engines (raises re.error)
+            except re.error as exc:
+                if pattern is rule.regex and rule.path_guard is not None:
+                    # The regex of a typed contract is derived: say so and name the field the author controls.
+                    raise ValueError(f"contract {rule.id!r}: path_guard.paths lowers to a pattern the contract engine "
+                                     f"does not accept ({exc}); use plainer globs") from None
+                raise
+            if (pattern is rule.regex and rule.path_guard is not None
+                    and time.perf_counter() - started > contract_paths.MAX_COMPILE_SEC):
+                raise ValueError(f"contract {rule.id!r}: path_guard.paths lowers to a pattern that takes more than "
+                                 f"{contract_paths.MAX_COMPILE_SEC} s to compile; use fewer or plainer globs")
     if rule.risk == "high" and rule.type == "must_not" and not rule.regex:
         raise ValueError(f"contract {rule.id!r}: a high-risk must_not needs a regex that names the actions it "
                          "covers; without one it would ask on every tool call")
@@ -68,7 +83,11 @@ def loosening_reasons(previous: ContractRule, new: ContractRule) -> list[str]:
         reasons.append("disabled")
     if new.type != previous.type:
         reasons.append("type changed")
-    if previous.regex and new.regex != previous.regex:
+    if previous.path_guard is not None and new.path_guard is not None:
+        # Typed on both sides: the derived regexes differ whenever the guard does, but a guard that only adds paths
+        # or drops exceptions enforces more, so the typed forms are compared, never the regexes.
+        reasons.extend(contract_paths.weakening(previous.path_guard, new.path_guard))
+    elif previous.regex and new.regex != previous.regex:
         reasons.append("regex changed")
     if new.before_regex != previous.before_regex:
         reasons.append("before_regex changed")

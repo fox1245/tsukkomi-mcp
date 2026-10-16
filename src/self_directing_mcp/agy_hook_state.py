@@ -34,6 +34,11 @@ except ImportError:   # a standalone copy next to a broken package: prose fields
         return f"[{label}:{tool_name}] " + (arguments if isinstance(arguments, str) else json.dumps(
             arguments, ensure_ascii=False, sort_keys=True))
 
+try:
+    from self_directing_mcp import contract_paths      # standard library only: lowers a typed ``path_guard`` to its regex
+except ImportError:                                    # a standalone copy: a typed high-risk contract then always asks
+    contract_paths = None
+
 STATE_FILE = "agy-hook-state.sqlite"
 MODES = ("advisory", "confirmed_only", "enforced")
 DEFAULT_MODE = "confirmed_only"
@@ -274,6 +279,12 @@ def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy"
             pattern = rule.get("regex") if rule.get("type") == "must_not" else rule.get("before_regex")
             if rule.get("type") == "must" and not pattern:
                 continue                      # a completion obligation does not gate actions
+            if rule.get("type") == "must_not" and rule.get("path_guard") is not None:
+                # A typed contract stores no regex: it is derived from the guard (the same function the engine loads
+                # it with) and run on the contract engine, whose time limit a hook needs.
+                if _typed_match(rule["path_guard"], text):
+                    return str(rule.get("id"))
+                continue
             try:
                 if not pattern or re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
                     return str(rule.get("id"))
@@ -282,6 +293,17 @@ def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy"
     except Exception:
         return None
     return None
+
+
+def _typed_match(guard, text) -> bool:
+    """Whether a typed ``path_guard`` applies to this call text. Anything that cannot be decided applies (it asks)."""
+    try:
+        if contract_paths is None:
+            return True
+        from self_directing_mcp.audit.patterns import compile_contract
+        return compile_contract(contract_paths.lower_mapping(guard)).search(text) is not None
+    except Exception:
+        return True
 
 
 # --- fail-open responses ----------------------------------------------------------------------------------

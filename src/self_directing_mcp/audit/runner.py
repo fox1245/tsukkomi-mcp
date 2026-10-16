@@ -5,6 +5,7 @@ import json
 import re
 from bisect import bisect_left, bisect_right
 
+from self_directing_mcp import contract_paths
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES, SUCCESS_TYPES
 from self_directing_mcp.audit.applicability import (
     INVALID, UNMET, downgrade_unproven_inapplicability, not_applicable_reason, when_needs, when_state,
@@ -404,10 +405,10 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
         if not hits:
             if turned:
                 return finding("clean", rejected_clean(len(turned)),
-                               basis=f"{rule.id}.regex matched only host-rejected proposal(s), which did not run",
+                               basis=f"{rule.id}.{contract_paths.verifier_field(rule)} matched only host-rejected proposal(s), which did not run",
                                stopped=stopped)
             return finding("clean", "no forbidden match in inspected events",
-                           basis=f"{rule.id}.regex did not match any inspected event")
+                           basis=f"{rule.id}.{contract_paths.verifier_field(rule)} did not match any inspected event")
         exception = None
         if rule.exception_regex:
             try:
@@ -419,11 +420,11 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
             return finding("suspicious", "forbidden match is covered by the authorized exception; confirm scope before proceeding",
                            basis=f"{rule.id}.exception_regex matched the same event(s); user-authorized exception requires confirmation",
                            stopped=stopped)
-        reason = f"forbidden regex matched {len(hits)} event(s)"
+        reason = f"{contract_paths.forbidden_label(rule)} matched {len(hits)} event(s)"
         if rule.source_quote:
             reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
         return finding("violation", reason,
-                       basis=f"{rule.id}.regex '{rule.regex}' matched prohibited content", items=[evidence(c) for c in hits[:20]],
+                       basis=contract_paths.verifier_basis(rule, "matched prohibited content"), items=[evidence(c) for c in hits[:20]],
                        stopped=stopped)
     if trigger:
         if proposed is not None:
@@ -849,11 +850,11 @@ def _attempt_hits(rule, item, events, proposals, blocked) -> None:
     verdict = "suspicious" if covered else "violation"
     if _worse(item.verdict, verdict) == item.verdict:
         return  # already at least this severe (it was matched on a receipt-linked call)
-    reason = f"forbidden regex matched {len(hits)} host-logged call attempt(s); execution is not proven"
+    reason = f"{contract_paths.forbidden_label(rule)} matched {len(hits)} host-logged call attempt(s); execution is not proven"
     if rule.source_quote:
         reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
     item.verdict, item.reason = verdict, reason
-    item.basis = f"{rule.id}.regex '{rule.regex}' matched a proposed call; the attempt itself is the violation"
+    item.basis = contract_paths.verifier_basis(rule, "matched a proposed call; the attempt itself is the violation")
     item.evidence = [evidence(hit, "forbidden call attempt (model proposal)") for hit in hits[:20]]
 
 

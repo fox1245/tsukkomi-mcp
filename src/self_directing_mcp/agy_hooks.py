@@ -15,6 +15,7 @@ import json
 import sys
 from typing import Any, TYPE_CHECKING
 
+from self_directing_mcp import contract_paths
 from self_directing_mcp import agy_hook_state as hook_state
 from self_directing_mcp import hook_policy
 from self_directing_mcp.agy_hook_state import AUDIT_UNAVAILABLE, CHECK_FAILED, HookState
@@ -145,7 +146,7 @@ def handle_pre_invocation(engine: SelfDirectEngine, session_id: str, payload: di
         tags = ("[high risk]" if rule.risk == "high" else "") + ("[auto-continue]" if rule.auto_continue else "")
         condition = (f" (applies once a tool call matching /{one_line(rule.when.tool_call_regex)}/ was observed)"
                      if rule.when else "")
-        lines.append(f"Contract [{one_line(rule.id)}]{tags} {rule.type}: {one_line(rule.description or rule.regex)}"
+        lines.append(f"Contract [{one_line(rule.id)}]{tags} {rule.type}: {one_line(rule.description or contract_paths.verifier_text(rule))}"
                      f"{condition}")
     for item in obligations["pending"][:8]:
         lines.append(f"Pending: {one_line(item.text)} ({item.status}; requires verified evidence)")

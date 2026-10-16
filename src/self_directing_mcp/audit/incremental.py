@@ -35,6 +35,7 @@ import re
 import time
 from bisect import bisect_left
 
+from self_directing_mcp import contract_paths
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES
 from self_directing_mcp.audit import hostblocks, runner, shellstatus
 from self_directing_mcp.audit import shadow as shadow_module
@@ -691,10 +692,10 @@ class RuleMonitor:
             if not count:
                 if stopped:
                     return self._make("clean", runner.rejected_clean(len(refused)),
-                                      basis=f"{rule.id}.regex matched only host-rejected proposal(s), which did not run",
+                                      basis=f"{rule.id}.{contract_paths.verifier_field(rule)} matched only host-rejected proposal(s), which did not run",
                                       stopped=stopped), {}
                 return self._make("clean", "no forbidden match in inspected events",
-                                  basis=f"{rule.id}.regex did not match any inspected event"), {}
+                                  basis=f"{rule.id}.{contract_paths.verifier_field(rule)} did not match any inspected event"), {}
             exception = None
             if rule.exception_regex:
                 try:
@@ -708,10 +709,10 @@ class RuleMonitor:
                     "forbidden match is covered by the authorized exception; confirm scope before proceeding",
                     basis=f"{rule.id}.exception_regex matched the same event(s); "
                           "user-authorized exception requires confirmation", stopped=stopped), {}
-            reason = f"forbidden regex matched {count} event(s)"
+            reason = f"{contract_paths.forbidden_label(rule)} matched {count} event(s)"
             if rule.source_quote:
                 reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
-            return self._make("violation", reason, basis=f"{rule.id}.regex '{rule.regex}' matched prohibited content",
+            return self._make("violation", reason, basis=contract_paths.verifier_basis(rule, "matched prohibited content"),
                               items=evidence, stopped=stopped), {i["i"]: i.get("tu") for i in evidence}
         if self.trigger is not None:
             if proposed is not None:
@@ -839,11 +840,11 @@ class RuleMonitor:
         verdict = "suspicious" if covered else "violation"
         if runner._worse(item.verdict, verdict) == item.verdict:
             return
-        reason = f"forbidden regex matched {count} host-logged call attempt(s); execution is not proven"
+        reason = f"{contract_paths.forbidden_label(rule)} matched {count} host-logged call attempt(s); execution is not proven"
         if rule.source_quote:
             reason += f"; user said: {mask_secrets(rule.source_quote)[:120]}"
         item.verdict, item.reason = verdict, reason
-        item.basis = f"{rule.id}.regex '{rule.regex}' matched a proposed call; the attempt itself is the violation"
+        item.basis = contract_paths.verifier_basis(rule, "matched a proposed call; the attempt itself is the violation")
         item.evidence = [_evidence(entry["e"]) for entry in listed[:EVIDENCE_LIMIT]]
 
     def _hidden_trigger(self, cut, blocked, facts):
@@ -873,8 +874,13 @@ def needs_digest(needs, link_calls, provider) -> str:
 
 
 def rule_fingerprint(rule, provider, parser_version, digest) -> str:
-    payload = json.dumps([EVALUATOR_VERSION, STATE_VERSION, provider, parser_version, mask_fingerprint(), digest,
-                          rule.model_dump(mode="json")], sort_keys=True, default=str)
+    parts = [EVALUATOR_VERSION, STATE_VERSION, provider, parser_version, mask_fingerprint(), digest,
+             rule.model_dump(mode="json")]
+    if rule.path_guard is not None:
+        # The stored form of a typed contract is its guard, but the monitor runs the regex derived from it under the
+        # tool map of this version: a changed map is a changed monitor, so the derived regex is part of the key.
+        parts.append(rule.regex)
+    payload = json.dumps(parts, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 

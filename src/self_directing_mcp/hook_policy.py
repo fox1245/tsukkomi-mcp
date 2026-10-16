@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import hashlib
 from typing import Any, Callable, TYPE_CHECKING
 
+from self_directing_mcp import contract_paths
 from self_directing_mcp import settings_core
 from self_directing_mcp.agy_hook_state import AUDIT_UNAVAILABLE
 from self_directing_mcp.security.mask import mask_secrets
@@ -181,7 +182,7 @@ def confirmed_misses(obligations: dict, audit: dict) -> list:
 
 
 def miss_summary(misses: list) -> str:
-    return "; ".join(f"[{rule.id}] {short(rule.description or rule.regex, 160)}" for rule, _f in misses)
+    return "; ".join(f"[{rule.id}] {short(rule.description or contract_paths.verifier_text(rule), 160)}" for rule, _f in misses)
 
 
 def miss_key(misses: list, prefix: str = "") -> str:
