@@ -337,19 +337,22 @@ def test_the_probe_proves_the_statistics_mechanism_on_this_sqlite():
 
 
 def test_open_sparse_index_resolves_the_setting(tmp_path, monkeypatch):
-    compact, resolution = open_sparse_index(tmp_path, "auto")
-    assert (compact.format, resolution) == ("compact", {"setting": "auto", "format": "compact", "reason": None})
+    compact, resolution = open_sparse_index(tmp_path, "compact")
+    assert (compact.format, resolution["setting"], resolution["format"], resolution["reason"]) == ("compact", "compact", "compact", None)
     assert compact.db_path == sparse_file(tmp_path, "compact") == tmp_path / "sparse-v2.sqlite"
-    assert not sparse_file(tmp_path, "legacy").exists()                              # the other file is not even created
+    assert not sparse_file(tmp_path, "legacy").exists() and not sparse_file(tmp_path, "cjk").exists()    # the other files are not even created
     legacy, resolution = open_sparse_index(tmp_path, "legacy")
-    assert (legacy.format, resolution) == ("legacy", {"setting": "legacy", "format": "legacy", "reason": None})
+    assert (legacy.format, resolution["setting"], resolution["format"], resolution["reason"]) == ("legacy", "legacy", "legacy", None)
     assert legacy.db_path == tmp_path / "sparse.sqlite"
-    forced, resolution = open_sparse_index(tmp_path, "compact")
-    assert forced.format == "compact"
+    assert not sparse_file(tmp_path, "cjk").exists()
+    # auto on this directory: sparse-v2.sqlite is empty and sparse.sqlite holds nothing, so no file holds data and the CJK format is new here
+    auto, resolution = open_sparse_index(tmp_path, "auto")
+    assert (auto.format, resolution["format"], resolution["reason"]) == ("cjk", "cjk", None)
+    assert auto.db_path == tmp_path / "sparse-v3.sqlite"
     monkeypatch.setattr(sparse_module, "sqlite_version_info", lambda: (3, 40, 0))
-    fallback, resolution = open_sparse_index(tmp_path, "auto")
+    fallback, resolution = open_sparse_index(tmp_path / "other", "auto")
     assert fallback.format == "legacy" and resolution["setting"] == "auto" and "3.40.0" in resolution["reason"]
-    with pytest.raises(ValueError, match="auto, legacy or compact"):
+    with pytest.raises(ValueError, match="auto, legacy, compact or cjk"):
         open_sparse_index(tmp_path, "v2")
 
 

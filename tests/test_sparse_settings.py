@@ -28,16 +28,16 @@ def clean(monkeypatch, tmp_path):
 def test_the_default_is_auto_in_both_readers(clean):
     for settings in (Settings(_env_file=None), hook_settings(), load_hook_settings()):
         assert settings.sparse_format == "auto"
-    assert settings_core.DEFAULT_SPARSE_FORMAT == "auto" and settings_core.SPARSE_FORMATS == ("auto", "legacy", "compact")
+    assert settings_core.DEFAULT_SPARSE_FORMAT == "auto" and settings_core.SPARSE_FORMATS == ("auto", "legacy", "compact", "cjk")
 
 
-@pytest.mark.parametrize("value", ["auto", "legacy", "compact"])
+@pytest.mark.parametrize("value", ["auto", "legacy", "compact", "cjk"])
 def test_each_format_is_read_by_both_readers(clean, value):
     clean.setenv("SELF_DIRECT_SPARSE_FORMAT", value)
     assert Settings(_env_file=None).sparse_format == hook_settings().sparse_format == load_hook_settings().sparse_format == value
 
 
-@pytest.mark.parametrize("value", ["Auto", "COMPACT", "", "v2", "sparse-v2", "true", "0", " legacy", "compact\n"])
+@pytest.mark.parametrize("value", ["Auto", "COMPACT", "CJK", "", "v2", "v3", "sparse-v2", "sparse-v3", "true", "0", " legacy", "compact\n", "cjk\n"])
 def test_an_unknown_format_is_an_error_in_both_readers_not_a_default(clean, value):
     clean.setenv("SELF_DIRECT_SPARSE_FORMAT", value)
     with pytest.raises(ValueError):
@@ -52,14 +52,15 @@ SUPPORTED = compact_support() is None
 @pytest.mark.parametrize("value,expected", [
     ("legacy", "legacy"),
     pytest.param("compact", "compact", marks=pytest.mark.skipif(not SUPPORTED, reason="this SQLite cannot use the compact format")),
-    ("auto", "compact" if SUPPORTED else "legacy")])
+    pytest.param("cjk", "cjk", marks=pytest.mark.skipif(not SUPPORTED, reason="this SQLite cannot use the compact format")),
+    ("auto", "cjk" if SUPPORTED else "legacy")])               # a fresh index directory: no sparse file holds data
 def test_the_setting_decides_which_file_the_engine_opens(clean, tmp_path, value, expected):
     engine = SelfDirectEngine(Settings(index_dir=tmp_path / "index", sparse_format=value, use_fake_embedder=True,
                                        dense_backend="numpy", _env_file=None))
     try:
         engine.ensure_ready()
         assert engine.sparse.format == expected
-        assert engine.sparse.db_path.name == ("sparse-v2.sqlite" if expected == "compact" else "sparse.sqlite")
+        assert engine.sparse.db_path.name == {"compact": "sparse-v2.sqlite", "cjk": "sparse-v3.sqlite", "legacy": "sparse.sqlite"}[expected]
         assert [p.name for p in (tmp_path / "index").glob("sparse*.sqlite")] == [engine.sparse.db_path.name]   # only the one in use
     finally:
         engine.close()

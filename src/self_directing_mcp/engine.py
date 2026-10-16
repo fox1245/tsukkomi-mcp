@@ -55,7 +55,9 @@ from self_directing_mcp.index.ingest import (
     AmbiguousSessionSource, AuditEventSnapshot, FlightBusy, IntegrityPolicy, SessionStore, SlicePolicy,
     capture_for_cursor, coverage_from_capture, ingest_session,
 )
-from self_directing_mcp.index.sparse import SparseIndex, count_sparse_file, open_sparse_index, sparse_file
+from self_directing_mcp.index.sparse import (
+    CJK_BUILDING, CJK_TOKENIZATION, CjkSparseIndex, CompactSparseIndex, SparseIndex, look_at_sparse_file, open_sparse_index, sparse_file,
+)
 from self_directing_mcp.index.vector import DenseBackendError, build_vector_index
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.retrieve.checks import regex_search
@@ -147,6 +149,7 @@ SPARSE_REPAIR_BATCH = 500     # documents per transaction when a search or the r
 SPARSE_PRUNE_BATCH = 500      # documents per transaction when a search or the rebuild command deletes sparse documents the store lacks
 SPARSE_PRUNE_SEARCH_SEC = 2.0     # a search spends at most this long on that deletion (it is housekeeping, never part of the answer) ...
 SPARSE_PRUNE_SEARCH_SHARE = 0.25  # ... and at most this share of the time its request has left
+SPARSE_CATCH_UP_ROUNDS = 5    # passes over events published while the CJK format was being built, before the rebuild gives up for this run
 
 
 def _request_over(control) -> bool:
@@ -208,10 +211,13 @@ class ChecklistConflict(ValueError):
 
 
 class SelfDirectEngine:
-    def __init__(self, settings: Settings | None = None, *, defer_derived: bool = False) -> None:
+    def __init__(self, settings: Settings | None = None, *, defer_derived: bool = False, sparse_build: bool = False) -> None:
         """``defer_derived``: a resident process (the daemon) holds the rows that carry no authority (monitor states,
         verification stamps, the AGY indexed marker) in memory and writes them with the next authority commit, at idle
-        and at ``close`` instead of committing each synchronously; see ``index.deferred``. Off for every other use."""
+        and at ``close`` instead of committing each synchronously; see ``index.deferred``. Off for every other use.
+
+        ``sparse_build``: the engine of the rebuild command (``maintenance sparse-rebuild``), which may open a CJK sparse
+        index that is still being built (state ``building``); every other engine refuses such a file."""
         self._lock = RLock()
         self._lifetime = Condition(self._lock)
         self._active_operations = 0
@@ -229,6 +235,7 @@ class SelfDirectEngine:
             settings = get_settings()
         self.settings = settings
         self.defer_derived = defer_derived
+        self.sparse_build = sparse_build
         self.store: SessionStore | None = None
         self.sparse: SparseIndex | None = None
         self.sparse_resolution: dict[str, Any] = {}     # how SELF_DIRECT_SPARSE_FORMAT was resolved (open_sparse_index)
@@ -421,7 +428,7 @@ class SelfDirectEngine:
             self.dense, self.dense_backend = build_vector_index(
                 index_dir / ("vectors-v2-" + policy), dim=s.embedding_dim,
                 backend=s.dense_backend, extension_path=s.sqlite_vector_path, **remote)
-        self.sparse, self.sparse_resolution = open_sparse_index(index_dir, getattr(s, "sparse_format", "auto"))
+        self.sparse, self.sparse_resolution = open_sparse_index(index_dir, getattr(s, "sparse_format", "auto"), build=self.sparse_build)
         self.store = SessionStore(index_dir / "meta.sqlite", max_decompressed_bytes=s.max_decompressed_session_bytes,
                                   defer_derived=self.defer_derived, journal=self._journal_policy())
         self.contracts = ContractStore(s.resolve_contracts_path())
@@ -737,7 +744,7 @@ class SelfDirectEngine:
         its ``pending`` missing documents are written, there is nothing to look for and the common case costs one cached
         count (an index that lacks documents of other providers can hide a few orphans from this gate; the rebuild
         command, which needs no gate, finds them)."""
-        if self.sparse.format != "compact" or len(indexed) + pending <= self.store.chunk_count():
+        if not isinstance(self.sparse, CompactSparseIndex) or len(indexed) + pending <= self.store.chunk_count():
             return []
         return sorted(indexed - self.store.chunk_ids(None, None))
 
@@ -800,12 +807,20 @@ class SelfDirectEngine:
     @detached_operation
     def rebuild_sparse(self, *, budget_sec: float | None = None, batch: int | None = None, progress=None,
                        orphan_progress=None) -> dict[str, Any]:
-        """Make the active (compact) sparse index hold exactly the canonical events, outside a request (``python -m
+        """Make the active (compact or CJK) sparse index hold exactly the canonical events, outside a request (``python -m
         self_directing_mcp.maintenance sparse-rebuild``): first write the events it lacks, then delete the documents the
         store no longer holds (orphans). Bounded (``budget_sec``), resumable and safe to interrupt: each batch is its own
         transaction and only what is still missing or still extra is touched, so running it again continues where it stopped
-        and a finished index is left unchanged. It converts a legacy index to the compact format without reading or
+        and a finished index is left unchanged. It converts a legacy index to the compact or CJK format without reading or
         touching the legacy file; the canonical store is the only source.
+
+        A CJK index that this command created, or that an interrupted run left, is in the state ``building`` and no other
+        process answers from it. When the run has written and pruned everything it takes a catch-up pass over the events
+        published meanwhile and then, under the publication guard (so that no event can be published in between), compares
+        the canonical ids with the index's and sets the state to ``ready`` in one transaction, only when the document count
+        equals the store's (``CjkSparseIndex.finish_build``). A CJK file that is already ``ready`` is only topped up: it is
+        never demoted to ``building`` for the run, since other processes may be answering from it (lazy repair keeps each
+        answer complete). ``index_state`` in the result is the state of the file at the end.
 
         Both sets come from one snapshot, taken under the publication guard: the event ids of the store and the ids of the
         index. The events are written first because a missing document makes a search incomplete while an orphan only
@@ -823,10 +838,13 @@ class SelfDirectEngine:
         resolution = dict(self.sparse_resolution)
         info: dict[str, Any] = {"ok": True, "format": self.sparse.format, "setting": resolution.get("setting"),
                                 "file": str(self.sparse.db_path), "state": "complete", "stopped_by": None}
-        if self.sparse.format != "compact":
+        if not isinstance(self.sparse, CompactSparseIndex):
             info.update(ok=False, error="sparse_format_not_compact", state="unchanged",
                         reason=resolution.get("reason") or "the active sparse format is legacy (SELF_DIRECT_SPARSE_FORMAT=legacy); there is nothing to convert")
             return info
+        cjk_index = isinstance(self.sparse, CjkSparseIndex)
+        if cjk_index:
+            info["tokenization"] = CJK_TOKENIZATION
         with self._publication_guard():
             canonical = self.store.chunk_ids(None, None)
             indexed = self.sparse.ids()
@@ -863,10 +881,41 @@ class SelfDirectEngine:
                 info["orphans_remaining"] = len(extra) - (start + len(piece))
                 if orphan_progress is not None:
                     orphan_progress(start + len(piece), len(extra), info["orphans_removed"])
+        if cjk_index and info["state"] == "complete" and self.sparse.state() == CJK_BUILDING:
+            self._finish_cjk_build(info, deadline, batch, prune_batch)
         info["seconds"] = round(time.monotonic() - started, 2)
+        if cjk_index:
+            info["index_state"] = self.sparse.state()
         if info["state"] == "complete":
             info["statistics"] = self.sparse.verify_statistics()
         return info
+
+    def _finish_cjk_build(self, info, deadline, batch, prune_batch) -> None:
+        """The last step of building the CJK index: catch up with the events published while the batches ran, then compare
+        the canonical ids with the index's and set the state to ``ready`` in one transaction, under the publication guard.
+        Each pass that finds a difference repairs it (writes, then prunes) and looks again; ``SPARSE_CATCH_UP_ROUNDS`` passes
+        that never find the two equal end the run as partial (``stopped_by="catch_up"``): run the command again."""
+        info["catch_up_written"] = info["catch_up_removed"] = 0
+        for _round in range(SPARSE_CATCH_UP_ROUNDS):
+            if deadline is not None and time.monotonic() >= deadline:
+                info.update(state="partial", stopped_by="time_budget")
+                return
+            try:
+                with self._publication_guard():
+                    canonical = self.store.chunk_ids(None, None)
+                    indexed = self.sparse.ids()
+                    if canonical == indexed and self.sparse.finish_build(len(canonical)):
+                        return
+                missing, extra = sorted(canonical - indexed), sorted(indexed - canonical)
+                for start in range(0, len(missing), batch):
+                    piece = missing[start:start + batch]
+                    info["catch_up_written"] += self._fill_sparse(None, None, piece, batch=len(piece))
+                for start in range(0, len(extra), prune_batch):
+                    info["catch_up_removed"] += self._prune_sparse_batch(extra[start:start + prune_batch])[0]
+            except IndexBusy:
+                info.update(state="partial", stopped_by="index_busy")
+                return
+        info.update(state="partial", stopped_by="catch_up")
 
     def _refresh_evidence(self, sid, provider, path=None, verify="full", *, sync_share=None, sizing=None):
         """Refresh only authority; return detached coverage and its exact inputs.
@@ -2650,13 +2699,15 @@ class SelfDirectEngine:
         return info
 
     def _sparse_status(self) -> dict[str, Any]:
-        """``audit_status`` fields of the sparse index: its format and how the setting was resolved, both files with their
-        sizes (so the owner sees what can be deleted once the compact index is complete) and the document count of each
-        (the one that is not in use is read through a read-only connection and is never modified)."""
+        """``audit_status`` fields of the sparse index: its format and how the setting was resolved (``sparse_format_choice``
+        says which file ``auto`` took and why, ``sparse_cjk_hint`` what to do about the CJK format), every file with its path,
+        format, tokenization and state (the CJK format only), size and document count, so the owner sees what can be deleted
+        once a newer index is complete. The files that are not in use are read through a read-only connection and are never
+        modified."""
         index_dir = Path(self.settings.index_dir)
         active = self.sparse.format
         files, counts = [], {}
-        for fmt in ("legacy", "compact"):
+        for fmt in ("legacy", "compact", "cjk"):
             path = sparse_file(index_dir, fmt)
             size = None
             for part in (path, Path(f"{path}-journal"), Path(f"{path}-wal")):
@@ -2665,11 +2716,21 @@ class SelfDirectEngine:
                 except OSError:
                     pass
             exists = path.exists()
-            files.append({"name": path.name, "format": fmt, "active": fmt == active, "exists": exists,
-                          "bytes": size if exists else None})
-            counts[fmt] = self.sparse.count() if fmt == active else (count_sparse_file(path) if exists else None)
-        return {"sparse_format": active, "sparse_format_setting": self.sparse_resolution.get("setting"),
-                "sparse_format_reason": self.sparse_resolution.get("reason"), "sparse_files": files, "sparse_counts": counts}
+            if fmt == active:
+                meta = self.sparse.meta() if isinstance(self.sparse, CompactSparseIndex) else {}
+                documents = self.sparse.count()
+            else:
+                found = look_at_sparse_file(path) if exists else None
+                meta = {k: v for k, v in (found or {}).items() if v is not None and k != "documents"}
+                documents = found["documents"] if found else None
+            files.append({"name": path.name, "path": str(path), "format": fmt, "active": fmt == active, "exists": exists,
+                          "bytes": size if exists else None, "tokenization": meta.get("tokenization"), "state": meta.get("state"),
+                          "documents": documents})
+            counts[fmt] = documents
+        resolution = self.sparse_resolution
+        return {"sparse_format": active, "sparse_format_setting": resolution.get("setting"),
+                "sparse_format_reason": resolution.get("reason"), "sparse_format_choice": resolution.get("choice"),
+                "sparse_cjk_hint": resolution.get("cjk_hint"), "sparse_files": files, "sparse_counts": counts}
 
     def _journal_status(self):
         """``(journal, journal_fallback)`` for ``audit_status``: the journal mode of each authority database, and the
@@ -2719,15 +2780,18 @@ class SelfDirectEngine:
             "sparse_count": self.sparse.count(),
             **self._sparse_status(),
         }
-        compact = status["sparse_counts"].get("compact")
-        # Documents of the compact file the store does not hold (orphans), from counts this status already has: no scan.
-        # A lower bound while the file lacks documents (they offset the orphans); None when there is no compact file.
+        # Documents of the compact-family file in use (compact, else CJK) that the store does not hold (orphans), from counts this
+        # status already has: no scan. A lower bound while the file lacks documents (they offset the orphans); None when there
+        # is no such file.
+        compact = status["sparse_counts"].get(status["sparse_format"] if status["sparse_format"] != "legacy" else "compact")
         status["sparse_extra_ids"] = max(0, compact - status["total_chunks"]) if compact is not None else None
         status["journal"], status["journal_fallback"] = self._journal_status()
         worker = self._integrity_worker
         status["integrity_worker"] = worker.snapshot() if worker is not None else None
         if self.sparse_resolution.get("reason"):
             status["degraded_flags"].append("sparse_legacy_fallback")       # auto asked for compact and this SQLite cannot
+        if self.sparse_resolution.get("cjk_problem"):
+            status["degraded_flags"].append("sparse_cjk_unavailable")       # sparse-v3.sqlite exists, auto cannot answer from it
         if self.embedder_degraded:
             status["degraded_flags"].append("embedder_fake_fallback")
         if self.dense_backend == "numpy":

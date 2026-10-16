@@ -1,12 +1,14 @@
 """Maintenance commands that run outside a request.
 
-    python -m self_directing_mcp.maintenance sparse-rebuild [--budget-sec N] [--batch N] [--index-dir DIR]
+    python -m self_directing_mcp.maintenance sparse-rebuild [--format auto|compact|cjk] [--budget-sec N] [--batch N] [--index-dir DIR]
 
 ``sparse-rebuild`` makes the sparse (FTS5) search index hold exactly the canonical events: it converts a whole index to the
 compact format (``SELF_DIRECT_SPARSE_FORMAT``, README "Sparse index formats") without waiting for searches and syncs to do
 it session by session, it repairs a compact index that lost documents, and it deletes the documents of a compact index that
-the canonical store no longer holds (orphans). The canonical store (``meta.sqlite``) is the only source. The legacy
-``sparse.sqlite`` is neither read nor written. The command is bounded (``--budget-sec``), resumable and safe to interrupt:
+the canonical store no longer holds (orphans). ``--format cjk`` builds ``sparse-v3.sqlite``, the CJK format, from the canonical
+store: the file is in the state ``building`` (no process answers from it) until the last run has written everything, caught up
+with the events published meanwhile and set the state to ``ready``. The canonical store (``meta.sqlite``) is the only source.
+The legacy ``sparse.sqlite`` and the compact ``sparse-v2.sqlite`` are neither read nor written by a CJK build. The command is bounded (``--budget-sec``), resumable and safe to interrupt:
 every batch is its own transaction and only missing documents are written and only extra ones deleted (never one that the
 store holds), so running it again continues where it stopped, and on a finished index it changes nothing. Progress goes to
 stderr; stdout gets one JSON line (``written``, ``orphans_removed``, ``orphans_remaining``, ...).
@@ -56,13 +58,13 @@ def sparse_rebuild(args, stderr=None, stdout=None) -> int:
         settings.sparse_format = args.format
     # Refuse before an engine opens (and so creates) a legacy file that nothing here would use.
     if settings.sparse_format == "legacy":
-        print("sparse-rebuild: SELF_DIRECT_SPARSE_FORMAT is legacy; there is nothing to convert (use compact or auto)", file=stderr)
+        print("sparse-rebuild: SELF_DIRECT_SPARSE_FORMAT is legacy; there is nothing to convert (use compact, cjk or auto)", file=stderr)
         return EXIT_FAILED
     reason = compact_support()
     if reason is not None:
         print(f"sparse-rebuild: {reason}", file=stderr)
         return EXIT_FAILED
-    engine = SelfDirectEngine(settings)
+    engine = SelfDirectEngine(settings, sparse_build=True)      # may open a CJK index that is still being built (and create it that way)
     show = _progress_printer(stderr)
     show_orphans = _progress_printer(stderr, what="extra documents", did="removed")
     try:
@@ -89,7 +91,11 @@ def sparse_rebuild(args, stderr=None, stdout=None) -> int:
         return EXIT_FAILED
     if info["state"] != "complete":
         left = f"{info['remaining']} events" + (f" and {info['orphans_remaining']} extra documents" if info["orphans_remaining"] else "")
-        print(f"sparse-rebuild: stopped by {info['stopped_by']} with {left} left; run the command again to continue", file=stderr)
+        if info["stopped_by"] == "catch_up":
+            print("sparse-rebuild: events kept arriving while the CJK index caught up; it stays unfinished (state building): "
+                  "run the command again to finish it", file=stderr)
+        else:
+            print(f"sparse-rebuild: stopped by {info['stopped_by']} with {left} left; run the command again to continue", file=stderr)
         return EXIT_PARTIAL
     if info.get("statistics") and not info["statistics"]["ok"]:
         print(f"sparse-rebuild: the FTS5 statistics do not match the documents: {info['statistics']}", file=stderr)
@@ -105,8 +111,8 @@ def main(argv=None) -> int:
     rebuild.add_argument("--budget-sec", type=float, default=None, help="stop after this many seconds (default: run to the end)")
     rebuild.add_argument("--batch", type=int, default=None, help="documents per transaction (default 500)")
     rebuild.add_argument("--index-dir", default=None, help="the index directory (default: SELF_DIRECT_INDEX_DIR or the user's default)")
-    rebuild.add_argument("--format", choices=("auto", "compact", "legacy"), default=None,
-                         help="override SELF_DIRECT_SPARSE_FORMAT for this run")
+    rebuild.add_argument("--format", choices=("auto", "compact", "cjk", "legacy"), default=None,
+                         help="override SELF_DIRECT_SPARSE_FORMAT for this run; cjk builds sparse-v3.sqlite (the CJK format)")
     args = parser.parse_args(argv)
     if args.command == "sparse-rebuild":
         if args.budget_sec is not None and args.budget_sec < 0:

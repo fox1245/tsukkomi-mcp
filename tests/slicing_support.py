@@ -422,7 +422,8 @@ def sparse_rows(engine: SelfDirectEngine, sid: str) -> list:
     """The full-text index rows of one session (the derived index), in a stable order. The legacy format stores the text;
     the compact format stores none, so its rows carry the document's token count (what FTS5 recorded) in its place."""
     conn = engine.sparse._conn
-    if engine.sparse.format == "compact":
+    from self_directing_mcp.index.sparse import CompactSparseIndex
+    if isinstance(engine.sparse, CompactSparseIndex):               # the compact and CJK formats store no text
         from self_directing_mcp.index.sparse import _read_varints
         return [(cid, session, kind, _read_varints(size)[0]) for cid, session, kind, size in conn.execute(
             "SELECT r.chunk_id, s.session_id, k.kind, d.sz FROM chunk_rows r JOIN sparse_sessions s USING (session_no) "
