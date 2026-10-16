@@ -4,7 +4,7 @@ tsukkomi's dense and hybrid search call an OpenAI-compatible `POST <base url>/em
 
 ## What was tried
 
-On one machine (WSL2, an NVIDIA RTX 4070 Ti with 12 GB), the model `Qwen/Qwen3-Embedding-0.6B` (multilingual, 1024-dimensional, about 1.2 GB of bf16 safetensors) served by the 50-line script below, through the unchanged client:
+On one Linux machine (WSL2) with a 12 GB NVIDIA GPU, the model `Qwen/Qwen3-Embedding-0.6B` (multilingual, 1024-dimensional, about 1.2 GB of bf16 safetensors) served by the 50-line script below, through the unchanged client:
 
 - 13 synthetic Korean and English chunks synced and embedded in 0.4 s; `audit_status` reported `dense_count` 13 and `embedder_degraded` false.
 - `dense` and `hybrid` search returned the semantically matching Korean chunk first for 8 of 8 hand-written queries, among them queries that share no word with the chunk (`회의` found a chunk about a `미팅` schedule, where `sparse` found nothing).
