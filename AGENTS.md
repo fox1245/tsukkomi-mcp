@@ -106,8 +106,8 @@ The default index is `~/.self_direct_index` (older versions used a directory ins
 An install that relied on that default must set `SELF_DIRECT_INDEX_DIR` to its existing directory
 before upgrading; nothing is moved automatically. The Codex installer registers an explicit directory.
 
-The sparse (FTS5) search index has two storage formats (`SELF_DIRECT_SPARSE_FORMAT=auto|legacy|compact`, default
-`auto`). `auto` and `compact` use `<index dir>/sparse-v2.sqlite`, a contentless index that returns the same ranked ids and
+The sparse (FTS5) search index has three storage formats (`SELF_DIRECT_SPARSE_FORMAT=auto|legacy|compact|cjk`, default
+`auto`). `compact` (and `auto` over an index that already holds data) uses `<index dir>/sparse-v2.sqlite`, a contentless index that returns the same ranked ids and
 bm25 scores as the legacy `sparse.sqlite` from a file about 70 % smaller. The legacy file is never read, written,
 truncated or deleted by the program: it stays until the owner deletes it, and the compact file fills lazily like any
 missing derived index (a search or a sync materializes the sessions it needs; the search never answers from the old file).
@@ -115,6 +115,13 @@ Convert a whole index outside a request with `python -m self_directing_mcp.maint
 progress on stderr). A SQLite older than 3.43 is an explicit error for `compact` and a visible fallback for `auto`
 (`audit_status`: `sparse_format`, `sparse_files`, `degraded_flags`); never substitute a format silently. Keep the two
 formats' search results identical (`tests/test_sparse_compact.py`) when changing either.
+The third format, `cjk` (`<index dir>/sparse-v3.sqlite`, `sparse_meta.format` `compact-cjk-1`, `tokenization` `cjk-bigram-1`), is the
+compact table over text whose Hangul, ideograph and kana runs `index/cjk.py` cuts into two-character windows; a query for a run is the
+phrase of its windows. `cjk.segments` is the one definition of a run for the writer and `_fts_query_cjk`; changing it needs a new
+tokenization value. `auto` uses the file once `sparse_meta.state` is `ready` or on a fresh install and never starts it over an index
+that holds data; a `building` file or an unknown tokenization is never searched (`auto` falls back visibly, `cjk` raises);
+`sparse-rebuild --format cjk` builds it and sets `ready` only when the counts agree under the publication guard. Text without CJK
+characters must stay byte-identical through `cjk.pretokenize` (`tests/test_sparse_cjk.py`).
 The compact index is also pruned: `sparse-rebuild` and a global `sparse`/`hybrid` search delete documents the canonical store
 does not hold (orphans; `audit_status.sparse_extra_ids`). Each batch asks the store again under the publication guard right
 before it deletes, so an event published after the snapshot is never removed, and the legacy file is never written. Keep that
