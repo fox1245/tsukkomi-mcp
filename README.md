@@ -1,6 +1,6 @@
 # Tsukkomi MCP (ツッコミ)
 
-> A deterministic governance and evidence server for autonomous coding agents, version 0.8.0.
+> A deterministic governance and evidence server for autonomous coding agents, version 0.9.0.
 > The distribution is `tsukkomi-mcp`; the Python package is `self_directing_mcp`.
 
 ## Overview
@@ -32,6 +32,18 @@ Every check returns one of four verdicts: `clean`, `violation`, `suspicious` or 
 ```
 
 Session evidence stays on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter. The canonical index keeps raw text so audits see the truth; everything that leaves it (tool results, errors, hook output, logs, remote payloads) is masked for known secret patterns, and the workflow classifier refuses context in which a secret pattern is found. See the [masking contract](SECURITY.md#masking-contract), [SECURITY.md](SECURITY.md) and [Verification scope](#verification-scope).
+
+## What is new in 0.9.0
+
+Version 0.9.0 (see [CHANGELOG.md](CHANGELOG.md)) adds a host, a search format and a stricter account of what a blocked call is.
+
+- **The Grok CLI as a host.** `python scripts/install_grok_hooks.py --apply` writes one hook file; a forbidden tool call is denied and the reason reaches the model. Grok's tools are rendered with Claude's names and keys, so the contracts you already hold apply. A call a Grok hook refused is listed as a rejected proposal, not counted as executed. See [Grok CLI](#grok-cli) and `docs/grok-installation.md`.
+- **Korean, Chinese and Japanese in sparse search.** Queries in these scripts used to match nothing. They now work in every format (word starts and a short list of Korean particles), and the new `sparse-v3.sqlite` format (`SELF_DIRECT_SPARSE_FORMAT=cjk`, built with `sparse-rebuild --format cjk`) finds any substring of two or more characters, including a word inside a compound. It is about 1.5 times the size of the compact file on CJK-heavy text. See [Sparse index formats](#sparse-index-formats) and "Language scope".
+- **An embedding endpoint of your own.** Any OpenAI-compatible server works (`SELF_DIRECT_EMBEDDING_BASE_URL`); [docs/local-embeddings.md](docs/local-embeddings.md) describes a smoke run with a local multilingual model. tsukkomi ships no weights.
+- **Contract authoring.** The fragility report now lists file-read tool calls (`Read`, `view_file`, `read`) as missed spellings of reading `.env`, an SSH key or cloud credentials, because a contract written for the shell never matches them.
+- **Smaller:** the compact sparse index deletes documents the store lacks, and `audit_status` shows every sparse file with its state.
+
+---
 
 ## What is new in 0.8.0
 
@@ -1327,6 +1339,17 @@ A parser upgrade (the AGY parser moved to version 8 and the Claude Code parser t
 `tests/test_reindex_spool.py`, `test_reindex_equivalence.py`, `test_reindex_staging.py`, `test_reindex_faults.py` (a stop at every cooperative check of a Codex re-index and at a sample of the others, a process that is killed after the row frames, after the trailer, with the spool complete, inside the commit transaction and after the commit, and a request that is stopped right after a spooled slice or after the commit) and `test_reindex_convergence.py` (a 150,000-event session with budgets of about 4 and 8 seconds on the development machine; on any other they are multiples of the time the one-shot re-index took there, so that a sanitizer build, which is three to four times slower, gives the same answer) pin all of this on synthetic sessions.
 
 `scripts/bench_eval_converge.py` measures what follows the sync, the judging: repeated `audit_session` calls under a budget of 8 or 45 seconds on synthetic sessions of 150,000 and 300,000 events, for a cold session and for one that is indexed but has no monitor state, with two, six and eighteen contracts (`--tool check` repeats `check_action` for a gated action instead, and the scenarios `cold+idle` and `synced+idle` give a resident server's idle comparison its turn after every call that did not complete); it reports the calls needed (K), the seconds of every call (a call the deadline cut is marked `x`), whether every call stayed inside its budget, and whether the final answer equals the unbounded one-shot answer, finding for finding. It resets the cost model before every run (the first request of a freshly started server) and also runs on a checkout without it, which is how the numbers of a change are compared with those before it. `tests/test_eval_converges.py` runs the same questions in virtual time (a price in seconds for parsing a record, folding an event, running the full evaluator; the deadlines read that clock), so that the calls, the stops and the answers do not depend on the machine. `tests/test_eval_reindex.py` pins how this fits with a staged re-index: a staged slice never reads the sizing numbers, the appended slice of the same session afterwards is cost-limited, and a request that stops while it stages is not noted to the idle comparison (scripted clocks, no wall clock).
+
+---
+
+## Upgrading to 0.9.0
+
+1. **Restart every process that uses the index.** A 0.8.0 process ignores `sparse-v3.sqlite`, does not know the provider `grok` and rejects a contract whose `provider` is `grok`; upgrade them all before you register such a contract.
+2. **Your sparse index is not changed.** `auto` keeps the compact (or legacy) file when it already holds data. To use the CJK format: `python -m self_directing_mcp.maintenance sparse-rebuild --format cjk` once per index (outside a request; progress on stderr; resumable), then restart the processes. Until the file is `ready` nothing answers from it. See [The CJK format](#the-cjk-format-sparse-v3sqlite) for the cost and limits. To go back, set `SELF_DIRECT_SPARSE_FORMAT=compact`; the older files were never touched.
+3. **Korean queries already work** on the compact and legacy formats after the restart (word starts, a short list of particles); the CJK format adds substring search.
+4. **Grok.** Nothing is installed for you. If you run Grok and have Claude Code hooks installed in `~/.claude/settings.json`, which Grok also loads, upgrade first: 0.9.0's Claude hook is silent on Grok's events, 0.8.0's prints a failure on each one.
+5. **First audits after the upgrade** re-derive stored incremental states once (evaluator version 9) and re-parse Grok sessions (parser version 2).
+6. `sparse-rebuild` on the compact format now also deletes documents the store lacks; `audit_status.sparse_extra_ids` shows how many.
 
 ---
 
