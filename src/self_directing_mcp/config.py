@@ -202,13 +202,17 @@ class Settings(SettingsAccessors, BaseSettings):
                     "indexed offset, to the end of a record (at least one whole record). Bounds the capture of a source "
                     "that is far from indexed. SELF_DIRECT_SYNC_SLICE_BYTES.",
     )
-    sparse_format: Literal["auto", "legacy", "compact"] = Field(
+    sparse_format: Literal["auto", "legacy", "compact", "cjk"] = Field(
         default=settings_core.DEFAULT_SPARSE_FORMAT,
         description="Storage format of the sparse (FTS5) search index. 'compact': a contentless index in sparse-v2.sqlite "
                     "(about 70 % smaller, the same results; needs SQLite 3.43 or newer, an error naming the repair "
-                    "otherwise); 'legacy': the sparse.sqlite of earlier versions; 'auto' (default): compact when this "
-                    "SQLite can use it, else legacy, shown in audit_status (sparse_format, degraded_flags). The file of "
-                    "the format that is not used is never read for results, modified or deleted. SELF_DIRECT_SPARSE_FORMAT.",
+                    "otherwise); 'cjk': the compact index over text whose Korean, Chinese and Japanese runs are cut into "
+                    "two-character windows, in sparse-v3.sqlite (finds a word inside a compound or an unspaced run; same "
+                    "SQLite requirement; an error naming the repair while the file is unfinished); 'legacy': the "
+                    "sparse.sqlite of earlier versions; 'auto' (default): cjk when sparse-v3.sqlite is ready or no sparse "
+                    "file holds data yet, else compact when this SQLite can use it, else legacy, shown in audit_status "
+                    "(sparse_format, sparse_format_choice, degraded_flags). The files of the formats that are not used are "
+                    "never read for results, modified or deleted. SELF_DIRECT_SPARSE_FORMAT.",
     )
 
     @field_validator("pgvector_schema")

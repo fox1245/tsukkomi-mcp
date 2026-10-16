@@ -46,7 +46,7 @@ DAEMON_MODES = ("off", "on")
 SQLITE_JOURNAL_MODES = ("auto", "delete")    # journal.py validates the same two values
 GRAPH_EXTRACTORS = ("openrouter", "host")    # who extracts for run_neograph_update: an OpenRouter model, or only the host agent
 SYNC_SLICING_MODES = ("auto", "off")         # index.ingest.SlicePolicy takes the same two values
-SPARSE_FORMATS = ("auto", "legacy", "compact")   # index.sparse.open_sparse_index takes the same three values
+SPARSE_FORMATS = ("auto", "legacy", "compact", "cjk")   # index.sparse.open_sparse_index takes the same four values
 PROJECT_CONTRACT_MODES = ("candidates", "off")   # contract_bundles: discover the project bundle as candidates, or not at all
 
 DEFAULT_ENFORCEMENT = "confirmed_only"
@@ -57,7 +57,7 @@ DEFAULT_DAEMON = "off"
 DEFAULT_GRAPH_EXTRACTOR = "openrouter"
 DEFAULT_SQLITE_JOURNAL = "delete"            # "auto" is opt-in until the commit benchmark says otherwise (README, "SQLite journal")
 DEFAULT_SYNC_SLICING = "auto"                # "off" is exactly the all-or-nothing sync of before slicing (README, "Large sessions and deadlines")
-DEFAULT_SPARSE_FORMAT = "auto"               # compact when this SQLite can, else the legacy file, visibly (README, "Sparse index formats")
+DEFAULT_SPARSE_FORMAT = "auto"               # cjk once built (or on a fresh install), else compact, else legacy, visibly (README, "Sparse index formats")
 DEFAULT_PROJECT_CONTRACTS = "candidates"     # discovery only: nothing is enforced without adopt_contracts (README, "Sharing contracts across devices")
 DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 DEFAULT_EMBEDDING_DIM = 1024

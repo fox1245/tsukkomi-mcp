@@ -7,12 +7,19 @@ import sqlite3
 from pathlib import Path
 import unicodedata
 
+from self_directing_mcp.index import cjk
 from self_directing_mcp.request_control import check_request, publication, request_operation
 from self_directing_mcp.security.mask import mask_secrets
 
 LEGACY_FILE = "sparse.sqlite"          # the first format: FTS5 table that stores a copy of every text
 COMPACT_FILE = "sparse-v2.sqlite"      # the compact format: FTS5 contentless table, nothing but the inverted index
 COMPACT_FORMAT = "compact-1"           # the value of sparse_meta.format in a compact file
+CJK_FILE = "sparse-v3.sqlite"          # the CJK format: the compact table over text whose CJK runs are cut into two-character windows
+CJK_FORMAT = "compact-cjk-1"           # the value of sparse_meta.format in a CJK file
+CJK_TOKENIZATION = cjk.TOKENIZATION    # sparse_meta.tokenization of a CJK file ("cjk-bigram-1")
+CJK_READY, CJK_BUILDING = "ready", "building"   # sparse_meta.state of a CJK file
+CJK_TERM_LIMIT = 24                    # terms a query keeps that came from CJK runs
+REBUILD_CJK = "python -m self_directing_mcp.maintenance sparse-rebuild --format cjk"
 COMPACT_MIN_SQLITE = (3, 43, 0)        # FTS5 contentless_delete
 LAZY_LOOKUPS = 4000                    # compact search with an allow list: rows resolved one by one before the joined query takes over
 
@@ -126,6 +133,69 @@ def _fts_query(raw: str) -> str:
     if not flat:
         return '""'
     return " OR ".join(flat)
+
+
+def _fts_query_cjk(raw: str) -> str:
+    """The FTS5 MATCH string of a search in the CJK format (``sparse-v3.sqlite``, tokenization ``cjk-bigram-1``).
+
+    The stored text had every CJK run cut into overlapping two-character windows (``index/cjk.py``, the one definition of a
+    run that the writer and this function share), so a run is queried as the **phrase of its windows**: ``색인을`` becomes
+    ``"색인 인을"`` and finds that substring wherever it sits (``원탁회의를`` is found by ``회의``, ``v2색인`` by ``색인``).
+
+    * The query is put in NFC like the text. Without any run character the string is exactly what ``_fts_query`` builds, so
+      an ASCII-only query is byte-identical to the one the compact-1 format gets, with the same ids and scores.
+    * A run of two or more characters is one quoted phrase term. A run longer than 33 characters keeps its first 32 windows
+      (``cjk.MAX_QUERY_WINDOWS``): a longer phrase would cost more and match nothing a 33-character one does not.
+    * A run of one character is a prefix term over the windows, ``"집"*``: it finds every window that starts with the
+      character and every one-character run. It **misses a document where the character only ends a run** (``서집`` holds the
+      windows ``서집`` and no token that starts with ``집``), which is the price of storing windows; search the character with a
+      neighbour to find it.
+    * The other tokens are the exact terms of ``_fts_query`` (ASCII two characters or longer, kept whole and in order,
+      duplicates included; a non-ASCII word of another script, once). A hyphen or underscore that only touches a run is
+      dropped from the token next to it, as the old builder cut such tokens at those characters.
+    * Terms are joined by `` OR `` as always; at most ``CJK_TERM_LIMIT`` (24) terms come from CJK runs, the same run once.
+
+    No quote, operator or ``*`` can come out of query text: a run consists of run characters only (letters of CJK scripts)
+    and a token of ``[\\w\\-]``.
+
+    Known limit, also in the README: FTS5 phrase adjacency ignores what separates two tokens, so two neighbouring runs whose
+    border windows form the query's windows (``버스`` next to ``스톱`` for the query ``버스톱``) match although the text never
+    holds ``버스톱``. Documents that hold the substring are never missed (tests/test_sparse_cjk.py).
+    """
+    raw = unicodedata.normalize("NFC", raw)
+    if not cjk.has_run_character(raw):
+        return _fts_query(raw)
+    pieces = cjk.segments(raw)
+    terms: list[str] = []
+    seen_runs: set[str] = set()         # quoted terms of runs already added
+    seen_words: set[str] = set()        # non-ASCII words of other scripts already added
+    taken = 0                           # terms that came from runs
+    for index, (is_run, piece) in enumerate(pieces):
+        check_request()
+        if is_run:
+            if len(piece) >= 2:
+                term = '"' + " ".join(cjk.windows(piece)[:cjk.MAX_QUERY_WINDOWS]) + '"'
+            else:
+                term = f'"{piece}"*'
+            if term not in seen_runs and taken < CJK_TERM_LIMIT:
+                seen_runs.add(term)
+                taken += 1
+                terms.append(term)
+            continue
+        for token in _QUERY_TOKEN.finditer(piece):      # the pieces alternate: a text piece borders runs, or the query's ends
+            word = token.group(0)
+            if index > 0 and token.start() == 0:
+                word = word.lstrip("-_")
+            if index + 1 < len(pieces) and token.end() == len(piece):
+                word = word.rstrip("-_")
+            if len(word) < 2:
+                continue
+            if word.isascii():
+                terms.append(f'"{word}"')
+            elif word not in seen_words:
+                seen_words.add(word)
+                terms.append(f'"{word}"')
+    return " OR ".join(terms) if terms else '""'
 
 
 class SparseIndex:
@@ -449,6 +519,7 @@ class CompactSparseIndex(SparseIndex):
     """
 
     format = "compact"
+    marker = COMPACT_FORMAT                 # the value of sparse_meta.format that identifies this class's files
 
     def __init__(self, db_path: Path) -> None:
         reason = compact_support()          # before the file is created: an unsupported SQLite leaves nothing behind
@@ -467,10 +538,14 @@ class CompactSparseIndex(SparseIndex):
         if names != set(self._TABLES):
             return False
         found = self._conn.execute("SELECT value FROM sparse_meta WHERE key='format'").fetchone()
-        if not found or found[0] != COMPACT_FORMAT:
-            raise SparseFormatError(f"{self.db_path.name} is not a {COMPACT_FORMAT} sparse index "
+        if not found or found[0] != self.marker:
+            raise SparseFormatError(f"{self.db_path.name} is not a {self.marker} sparse index "
                                     f"(format {found[0] if found else 'missing'!r}); it is left untouched")
         return True
+
+    def _new_meta(self) -> list[tuple[str, str]]:
+        """The ``sparse_meta`` rows of a file that is being created."""
+        return [("format", self.marker), ("sqlite_version", sqlite3.sqlite_version)]
 
     def _init_schema(self) -> None:
         check_request()
@@ -481,8 +556,8 @@ class CompactSparseIndex(SparseIndex):
             existing = self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sparse_meta'").fetchone()
             if existing:
                 found = self._conn.execute("SELECT value FROM sparse_meta WHERE key='format'").fetchone()
-                if not found or found[0] != COMPACT_FORMAT:
-                    raise SparseFormatError(f"{self.db_path.name} is not a {COMPACT_FORMAT} sparse index "
+                if not found or found[0] != self.marker:
+                    raise SparseFormatError(f"{self.db_path.name} is not a {self.marker} sparse index "
                                             f"(format {found[0] if found else 'missing'!r}); it is left untouched")
             elif self._conn.execute("SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchone():
                 raise SparseFormatError(f"{self.db_path.name} holds tables of another format; it is left untouched")
@@ -493,8 +568,8 @@ class CompactSparseIndex(SparseIndex):
                                "session_no INTEGER NOT NULL, kind_no INTEGER NOT NULL)")
             self._conn.execute("CREATE TABLE IF NOT EXISTS sparse_sessions(session_no INTEGER PRIMARY KEY, session_id TEXT NOT NULL UNIQUE)")
             self._conn.execute("CREATE TABLE IF NOT EXISTS sparse_kinds(kind_no INTEGER PRIMARY KEY, kind TEXT NOT NULL UNIQUE)")
-            self._conn.execute("INSERT OR IGNORE INTO sparse_meta(key, value) VALUES ('format', ?)", (COMPACT_FORMAT,))
-            self._conn.execute("INSERT OR IGNORE INTO sparse_meta(key, value) VALUES ('sqlite_version', ?)", (sqlite3.sqlite_version,))
+            for key, value in self._new_meta():
+                self._conn.execute("INSERT OR IGNORE INTO sparse_meta(key, value) VALUES (?, ?)", (key, value))
             with publication():
                 self._conn.commit()
 
@@ -547,8 +622,16 @@ class CompactSparseIndex(SparseIndex):
             self._conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (rowid,))
             self._conn.execute("DELETE FROM chunk_rows WHERE rowid=?", (rowid,))
 
+    def _index_text(self, text: str) -> str:
+        """The text as FTS5 indexes it: masked first, so that no raw secret is ever tokenized."""
+        return mask_secrets(text)
+
+    def _match(self, query: str) -> str:
+        """The FTS5 MATCH string of a query in this format."""
+        return _fts_query(query)
+
     def _add(self, chunk_id: str, session_id: str, kind: str, text: str, local: dict) -> None:
-        masked = mask_secrets(text)
+        masked = self._index_text(text)
         session_no = self._intern("sparse_sessions", "session_id", session_id, local, create=True)
         kind_no = self._intern("sparse_kinds", "kind", kind, local, create=True)
         rowid = self._conn.execute("INSERT INTO chunk_rows(chunk_id, session_no, kind_no) VALUES (?,?,?)",
@@ -600,7 +683,7 @@ class CompactSparseIndex(SparseIndex):
         session_id: str | None = None,
         allowed_ids: set[str] | None = None,
     ) -> list[tuple[str, float, int]]:
-        q = _fts_query(query)
+        q = self._match(query)
         if allowed_ids is not None and not allowed_ids:
             return []
         if session_id:
@@ -701,35 +784,217 @@ class CompactSparseIndex(SparseIndex):
                 "recorded": totals, "mapped": mapped}
 
 
+class CjkSparseIndex(CompactSparseIndex):
+    """The CJK format, ``sparse-v3.sqlite``: the compact format over text whose CJK runs are cut into two-character windows.
+
+    Everything but the text is the compact format (the contentless FTS5 table with the same ``porter unicode61`` tokenizer,
+    the chunk map, the exact bm25 statistics, ``verify_statistics``); the differences are the two ends of the pipeline:
+
+    * **Write.** ``cjk.pretokenize`` runs on the masked text, so ``색인을 다시`` is indexed as the tokens ``색인``, ``인을``,
+      ``다시`` and ``v2색인`` as ``v2``, ``색인`` (``index/cjk.py`` has the exact rules). The document length FTS5 records,
+      and so the bm25 statistics that ``_retire_statistics`` keeps exact, is the token count of that rewritten text.
+    * **Query.** ``_fts_query_cjk``: a CJK run is the phrase of its windows, so any substring of two or more characters is
+      found. A text without CJK characters is indexed and queried exactly as in the compact-1 format (same ids, same scores).
+
+    ``sparse_meta`` holds ``format`` = ``compact-cjk-1``, ``tokenization`` = ``cjk-bigram-1`` and ``state``: ``ready``, or
+    ``building`` while ``sparse-rebuild --format cjk`` has not finished the file. A process opens a file for answers only
+    when the tokenization is the one it knows and the state is ``ready``; otherwise ``SparseFormatError`` names the repair,
+    and nothing is substituted. ``build=True`` (the rebuild command) also opens a ``building`` file, and creates a new file
+    in that state. A file that an engine creates on its own (a fresh install, or the explicit setting) is ``ready`` from the
+    start: like the compact index it is filled lazily and every search repairs its scope before it answers.
+    """
+
+    format = "cjk"
+    marker = CJK_FORMAT
+
+    def __init__(self, db_path: Path, *, build: bool = False) -> None:
+        self.build = build
+        super().__init__(db_path)
+
+    def _new_meta(self) -> list[tuple[str, str]]:
+        return super()._new_meta() + [("tokenization", CJK_TOKENIZATION), ("state", CJK_BUILDING if self.build else CJK_READY)]
+
+    def _check_usable(self) -> None:
+        """Refuse an existing file this process may not answer from, before anything is written to it."""
+        meta = self.meta()
+        if meta.get("format") != self.marker:
+            return                                  # _init_schema's own check names the foreign format
+        name = self.db_path.name
+        if meta.get("tokenization") != CJK_TOKENIZATION:
+            raise SparseFormatError(
+                f"{name} uses the tokenization {meta.get('tokenization')!r}, which this version does not know (it writes and reads "
+                f"{CJK_TOKENIZATION!r}); the file is left untouched. Use a version that knows it, or set "
+                f"SELF_DIRECT_SPARSE_FORMAT=compact (sparse-v2.sqlite)")
+        state = meta.get("state")
+        if state == CJK_BUILDING and not self.build:
+            raise SparseFormatError(
+                f"{name} is not finished (state {CJK_BUILDING!r}): run `{REBUILD_CJK}` to finish it, or set "
+                f"SELF_DIRECT_SPARSE_FORMAT=compact to use sparse-v2.sqlite meanwhile")
+        if state not in (CJK_READY, CJK_BUILDING):
+            raise SparseFormatError(f"{name} has the unknown state {state!r}; the file is left untouched")
+
+    def _init_schema(self) -> None:
+        check_request()
+        if self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sparse_meta'").fetchone():
+            self._check_usable()
+        super()._init_schema()
+
+    def _index_text(self, text: str) -> str:
+        return cjk.pretokenize(mask_secrets(text))          # mask first: the secret patterns see the text as it was written
+
+    def _match(self, query: str) -> str:
+        return _fts_query_cjk(query)
+
+    # ---- the state of the file ------------------------------------------------------------------------------------
+    def state(self) -> str | None:
+        return self.meta().get("state")
+
+    def set_state(self, state: str) -> None:
+        """Set ``sparse_meta.state`` (one transaction; nothing is written when it already holds the value)."""
+        if state not in (CJK_READY, CJK_BUILDING):
+            raise ValueError(f"unknown sparse state {state!r}")
+        if self.state() == state:
+            return
+        with self._write():
+            self._conn.execute("INSERT OR REPLACE INTO sparse_meta(key, value) VALUES ('state', ?)", (state,))
+
+    def finish_build(self, documents: int) -> bool:
+        """Set the state to ``ready`` in one transaction, only when the file holds exactly ``documents`` documents (the
+        canonical store's count, which the caller has just compared under the publication guard). False: nothing changed."""
+        with self._write():
+            held = self._conn.execute("SELECT COUNT(*) FROM chunk_rows").fetchone()[0]
+            if held != documents:
+                return False
+            self._conn.execute("INSERT OR REPLACE INTO sparse_meta(key, value) VALUES ('state', ?)", (CJK_READY,))
+        return True
+
+
+FORMAT_FILES = {"legacy": LEGACY_FILE, "compact": COMPACT_FILE, "cjk": CJK_FILE}
+SPARSE_SETTINGS = ("auto", "legacy", "compact", "cjk")
+
+
 def sparse_file(index_dir, fmt: str) -> Path:
-    return Path(index_dir) / (COMPACT_FILE if fmt == "compact" else LEGACY_FILE)
+    return Path(index_dir) / FORMAT_FILES[fmt]
 
 
-def open_sparse_index(index_dir, setting: str = "auto") -> tuple[SparseIndex, dict]:
-    """Open the sparse index of ``index_dir`` in the format ``setting`` asks for (``auto``, ``legacy``, ``compact``).
+def look_at_sparse_file(path, *, count: bool = True) -> dict | None:
+    """What a sparse file holds, read through a read-only connection (the file is never created, written or recovered):
+    ``{"documents", "format", "tokenization", "state"}`` (the last three from ``sparse_meta``, None for a legacy file, which
+    has none). ``documents`` is the size of the id map, or with ``count=False`` just 1 or 0 (does it hold anything: an
+    O(1) probe for the open path). None when the file does not exist or holds no table at all (an empty file is a fresh one);
+    ``documents`` is None when it cannot be read or has no id map."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    info = {"documents": None, "format": None, "tokenization": None, "state": None}
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
+    except (sqlite3.Error, ValueError):
+        return info
+    try:
+        try:
+            if conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
+                return None
+        except sqlite3.Error:
+            return info
+        try:
+            info["documents"] = int(conn.execute("SELECT COUNT(*) FROM chunk_rows").fetchone()[0] if count else
+                                    conn.execute("SELECT EXISTS(SELECT 1 FROM chunk_rows)").fetchone()[0])
+        except sqlite3.Error:
+            pass
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM sparse_meta").fetchall())
+            info.update(format=meta.get("format"), tokenization=meta.get("tokenization"), state=meta.get("state"))
+        except sqlite3.Error:
+            pass                                    # a legacy file has no sparse_meta
+        return info
+    finally:
+        conn.close()
 
-    ``compact`` raises ``SparseFormatError`` when this SQLite cannot use it. ``auto`` uses the compact format when it can
-    and otherwise the legacy one, and says so in the returned resolution (``reason``) so that ``audit_status`` shows it.
-    The file of the format that is not opened is never touched."""
-    if setting not in ("auto", "legacy", "compact"):
-        raise ValueError(f"SELF_DIRECT_SPARSE_FORMAT must be auto, legacy or compact, not {setting!r}")
+
+def _cjk_unusable(info: dict, *, build: bool) -> str | None:
+    """Why ``sparse-v3.sqlite`` (as ``look_at_sparse_file`` saw it) cannot answer for this process, else None."""
+    if info["documents"] is None and info["format"] is None:
+        return "sparse-v3.sqlite could not be read"
+    if info["format"] != CJK_FORMAT:
+        return f"sparse-v3.sqlite is not a {CJK_FORMAT} file (format {info['format']!r})"
+    if info["tokenization"] != CJK_TOKENIZATION:
+        return (f"sparse-v3.sqlite uses the tokenization {info['tokenization']!r}, which this version does not know "
+                f"(it uses {CJK_TOKENIZATION!r})")
+    if info["state"] == CJK_BUILDING:
+        return None if build else f"sparse-v3.sqlite is not finished (state {CJK_BUILDING!r}); run `{REBUILD_CJK}` to finish it"
+    if info["state"] != CJK_READY:
+        return f"sparse-v3.sqlite has the unknown state {info['state']!r}"
+    return None
+
+
+def choose_auto_format(index_dir, *, build: bool = False) -> tuple[str, dict]:
+    """The format ``auto`` uses on a SQLite that can use the compact formats, and why: ``(format, details)`` with
+    ``details["choice"]`` (the reason in words), ``details["cjk_problem"]`` (True when ``sparse-v3.sqlite`` exists and is
+    unusable, which ``audit_status`` flags) and ``details["cjk_hint"]`` (what to do about the CJK format, or None).
+
+    1. ``sparse-v3.sqlite`` is ready and its tokenization is known: it.
+    2. It exists but is not usable (still ``building``, an unknown tokenization, unreadable): the compact format, visibly.
+    3. It does not exist and an earlier file already holds data: that earlier choice (the compact format, as in 0.8.0) is kept,
+       and the hint says how to build the CJK format. Nothing is rebuilt by itself.
+    4. It does not exist and no sparse file holds a document (a fresh install): the CJK format.
+
+    ``build=True`` is the rebuild command: a ``building`` file is the one to continue."""
+    index_dir = Path(index_dir)
+    v3 = look_at_sparse_file(index_dir / CJK_FILE, count=False)
+    if v3 is not None:
+        problem = _cjk_unusable(v3, build=build)
+        if problem is None:
+            return "cjk", {"choice": f"auto: {CJK_FILE} is {v3['state']}" + (" and being continued" if v3["state"] == CJK_BUILDING else ""),
+                           "cjk_problem": False, "cjk_hint": None}
+        return "compact", {"choice": f"auto: the compact format ({COMPACT_FILE}), because {problem}", "cjk_problem": True,
+                           "cjk_hint": problem}
+    older = [name for name in (COMPACT_FILE, LEGACY_FILE)       # a file that cannot be read counts as holding data: never guess
+             if (found := look_at_sparse_file(index_dir / name, count=False)) is not None and found["documents"] != 0]
+    if older:
+        hint = f"{CJK_FILE} is not built: run `{REBUILD_CJK}` to build it from the canonical store (auto uses it once it is ready)"
+        return "compact", {"choice": f"auto: the compact format ({COMPACT_FILE}); {older[0]} already holds data, so the CJK format "
+                                     f"is not started by itself", "cjk_problem": False, "cjk_hint": hint}
+    return "cjk", {"choice": f"auto: no sparse file holds data yet, so the CJK format ({CJK_FILE}) is used", "cjk_problem": False,
+                   "cjk_hint": None}
+
+
+def open_sparse_index(index_dir, setting: str = "auto", *, build: bool = False) -> tuple[SparseIndex, dict]:
+    """Open the sparse index of ``index_dir`` in the format ``setting`` asks for (``auto``, ``legacy``, ``compact``, ``cjk``).
+
+    ``compact`` and ``cjk`` raise ``SparseFormatError`` when this SQLite cannot use them, and ``cjk`` also when the file is
+    not finished (state ``building``) or uses a tokenization this version does not know. ``auto`` follows
+    ``choose_auto_format`` (the CJK format once it is ready or on a fresh install, else the compact format, else the legacy
+    one on a SQLite that cannot use either) and says why in the returned resolution (``choice``, ``reason``, ``cjk_hint``,
+    ``cjk_problem``), so that ``audit_status`` shows it. ``build=True`` is for the rebuild command: a CJK file in state
+    ``building`` is opened (and a new one is created in that state). The file of a format that is not opened is never
+    touched."""
+    if setting not in SPARSE_SETTINGS:
+        raise ValueError(f"SELF_DIRECT_SPARSE_FORMAT must be auto, legacy, compact or cjk, not {setting!r}")
     reason = None
+    details: dict = {"choice": f"SELF_DIRECT_SPARSE_FORMAT={setting}", "cjk_problem": False, "cjk_hint": None}
     if setting == "legacy":
         fmt = "legacy"
     else:
         reason = compact_support()
-        if reason is None:
-            fmt = "compact"
-        elif setting == "compact":
-            raise SparseFormatError(reason)
-        else:
+        if reason is not None:
+            if setting != "auto":
+                raise SparseFormatError(reason)
             fmt = "legacy"
-    cls = CompactSparseIndex if fmt == "compact" else SparseIndex
-    return cls(sparse_file(index_dir, fmt)), {"setting": setting, "format": fmt, "reason": reason}
+            details["choice"] = "auto: the legacy format, because this SQLite cannot use the compact formats"
+        elif setting == "auto":
+            fmt, details = choose_auto_format(index_dir, build=build)
+        else:
+            fmt = setting
+    if fmt == "cjk":
+        index = CjkSparseIndex(sparse_file(index_dir, fmt), build=build)
+    else:
+        index = (CompactSparseIndex if fmt == "compact" else SparseIndex)(sparse_file(index_dir, fmt))
+    return index, {"setting": setting, "format": fmt, "reason": reason, **details}
 
 
 def count_sparse_file(path) -> int | None:
-    """Documents in a sparse file this process does not use (``audit_status`` shows both formats). Read-only: the file is
+    """Documents in a sparse file this process does not use (``audit_status`` shows every format). Read-only: the file is
     never created, written or recovered, and only its id map is read, not the FTS5 tables. None when it cannot be read."""
     try:
         conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)

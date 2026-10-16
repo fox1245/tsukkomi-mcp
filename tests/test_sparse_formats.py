@@ -26,6 +26,9 @@ WORDS = ["alpha", "beta", "gamma"]
 
 
 def make(tmp_path, monkeypatch, *, events=14, ready=True, **settings):
+    """An engine over a small synthetic session. The tests of this file are about the legacy and compact formats, so the
+    format is pinned to ``compact`` unless a test passes its own (the CJK format and ``auto`` are in test_sparse_cjk*.py)."""
+    settings.setdefault("sparse_format", "compact")
     for name in ("SELF_DIRECT_CODEX_SESSIONS_DIR", "CODEX_SESSIONS_DIR", "SELF_DIRECT_SESSION_PROVIDER", "SELF_DIRECT_GROKBOT_TRANSCRIPTS_DIR",
                  "SELF_DIRECT_SPARSE_FORMAT"):
         monkeypatch.delenv(name, raising=False)
@@ -47,7 +50,7 @@ def stat_key(path):
     return sha256(path), info.st_size, info.st_mtime_ns
 
 
-def test_the_default_is_the_compact_format_in_its_own_file(tmp_path, monkeypatch):
+def test_the_compact_format_is_in_its_own_file(tmp_path, monkeypatch):
     engine, _ = make(tmp_path, monkeypatch)
     try:
         assert engine.sync_session(session_id=SID, embed=False)["ok"]
@@ -73,12 +76,14 @@ def test_a_legacy_index_is_never_touched_and_never_answers(tmp_path, monkeypatch
     old = tmp_path / "index" / "sparse.sqlite"
     before = stat_key(old)
 
-    engine, path = make(tmp_path, monkeypatch)                      # the default: compact, same index directory
+    engine, path = make(tmp_path, monkeypatch, sparse_format="auto")        # auto over an index that holds legacy data: compact (as in 0.8.0)
     try:
         assert engine.sparse.format == "compact" and engine.sparse.count() == 0
         assert stat_key(old) == before
         status = engine.audit_status()
-        assert status["sparse_counts"] == {"legacy": total + 1, "compact": 0} and stat_key(old) == before
+        assert status["sparse_counts"] == {"legacy": total + 1, "compact": 0, "cjk": None} and stat_key(old) == before
+        assert not (tmp_path / "index" / "sparse-v3.sqlite").exists()                      # auto did not start the CJK format by itself
+        assert "sparse-v3.sqlite is not built" in status["sparse_cjk_hint"] and "--format cjk" in status["sparse_cjk_hint"]
         # Until the session is in the new file nothing is answered from the old one: the repair path runs first.
         found = engine.search_history("alpha", session_id=SID, mode="sparse")
         assert found["hits"] and engine.sparse.count() == total
@@ -108,17 +113,19 @@ def test_audit_status_shows_the_format_both_files_and_both_counts(tmp_path, monk
         assert not (tmp_path / "index" / "sparse-v2.sqlite").exists()
     finally:
         legacy.close()
-    engine, _ = make(tmp_path, monkeypatch)
+    engine, _ = make(tmp_path, monkeypatch, sparse_format="auto")
     try:
         engine.sync_session(session_id=SID, embed=False)
         status = engine.audit_status()
         index = tmp_path / "index"
         assert status["sparse_format"] == "compact" and status["sparse_format_setting"] == "auto" and status["sparse_format_reason"] is None
-        assert "sparse_legacy_fallback" not in status["degraded_flags"]
+        assert "sparse_legacy_fallback" not in status["degraded_flags"] and "sparse_cjk_unavailable" not in status["degraded_flags"]
         files = {f["name"]: f for f in status["sparse_files"]}
-        assert set(files) == {"sparse.sqlite", "sparse-v2.sqlite"}
-        assert files["sparse.sqlite"] == {"name": "sparse.sqlite", "format": "legacy", "active": False, "exists": True,
-                                          "bytes": (index / "sparse.sqlite").stat().st_size}
+        assert set(files) == {"sparse.sqlite", "sparse-v2.sqlite", "sparse-v3.sqlite"}
+        assert files["sparse.sqlite"] == {"name": "sparse.sqlite", "path": str(index / "sparse.sqlite"), "format": "legacy", "active": False,
+                                          "exists": True, "bytes": (index / "sparse.sqlite").stat().st_size, "tokenization": None,
+                                          "state": None, "documents": status["total_chunks"]}
+        assert files["sparse-v3.sqlite"]["exists"] is False and files["sparse-v3.sqlite"]["bytes"] is None
         assert files["sparse-v2.sqlite"]["active"] and files["sparse-v2.sqlite"]["bytes"] == (index / "sparse-v2.sqlite").stat().st_size
         assert status["sparse_count"] == status["sparse_counts"]["compact"] == status["sparse_counts"]["legacy"] == status["total_chunks"]
     finally:
@@ -131,7 +138,7 @@ def test_an_old_sqlite_is_an_error_for_compact_and_a_visible_fallback_for_auto(t
     with pytest.raises(SparseFormatError, match=r"3\.43.*SELF_DIRECT_SPARSE_FORMAT=legacy"):
         engine.sync_session(session_id=SID, embed=False)
     assert not (tmp_path / "index" / "sparse-v2.sqlite").exists()
-    engine, _ = make(tmp_path, monkeypatch)
+    engine, _ = make(tmp_path, monkeypatch, sparse_format="auto")
     try:
         engine.sync_session(session_id=SID, embed=False)
         status = engine.audit_status()
@@ -244,7 +251,7 @@ def test_the_rebuild_command(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SELF_DIRECT_CODEX_SESSIONS_DIR", str(tmp_path / "sessions"))
     monkeypatch.setenv("SELF_DIRECT_USE_FAKE_EMBEDDER", "true")
     index = tmp_path / "index"
-    argv = ["sparse-rebuild", "--index-dir", str(index)]
+    argv = ["sparse-rebuild", "--index-dir", str(index), "--format", "compact"]
 
     assert maintenance.main([*argv, "--budget-sec", "0"]) == maintenance.EXIT_PARTIAL
     out, err = capsys.readouterr()
@@ -261,7 +268,7 @@ def test_the_rebuild_command(tmp_path, monkeypatch, capsys):
     assert maintenance.main(argv) == 0
     assert json.loads(capsys.readouterr()[0])["written"] == 0 and stat_key(index / "sparse-v2.sqlite")[0] == key[0]
 
-    assert maintenance.main([*argv, "--format", "legacy"]) == maintenance.EXIT_FAILED
+    assert maintenance.main([*argv[:-2], "--format", "legacy"]) == maintenance.EXIT_FAILED
     assert "legacy" in capsys.readouterr()[1]
     assert not (index / "sparse.sqlite").exists()
     with pytest.raises(SystemExit):
@@ -293,7 +300,8 @@ def test_a_rebuild_killed_between_batches_leaves_a_sound_index_and_resumes(tmp_p
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": str(root / "src"), "PYTHONDONTWRITEBYTECODE": "1", "SELF_DIRECT_CODEX_SESSIONS_DIR": str(tmp_path / "sessions"),
            "SELF_DIRECT_USE_FAKE_EMBEDDER": "true", "SELF_DIRECT_DENSE_BACKEND": "numpy"}
-    command = [sys.executable, "-m", "self_directing_mcp.maintenance", "sparse-rebuild", "--index-dir", str(index), "--batch", "10"]
+    command = [sys.executable, "-m", "self_directing_mcp.maintenance", "sparse-rebuild", "--index-dir", str(index), "--batch", "10",
+               "--format", "compact"]
     process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         assert "sparse-rebuild:" in process.stderr.readline()            # the first batch is committed before this line

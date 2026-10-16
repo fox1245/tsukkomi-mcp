@@ -208,8 +208,8 @@ CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Adviso
            "sqlite_journal": ["auto", "delete", "Auto", "DELETE", "", " auto", "delete ", "wal", "off", "true", "truncate"],
            "sync_slicing": ["auto", "off", "Auto", "OFF", "Off", "", " off", "auto ", "on", "false", "0", "true", "slice",
                            "off\n"],
-           "sparse_format": ["auto", "legacy", "compact", "Auto", "COMPACT", "Legacy", "", " compact", "legacy ", "v2", "on", "off",
-                             "true", "0", "compact\n", "sparse-v2"],
+           "sparse_format": ["auto", "legacy", "compact", "cjk", "Auto", "COMPACT", "Legacy", "CJK", "Cjk", "", " compact", "legacy ",
+                             " cjk", "cjk\n", "v2", "v3", "on", "off", "true", "0", "compact\n", "sparse-v2", "sparse-v3", "cjk-bigram-1"],
            "project_contracts": ["candidates", "off", "Candidates", "OFF", "", " off", "off ", "on", "enforce", "true",
                                  "adopt", "auto", "candidate", "candidates\n"]}
 # SELF_DIRECT_AUDIT_SHADOW_EVERY: a non-negative integer, or "adaptive" in any case with surrounding whitespace.
