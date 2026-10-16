@@ -836,8 +836,9 @@ class CjkSparseIndex(CompactSparseIndex):
     def _init_schema(self) -> None:
         check_request()
         if self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sparse_meta'").fetchone():
-            self._check_usable()
+            self._check_usable()                    # before anything is written to an existing file
         super()._init_schema()
+        self._check_usable()                        # a file another process created while this one waited for the write lock
 
     def _index_text(self, text: str) -> str:
         return cjk.pretokenize(mask_secrets(text))          # mask first: the secret patterns see the text as it was written
