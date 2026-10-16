@@ -1,6 +1,6 @@
 # Tsukkomi MCP (ツッコミ)
 
-> A deterministic governance and evidence server for autonomous coding agents, version 0.9.0.
+> A deterministic governance and evidence server for autonomous coding agents, version 0.10.0.
 > The distribution is `tsukkomi-mcp`; the Python package is `self_directing_mcp`.
 
 ## Overview
@@ -32,6 +32,16 @@ Every check returns one of four verdicts: `clean`, `violation`, `suspicious` or 
 ```
 
 Session evidence stays on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter. The canonical index keeps raw text so audits see the truth; everything that leaves it (tool results, errors, hook output, logs, remote payloads) is masked for known secret patterns, and the workflow classifier refuses context in which a secret pattern is found. See the [masking contract](SECURITY.md#masking-contract), [SECURITY.md](SECURITY.md) and [Verification scope](#verification-scope).
+
+## What is new in 0.10.0
+
+Version 0.10.0 (see [CHANGELOG.md](CHANGELOG.md)) closes a gap in how a rule about a file is written.
+
+- **Typed path contracts.** A `must_not` contract can say `"path_guard": {"paths": [".env", "~/.ssh/id_*"], "except": [".env.example"], "modes": "any"}` instead of a regex. The server matches the path through the file-read tool of every host (Claude Code `Read`, AGY `view_file`, OMP `read`) as well as through shell readers, so a model that opens the file with its host's read tool is stopped like one that runs `cat`. `modes: "read"` matches reads only. The contracts file keeps the typed form; the regex is derived when it is loaded. See [Typed path contracts](#typed-path-contracts-path_guard) for the semantics and the limits (shell variables, `cd` chains, string building and symbolic links are not seen).
+- **Weakening is judged on the typed form.** A removed path, an added exception or a narrower mode needs a user anchor, like a changed regex; more paths or fewer exceptions do not.
+- **Authoring help.** `upsert_contracts` suggests a `path_guard` for a shell-scoped regex that names a file (informational; nothing is rewritten).
+
+---
 
 ## What is new in 0.9.0
 
@@ -1361,6 +1371,14 @@ A parser upgrade (the AGY parser moved to version 8 and the Claude Code parser t
 `tests/test_reindex_spool.py`, `test_reindex_equivalence.py`, `test_reindex_staging.py`, `test_reindex_faults.py` (a stop at every cooperative check of a Codex re-index and at a sample of the others, a process that is killed after the row frames, after the trailer, with the spool complete, inside the commit transaction and after the commit, and a request that is stopped right after a spooled slice or after the commit) and `test_reindex_convergence.py` (a 150,000-event session with budgets of about 4 and 8 seconds on the development machine; on any other they are multiples of the time the one-shot re-index took there, so that a sanitizer build, which is three to four times slower, gives the same answer) pin all of this on synthetic sessions.
 
 `scripts/bench_eval_converge.py` measures what follows the sync, the judging: repeated `audit_session` calls under a budget of 8 or 45 seconds on synthetic sessions of 150,000 and 300,000 events, for a cold session and for one that is indexed but has no monitor state, with two, six and eighteen contracts (`--tool check` repeats `check_action` for a gated action instead, and the scenarios `cold+idle` and `synced+idle` give a resident server's idle comparison its turn after every call that did not complete); it reports the calls needed (K), the seconds of every call (a call the deadline cut is marked `x`), whether every call stayed inside its budget, and whether the final answer equals the unbounded one-shot answer, finding for finding. It resets the cost model before every run (the first request of a freshly started server) and also runs on a checkout without it, which is how the numbers of a change are compared with those before it. `tests/test_eval_converges.py` runs the same questions in virtual time (a price in seconds for parsing a record, folding an event, running the full evaluator; the deadlines read that clock), so that the calls, the stops and the answers do not depend on the machine. `tests/test_eval_reindex.py` pins how this fits with a staged re-index: a staged slice never reads the sizing numbers, the appended slice of the same session afterwards is cost-limited, and a request that stops while it stages is not noted to the idle comparison (scripted clocks, no wall clock).
+
+---
+
+## Upgrading to 0.10.0
+
+1. **Restart every process that uses the index, and upgrade all of them before you register a typed contract.** A 0.9.0 process cannot read a contracts file that holds a `path_guard` contract and reports the contracts unavailable (visible and fail-safe). A contracts file without one is byte-identical to the 0.9.0 file.
+2. **Nothing changes by itself.** Existing regex contracts are not rewritten or promoted; to move a rule to the typed form, re-submit it with `path_guard` (replacing a regex by a guard is a changed verifier and needs the user's message as `source_event_id`).
+3. **First audits after the upgrade** rebuild the saved incremental monitor state of each contract once (evaluator version 10).
 
 ---
 

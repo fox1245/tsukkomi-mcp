@@ -2,7 +2,11 @@
 
 Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions follow `pyproject.toml`. Releases before 0.6.0 are not itemized here; see the git history.
 
-## Unreleased
+## 0.10.0 - 2026-10-17
+
+**Highlights.** One thing since 0.9.0: **a contract about a file can name the file.** A `must_not` contract can carry `path_guard` (`paths`, `except`, `modes` `any` or `read`) instead of a regex. A regex such as `(cat|head|tail|less)\s+\S*\.env` never matches a host's own file-read tool (`Read`, `view_file`, `read`), which is how a "never print the secrets in `.env`" rule is bypassed in practice; a typed path contract is matched through every host's tool vocabulary, and the server derives the regex itself when it loads the contract. Class D routes (a shell variable, a `cd` chain, string building in an interpreter, symbolic links, ...) are not seen and are listed with a test each.
+
+**Upgrading.** Restart every process that shares the index, and **upgrade all of them before you register a typed contract**: a 0.9.0 process cannot read a contracts file that holds one (it reports the contracts unavailable, visibly and fail-safe). A contracts file without a typed contract is byte-identical to what 0.9.0 wrote, and nothing is registered for you. The audit evaluator version is 10, so the saved monitor state of every contract is rebuilt once, on the first audit after the upgrade.
 
 ### Added
 
