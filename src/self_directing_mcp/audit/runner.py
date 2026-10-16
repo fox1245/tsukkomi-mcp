@@ -15,7 +15,7 @@ from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.neograph_runtime import run_stages
 from self_directing_mcp.request_control import check_request, current_request, request_operation
 
-from self_directing_mcp.audit import shellstatus
+from self_directing_mcp.audit import hostblocks, shellstatus
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 
 REGEX_TIMEOUT = "regex_timeout: a contract pattern exceeded its time limit, so this contract could not be evaluated"
@@ -69,16 +69,32 @@ def rejected_calls(events) -> dict:
     return found
 
 
+def blocked_calls(events) -> dict:
+    """Grok: ``{tool call chunk id: (chunk id of the host's note, source)}`` for calls a hook blocked.
+
+    Grok records no decision on the result. Its note that a hook blocked a tool and the failed result of the call are
+    numbered one apart by the host itself; ``hostblocks.HostBlocks`` joins them (the incremental evaluator keeps the same
+    class in its facts), so the answer does not depend on which record the file shows first or where a read ended.
+    """
+    blocks = hostblocks.HostBlocks()
+    for event in _checked(events):
+        blocks.feed(event)
+    return {call: tuple(denial) for call, denial in blocks.rejected.items()}
+
+
 def _wants_rejections(rule) -> bool:
     """A prohibition over calls: the only rules a refused call can change."""
     return rule.type == "must_not" and rule.scope in ("tool_call", "any")
 
 
+REFUSAL_PROVIDERS = ("claude", "grok")      # hosts whose own records tell a refused call from one that ran
+
+
 def rejections(provider, rules, events, proposed):
     """The rejected calls of a history audit (``None`` when there are none or none can matter)."""
-    if provider != "claude" or proposed is not None or not any(_wants_rejections(rule) for rule in rules):
+    if provider not in REFUSAL_PROVIDERS or proposed is not None or not any(_wants_rejections(rule) for rule in rules):
         return None
-    return rejected_calls(events) or None
+    return (rejected_calls(events) if provider == "claude" else blocked_calls(events)) or None
 
 
 def _event_byte(event):
@@ -87,8 +103,9 @@ def _event_byte(event):
 
 
 def rejection_entry(rule_id, event_id, call_id, denial, at_byte) -> dict:
-    """One ``proposals_rejected`` entry. ``denial`` is ``(chunk id of the result carrying the decision, source)``;
-    ``denied_by`` is the decision's ``source`` (``hook``, ``user``, ...) and ``host`` when it names none."""
+    """One ``proposals_rejected`` entry. ``denial`` is ``(chunk id of the host's record of the decision, source)``: for
+    Claude Code the result carrying it, for Grok the host's note. ``denied_by`` is the decision's ``source`` (``hook``,
+    ``user``, a Grok hook's name, ...) and ``host`` when it names none."""
     return {"contract_id": rule_id, "event_id": event_id, "call_id": call_id, "reason": REJECTED_REASON,
             "denied_by": denial[1] or "host", "denial_event_id": denial[0], "at_byte": at_byte}
 
@@ -337,7 +354,8 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
                     rejected=None, ids=None, linked=None):
     """Regex checks operate on events. Retrieval ranks are never verification evidence.
 
-    ``rejected`` (Claude Code history audits): the calls the host refused, see ``rejected_calls``.
+    ``rejected`` (Claude Code and Grok history audits): the calls the host refused, see ``rejected_calls`` and
+    ``blocked_calls``.
     """
     check_request()
     def finding(verdict, reason, items=None, basis=None, applicability="applicable", stopped=None):

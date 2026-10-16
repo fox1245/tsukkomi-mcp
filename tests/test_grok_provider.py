@@ -80,17 +80,24 @@ def fixture_copy(root, name, sid):
 def test_recorded_session_with_a_denied_read(root):
     chunks = parse(fixture_copy(root, "updates_session2.jsonl", SID))
     kinds = [(c.kind, c.meta.get("role")) for c in chunks]
+    # the host's note of the blocked read is the one `_x.ai` record that is indexed; the file shows it before the call
     assert kinds == [("turn", "user"), ("meta", "runtime"), ("turn", "assistant"), ("tool_call", "assistant"),
-                     ("tool_call", "assistant"), ("tool_result", "tool"), ("tool_call", "assistant"),
-                     ("tool_result", "tool"), ("tool_result", "tool"), ("turn", "assistant"), ("meta", "runtime")]
+                     ("meta", "runtime"), ("tool_call", "assistant"), ("tool_result", "tool"),
+                     ("tool_call", "assistant"), ("tool_result", "tool"), ("tool_result", "tool"),
+                     ("turn", "assistant"), ("meta", "runtime")]
     texts = [c.text for c in chunks]
     assert texts[3] == '[tool_call:Read] {"file_path": "/work/proj/notes.txt", "limit": 5}'
-    assert texts[6] == '[tool_call:Bash] {"command": "echo probe-ok"}'
-    # the host's own annotation of this server's denial is not evidence, and no `_x.ai` hook record is indexed
-    assert "blocked by project/hook" not in dump(chunks) and "hook_execution" not in dump(chunks)
+    assert texts[7] == '[tool_call:Bash] {"command": "echo probe-ok"}'
+    # no `_x.ai` hook report is indexed; the host's note of the blocked read is, without the reason a hook wrote
+    assert "hook_execution" not in dump(chunks)
+    (note,) = [c for c in chunks if c.meta.get("evidence_origin") == "host_tool_outcome"]
+    assert "secret.env" not in note.model_dump_json() and note.text == "[host_tool_outcome] blocked" and note.meta["role"] == "runtime"
+    assert (note.meta["host_event_id"], note.meta["blocked_tool"], note.meta["denied_by"]) == (
+        34, "read_file", "project/hook probe")
     # the denied read: the call is an attempt, its refusal a failed result with the host's text, linked by id
     denied = {c.meta["call_id"]: c for c in chunks if c.kind == "tool_result"}
     assert denied["call-0000-1"].meta["success"] is False and denied["call-0000-1"].text.startswith("[tool_result] Hook denied")
+    assert denied["call-0000-1"].meta["host_event_id"] == 33 and "host_event_id" not in denied["call-0000-0"].meta
     assert denied["call-0000-0"].meta["success"] is True and denied["call-0000-2"].meta["success"] is True
     assert denied["call-0000-2"].meta["exit_code"] == 0 and denied["call-0000-2"].text == "[tool_result] probe-ok\n"
     # the call and its result share only the id; every event keeps its own record's byte range
@@ -512,9 +519,9 @@ def test_the_engine_indexes_appends_and_reindexes_when_the_file_shrinks(root, en
 def test_parser_upgrade_reindexes(root, engine, monkeypatch):
     path = write(session_file(root), user("go", 0), agent("x"))
     sync(engine, path)
-    assert current_parser_version("grok") == grok.PARSER_VERSION == 1
-    monkeypatch.setattr(grok, "PARSER_VERSION", 2)
-    assert current_parser_version("grok") == 2
+    assert current_parser_version("grok") == grok.PARSER_VERSION == 2
+    monkeypatch.setattr(grok, "PARSER_VERSION", 3)
+    assert current_parser_version("grok") == 3
     info = sync(engine, path)
     assert info["reindexed"] is True and info["reindex_reason"] == "parser_updated"
 

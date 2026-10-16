@@ -14,7 +14,7 @@ from self_directing_mcp.audit import incremental as inc
 from self_directing_mcp.audit import runner
 from incremental_support import Session, contracts, proposed_action
 
-PROVIDERS = ["codex", "claude", "agy", "omp"]
+PROVIDERS = ["codex", "claude", "agy", "omp", "grok"]
 
 
 def prior_pools(previous, lookback=4096):
