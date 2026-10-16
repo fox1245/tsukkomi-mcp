@@ -39,6 +39,7 @@ import re
 import time
 from typing import Any
 
+from self_directing_mcp import contract_paths
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 
 LIBRARY_RESOURCE = ("resources", "contract_variants.json")
@@ -253,8 +254,42 @@ def _analyzed_pattern(rule: Any) -> tuple[str, str | None]:
     """The pattern that names the action a contract is about: a prohibition's regex, or the gated action
     (``before_regex``) of an obligation."""
     if getattr(rule, "type", None) == "must_not":
-        return "regex", getattr(rule, "regex", None)
+        # A typed contract (path_guard) names the path and is matched through every host's tools: there is no
+        # shell-scoped regex to widen, and the derived one is not the author's text, so it is not analyzed.
+        return "regex", None if getattr(rule, "path_guard", None) is not None else getattr(rule, "regex", None)
     return "before_regex", getattr(rule, "before_regex", None)
+
+
+def suggested_path_guard(rule: Any) -> dict[str, Any] | None:
+    """For a shell-scoped ``must_not`` regex that names a path: the typed contract that would match the path through
+    every host's tools, as JSON the caller can submit. Informational: nothing is rewritten or promoted."""
+    if getattr(rule, "type", None) != "must_not" or getattr(rule, "path_guard", None) is not None:
+        return None
+    paths = contract_paths.suggest_from_regex(getattr(rule, "regex", None) or "")
+    if not paths:
+        return None
+    try:
+        contract_paths.lower(paths, (), "read")
+    except contract_paths.PathGuardError:
+        return None
+    contract = {"id": rule.id, "type": "must_not", "scope": "tool_call", "severity": rule.severity,
+                "path_guard": {"paths": paths, "except": [], "modes": "read"}}
+    if rule.description:
+        contract["description"] = rule.description
+    for name in ("provider", "session_id", "source_event_id", "applies_from_event_id", "source_quote"):
+        if getattr(rule, name, None) is not None:
+            contract[name] = getattr(rule, name)
+    if rule.risk != "normal":
+        contract["risk"] = rule.risk
+    return {
+        "paths": paths, "path_guard": contract["path_guard"], "contract": contract,
+        "note": ("Informational: nothing was changed. This regex reads like a shell-scoped rule about a file, and a "
+                 "host's file-read tool is not a shell command. The typed contract above matches the same path "
+                 "through the file-read tools of Claude Code, AGY, OMP and Grok, shell readers and patches (tool "
+                 f"map v{contract_paths.TOOL_MAP_VERSION}). Re-submitting it under this id replaces the regex, which "
+                 "counts as a changed verifier and needs source_event_id of the user's own message; use modes "
+                 "'any' if the rule is about touching the file at all, not only reading it."),
+    }
 
 
 def fragility_report(rules: list[Any]) -> dict[str, Any]:
@@ -272,8 +307,12 @@ def fragility_report(rules: list[Any]) -> dict[str, Any]:
             result: dict[str, Any] = {"status": "skipped_time_budget", "families": [], "families_omitted": 0}
         else:
             result = analyze_pattern(pattern, library)
-        if result["status"] != "ok" or result["families"]:
-            contracts.append({"contract_id": rule.id, "field": field, **result})
+        suggestion = suggested_path_guard(rule)
+        if result["status"] != "ok" or result["families"] or suggestion is not None:
+            entry = {"contract_id": rule.id, "field": field, **result}
+            if suggestion is not None:
+                entry["suggested_path_guard"] = suggestion
+            contracts.append(entry)
     report: dict[str, Any] = {
         "library_version": library.version,
         "informational": True,

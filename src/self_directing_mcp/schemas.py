@@ -3,7 +3,9 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ConfigDict, model_serializer, model_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_serializer, model_validator
+
+from self_directing_mcp import contract_paths
 
 
 SCHEMA_VERSION = "1.0"
@@ -62,7 +64,7 @@ class ContractWhen(BaseModel):
 
 # Fields added after 1.0. They are omitted from serialized contracts while at their default so files written
 # by this version stay loadable by older processes (extra="forbid") and snapshots of unchanged contracts hold.
-_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None, "origin": None}
+_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None, "origin": None, "path_guard": None}
 
 
 class ContractOrigin(BaseModel):
@@ -91,6 +93,56 @@ class ContractOrigin(BaseModel):
         return data
 
 
+class PathGuard(BaseModel):
+    """A typed ``must_not`` verifier that names PATHS instead of a regex (see ``contract_paths`` for the semantics).
+
+    Stored, hashed, exported and compared in this form. The contract regex every evaluator runs is derived from it
+    when the contract is loaded, through the versioned per-host tool map, and is never written back.
+    """
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    paths: list[str] = Field(
+        description="Paths or globs the contract guards: 1 to 16 entries of at most 256 characters. A bare name "
+                    "('.env') matches that file name in any directory; an entry that starts with '/', '~/' or a drive "
+                    "letter is anchored ('~/' also matches $HOME and the home directories); '*' stays inside a path "
+                    "segment, '**' crosses segments, '?' and '[...]' work as in a shell; forward and back slashes are "
+                    "equivalent; the match is case-insensitive.")
+    except_: list[str] = Field(
+        default_factory=list, alias="except",
+        description="Paths or globs that are NOT guarded although 'paths' matches them, for example '.env.example'.")
+    modes: Literal["any", "read"] = Field(
+        default="any",
+        description="'any' (default): the path appears as a path argument of any tool call (a read, a write, a patch, "
+                    "a shell word). 'read': the path is read (a file-read tool, or a reader inside a shell command). "
+                    "'write' is not supported in this version.")
+
+    @field_validator("paths", mode="before")
+    @classmethod
+    def _check_paths(cls, value):
+        return list(_checked(contract_paths.check_entries, "paths", value, required=True))
+
+    @field_validator("except_", mode="before")
+    @classmethod
+    def _check_except(cls, value):
+        return list(_checked(contract_paths.check_entries, "except", value, required=False))
+
+    @field_validator("modes", mode="before")
+    @classmethod
+    def _check_modes(cls, value):
+        return _checked(contract_paths.check_modes, value)
+
+    @model_serializer(mode="plain")
+    def _typed_form(self):
+        return contract_paths.as_dict(self)
+
+
+def _checked(check, *args, **kwargs):
+    """Run a ``contract_paths`` check; its error already names the field."""
+    try:
+        return check(*args, **kwargs)
+    except contract_paths.PathGuardError as exc:
+        raise ValueError(str(exc)) from None
+
+
 class ContractRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(description="Stable unique contract id used for updates (revision increments).")
@@ -108,7 +160,15 @@ class ContractRule(BaseModel):
     )
     regex: str | None = Field(
         default=None,
-        description="Primary verifier regex over scoped text. Required for temporal rules.",
+        description="Primary verifier regex over scoped text. Required for temporal rules. Omit it when "
+                    "path_guard names the paths: the regex is then derived from path_guard and never stored.",
+    )
+    path_guard: PathGuard | None = Field(
+        default=None,
+        description="Typed alternative to regex for a must_not contract about files (scope tool_call): names the "
+                    "paths, and the server matches them through every host's tool vocabulary (Claude Code Read, "
+                    "AGY view_file, OMP read, shell readers such as cat, patches). {paths, except, modes}. "
+                    "path_guard and regex cannot be combined.",
     )
     # Hybrid auxiliary: description/query used for semantic+sparse support (never sole evidence for violation)
     search_query: str | None = Field(
@@ -177,7 +237,37 @@ class ContractRule(BaseModel):
         for name, default in _OPTIONAL_DEFAULTS.items():
             if name in data and data[name] == default:
                 del data[name]
+        if data.get("path_guard") is not None:
+            data.pop("regex", None)          # derived from path_guard when loaded: the typed form is what is stored
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _typed_inputs(cls, data):
+        if isinstance(data, dict) and data.get("path_guard") is not None:
+            if data.get("regex") is not None:
+                raise ValueError("path_guard and regex cannot both be set on one contract: path_guard is the single "
+                                 "source of truth and the regex is derived from it")
+            if "scope" not in data:
+                data = {**data, "scope": "tool_call"}
+        return data
+
+    @model_validator(mode="after")
+    def lower_path_guard(self):
+        """The one place a typed guard becomes the regex every evaluator reads (see ``contract_paths``)."""
+        if self.path_guard is None:
+            return self
+        if self.type != "must_not":
+            raise ValueError("path_guard applies only to must_not contracts (a must contract, or one with before_regex, "
+                             "requires_success or auto_continue, takes a regex)")
+        if self.scope != "tool_call":
+            raise ValueError(f"path_guard needs scope 'tool_call' (it is matched against the text of tool calls), "
+                             f"got {self.scope!r}")
+        try:
+            self.regex = contract_paths.lower(self.path_guard.paths, self.path_guard.except_, self.path_guard.modes)
+        except contract_paths.PathGuardError as exc:
+            raise ValueError(f"path_guard.{exc}") from None
+        return self
 
     # https://docs.pydantic.dev/latest/concepts/validators/ (Pydantic 2)
     @model_validator(mode="after")

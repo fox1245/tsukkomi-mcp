@@ -31,6 +31,7 @@ from typing import Any, Sequence
 
 from pydantic import ValidationError
 
+from self_directing_mcp import contract_paths
 from self_directing_mcp.audit.contracts import check_rule_patterns
 from self_directing_mcp.request_control import check_request
 from self_directing_mcp.schemas import ContractRule
@@ -57,8 +58,9 @@ SHORT_HASH = 12
 
 # What a bundle contract may carry. ``CONTENT_FIELDS`` decide whether two contracts are the same; the provenance fields
 # are plain text kept beside them and never compared (the quote is the author's wording, the claimed event an assertion).
-CONTENT_FIELDS = ("id", "type", "scope", "severity", "description", "regex", "search_query", "enabled", "provider",
-                  "roles", "before_regex", "requires_success", "exception_regex", "risk", "auto_continue", "when")
+CONTENT_FIELDS = ("id", "type", "scope", "severity", "description", "regex", "path_guard", "search_query", "enabled",
+                  "provider", "roles", "before_regex", "requires_success", "exception_regex", "risk", "auto_continue",
+                  "when")
 PROVENANCE_FIELDS = ("source_quote", "claimed_origin_event_id")
 BUNDLE_CONTRACT_FIELDS = frozenset(CONTENT_FIELDS + PROVENANCE_FIELDS)
 DEVICE_BOUND_FIELDS = ("source_event_id", "applies_from_event_id", "session_id", "revision", "origin")
@@ -101,13 +103,18 @@ def content_of(rule: ContractRule) -> dict[str, Any]:
     the author's quote and enable bookkeeping are not in it. A contract limited to one session cannot be the same as a
     global one, so that fact is part of what a stored contract shows."""
     content: dict[str, Any] = {
+        # A typed contract is its guard: the regex derived from it belongs to the tool map of the running version, so it
+        # is not content (a newer map must not change what a bundle's contract is or break its pin).
         "id": rule.id, "type": rule.type, "scope": rule.scope, "severity": rule.severity,
-        "description": rule.description, "regex": rule.regex, "search_query": rule.search_query,
+        "description": rule.description, "regex": None if rule.path_guard is not None else rule.regex,
+        "search_query": rule.search_query,
         "enabled": rule.enabled, "provider": rule.provider, "roles": sorted(set(rule.roles)),
         "before_regex": rule.before_regex, "requires_success": rule.requires_success,
         "exception_regex": rule.exception_regex, "risk": rule.risk, "auto_continue": rule.auto_continue,
         "when": rule.when.tool_call_regex if rule.when else None,
     }
+    if rule.path_guard is not None:
+        content["path_guard"] = contract_paths.as_dict(rule.path_guard)      # absent otherwise: old hashes stay as they were
     if rule.session_id is not None:
         content["session_scoped"] = True
     return content
@@ -223,8 +230,15 @@ def _parse_contract(index: int, item: Any, problems: list[str]) -> BundleContrac
         return None
     for name in _REGEX_FIELDS:
         value = getattr(rule, name)
+        if name == "regex" and rule.path_guard is not None:
+            continue                    # derived from path_guard, whose entries are checked below
         if value is not None and not _check_text(problems, where, name, value, REGEX_MAX, multiline=True):
             return None
+    if rule.path_guard is not None:
+        for name, entries in (("paths", rule.path_guard.paths), ("except", rule.path_guard.except_)):
+            if not all(_check_text(problems, where, f"path_guard.{name}", entry, contract_paths.MAX_ENTRY_CHARS,
+                                   nonempty=True) for entry in entries):
+                return None
     if rule.when and not _check_text(problems, where, "when.tool_call_regex", rule.when.tool_call_regex, REGEX_MAX,
                                      multiline=True):
         return None
@@ -590,8 +604,10 @@ def describe_contract(entry: Entry) -> dict[str, Any]:
                            "severity": rule.severity, "roles": list(rule.roles), "enabled": rule.enabled,
                            "risk": rule.risk, "content_hash": entry.contract.content_hash[:SHORT_HASH]}
     for name in ("provider", *_REGEX_FIELDS):
-        if getattr(rule, name) is not None:
+        if getattr(rule, name) is not None and not (name == "regex" and rule.path_guard is not None):
             out[name] = getattr(rule, name)         # a verifier is shown whole (the file's cap makes that possible)
+    if rule.path_guard is not None:
+        out["path_guard"] = contract_paths.as_dict(rule.path_guard)
     if rule.when:
         out["when"] = {"tool_call_regex": rule.when.tool_call_regex}
     for name in ("requires_success", "auto_continue"):
@@ -635,7 +651,9 @@ def portable_dict(rule: ContractRule) -> dict[str, Any]:
     if rule.description:
         out["description"] = rule.description
     for name in (*_REGEX_FIELDS, "search_query", "provider"):
-        if getattr(rule, name) is not None:
+        if name == "regex" and rule.path_guard is not None:
+            out["path_guard"] = contract_paths.as_dict(rule.path_guard)      # the typed form, never the derived regex
+        elif getattr(rule, name) is not None:
             out[name] = getattr(rule, name)
     out["roles"] = list(rule.roles)
     if not rule.enabled:

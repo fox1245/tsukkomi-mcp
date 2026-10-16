@@ -41,6 +41,8 @@ jobs:
           tests/test_journal.py
           tests/test_graph_host_extraction.py
           tests/test_contract_bundles.py
+          tests/test_contract_path_guard.py
+          tests/test_contract_path_guard_engine.py
           tests/test_portable_contracts.py
           tests/test_slice_capture.py
           tests/test_slice_equivalence.py
@@ -147,6 +149,8 @@ jobs:
           tests/test_hook_import_budget.py
           tests/test_hook_settings_parity.py
           tests/test_contract_bundles.py
+          tests/test_contract_path_guard.py
+          tests/test_contract_path_guard_engine.py
           tests/test_portable_contracts.py
           tests/test_portable_contracts_docs.py
           tests/test_portable_contract_hooks.py

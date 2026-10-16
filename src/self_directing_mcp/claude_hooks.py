@@ -31,6 +31,7 @@ from pathlib import Path
 import sys
 from typing import Any, TYPE_CHECKING
 
+from self_directing_mcp import contract_paths
 from self_directing_mcp import claude_hook_state as hook_state
 from self_directing_mcp import claude_ids
 from self_directing_mcp import grok_ids
@@ -268,7 +269,7 @@ def handle_session_start(engine: SelfDirectEngine, call: HookCall) -> dict[str, 
         tags = ("[high risk]" if rule.risk == "high" else "") + ("[auto-continue]" if rule.auto_continue else "")
         condition = f" (applies once a tool call matching /{rule.when.tool_call_regex}/ was observed)" if rule.when else ""
         lines.append(hook_policy.short(
-            f"Contract [{rule.id}]{tags} {rule.type}: {rule.description or rule.regex}{condition}", 400))
+            f"Contract [{rule.id}]{tags} {rule.type}: {rule.description or contract_paths.verifier_text(rule)}{condition}", 400))
     for item in obligations["pending"][:8]:
         lines.append(f"Pending: {item.text} ({item.status}; requires verified evidence)")
     return _context_reply(lines, banner)

@@ -57,7 +57,7 @@ mcp = _MaskedFastMCP(
 
 # Rule logic must round-trip exactly (list -> edit -> upsert) and single-use grants are credentials the
 # caller must replay; every other string leaving a tool is masked.
-_RULE_KEYS = frozenset({"regex", "before_regex", "exception_regex"})
+_RULE_KEYS = frozenset({"regex", "before_regex", "exception_regex", "path_guard", "suggested_path_guard"})
 _GRANT_KEYS = frozenset({"grant"})
 
 
@@ -653,7 +653,11 @@ async def upsert_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
     tools (Claude Code Read, AGY view_file, OMP read), whose text is
     `[tool_call:<name>] {json}` and not a shell command, so name the file itself
     rather than only shell readers such as cat; the fragility report in the
-    response lists such spellings.
+    response lists such spellings. Prefer path_guard when the user's rule is
+    about a file: {"id": "no-dotenv", "type": "must_not", "path_guard":
+    {"paths": [".env"], "except": [".env.example"], "modes": "any" | "read"}}
+    names the path once and the server matches it through every host's tools
+    (instead of regex, never together with it).
     Optional fields: provider, session_id, roles (default assistant), source_event_id
     (the user's own message the rule came from; a tool result or injected text is
     rejected), applies_from_event_id (exclusive), before_regex, requires_success.
