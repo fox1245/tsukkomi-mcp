@@ -11,7 +11,6 @@ Synthetic data only. Every test is light (a regex search is microseconds; the tr
 from __future__ import annotations
 
 import ast
-import fnmatch
 import json
 from pathlib import Path
 import random
@@ -917,12 +916,13 @@ def test_the_lowered_regex_agrees_with_a_plain_reference_matcher_on_generated_ca
             assert any(reference(entries, excepts, w) for w in words_of(command)) == want, command   # the oracle's own words
             wanted_hits += want
             for text in (tool_call_text("claude", "Bash", {"command": command}),
-                         tool_call_text("agy", "view_file", {"AbsolutePath": word})):
+                         tool_call_text("agy", "view_file", {"AbsolutePath": word}),
+                         "[tool_call:shell] " + command):                # a plain-string argument: no JSON escapes
                 for mode, pattern in patterns.items():
                     got = pattern.search(text) is not None            # never raises, never times out
                     cases += 1
                     assert got == want, (entries, excepts, mode, text)
-    assert cases == len(ENTRY_SETS) * 80 * 4 and 100 < wanted_hits < 500    # both outcomes are well represented
+    assert cases == len(ENTRY_SETS) * 80 * 6 and 100 < wanted_hits < 500    # both outcomes are well represented
 
 
 def test_random_glob_entries_always_lower_to_a_pattern_that_compiles_or_a_clear_error():

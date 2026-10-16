@@ -499,3 +499,42 @@ def test_a_typed_contract_travels_in_a_bundle_and_is_enforced_after_adoption(wor
     replaced = adopter.engine.adopt_contracts(changed["bundle_id"], anchor, replace_ids=["no-dotenv"], project_dir=str(project))
     assert replaced["replaced"][0]["weakening"] is True
     assert set(replaced["replaced"][0]["reasons"]) == {"path_guard.except added", "path_guard.modes narrowed (any -> read)"}
+
+
+# ------------------------------------------------------------- saved monitor state, and a file that cannot be loaded
+
+def test_the_monitor_fingerprint_of_a_typed_contract_follows_the_tool_map_and_a_regex_contract_is_unchanged(monkeypatch):
+    from self_directing_mcp.audit import incremental
+    typed = ContractRule.model_validate(READ_ONLY)            # mode read: the later tool map adds a read tool to its regex
+    plain = ContractRule(id="p", type="must_not", scope="tool_call", regex=r"rm\s+-rf")
+
+    def prints():
+        return [incremental.rule_fingerprint(r, "claude", 3, "digest") for r in (typed, plain)]
+
+    before = prints()
+    assert before == prints()
+    extra = contract_paths.ToolEntry("omp", "cat_file", contract_paths.FILE_READ, ("filename",), False, "test")
+    monkeypatch.setattr(contract_paths, "TOOL_MAP_VERSION", 2)
+    monkeypatch.setattr(contract_paths, "TOOL_ENTRIES", contract_paths.TOOL_ENTRIES + (extra,))
+    contract_paths._lower.cache_clear()
+    try:
+        later_rule = ContractRule.model_validate(READ_ONLY)
+        assert later_rule.model_dump(mode="json") == typed.model_dump(mode="json")      # the stored form did not move
+        assert incremental.rule_fingerprint(later_rule, "claude", 3, "digest") != before[0]   # the monitor must be rebuilt
+        assert incremental.rule_fingerprint(plain, "claude", 3, "digest") == before[1]        # a regex contract keeps its state
+    finally:
+        monkeypatch.undo()
+        contract_paths._lower.cache_clear()
+
+
+def test_a_contracts_file_with_a_bad_typed_contract_is_reported_not_silently_dropped(claude):
+    claude.upsert(GUARD)
+    path = claude.engine.settings.resolve_contracts_path()
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["contracts"][0]["path_guard"]["modes"] = "write"                  # a file edited by hand, or written by a later version
+    path.write_text(json.dumps(document), encoding="utf-8")
+    audit = claude.audit()
+    assert "contracts_corrupt" in audit["coverage"]["issues"] and audit["coverage"]["complete"] is False
+    with pytest.raises(Exception, match="contracts or checklist unavailable"):
+        from self_directing_mcp.hook_policy import read_obligations
+        read_obligations(claude.engine, "claude", CLAUDE_SID, str(claude.path))

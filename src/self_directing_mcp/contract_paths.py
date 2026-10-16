@@ -104,8 +104,8 @@ class ToolEntry:
 
 
 # Every entry is derived from this repository's own parsers, fixtures and tests. ``traced=False`` marks what could not be
-# found there (a name the owner listed, or a key a host documents): those entries are best effort and are listed as
-# untraced in the README; ``tests/test_contract_path_guard_toolmap.py`` pins the list.
+# found there (a tool name a host is known to have, or a key it documents): those entries are best effort and are listed
+# as untraced in the README; ``tests/test_contract_path_guard.py`` pins the list.
 TOOL_ENTRIES: tuple[ToolEntry, ...] = (
     # Claude Code (also: Grok, whose calls are rendered with these names by grok_tools)
     ToolEntry("claude", "Read", FILE_READ, ("file_path",), True,
@@ -118,10 +118,10 @@ TOOL_ENTRIES: tuple[ToolEntry, ...] = (
     ToolEntry("claude", "Grep", SEARCH, ("path", "glob"), False,
               "path: grok_tools.py row grep; glob: Claude Code's file filter, not in a fixture here"),
     ToolEntry("claude", "Glob", FIND, ("path", "pattern"), False,
-              "grok_tools.py notes that Glob needs a pattern; the keys are not in a fixture here"),
+              "grok_tools.py notes that Glob needs a pattern; the keys are in no fixture here"),
     ToolEntry("claude", "LS", LIST, ("path",), True, "grok_tools.py row list_dir -> LS: path"),
-    ToolEntry("claude", "MultiEdit", FILE_WRITE, ("file_path",), False, "named by the task brief; no fixture here"),
-    ToolEntry("claude", "NotebookEdit", FILE_WRITE, ("notebook_path",), False, "named by the task brief; no fixture here"),
+    ToolEntry("claude", "MultiEdit", FILE_WRITE, ("file_path",), False, "a Claude Code tool name; no fixture in this repository"),
+    ToolEntry("claude", "NotebookEdit", FILE_WRITE, ("notebook_path",), False, "a Claude Code tool name; no fixture in this repository"),
     ToolEntry("claude", "NotebookRead", FILE_READ, ("notebook_path",), False, "no fixture here"),
     # AGY
     ToolEntry("agy", "view_file", FILE_READ, ("AbsolutePath",), True,
@@ -132,7 +132,7 @@ TOOL_ENTRIES: tuple[ToolEntry, ...] = (
               "tests/test_agy_parser_v7.py: replace_file_content{TargetFile}"),
     ToolEntry("agy", "multi_replace_file_content", FILE_WRITE, ("TargetFile",), False,
               "the name is in tests/test_agy_hooks.py with an invented argument; TargetFile is untraced for it"),
-    ToolEntry("agy", "write_to_file", FILE_WRITE, ("TargetFile",), False, "named by the task brief; no fixture here"),
+    ToolEntry("agy", "write_to_file", FILE_WRITE, ("TargetFile",), False, "an AGY tool name; no fixture in this repository"),
     ToolEntry("agy", "list_dir", LIST, ("DirectoryPath",), True,
               "tests/test_agy_parser_v7.py: list_dir{DirectoryPath}"),
     ToolEntry("agy", "grep_search", SEARCH, ("SearchPath",), False, "no fixture here"),
@@ -155,7 +155,7 @@ TOOL_ENTRIES: tuple[ToolEntry, ...] = (
     ToolEntry("codex", "read_file", FILE_READ, ("path",), False,
               "the name is in codex_hooks._READ_TOOLS; the key is untraced"),
     ToolEntry("codex", "apply_patch", PATCH, (), False,
-              "named by the task brief; no Codex fixture here. Matched by the patch envelope's file headers"),
+              "Codex's patch tool; no fixture in this repository. Matched by the file headers of the patch envelope"),
     # Grok Bot (fixtures/sample_grokbot_session)
     ToolEntry("grokbot", "Read", FILE_READ, ("path",), True, "tests/test_contract_fragility_file_reads.py: Read{path}"),
 )

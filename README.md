@@ -124,7 +124,7 @@ Set these only when the user asked for them. The high-risk presets in [`src/self
 
 #### Typed path contracts (`path_guard`)
 
-A `must_not` contract about a file should name the file, not one shell spelling that reads it. A regex written as `(cat|head|tail|less)\s+\S*\.env` never sees a host's file-read tool, whose call text is `[tool_call:Read] {"file_path": "/work/.env"}` (Claude Code), `[tool_call:view_file] {"AbsolutePath": ...}` (AGY) or `[tool_call:read] {"path": ...}` (OMP); in a controlled study that gap was the only way a "never print the secrets in `.env`" contract was violated. `path_guard` names the path once, and the server matches it through every host's tool vocabulary:
+A `must_not` contract about a file should name the file, not one shell spelling that reads it. A regex written as `(cat|head|tail|less)\s+\S*\.env` never sees a host's file-read tool, whose call text is `[tool_call:Read] {"file_path": "/work/.env"}` (Claude Code), `[tool_call:view_file] {"AbsolutePath": ...}` (AGY) or `[tool_call:read] {"path": ...}` (OMP): that is how a "never print the secrets in `.env`" contract is bypassed in practice, by a model that reads the file with its host's file-read tool. `path_guard` names the path once, and the server matches it through every host's tool vocabulary:
 
 ```json
 {"id": "no-dotenv", "type": "must_not", "scope": "tool_call", "description": "Never read the secrets in .env.",
@@ -1585,6 +1585,8 @@ Never loaded on the local-only hook path. The cost is the cumulative import time
 | `self_directing_mcp.contract_bundles` | Portable contract bundles are read by the candidate, adopt and export tools and `audit_status`, never by a hook (`FORBIDDEN_OURS` in the test). | not loaded |
 
 Claude Code's bookkeeping events (`UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`) load none of pydantic, the engine or the transcript parser: they validate the session id with `claude_ids` and deliver queued warnings.
+
+`self_directing_mcp.contract_paths` (typed path contracts) is loaded by every hook that judges contracts, through `schemas`: it imports the standard library only (a test pins that), builds no regex at import, and generates the regex of a typed contract once per process when a contract that has a `path_guard` is loaded (see [Typed path contracts](#typed-path-contracts-path_guard) for the compile cost).
 
 Documented exceptions, loaded by every hook that judges contracts:
 
