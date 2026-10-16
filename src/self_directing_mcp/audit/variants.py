@@ -254,8 +254,9 @@ def _analyzed_pattern(rule: Any) -> tuple[str, str | None]:
     """The pattern that names the action a contract is about: a prohibition's regex, or the gated action
     (``before_regex``) of an obligation."""
     if getattr(rule, "type", None) == "must_not":
-        # A typed contract is analyzed through the regex derived from its guard, and says so.
-        return contract_paths.verifier_field(rule), getattr(rule, "regex", None)
+        # A typed contract (path_guard) names the path and is matched through every host's tools: there is no
+        # shell-scoped regex to widen, and the derived one is not the author's text, so it is not analyzed.
+        return "regex", None if getattr(rule, "path_guard", None) is not None else getattr(rule, "regex", None)
     return "before_regex", getattr(rule, "before_regex", None)
 
 
