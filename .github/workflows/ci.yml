@@ -78,7 +78,7 @@ jobs:
     # Linux coverage complements, rather than replaces, the cross-platform smoke job.
     # Keep larger allocation probes out of CI; small regressions do not certify live-service RSS.
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
     env:
       SELF_DIRECT_USE_FAKE_EMBEDDER: "true"
       SELF_DIRECT_DENSE_BACKEND: "numpy"
