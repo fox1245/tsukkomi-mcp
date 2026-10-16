@@ -31,7 +31,8 @@ from test_reliability import SID, call, message, result, session, write  # noqa:
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "self_directing_mcp"
 REQUIRED_FAMILIES = {"recursive_delete", "force_push", "discard_worktree", "world_writable", "remote_script_exec",
-                     "read_secret_file", "stage_all", "db_cli_access", "skip_tests", "tls_verify_off"}
+                     "read_secret_file", "read_env_production", "read_ssh_private_key", "read_aws_credentials",
+                     "stage_all", "db_cli_access", "skip_tests", "tls_verify_off"}
 REQUIRED_FIELDS = {"id", "text", "platform", "technique", "preconditions", "verified"}
 PATHOLOGICAL = r"^(.|.)+\d$"       # exponential on any long text without a trailing digit, even for the regex engine
 LIBRARY = variants.load_library()

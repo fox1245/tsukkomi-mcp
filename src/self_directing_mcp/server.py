@@ -649,6 +649,11 @@ async def upsert_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
     requirement; type="must_not" is a prohibited action/effect.
     Example: [{"id": "no-delete", "type": "must_not", "scope": "tool_call",
     "regex": "rm\\s+-rf", "description": "Never delete user files."}]
+    A contract about a file must also match the calls of the host's file-read
+    tools (Claude Code Read, AGY view_file, OMP read), whose text is
+    `[tool_call:<name>] {json}` and not a shell command, so name the file itself
+    rather than only shell readers such as cat; the fragility report in the
+    response lists such spellings.
     Optional fields: provider, session_id, roles (default assistant), source_event_id
     (the user's own message the rule came from; a tool result or injected text is
     rejected), applies_from_event_id (exclusive), before_regex, requires_success.

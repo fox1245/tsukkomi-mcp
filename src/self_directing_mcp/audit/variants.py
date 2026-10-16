@@ -16,6 +16,17 @@ entry (for example ``git push -f`` when the regex names ``--force``) counts as o
 the regex does not match are not reported. Matching uses the contract regex engine (``audit.patterns``) with its
 time limits: a regex that times out yields an explicit ``regex_timeout`` entry, never a crash or silence.
 
+Tool calls. A contract is matched against the text of a tool call, ``[tool_call:<name>] <JSON arguments>`` (see
+``tool_payload``), and that is not a shell command: a regex written around the shell readers (``cat``, ``head``,
+``tail``, ``less`` followed by the file name) never matches the call of a host's file-read tool (Claude Code
+``Read``, AGY ``view_file``, OMP ``read``). The file-reading families therefore carry such calls as non-canonical entries of the
+platform ``tool_call``, each the exact text the parsers and the hooks build for that host. Their canonical entries
+stay plain shell readers (so a regex that already matches the tool calls, for example any regex naming the file, is
+told nothing about them) and a regex that matches only tool-call text selects no such family. Selection is by
+substring search, so a regex that names ``.env`` also matches the canonical spellings of the ``.env.production``
+family and is reported for both; a regex about ``.env.production`` does not match the ``.env`` ones. The report
+lists each missed tool-call entry on its own (see ``_pick``).
+
 Extension point: ``analyze_pattern(pattern, library)`` accepts any ``Library`` built by ``parse_library`` from a
 document in the same schema. No generator of further candidates exists, and none is called here.
 """
@@ -39,7 +50,9 @@ MAX_CONTRACTS = 20                 # contracts analyzed per call; the rest are c
 REPORT_BUDGET_SEC = 3.0            # all contracts of one call; later contracts are reported as skipped
 
 NOTE = ("Informational only: contracts are saved unchanged and no verdict changes. Variants are unverified "
-        "candidates (equivalence was not verified by execution), matched as plain command text.")
+        "candidates (equivalence was not verified by execution), matched as plain text: a command line, or for "
+        "the tool_call platform the text of a tool call, [tool_call:<name>] <JSON arguments>.")
+TOOL_CALL_PLATFORM = "tool_call"
 
 _VERSION = re.compile(r"^\d+\.\d+\.\d+$")
 _ID = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
@@ -172,23 +185,30 @@ def _variant_view(variant: Variant, family: Family) -> dict[str, Any]:
     return view
 
 
+def _kind(variant: Variant) -> tuple[str, str]:
+    """What counts as one kind of gap in a capped list: a technique, except that every tool call is its own kind
+    (each host names its file-read tool and its path argument differently, and a regex can miss any of them)."""
+    return variant.technique, variant.id if variant.platform == TOOL_CALL_PLATFORM else ""
+
+
 def _pick(missed: list[Variant], cap: int, priority: tuple[str, ...]) -> list[Variant]:
     """At most ``cap`` of the missed variants, in library order: unmatched canonical spellings first, then one
-    variant per technique in turn (techniques in the library's priority order), so a capped list shows different
-    kinds of gap rather than the first eight option spellings."""
+    variant per technique in turn (techniques in the library's priority order; each tool call counts as a
+    technique of its own), so a capped list shows different kinds of gap rather than the first eight option
+    spellings."""
     if len(missed) <= cap:
         return missed
     picked = [v for v in missed if v.canonical][:cap]
-    queues: dict[str, list[Variant]] = {}
+    queues: dict[tuple[str, str], list[Variant]] = {}
     for variant in missed:
         if not variant.canonical:
-            queues.setdefault(variant.technique, []).append(variant)
+            queues.setdefault(_kind(variant), []).append(variant)
     rank = {technique: index for index, technique in enumerate(priority)}
     while len(picked) < cap and queues:
-        for technique in sorted(queues, key=rank.__getitem__):
-            picked.append(queues[technique].pop(0))
-            if not queues[technique]:
-                del queues[technique]
+        for kind in sorted(queues, key=lambda kind: rank[kind[0]]):     # stable: equal ranks keep library order
+            picked.append(queues[kind].pop(0))
+            if not queues[kind]:
+                del queues[kind]
             if len(picked) >= cap:
                 break
     order = {id(variant): index for index, variant in enumerate(missed)}
