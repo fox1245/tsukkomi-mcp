@@ -186,7 +186,8 @@ class WorkflowController:
         settings = Settings()
         result = classify(context, key_file=settings.openrouter_api_key_file,
                           api_key=settings.openrouter_api_key,
-                          threshold=self.project.manifest.get("confidence_threshold", .7))
+                          threshold=self.project.manifest.get("confidence_threshold", .7),
+                          mask_pii=settings.mask_pii)
         payload = result.as_dict()
         classification_id = secrets.token_hex(16)
         with self._db() as db:

@@ -128,7 +128,239 @@ def register_secret(value) -> None:
         _KNOWN += (value.strip(),)
 
 
-def mask_secrets(text: str) -> str:
+_EMAIL_LOCAL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&'*+/=?^_`{|}~-")
+_DOMAIN_LABEL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+
+
+def parse_mask_pii(spec=None) -> tuple[str, ...]:
+    """Normalize a PII masking specification (e.g. ``'email,phone'``) into canonical tokens."""
+    if spec is None:
+        return ()
+    if isinstance(spec, str):
+        raw_parts = [part.strip() for chunk in spec.replace("\n", ",").split(",") for part in chunk.split()]
+    else:
+        raw_parts = [str(item).strip() for item in spec if str(item).strip()]
+    tokens: list[str] = []
+    for part in raw_parts:
+        if not part:
+            continue
+        low = part.lower()
+        if low in ("none", "false", "0", "off", "no"):
+            continue
+        if low in ("all", "true", "1", "on", "yes"):
+            for kind in ("email", "phone"):
+                if kind not in tokens:
+                    tokens.append(kind)
+        elif low in ("email", "emails"):
+            if "email" not in tokens:
+                tokens.append("email")
+        elif low in ("phone", "phones"):
+            if "phone" not in tokens:
+                tokens.append("phone")
+        elif len(part) >= 2:
+            lit = "literal:" + part
+            if lit not in tokens:
+                tokens.append(lit)
+    return tuple(tokens)
+
+
+def _is_valid_domain(domain: str) -> bool:
+    labels = domain.split(".")
+    if len(labels) < 2 or len(labels) > 10:
+        return False
+    for label in labels:
+        if not (1 <= len(label) <= 63) or label.startswith("-") or label.endswith("-"):
+            return False
+        if not all(ch in _DOMAIN_LABEL_CHARS for ch in label):
+            return False
+    tld = labels[-1]
+    return 2 <= len(tld) <= 63 and tld.isascii() and tld.isalpha()
+
+
+def _mask_emails(text: str) -> str:
+    if "@" not in text:
+        return text
+    n = len(text)
+    out: list[str] = []
+    cursor = 0
+    at = text.find("@")
+    while at != -1:
+        if at < cursor:
+            at = text.find("@", cursor)
+            continue
+        left = at
+        while left > cursor and text[left - 1] in _EMAIL_LOCAL_CHARS:
+            left -= 1
+        while left < at and text[left] == ".":
+            left += 1
+        local = text[left:at]
+        valid_local = (
+            1 <= len(local) <= 64
+            and not local.endswith(".")
+            and ".." not in local
+            and (left == 0 or text[left - 1] not in ("/", "\\"))
+        )
+        right = at + 1
+        while right < n and (text[right] in _DOMAIN_LABEL_CHARS or text[right] == "."):
+            right += 1
+        end = right
+        while end > at + 1 and text[end - 1] in (".", "-"):
+            end -= 1
+        domain = text[at + 1:end]
+        if valid_local and _is_valid_domain(domain):
+            out.append(text[cursor:left])
+            out.append("[MASKED_EMAIL]")
+            cursor = end
+            at = text.find("@", cursor)
+        else:
+            at = text.find("@", at + 1)
+    if cursor == 0:
+        return text
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+def _digits_only(segment: str) -> bool:
+    return bool(segment) and all("0" <= ch <= "9" for ch in segment)
+
+
+def _mask_phones(text: str) -> str:
+    """Scan for formatted domestic and international phone numbers without matching dates, versions, or UUIDs."""
+    n = len(text)
+    if n < 9 or not any("0" <= ch <= "9" for ch in text):
+        return text
+    out: list[str] = []
+    cursor = 0
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch not in "+0123456789(":
+            i += 1
+            continue
+        if i > 0 and (text[i - 1].isalnum() or text[i - 1] in ("_", "/", "-", ".")):
+            i += 1
+            continue
+        pos = i
+        has_plus = False
+        has_paren = False
+        groups: list[str] = []
+        seps: list[str] = []
+        if text[pos] == "+":
+            has_plus = True
+            pos += 1
+            start_d = pos
+            while pos < n and "0" <= text[pos] <= "9" and pos - start_d < 4:
+                pos += 1
+            cc = text[start_d:pos]
+            if not (1 <= len(cc) <= 3) or pos >= n or text[pos] not in ("-", ".", " "):
+                i += 1
+                continue
+            groups.append(cc)
+            seps.append(text[pos])
+            pos += 1
+        while len(groups) < 4 and pos < n:
+            if text[pos] == "(" and not groups and not has_paren:
+                has_paren = True
+                pos += 1
+                start_d = pos
+                while pos < n and "0" <= text[pos] <= "9" and pos - start_d < 5:
+                    pos += 1
+                area = text[start_d:pos]
+                if not (2 <= len(area) <= 4) or pos >= n or text[pos] != ")":
+                    break
+                pos += 1
+                groups.append(area)
+                if pos < n and text[pos] in ("-", ".", " "):
+                    seps.append(text[pos])
+                    pos += 1
+                else:
+                    seps.append(" ")
+            else:
+                start_d = pos
+                while pos < n and "0" <= text[pos] <= "9" and pos - start_d < 5:
+                    pos += 1
+                seg = text[start_d:pos]
+                if not seg:
+                    break
+                groups.append(seg)
+                if pos < n and text[pos] in ("-", ".", " ") and len(groups) < (4 if has_plus else 3):
+                    next_pos = pos + 1
+                    if next_pos < n and "0" <= text[next_pos] <= "9":
+                        seps.append(text[pos])
+                        pos = next_pos
+                    else:
+                        break
+                else:
+                    break
+        valid_phone = False
+        right_ok = (
+            pos == n
+            or (
+                not text[pos].isalnum()
+                and text[pos] != "_"
+                and not (text[pos] in (".", "-", "/") and pos + 1 < n and text[pos + 1].isalnum())
+            )
+        )
+        if pos <= n and right_ok:
+            if has_plus and len(groups) in (3, 4):
+                if len(groups[-1]) == 4 and 3 <= len(groups[-2]) <= 4 and all(_digits_only(g) for g in groups):
+                    valid_phone = True
+            elif not has_plus and len(groups) == 3 and len(seps) == 2 and seps[0] == seps[1]:
+                g0, g1, g2 = groups
+                if len(g2) == 4 and 3 <= len(g1) <= 4 and 2 <= len(g0) <= 4:
+                    if g0.startswith("0") or has_paren or (len(g0) == 3 and seps[0] == "-"):
+                        valid_phone = True
+        if valid_phone:
+            out.append(text[cursor:i])
+            out.append("[MASKED_PHONE]")
+            cursor = pos
+            i = pos
+        else:
+            i += 1
+    if cursor == 0:
+        return text
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+def mask_pii(text: str, pii=None) -> str:
+    """Mask configured PII categories/literals in ``text`` for external egress only."""
+    if not text:
+        return text
+    tokens = parse_mask_pii(pii)
+    if not tokens:
+        return text
+    out = text
+    literals = [tok[len("literal:"):] for tok in tokens if tok.startswith("literal:")]
+    for lit in sorted(literals, key=len, reverse=True):
+        if lit in out:
+            out = out.replace(lit, "[MASKED_PII]")
+    if "email" in tokens:
+        out = _mask_emails(out)
+    if "phone" in tokens:
+        out = _mask_phones(out)
+    return out
+
+
+def mask_pii_value(value, pii=None, *, skip_keys=frozenset()):
+    """Mask only configured PII inside a JSON-like value (leaving secrets to separate checks)."""
+    tokens = parse_mask_pii(pii)
+    if not tokens:
+        return value
+    if isinstance(value, str):
+        return mask_pii(value, tokens)
+    if isinstance(value, dict):
+        return {mask_pii(key, tokens) if isinstance(key, str) else key:
+                item if key in skip_keys else mask_pii_value(item, tokens, skip_keys=skip_keys)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [mask_pii_value(item, tokens, skip_keys=skip_keys) for item in value]
+    if isinstance(value, tuple):
+        return tuple(mask_pii_value(item, tokens, skip_keys=skip_keys) for item in value)
+    return value
+
+
+def mask_secrets(text: str, *, pii=None) -> str:
     if not text:
         return text
     out = text
@@ -142,23 +374,25 @@ def mask_secrets(text: str) -> str:
         masked = pattern.sub(replacement, out)
         if masked is not out and masked != out:
             out, lowered = masked, masked.lower()
+    if pii is not None:
+        out = mask_pii(out, pii)
     return out
 
 
-def mask_value(value, *, skip_keys=frozenset()):
+def mask_value(value, *, skip_keys=frozenset(), pii=None):
     """Mask every string (and mapping key) inside a JSON-like value.
 
     ``skip_keys`` names mapping keys whose values are returned unchanged, for fields that
     must round-trip exactly (rule regexes, single-use grants).
     """
     if isinstance(value, str):
-        return mask_secrets(value)
+        return mask_secrets(value, pii=pii)
     if isinstance(value, dict):
-        return {mask_secrets(key) if isinstance(key, str) else key:
-                item if key in skip_keys else mask_value(item, skip_keys=skip_keys)
+        return {mask_secrets(key, pii=pii) if isinstance(key, str) else key:
+                item if key in skip_keys else mask_value(item, skip_keys=skip_keys, pii=pii)
                 for key, item in value.items()}
     if isinstance(value, list):
-        return [mask_value(item, skip_keys=skip_keys) for item in value]
+        return [mask_value(item, skip_keys=skip_keys, pii=pii) for item in value]
     if isinstance(value, tuple):
-        return tuple(mask_value(item, skip_keys=skip_keys) for item in value)
+        return tuple(mask_value(item, skip_keys=skip_keys, pii=pii) for item in value)
     return value

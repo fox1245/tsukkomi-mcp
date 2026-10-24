@@ -108,7 +108,8 @@ def test_literal_choices_match_the_model():
                           ("sqlite_journal", settings_core.SQLITE_JOURNAL_MODES),
                           ("sync_slicing", settings_core.SYNC_SLICING_MODES),
                           ("sparse_format", settings_core.SPARSE_FORMATS),
-                          ("project_contracts", settings_core.PROJECT_CONTRACT_MODES)):
+                          ("project_contracts", settings_core.PROJECT_CONTRACT_MODES),
+                          ("graph_reasoning_effort", settings_core.GRAPH_REASONING_EFFORTS)):
         assert typing.get_args(Settings.model_fields[name].annotation) == choices, name
 
 
@@ -149,8 +150,11 @@ def test_the_hook_reader_never_reads_the_working_directory_env_file(world):
 
 
 def test_the_light_settings_hide_the_api_key_in_repr(world):
-    put(world, OPENROUTER_API_KEY="sk-synthetic-not-a-real-key")
-    assert "sk-synthetic" not in repr(load_hook_settings())
+    put(world, OPENROUTER_API_KEY="sk-synthetic-not-a-real-key",
+        SELF_DIRECT_EMBEDDING_API_KEY="emb-synthetic-not-a-real-key")
+    for s in (hook_settings(), load_hook_settings()):
+        assert "sk-synthetic" not in repr(s)
+        assert "emb-synthetic" not in repr(s)
 
 
 def test_the_hook_adapters_run_on_the_light_reader(world):
@@ -202,6 +206,7 @@ CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Adviso
                                 "Grok", "grok "],
            "dense_backend": ["sqlite-vector", "numpy", "pgvector", "NumPy", "PGVECTOR", "Pgvector", "", "sqlite_vector", "faiss",
                              "pg-vector", "pgvector ", "postgres"],
+           "graph_reasoning_effort": ["none", "minimal", "low", "medium", "high", "Low", "HIGH", "", " low", "low ", "max", "auto", "true", "1"],
            "graph_extractor": ["openrouter", "host", "Host", "HOST", "OpenRouter", "OPENROUTER", "", " host", "host ",
                                "open_router", "open-router", "local", "none", "true", "1", "host\n"],
            "daemon": ["off", "on", "On", "ON", "", " on", "on ", "auto", "true", "1", "false", "Off"],
@@ -237,13 +242,18 @@ FIELD_KINDS = {
     "audit_incremental": "bool", "audit_shadow_every": "shadow_every", "audit_shadow_idle_sec": "float",
     "audit_incremental_min_events": "int", "sync_slice_bytes": "int",
     "session_start_max_contracts": "int",
+    "embedding_api_key_file": "path",
+    "graph_max_output_tokens": "int",
 }
 # SELF_DIRECT_PGVECTOR_SCHEMA: ASCII letters, digits, underscore; at most 63; no leading digit; not pg_* or information_schema.
 PGVECTOR_SCHEMAS = ["tsukkomi", "a_b1", "Tsukkomi", "_x", "x", "public", "x" * 63, "x" * 64, "1abc", "", " tsukkomi", "tsukkomi ",
                     "x y", "a;b", 'a"b', "a-b", "a$b", "schema\u00e9", "pg_catalog", "PG_x", "pgx", "information_schema",
                     "Information_Schema", "tsukkomi\n", "a.b", "\u0661a"]
 FREE_TEXT = {"pgvector_schema": PGVECTOR_SCHEMAS, "embedding_model": ["m", "", " spaced model ", "a/b:c"], "embedding_base_url": ["http://x", "", "u r l"],
-             "openrouter_api_key": ["k", "", " k ", "sk-synthetic"]}
+             "openrouter_api_key": ["k", "", " k ", "sk-synthetic"],
+             "embedding_api_key": ["k", "", " k ", "emb-synthetic"],
+             "mask_pii": ["email", "email,phone", "", "all", "none"],
+             "graph_model": ["deepseek/deepseek-v4-flash-0731", "m", "", "a/b:c"]}
 
 
 def single_cases():

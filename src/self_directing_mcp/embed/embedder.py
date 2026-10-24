@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import time
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from self_directing_mcp._runtime import np
 
-from self_directing_mcp.security.mask import mask_secrets, register_secret
+from self_directing_mcp.security.mask import mask_secrets, parse_mask_pii, register_secret
+from self_directing_mcp.settings_core import is_openrouter_url
 from self_directing_mcp.request_control import check_request, current_request, request_operation
 
 
@@ -124,33 +126,50 @@ class OpenRouterEmbedder(Embedder):
     @property
     def cache_key(self) -> str:
         identity = f"{super().cache_key}:split-{self.document_chunk_chars}-weighted-mean-v1"
+        pii_tokens = self._resolved_pii()
+        if pii_tokens:
+            identity += f":pii-{','.join(pii_tokens)}"
         return hashlib.sha256(identity.encode()).hexdigest()
 
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None = None,
         model: str = "qwen/qwen3-embedding-8b",
         dim: int = 1024,
         base_url: str = "https://openrouter.ai/api/v1",
+        *,
+        mask_pii: str | Iterable[str] | None = None,
     ) -> None:
-        self.api_key = api_key
-        register_secret(api_key)
+        cleaned_key = api_key.strip() if isinstance(api_key, str) and api_key.strip() else None
+        if cleaned_key and not is_openrouter_url(base_url):
+            env_or_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+            env_emb_key = (os.environ.get("SELF_DIRECT_EMBEDDING_API_KEY") or "").strip()
+            if env_or_key and cleaned_key == env_or_key and cleaned_key != env_emb_key:
+                cleaned_key = None
+        self.api_key = cleaned_key
+        if self.api_key:
+            register_secret(self.api_key)
         self.model = model
         self.dim = dim
         self.base_url = base_url.rstrip("/")
+        self.mask_pii = mask_pii
+
+    def _resolved_pii(self) -> tuple[str, ...]:
+        raw = self.mask_pii if self.mask_pii is not None else os.environ.get("SELF_DIRECT_MASK_PII")
+        return parse_mask_pii(raw)
 
     def _call(self, texts: Sequence[str]) -> list[np.ndarray]:
         import httpx
         check_request()
+        pii = self._resolved_pii()
         inputs = []
         for text in texts:
             check_request()
-            inputs.append(mask_secrets(text))
+            inputs.append(mask_secrets(text, pii=pii))
         payload = {"model": self.model, "input": inputs, "dimensions": self.dim}
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         with httpx.Client(timeout=httpx.Timeout(180.0, connect=10.0)) as client:
             for attempt in range(3):
                 check_request()
@@ -198,11 +217,12 @@ class OpenRouterEmbedder(Embedder):
             return []
         # Mask BEFORE splitting so credentials crossing a segment boundary
         # cannot evade redaction. Preserve every character of sanitized text.
+        pii = self._resolved_pii()
         segments = []
         owners = []
         for index, original in enumerate(texts):
             check_request()
-            text = mask_secrets(original)
+            text = mask_secrets(original, pii=pii)
             parts = [text[i:i + self.document_chunk_chars]
                      for i in range(0, len(text), self.document_chunk_chars)] or [""]
             for part in parts:
@@ -234,9 +254,10 @@ def build_embedder(
     model: str = "qwen/qwen3-embedding-8b",
     dim: int = 1024,
     base_url: str = "https://openrouter.ai/api/v1",
+    mask_pii: str | Iterable[str] | None = None,
 ) -> tuple[Embedder, bool]:
     if use_fake:
         return FakeEmbedder(dim=dim), False
-    if not api_key or not api_key.strip():
+    if is_openrouter_url(base_url) and (not api_key or not api_key.strip()):
         raise ValueError("OPENROUTER_API_KEY is required unless the fake embedder is explicitly enabled")
-    return OpenRouterEmbedder(api_key=api_key, model=model, dim=dim, base_url=base_url), False
+    return OpenRouterEmbedder(api_key=api_key, model=model, dim=dim, base_url=base_url, mask_pii=mask_pii), False

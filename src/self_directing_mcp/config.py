@@ -53,10 +53,28 @@ class Settings(SettingsAccessors, BaseSettings):
         default=None,
         description="Optional JSON contracts file; default index_dir/contracts.json",
     )
-    openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
+    openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY", repr=False)
     embedding_model: str = settings_core.DEFAULT_EMBEDDING_MODEL
     embedding_dim: int = settings_core.DEFAULT_EMBEDDING_DIM
     embedding_base_url: str = settings_core.DEFAULT_EMBEDDING_BASE_URL
+    embedding_api_key: str | None = Field(
+        default=None,
+        repr=False,
+        description="Optional bearer token dedicated to the embedding endpoint; prevents leaking OPENROUTER_API_KEY "
+                    "to a custom SELF_DIRECT_EMBEDDING_BASE_URL. SELF_DIRECT_EMBEDDING_API_KEY.",
+    )
+    embedding_api_key_file: Path | None = Field(
+        default=None,
+        description="Optional dotenv/key file for the embedding endpoint; when unset or empty on a non-OpenRouter "
+                    "SELF_DIRECT_EMBEDDING_BASE_URL, requests are sent without an Authorization header. "
+                    "SELF_DIRECT_EMBEDDING_API_KEY_FILE.",
+    )
+    mask_pii: str | None = Field(
+        default=None,
+        description="Optional comma-separated PII categories/literals (e.g. 'email,phone') masked only on external "
+                    "egress (remote embedding, remote GraphRAG extraction, workflow classification), leaving the "
+                    "local index and regex contract audits untouched. SELF_DIRECT_MASK_PII.",
+    )
     use_fake_embedder: bool = False
     local_only: bool = False
     dense_backend: Literal["sqlite-vector", "numpy", "pgvector"] = settings_core.DEFAULT_DENSE_BACKEND
@@ -94,6 +112,19 @@ class Settings(SettingsAccessors, BaseSettings):
                     "disables that tool (error extractor_disabled, no key and no network touched) so that only the "
                     "calling agent extracts, through graph_next_batch and graph_submit_batch, which work in both "
                     "modes. SELF_DIRECT_GRAPH_EXTRACTOR.",
+    )
+    graph_model: str = Field(
+        default=settings_core.DEFAULT_GRAPH_MODEL,
+        description="OpenRouter model id used by run_neograph_update for GraphRAG extraction. SELF_DIRECT_GRAPH_MODEL.",
+    )
+    graph_max_output_tokens: int = Field(
+        default=settings_core.DEFAULT_GRAPH_MAX_OUTPUT_TOKENS,
+        ge=1,
+        description="Maximum completion tokens requested by run_neograph_update. SELF_DIRECT_GRAPH_MAX_OUTPUT_TOKENS.",
+    )
+    graph_reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] = Field(
+        default=settings_core.DEFAULT_GRAPH_REASONING_EFFORT,
+        description="Reasoning effort requested by run_neograph_update. SELF_DIRECT_GRAPH_REASONING_EFFORT.",
     )
     max_tool_timeout_sec: float = Field(
         default=settings_core.DEFAULT_MAX_TOOL_TIMEOUT_SEC,

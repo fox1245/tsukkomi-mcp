@@ -32,6 +32,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES
 
@@ -45,6 +46,7 @@ REMOTE_DENSE_BACKENDS = ("pgvector",)        # a database server: never on the h
 DAEMON_MODES = ("off", "on")
 SQLITE_JOURNAL_MODES = ("auto", "delete")    # journal.py validates the same two values
 GRAPH_EXTRACTORS = ("openrouter", "host")    # who extracts for run_neograph_update: an OpenRouter model, or only the host agent
+GRAPH_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high")
 SYNC_SLICING_MODES = ("auto", "off")         # index.ingest.SlicePolicy takes the same two values
 SPARSE_FORMATS = ("auto", "legacy", "compact", "cjk")   # index.sparse.open_sparse_index takes the same four values
 PROJECT_CONTRACT_MODES = ("candidates", "off")   # contract_bundles: discover the project bundle as candidates, or not at all
@@ -55,6 +57,9 @@ DEFAULT_DENSE_BACKEND = "sqlite-vector"
 DEFAULT_PGVECTOR_SCHEMA = "tsukkomi"
 DEFAULT_DAEMON = "off"
 DEFAULT_GRAPH_EXTRACTOR = "openrouter"
+DEFAULT_GRAPH_MODEL = "deepseek/deepseek-v4-flash-0731"
+DEFAULT_GRAPH_MAX_OUTPUT_TOKENS = 8000
+DEFAULT_GRAPH_REASONING_EFFORT = "low"
 DEFAULT_SQLITE_JOURNAL = "delete"            # "auto" is opt-in until the commit benchmark says otherwise (README, "SQLite journal")
 DEFAULT_SYNC_SLICING = "auto"                # "off" is exactly the all-or-nothing sync of before slicing (README, "Large sessions and deadlines")
 DEFAULT_SPARSE_FORMAT = "auto"               # cjk once built (or on a fresh install), else compact, else legacy, visibly (README, "Sparse index formats")
@@ -85,9 +90,31 @@ AGY_APP_DATA_NAMES = ("antigravity", "antigravity-cli", "antigravity-ide")
 
 PATH_FIELDS = frozenset({
     "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
-    "grok_sessions_dir", "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file", "pgvector_dsn_file",
-    "contract_bundle_paths",
+    "grok_sessions_dir", "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file",
+    "embedding_api_key_file", "pgvector_dsn_file", "contract_bundle_paths",
 })
+
+GRAPH_TOML_KEYS = {
+    "model": "graph_model",
+    "graph_model": "graph_model",
+    "max_output_tokens": "graph_max_output_tokens",
+    "graph_max_output_tokens": "graph_max_output_tokens",
+    "reasoning_effort": "graph_reasoning_effort",
+    "graph_reasoning_effort": "graph_reasoning_effort",
+    "extractor": "graph_extractor",
+    "graph_extractor": "graph_extractor",
+}
+
+
+def is_openrouter_url(url: object) -> bool:
+    """Whether ``url`` targets an official OpenRouter host (the only host ``OPENROUTER_API_KEY`` may be sent to)."""
+    if not isinstance(url, str) or not url.strip():
+        return False
+    try:
+        host = (urlsplit(url.strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in ("openrouter.ai", "www.openrouter.ai")
 
 
 # --- default factories --------------------------------------------------------------------------------------
@@ -236,12 +263,35 @@ def toml_path_settings() -> dict[str, object]:
         return {}
     except (OSError, UnicodeError, tomllib.TOMLDecodeError):
         raise ValueError("Unable to read valid TOML path configuration") from None
-    if set(document) - {"paths"}:
-        raise ValueError("TOML path configuration only supports [paths]")
+    if set(document) - {"paths", "graph"}:
+        raise ValueError("TOML path configuration only supports [paths] and [graph]")
     paths = document.get("paths", {})
     if not isinstance(paths, dict) or set(paths) - PATH_FIELDS:
         raise ValueError("Invalid or unknown TOML path setting")
+    graph = document.get("graph", {})
+    if not isinstance(graph, dict) or set(graph) - set(GRAPH_TOML_KEYS):
+        raise ValueError("Invalid or unknown TOML graph setting")
     resolved: dict[str, object] = {}
+    for raw_key, value in graph.items():
+        target = GRAPH_TOML_KEYS[raw_key]
+        if target in resolved:
+            raise ValueError(f"Duplicate TOML graph setting for {target}")
+        if target == "graph_model":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("TOML graph_model must be a nonempty string")
+            resolved[target] = value
+        elif target == "graph_max_output_tokens":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError("TOML graph_max_output_tokens must be a positive integer")
+            resolved[target] = value
+        elif target == "graph_reasoning_effort":
+            if not isinstance(value, str) or value not in GRAPH_REASONING_EFFORTS:
+                raise ValueError("Invalid TOML graph_reasoning_effort")
+            resolved[target] = value
+        elif target == "graph_extractor":
+            if not isinstance(value, str) or value not in GRAPH_EXTRACTORS:
+                raise ValueError("Invalid TOML graph_extractor")
+            resolved[target] = value
     for name, value in paths.items():
         if name == "grokbot_transcripts_dir":
             from self_directing_mcp.grokbot.discover import parse_transcripts_dirs
@@ -288,6 +338,46 @@ class SettingsAccessors:
                 raise ValueError("Configured OpenRouter key file has no OPENROUTER_API_KEY")
             return key.strip()
         return self.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
+
+    def resolve_embedding_api_key(self) -> str | None:
+        """Resolve the API key for the embedding endpoint without leaking OPENROUTER_API_KEY to custom hosts."""
+        openrouter = is_openrouter_url(self.embedding_base_url)
+        if getattr(self, "embedding_api_key_file", None) is not None:
+            from dotenv import dotenv_values
+            source = Path(self.embedding_api_key_file).expanduser().resolve()
+            if not source.is_file():
+                raise ValueError("Configured embedding key file does not exist")
+            raw_text = source.read_text(encoding="utf-8", errors="replace").strip()
+            if not raw_text:
+                if openrouter:
+                    raise ValueError("Configured embedding key file has no API key")
+                return None
+            values = dotenv_values(source, interpolate=False)
+            key = (
+                values.get("SELF_DIRECT_EMBEDDING_API_KEY")
+                or values.get("EMBEDDING_API_KEY")
+                or (values.get("OPENROUTER_API_KEY") if openrouter else None)
+            )
+            if key is None and "=" not in raw_text and len(raw_text.splitlines()) == 1:
+                key = raw_text
+            if not key or not key.strip():
+                if openrouter:
+                    raise ValueError("Configured embedding key file has no API key")
+                return None
+            return key.strip()
+        explicit = getattr(self, "embedding_api_key", None) or os.environ.get("SELF_DIRECT_EMBEDDING_API_KEY")
+        if explicit is not None and explicit.strip():
+            return explicit.strip()
+        if openrouter:
+            return self.resolve_api_key()
+        return None
+
+    def resolve_mask_pii(self) -> tuple[str, ...]:
+        from self_directing_mcp.security.mask import parse_mask_pii
+        raw = getattr(self, "mask_pii", None)
+        if raw is None:
+            raw = os.environ.get("SELF_DIRECT_MASK_PII")
+        return parse_mask_pii(raw)
 
     def resolve_pgvector_dsn(self) -> str:
         """The libpq connection string from ``pgvector_dsn_file``, or ``""`` to use the libpq environment alone
@@ -494,6 +584,9 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("embedding_model", lambda name, text: text, _static(DEFAULT_EMBEDDING_MODEL)),
     FieldSpec("embedding_dim", lambda name, text: _to_int(name, text), _static(DEFAULT_EMBEDDING_DIM)),
     FieldSpec("embedding_base_url", lambda name, text: text, _static(DEFAULT_EMBEDDING_BASE_URL)),
+    FieldSpec("embedding_api_key", lambda name, text: text, _static(None)),
+    FieldSpec("embedding_api_key_file", _path, _static(None)),
+    FieldSpec("mask_pii", lambda name, text: text, _static(None)),
     FieldSpec("use_fake_embedder", lambda name, text: _to_bool(name, text), _static(False)),
     FieldSpec("local_only", lambda name, text: _to_bool(name, text), _static(False)),
     FieldSpec("dense_backend", _literal(DENSE_BACKENDS), _static(DEFAULT_DENSE_BACKEND)),
@@ -512,6 +605,10 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("graph_update_timeout_sec", lambda name, text: _to_float(name, text, positive=True, finite=True),
               _static(DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC)),
     FieldSpec("graph_extractor", _literal(GRAPH_EXTRACTORS), _static(DEFAULT_GRAPH_EXTRACTOR)),
+    FieldSpec("graph_model", lambda name, text: text, _static(DEFAULT_GRAPH_MODEL)),
+    FieldSpec("graph_max_output_tokens", lambda name, text: _to_int(name, text, 1),
+              _static(DEFAULT_GRAPH_MAX_OUTPUT_TOKENS)),
+    FieldSpec("graph_reasoning_effort", _literal(GRAPH_REASONING_EFFORTS), _static(DEFAULT_GRAPH_REASONING_EFFORT)),
     FieldSpec("max_tool_timeout_sec", lambda name, text: _to_float(name, text, positive=True),
               _static(DEFAULT_MAX_TOOL_TIMEOUT_SEC)),
     FieldSpec("max_concurrent_calls", lambda name, text: _to_int(name, text, 1), _static(DEFAULT_MAX_CONCURRENT_CALLS)),
@@ -565,7 +662,7 @@ class LightSettings(SettingsAccessors):
         return {name: self.__dict__[name] for name in FIELD_NAMES}
 
     def __repr__(self) -> str:
-        shown = {name: ("***" if name == "openrouter_api_key" and value else value)
+        shown = {name: ("***" if name in ("openrouter_api_key", "embedding_api_key") and value else value)
                  for name, value in self.model_dump().items()}
         return "LightSettings(" + ", ".join(f"{k}={v!r}" for k, v in shown.items()) + ")"
 

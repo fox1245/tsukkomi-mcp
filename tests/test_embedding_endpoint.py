@@ -103,7 +103,7 @@ def test_the_engine_embeds_and_searches_through_a_local_endpoint(local_endpoint)
     assert stub.requests, "the client never called the configured endpoint"
     first = stub.requests[0]
     assert first["path"] == "/v1/embeddings"
-    assert first["authorization"] == "Bearer local-server-needs-no-key"
+    assert first["authorization"] is None
     assert first["body"]["model"] == "local-test-model" and first["body"]["dimensions"] == DIM
     assert all(isinstance(text, str) for request in stub.requests for text in request["body"]["input"])
     status = engine.audit_status(session_id=SID)
@@ -123,3 +123,68 @@ def test_a_query_is_embedded_by_the_same_endpoint(local_endpoint):
     before = len(stub.requests)
     assert engine.search_history("배포 계약", session_id=SID, mode="dense")["hits"]
     assert len(stub.requests) > before, "the query vector did not come from the configured endpoint"
+
+
+def test_local_endpoint_uses_dedicated_embedding_api_key_file_and_masks_pii(tmp_path, monkeypatch):
+    from self_directing_mcp.config import Settings
+    from self_directing_mcp.engine import SelfDirectEngine
+
+    key_file = tmp_path / "emb.key"
+    key_file.write_text("EMBEDDING_API_KEY=dedicated-local-emb-key\n", encoding="utf-8")
+    root = tmp_path / "sessions"
+    root.mkdir()
+    raw_text = "Contact alice.dev@example.invalid. Call +82-10-1234-5678. On 2026-10-24 v0.14.1"
+    write(
+        root / f"rollout-2026-09-09T01-00-00-{SID}.jsonl",
+        [{"type": "session_meta", "payload": {"id": SID}}, message(raw_text)],
+    )
+    with Stub() as stub:
+        engine = SelfDirectEngine(Settings(
+            codex_sessions_dir=root,
+            use_fake_embedder=False,
+            local_only=False,
+            dense_backend="numpy",
+            index_dir=tmp_path / "index",
+            contracts_path=tmp_path / "contracts.json",
+            embedding_base_url=stub.base_url,
+            embedding_model="local-test-model",
+            embedding_dim=DIM,
+            openrouter_api_key="openrouter-secret-must-not-leak",
+            embedding_api_key_file=key_file,
+            mask_pii="email,phone",
+            _env_file=None,
+        ))
+        try:
+            engine.ensure_ready()
+            res = engine.sync_session(session_id=SID, embed=True)
+            assert res["ok"] is True
+            assert stub.requests
+            req = stub.requests[0]
+            assert req["authorization"] == "Bearer dedicated-local-emb-key"
+            sent_inputs = " ".join(req["body"]["input"])
+            assert "alice.dev@example.invalid" not in sent_inputs
+            assert "+82-10-1234-5678" not in sent_inputs
+            assert "[MASKED_EMAIL]." in sent_inputs and "[MASKED_PHONE]." in sent_inputs
+            assert "2026-10-24" in sent_inputs and "v0.14.1" in sent_inputs
+        finally:
+            engine.close()
+
+
+def test_shared_dotenv_with_only_openrouter_key_never_leaks_to_local_endpoint(tmp_path):
+    from self_directing_mcp.config import Settings
+
+    shared_env = tmp_path / "shared.env"
+    shared_env.write_text("OPENROUTER_API_KEY=or-secret-never-send-to-local\n", encoding="utf-8")
+    s_local = Settings(
+        embedding_base_url="http://127.0.0.1:11434/v1",
+        embedding_api_key_file=shared_env,
+        _env_file=None,
+    )
+    assert s_local.resolve_embedding_api_key() is None
+
+    s_or = Settings(
+        embedding_base_url="https://openrouter.ai/api/v1",
+        embedding_api_key_file=shared_env,
+        _env_file=None,
+    )
+    assert s_or.resolve_embedding_api_key() == "or-secret-never-send-to-local"

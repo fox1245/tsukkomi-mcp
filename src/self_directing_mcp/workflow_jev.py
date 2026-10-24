@@ -15,7 +15,7 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .security.mask import mask_secrets, register_secret
+from .security.mask import mask_pii_value, mask_secrets, parse_mask_pii, register_secret
 
 
 def __getattr__(name: str):
@@ -159,7 +159,8 @@ def _safe_context(value: object) -> bool:
 
 def classify(context: dict, *, api_key: str | None = None,
              key_file: Path | None = None, model: str = MODEL,
-             threshold: float = .7, timeout_sec: float = 15) -> ClassifierResult:
+             threshold: float = .7, timeout_sec: float = 15,
+             mask_pii: object = None) -> ClassifierResult:
     """Evaluate approved external context; all failures are explicitly nonauthorizing.
 
     An explicit key file is authoritative and reads OPENROUTER_API_KEY only, without
@@ -175,6 +176,10 @@ def classify(context: dict, *, api_key: str | None = None,
     try:
         if not isinstance(context, dict) or not _safe_context(context):
             return _failure("unsafe_context", "Context is not a JSON object free of recognized secret material.", model, "")
+        pii_spec = mask_pii if mask_pii is not None else os.environ.get("SELF_DIRECT_MASK_PII")
+        pii_tokens = parse_mask_pii(pii_spec)
+        if pii_tokens:
+            context = mask_pii_value(context, pii_tokens)
         request = {
             "model": model,
             "state": context,

@@ -67,6 +67,7 @@ from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.timeseries import analyze_activity
 from self_directing_mcp import graph_batch
 from self_directing_mcp.graphrag import GraphStore, validate_proposal
+from self_directing_mcp import neograph_runner
 from self_directing_mcp.neograph_runner import run_update_pipeline
 from self_directing_mcp.neograph_runtime import ng, graph_operation
 from self_directing_mcp.request_control import (
@@ -416,12 +417,25 @@ class SelfDirectEngine:
 
         if not s.local_only:
             self.embedder, self.embedder_degraded = build_embedder(
-                api_key=s.resolve_api_key(),
+                api_key=s.resolve_embedding_api_key(),
                 use_fake=s.use_fake_embedder,
                 model=s.embedding_model,
                 dim=s.embedding_dim,
                 base_url=s.embedding_base_url,
+                mask_pii=s.mask_pii,
             )
+            if s.graph_extractor == "openrouter" and (
+                not s.use_fake_embedder
+                or getattr(s, "graph_model", neograph_runner.DEFAULT_GRAPH_MODEL) != neograph_runner.DEFAULT_GRAPH_MODEL
+                or neograph_runner._model_catalog_cache is not None
+            ):
+                check = neograph_runner.validate_graph_model(
+                    getattr(s, "graph_model", neograph_runner.DEFAULT_GRAPH_MODEL),
+                    max_output_tokens=getattr(s, "graph_max_output_tokens", neograph_runner.DEFAULT_GRAPH_MAX_OUTPUT_TOKENS),
+                    fetch=True,
+                )
+                if not check["ok"]:
+                    raise ValueError(check["message"])
             policy = self.embedder.cache_key[:16]
             remote = ({"dsn": s.resolve_pgvector_dsn(), "schema": s.pgvector_schema, "hnsw": s.pgvector_hnsw,
                        "policy": policy} if s.dense_backend == "pgvector" else {})
@@ -2499,17 +2513,56 @@ class SelfDirectEngine:
         if self.neograph is None:
             return {"ok": False, "error": "neograph_missing",
                     "message": "pip install neograph-engine first."}
+        graph_model = getattr(self.settings, "graph_model", neograph_runner.DEFAULT_GRAPH_MODEL)
+        graph_max_out = getattr(self.settings, "graph_max_output_tokens", neograph_runner.DEFAULT_GRAPH_MAX_OUTPUT_TOKENS)
+        graph_effort = getattr(self.settings, "graph_reasoning_effort", neograph_runner.DEFAULT_GRAPH_REASONING_EFFORT)
+        should_fetch_catalog = (
+            not getattr(self.settings, "use_fake_embedder", False)
+            or graph_model != neograph_runner.DEFAULT_GRAPH_MODEL
+            or neograph_runner._model_catalog_cache is not None
+        )
+        model_check = neograph_runner.validate_graph_model(
+            graph_model,
+            max_output_tokens=graph_max_out,
+            fetch=should_fetch_catalog,
+        )
+        if not model_check["ok"]:
+            return {**model_check, "graph_cursor_after": cursor}
         if not read.total:
             return {"ok": False, "error": "no_events",
                     "message": "Nothing to extract; sync_session first."}
         if read.start >= read.total or (not read.frames and read.blocked is None):
             return {"ok": True, "status": "up_to_date", "graph_cursor_after": cursor}
         pending = read.total - read.start
-        batch = [mask_value(frame) for frame in read.frames]
+        pii = self.settings.resolve_mask_pii() if hasattr(self.settings, "resolve_mask_pii") else ()
+        batch = [mask_value(frame, pii=pii) for frame in read.frames]
         if not batch:
             return {"ok": False, "error": "graph_event_too_large",
                     "chunk_id": read.blocked["chunk_id"], "graph_cursor_after": cursor,
                     "message": "The next complete event exceeds the graph input budget; no text was truncated."}
+        budget_tokens = neograph_runner.compute_input_token_budget(
+            graph_model,
+            max_output_tokens=graph_max_out,
+            context_length=model_check.get("context_length"),
+            max_completion_tokens=model_check.get("max_completion_tokens"),
+        )
+        trimmed_batch, needed_tokens, needed_chars = neograph_runner.trim_events_to_budget(
+            batch,
+            budget_tokens=budget_tokens,
+            pii=pii,
+        )
+        if not trimmed_batch:
+            return {
+                "ok": False,
+                "error": "graph_event_too_large",
+                "chunk_id": batch[0]["chunk_id"],
+                "needed_tokens": needed_tokens,
+                "budget_tokens": budget_tokens,
+                "needed_chars": needed_chars,
+                "graph_cursor_after": cursor,
+                "message": "The next complete event exceeds the graph input budget; no text was truncated.",
+            }
+        batch = trimmed_batch
         proposal_result: dict[str, Any] = {}
 
         def on_proposal(step: str, proposal: Any) -> dict[str, Any]:
@@ -2526,11 +2579,19 @@ class SelfDirectEngine:
             return self._commit_neograph_snapshot(sid, resolved_provider, proposal,
                 cursor["graph_version"], through, cancel_event=cancel_event, _deadline=_deadline)
 
+        extra_kwargs: dict[str, Any] = {}
+        if run_update_pipeline is neograph_runner.run_update_pipeline:
+            extra_kwargs = {
+                "max_tokens": graph_max_out,
+                "reasoning_effort": graph_effort,
+                "mask_pii": pii,
+                "budget_tokens": budget_tokens,
+            }
         pipeline = run_update_pipeline(
             session_id=sid, provider=resolved_provider, events=batch,
-            api_key=api_key, model="deepseek/deepseek-v4-flash-0731",
+            api_key=api_key, model=graph_model,
             checkpoint_dir=Path(self.settings.index_dir), on_proposal=on_proposal,
-            _deadline=_deadline, cancel_event=cancel_event)
+            _deadline=_deadline, cancel_event=cancel_event, **extra_kwargs)
         # Preserve actual completed workflow receipts even after response expiry.
         with self._lock:
             pipeline["graph_cursor_after"] = self.graph.observed_cursor(sid, resolved_provider)
@@ -2844,6 +2905,14 @@ class SelfDirectEngine:
             "vector_compute_backend": getattr(self.dense, "compute_backend", None),
             "embedder": type(self.embedder).__name__ if self.embedder else None,
             "embedder_degraded": self.embedder_degraded,
+            "graph_extractor": getattr(s, "graph_extractor", "openrouter"),
+            "graph_model": getattr(s, "graph_model", neograph_runner.DEFAULT_GRAPH_MODEL),
+            "graph_max_output_tokens": getattr(s, "graph_max_output_tokens", neograph_runner.DEFAULT_GRAPH_MAX_OUTPUT_TOKENS),
+            "graph_reasoning_effort": getattr(s, "graph_reasoning_effort", neograph_runner.DEFAULT_GRAPH_REASONING_EFFORT),
+            "graph_input_budget_tokens": neograph_runner.compute_input_token_budget(
+                getattr(s, "graph_model", neograph_runner.DEFAULT_GRAPH_MODEL),
+                max_output_tokens=getattr(s, "graph_max_output_tokens", neograph_runner.DEFAULT_GRAPH_MAX_OUTPUT_TOKENS),
+            ),
             "degraded_flags": [],
             "total_chunks": self.store.chunk_count(),
             "legacy_chunks_retained": self.store.legacy_count(),

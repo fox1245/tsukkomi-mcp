@@ -171,3 +171,251 @@ def test_graph_extraction_masks_session_secrets_before_remote_prompt(tmp_path, m
         assert "event-1" in prompts[0]
     finally:
         engine.close()
+
+
+def test_graph_settings_toml_catalog_validation_and_audit_status(tmp_path, monkeypatch):
+    from self_directing_mcp import neograph_runner, settings_core
+    from self_directing_mcp.config import hook_settings
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[paths]\nembedding_api_key_file = "emb.key"\n'
+        '[graph]\nmodel = "qwen/qwen3-30b-a3b"\nmax_output_tokens = 6000\nreasoning_effort = "medium"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SELF_DIRECT_CONFIG_FILE", str(cfg))
+    for reader in (hook_settings, settings_core.load_hook_settings):
+        s = reader()
+        assert s.graph_model == "qwen/qwen3-30b-a3b"
+        assert s.graph_max_output_tokens == 6000
+        assert s.graph_reasoning_effort == "medium"
+        assert s.embedding_api_key_file == (tmp_path / "emb.key").resolve()
+
+    fake_catalog = {
+        "qwen/qwen3-30b-a3b": {"id": "qwen/qwen3-30b-a3b", "context_length": 65536, "supported_parameters": ["response_format", "reasoning"]},
+        "bad/no-json-model": {"id": "bad/no-json-model", "context_length": 32768, "supported_parameters": ["temperature"]},
+    }
+    neograph_runner.set_model_catalog_cache(fake_catalog)
+    try:
+        info = neograph_runner.validate_graph_model("qwen/qwen3-30b-a3b")
+        assert info["ok"] is True
+        assert info["context_length"] == 65536
+        bad_info = neograph_runner.validate_graph_model("bad/no-json-model")
+        assert bad_info["ok"] is False and bad_info["error"] == "unsupported_graph_model"
+        missing_info = neograph_runner.validate_graph_model("unknown/missing-model")
+        assert missing_info["ok"] is False and missing_info["error"] == "invalid_graph_model"
+    finally:
+        neograph_runner.clear_model_catalog_cache()
+
+
+def test_graph_batch_trimming_and_specific_failure_reasons(tmp_path, monkeypatch):
+    from self_directing_mcp import neograph_runner
+    from self_directing_mcp.neograph_runner import _Transport
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-not-a-real-key")
+    neograph_runner.set_model_catalog_cache({
+        neograph_runner.DEFAULT_GRAPH_MODEL: {
+            "id": neograph_runner.DEFAULT_GRAPH_MODEL,
+            "context_length": 1800,
+            "supported_parameters": ["response_format", "reasoning"],
+        }
+    })
+    prompts = []
+    def complete_ok(self, prompt):
+        prompts.append(prompt)
+        return {
+            "nodes": [
+                {"node_id": "file:src/a.py", "kind": "File", "label": "src/a.py"},
+                {"node_id": "req:R-1", "kind": "Requirement", "label": "R-1"},
+            ],
+            "edges": [
+                {
+                    "src": "file:src/a.py",
+                    "dst": "req:R-1",
+                    "relation": "IMPLEMENTS",
+                    "origin": "observed",
+                    "evidence_chunk_ids": ["ev-1"],
+                }
+            ],
+            "extraction_summary": "extracted file relation",
+        }, 12
+
+    monkeypatch.setattr(_Transport, "complete_json", complete_ok)
+    engine = SelfDirectEngine(Settings(
+        use_fake_embedder=True,
+        index_dir=tmp_path / "index",
+        contracts_path=tmp_path / "contracts.json",
+        graph_max_output_tokens=1000,
+        mask_pii="email",
+    ))
+    try:
+        engine.ensure_ready()
+        status = engine.audit_status()
+        assert status["graph_model"] == neograph_runner.DEFAULT_GRAPH_MODEL
+        assert status["graph_max_output_tokens"] == 1000
+        assert status["graph_reasoning_effort"] == "low"
+        assert isinstance(status["graph_input_budget_tokens"], int) and status["graph_input_budget_tokens"] > 0
+
+        engine.store.commit_events([
+            Chunk(chunk_id="ev-1", session_id=SID, provider="codex", kind="turn",
+                  text="contact dev@example.invalid src/a.py IMPLEMENTS R-1 " + ("alpha " * 90), content_hash="h1"),
+            Chunk(chunk_id="ev-2", session_id=SID, provider="codex", kind="turn",
+                  text="second event src/a.py IMPLEMENTS R-1 " + ("beta " * 90), content_hash="h2"),
+        ], session_id=SID, provider="codex", path=tmp_path / "s.jsonl", offset=20, digest="d1")
+
+        r1 = engine.run_neograph_update(SID)
+        assert r1["ok"] is True
+        assert r1["batch_events"] == 1
+        assert r1["remaining_events"] == 1
+        assert "dev@example.invalid" not in prompts[0]
+        assert "[MASKED_EMAIL]" in prompts[0]
+
+        # Drain ev-2 with matching evidence_chunk_ids
+        def complete_ok_2(self, prompt):
+            prompts.append(prompt)
+            return {
+                "nodes": [
+                    {"node_id": "file:src/a.py", "kind": "File", "label": "src/a.py"},
+                    {"node_id": "req:R-1", "kind": "Requirement", "label": "R-1"},
+                ],
+                "edges": [
+                    {
+                        "src": "file:src/a.py",
+                        "dst": "req:R-1",
+                        "relation": "IMPLEMENTS",
+                        "origin": "observed",
+                        "evidence_chunk_ids": ["ev-2"],
+                    }
+                ],
+                "extraction_summary": "extracted second event",
+            }, 12
+        monkeypatch.setattr(_Transport, "complete_json", complete_ok_2)
+        r2 = engine.run_neograph_update(SID)
+        assert r2["ok"] is True
+        assert r2["batch_events"] == 1
+        assert r2["remaining_events"] == 0
+        assert len(prompts) == 2
+        assert "second event" in prompts[1]
+
+        # Oversized single event -> graph_event_too_large with needed_tokens and budget_tokens
+        engine.store.commit_events([
+            Chunk(chunk_id="ev-huge", session_id=SID, provider="codex", kind="turn",
+                  text="가" * 5000, content_hash="h3"),
+        ], session_id=SID, provider="codex", path=tmp_path / "s.jsonl", offset=40, digest="d2")
+        r3 = engine.run_neograph_update(SID)
+        assert r3["ok"] is False
+        assert r3["error"] == "graph_event_too_large"
+        assert r3["chunk_id"] == "ev-huge"
+        assert r3["needed_tokens"] > r3["budget_tokens"]
+    finally:
+        engine.close()
+        neograph_runner.clear_model_catalog_cache()
+
+
+def test_graph_transport_distinguishes_completion_not_stopped_and_invalid_json(tmp_path, monkeypatch):
+    from self_directing_mcp import neograph_runner
+    from self_directing_mcp.neograph_runner import _Transport
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-not-a-real-key")
+    neograph_runner.clear_model_catalog_cache()
+
+    def fail_length(self, prompt):
+        raise ValueError("completion_not_stopped: finish_reason=length")
+
+    monkeypatch.setattr(_Transport, "complete_json", fail_length)
+    engine = SelfDirectEngine(Settings(
+        use_fake_embedder=True,
+        index_dir=tmp_path / "index",
+        contracts_path=tmp_path / "contracts.json",
+    ))
+    try:
+        engine.ensure_ready()
+        engine.store.commit_events([
+            Chunk(chunk_id="ev-len", session_id=SID, provider="codex", kind="turn",
+                  text="src/x.py IMPLEMENTS R-1", content_hash="hx"),
+        ], session_id=SID, provider="codex", path=tmp_path / "s.jsonl", offset=10, digest="dx")
+        res = engine.run_neograph_update(SID)
+        assert res["ok"] is False
+        assert any("completion_not_stopped" in p for p in res["validation"]["problems"])
+
+        def fail_json(self, prompt):
+            raise ValueError("invalid_json: Expecting value")
+
+        monkeypatch.setattr(_Transport, "complete_json", fail_json)
+        res2 = engine.run_neograph_update(SID)
+        assert res2["ok"] is False
+        assert any("invalid_json" in p for p in res2["validation"]["problems"])
+    finally:
+        engine.close()
+
+
+def test_explicit_mask_pii_none_overrides_env_and_strict_catalog_checks(tmp_path, monkeypatch):
+    from self_directing_mcp import neograph_runner
+    from self_directing_mcp.neograph_runner import _Transport
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-not-a-real-key")
+    monkeypatch.setenv("SELF_DIRECT_MASK_PII", "email,phone")
+
+    # 1. Catalog missing when fetch=True returns catalog_unavailable
+    monkeypatch.setattr(neograph_runner, "fetch_model_catalog", lambda *a, **k: None)
+    neograph_runner.clear_model_catalog_cache()
+    unavail = neograph_runner.validate_graph_model("deepseek/deepseek-v4-flash-0731", fetch=True)
+    assert unavail["ok"] is False and unavail["error"] == "catalog_unavailable"
+
+    # 2. structured_outputs alone without response_format is rejected; non-list supported_parameters is rejected
+    neograph_runner.set_model_catalog_cache({
+        "m/struct-only": {"id": "m/struct-only", "context_length": 32768, "supported_parameters": ["structured_outputs"]},
+        "m/no-list": {"id": "m/no-list", "context_length": 32768},
+        "m/valid": {"id": "m/valid", "context_length": 4096, "supported_parameters": ["response_format"]},
+    })
+    try:
+        assert neograph_runner.validate_graph_model("m/struct-only")["error"] == "unsupported_graph_model"
+        assert neograph_runner.validate_graph_model("m/no-list")["error"] == "unsupported_graph_model"
+        # max_output_tokens exceeding context_length is rejected and budget is 0 (no 256 floor)
+        over_ctx = neograph_runner.validate_graph_model("m/valid", max_output_tokens=4000)
+        assert over_ctx["ok"] is False and over_ctx["error"] == "invalid_graph_max_output_tokens"
+        assert neograph_runner.compute_input_token_budget("m/valid", max_output_tokens=4000) == 0
+
+        # 3. Settings(mask_pii="none") overrides SELF_DIRECT_MASK_PII=email,phone on the graph path
+        prompts = []
+        def complete_ok(self, prompt):
+            prompts.append(prompt)
+            return {
+                "nodes": [
+                    {"node_id": "file:src/b.py", "kind": "File", "label": "src/b.py"},
+                    {"node_id": "req:R-2", "kind": "Requirement", "label": "R-2"},
+                ],
+                "edges": [
+                    {
+                        "src": "file:src/b.py",
+                        "dst": "req:R-2",
+                        "relation": "IMPLEMENTS",
+                        "origin": "observed",
+                        "evidence_chunk_ids": ["ev-nomask"],
+                    }
+                ],
+                "extraction_summary": "ok",
+            }, 10
+        monkeypatch.setattr(_Transport, "complete_json", complete_ok)
+        engine = SelfDirectEngine(Settings(
+            use_fake_embedder=True,
+            index_dir=tmp_path / "index",
+            contracts_path=tmp_path / "contracts.json",
+            graph_model="m/valid",
+            graph_max_output_tokens=1000,
+            mask_pii="none",
+        ))
+        try:
+            engine.ensure_ready()
+            engine.store.commit_events([
+                Chunk(chunk_id="ev-nomask", session_id=SID, provider="codex", kind="turn",
+                      text="keep bob@example.invalid and 010-1234-5678. src/b.py IMPLEMENTS R-2", content_hash="hnm"),
+            ], session_id=SID, provider="codex", path=tmp_path / "s.jsonl", offset=10, digest="dnm")
+            res = engine.run_neograph_update(SID)
+            assert res["ok"] is True
+            assert "bob@example.invalid" in prompts[0]
+            assert "010-1234-5678." in prompts[0]
+        finally:
+            engine.close()
+    finally:
+        neograph_runner.clear_model_catalog_cache()
