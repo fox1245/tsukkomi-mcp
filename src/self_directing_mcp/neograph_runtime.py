@@ -13,7 +13,7 @@ try:
     import neograph_engine as ng
 except (ImportError, OSError) as exc:
     raise RuntimeError(
-        "NeoGraph native runtime is required. Install neograph-engine==0.14.1 "
+        "NeoGraph native runtime is required. Install neograph-engine>=0.16.0 "
         "in this MCP's configured Python environment; no direct executor fallback."
     ) from exc
 
