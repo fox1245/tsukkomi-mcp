@@ -662,3 +662,31 @@ def test_concurrent_claims_spend_the_budget_exactly_once(env):
         results = list(pool.map(lambda _: state.HookState(engine.settings.index_dir).claim_continue(SID, "same"), range(8)))
     assert results.count(True) == 1
     assert health.continue_claims(SID) == 1
+
+
+def test_agy_pre_invocation_inject_only_and_max_contracts(env):
+    engine, path = env
+    engine.upsert_contracts([
+        {
+            "id": "low-rule",
+            "provider": "agy",
+            "type": "must_not",
+            "scope": "tool_call",
+            "severity": "low",
+            "regex": "unused-pattern",
+            "description": "low rule",
+        },
+        {
+            "id": "high-inject",
+            "provider": "agy",
+            "type": "must",
+            "mode": "inject_only",
+            "severity": "critical",
+            "risk": "high",
+            "description": "high priority reminder",
+        },
+    ])
+    engine.settings.session_start_max_contracts = 1
+    injected = handle_pre_invocation(engine, SID, {"transcriptPath": str(path)})["injectSteps"][0]["ephemeralMessage"]
+    assert "Contract [high-inject][high risk][inject-only]" in injected
+    assert "Contracts omitted: 1 lower-priority contract(s) not shown" in injected

@@ -54,7 +54,7 @@ from self_directing_mcp.security.mask import mask_secrets
 # calls are rejected proposals too (``runner.blocked_calls`` / ``GrokFacts``). 10: the reason and basis of a typed
 # ``path_guard`` contract name the guarded path (``contract_paths.forbidden_label`` / ``verifier_basis``), and the
 # fingerprint of its saved state includes the regex derived from it; regex contracts judge and read exactly as before.)
-EVALUATOR_VERSION = 10
+EVALUATOR_VERSION = 11
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
@@ -462,18 +462,19 @@ class RuleMonitor:
     # --- feeding ---
 
     def eligible(self, event):
-        return (self.kind is None or event.kind == self.kind) and event.meta.get("role") in self.roles
+        return ((self.kind is None or event.kind == self.kind)
+                and event.meta.get("role") in self.roles
+                and runner._tool_matches(event, getattr(self.rule, "tools", None)))
 
     def _feed_forbidden(self, event, pools):
-        if (not self.inert and (self.kind is None or event.kind == self.kind)
-                and event.meta.get("role") in self.roles and self.regex.search(event.text)):
+        if not self.inert and self.eligible(event) and self.regex.search(event.text):
             self._forbidden(event)
 
     def _feed_required(self, event, pools):
         if self.inert:
             return
         matched = False
-        if (self.kind is None or event.kind == self.kind) and event.meta.get("role") in self.roles:
+        if self.eligible(event):
             text = event.text
             if self.trigger is not None and self.trigger.search(text):
                 self._checkpoint(event)
@@ -587,7 +588,7 @@ class RuleMonitor:
                         break
         if self.legacy is None and meta.get("linkage") == "legacy_unlinked":
             self.legacy = event.key
-        if meta.get("evidence_origin") == "model_proposal":
+        if meta.get("evidence_origin") == "model_proposal" and runner._tool_matches(event, getattr(self.rule, "tools", None)):
             text = event.text
             if self.wants_attempts and self.regex.search(text):
                 self.att_n += 1
@@ -637,6 +638,12 @@ class RuleMonitor:
         if self.overflow:
             raise NeedFull(self.overflow)
         rule = self.rule
+        if getattr(rule, "mode", "enforced") == "inject_only":
+            return self._make("clean", "not_applicable: contract mode is inject_only (reminder only)",
+                              basis=f"{rule.id}.mode is inject_only", applicability="not_applicable")
+        if proposed is not None and not self.eligible(proposed):
+            return self._make("clean", f"not_applicable: contract scope ({rule.scope}) does not apply to proposed action",
+                              basis=f"{rule.id} does not apply to this proposed action", applicability="not_applicable")
         if (self.src_id and not self.src) or (self.from_id and not self.started):
             return self._make("unknown", "contract source or activation event is not in this session")
         if self.src_id and not self.src_user:
@@ -1036,7 +1043,7 @@ class AuditPlan:
         contract set in ``eval_cost.COSTS`` (what a comparison is expected to cost, once this process has measured the set);
         ``defer``: a resident engine can verify a skipped comparison later, and the report then says ``deferred``."""
         report = {} if report is None else report
-        history = [r for r in active if r.regex and (r.type == "must" or planned is None)]
+        history = [r for r in active if getattr(r, "mode", "enforced") != "inject_only" and r.regex and (r.type == "must" or planned is None)]
         history_ids = {r.id for r in history}
         lineage = store.audit_lineage(session_id, provider)
         cursor, generation, latest = lineage["cursor"], lineage["generation"], lineage["latest"]

@@ -68,6 +68,7 @@ class HookCall:
     agent_transcript_path: str | None = None
     stop_hook_active: bool = True     # only an explicit false (or absence) permits a continue
     last_message: str | None = None   # the host's own copy of the final assistant text (Stop / SubagentStop)
+    source: str | None = None         # SessionStart source (startup | resume | clear | compact)
 
 
 def failure_response(event: str | None, payload: Any = None, *, reason: str = "Hook verification unavailable") -> dict:
@@ -110,7 +111,7 @@ def _validate_payload(payload: Any, event: str | None) -> HookCall:
     raw = payload.get("stop_hook_active", False)
     return HookCall(event, payload["session_id"], path, name, arguments,
                     _text(payload, "agent_id"), _text(payload, "agent_transcript_path"), raw is not False,
-                    _text(payload, "last_assistant_message"))
+                    _text(payload, "last_assistant_message"), _text(payload, "source"))
 
 
 def _validated_path(engine: SelfDirectEngine, session_id: str, path: str) -> str:
@@ -268,13 +269,34 @@ def handle_light(settings: Any, call: HookCall) -> dict[str, Any]:
 def handle_session_start(engine: SelfDirectEngine, call: HookCall) -> dict[str, Any]:
     obligations = hook_policy.read_obligations(engine, "claude", call.session_id, call.transcript_path)
     lines, banner = _health_lines(ClaudeHookState(engine.settings.index_dir), call, banner=True)
-    for rule in obligations["contracts"][:8]:
-        tags = ("[high risk]" if rule.risk == "high" else "") + ("[auto-continue]" if rule.auto_continue else "")
-        condition = f" (applies once a tool call matching /{rule.when.tool_call_regex}/ was observed)" if rule.when else ""
-        lines.append(hook_policy.short(
-            f"Contract [{rule.id}]{tags} {rule.type}: {rule.description or contract_paths.verifier_text(rule)}{condition}", 400))
+    max_contracts = getattr(engine.settings, "session_start_max_contracts", 16)
+    shown, omitted = hook_policy.select_session_start_contracts(obligations["contracts"], max_contracts)
+    from self_directing_mcp.graphrag import escape_unsafe as one_line
+    for rule in shown:
+        tags = (
+            ("[high risk]" if rule.risk == "high" else "")
+            + ("[auto-continue]" if rule.auto_continue else "")
+            + ("[inject-only]" if getattr(rule, "mode", "enforced") == "inject_only" else "")
+        )
+        condition = f" (applies once a tool call matching /{one_line(rule.when.tool_call_regex)}/ was observed)" if rule.when else ""
+        lines.append(hook_policy.short(one_line(
+            f"Contract [{one_line(rule.id)}]{tags} {rule.type}: {one_line(rule.description or contract_paths.verifier_text(rule))}{condition}"), 400))
+    if omitted > 0:
+        lines.append(f"Contracts omitted: {omitted} lower-priority contract(s) not shown; call list_contracts to inspect all.")
     for item in obligations["pending"][:8]:
-        lines.append(f"Pending: {item.text} ({item.status}; requires verified evidence)")
+        lines.append(f"Pending: {one_line(item.text)} ({item.status}; requires verified evidence)")
+    if getattr(call, "source", None) == "compact" and call.session_id:
+        try:
+            graph = engine.get_graph_context(
+                session_id=call.session_id, provider="claude", path=None, include_subagents=True
+            )
+            from self_directing_mcp.graphrag import escape_unsafe as one_line
+            for edge in (graph.get("edges") or [])[:8]:
+                lines.append("Context only: " + " ".join((
+                    one_line(edge["src"]), f"-[{one_line(edge['relation'])}]->", one_line(edge["dst"])
+                )))
+        except Exception:
+            pass
     return _context_reply(lines, banner)
 
 

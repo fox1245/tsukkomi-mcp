@@ -1056,7 +1056,7 @@ class SelfDirectEngine:
                   and rule.session_id in (None, sid)]
         if proposed is not None:
             active = [rule for rule in active if rule.type != "must" or rule.before_regex]
-        history = [rule for rule in active if rule.regex and (rule.type == "must" or proposed is None)]
+        history = [rule for rule in active if getattr(rule, "mode", "enforced") != "inject_only" and rule.regex and (rule.type == "must" or proposed is None)]
         if not history:
             return None
         try:
@@ -1128,7 +1128,7 @@ class SelfDirectEngine:
             contracts = [rule for rule in contracts if rule.type != "must" or rule.before_regex]
         active = [rule for rule in contracts if rule.enabled and rule.provider in (None, provider)
                   and rule.session_id in (None, sid)]
-        history_rules = [rule for rule in active if rule.regex and (rule.type == "must" or planned is None)]
+        history_rules = [rule for rule in active if getattr(rule, "mode", "enforced") != "inject_only" and rule.regex and (rule.type == "must" or planned is None)]
         history = bool(history_rules)
         cost_key = self._cost_key(provider, history_rules) if history else None
         anchors = {anchor for rule in active for anchor in (rule.source_event_id, rule.applies_from_event_id) if anchor}
@@ -1367,6 +1367,7 @@ class SelfDirectEngine:
                        applicable_contracts=len(active), requires_attention=result.verdict != "clean")
         if planned is not None:
             action_rules = [rule for rule in active if action_applies(rule, planned)]
+            action_ids = {rule.id for rule in action_rules}
             payload["action_scope"] = "applicable" if action_rules else "not_applicable"
             payload["action_contracts"] = [rule.id for rule in action_rules]
             payload["requires_history"] = any(rule.type == "must" for rule in action_rules)
@@ -1437,6 +1438,15 @@ class SelfDirectEngine:
                 if gate_ids:
                     payload["verdict"] = _worse(payload["verdict"], "unknown")
                     payload["notes"].append("Current action prerequisites remain unverified while their required evidence is incomplete.")
+            if planned is not None:
+                action_verdict = "clean"
+                for item in payload["findings"]:
+                    if item.get("applicability", "applicable") != "not_applicable" and item.get("contract_id") in action_ids:
+                        action_verdict = _worse(action_verdict, item["verdict"])
+                if stale and (action_rules or any(s.startswith("contracts_") for s in stale)):
+                    action_verdict = "unknown"
+                payload["action_verdict"] = action_verdict
+                payload["session_verdict"] = payload["verdict"]
             payload["requires_attention"] = payload["verdict"] != "clean"
             payload["integrity"] = integrity
             if plan is not None and not mismatch:

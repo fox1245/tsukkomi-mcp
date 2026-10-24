@@ -238,6 +238,12 @@ class Settings(SettingsAccessors, BaseSettings):
                     "directory that export_contracts may write. Candidates only, like the project bundle. "
                     "SELF_DIRECT_CONTRACT_BUNDLE_PATHS.",
     )
+    session_start_max_contracts: int = Field(
+        default=settings_core.DEFAULT_SESSION_START_MAX_CONTRACTS,
+        ge=1,
+        description="Maximum number of active contracts injected at SessionStart / PreInvocation, ordered by risk and "
+                    "severity. SELF_DIRECT_SESSION_START_MAX_CONTRACTS.",
+    )
 
     @field_validator("contract_bundle_paths", mode="before")
     @classmethod

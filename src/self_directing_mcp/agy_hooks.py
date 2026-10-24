@@ -142,12 +142,20 @@ def handle_pre_invocation(engine: SelfDirectEngine, session_id: str, payload: di
     # Stored text is data and each item is one line of this message whatever it holds: a contract description, a
     # checklist item or a graph id with a newline in it must not start a line of its own (and look like a rule).
     from self_directing_mcp.graphrag import escape_unsafe as one_line
-    for rule in obligations["contracts"][:8]:
-        tags = ("[high risk]" if rule.risk == "high" else "") + ("[auto-continue]" if rule.auto_continue else "")
+    max_contracts = getattr(engine.settings, "session_start_max_contracts", 16)
+    shown, omitted = hook_policy.select_session_start_contracts(obligations["contracts"], max_contracts)
+    for rule in shown:
+        tags = (
+            ("[high risk]" if rule.risk == "high" else "")
+            + ("[auto-continue]" if rule.auto_continue else "")
+            + ("[inject-only]" if getattr(rule, "mode", "enforced") == "inject_only" else "")
+        )
         condition = (f" (applies once a tool call matching /{one_line(rule.when.tool_call_regex)}/ was observed)"
                      if rule.when else "")
         lines.append(f"Contract [{one_line(rule.id)}]{tags} {rule.type}: {one_line(rule.description or contract_paths.verifier_text(rule))}"
                      f"{condition}")
+    if omitted > 0:
+        lines.append(f"Contracts omitted: {omitted} lower-priority contract(s) not shown; call list_contracts to inspect all.")
     for item in obligations["pending"][:8]:
         lines.append(f"Pending: {one_line(item.text)} ({item.status}; requires verified evidence)")
     # Graph relations are context, not new authorization or executable policy.

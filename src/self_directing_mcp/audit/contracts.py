@@ -62,7 +62,7 @@ def check_rule_patterns(rule: ContractRule) -> None:
                     and time.perf_counter() - started > contract_paths.MAX_COMPILE_SEC):
                 raise ValueError(f"contract {rule.id!r}: path_guard.paths lowers to a pattern that takes more than "
                                  f"{contract_paths.MAX_COMPILE_SEC} s to compile; use fewer or plainer globs")
-    if rule.risk == "high" and rule.type == "must_not" and not rule.regex:
+    if rule.mode != "inject_only" and rule.risk == "high" and rule.type == "must_not" and not rule.regex:
         raise ValueError(f"contract {rule.id!r}: a high-risk must_not needs a regex that names the actions it "
                          "covers; without one it would ask on every tool call")
 
@@ -109,6 +109,13 @@ def loosening_reasons(previous: ContractRule, new: ContractRule) -> list[str]:
         reasons.append("risk lowered")
     if previous.auto_continue and not new.auto_continue:
         reasons.append("auto_continue removed")
+    if previous.mode == "enforced" and new.mode != "enforced":
+        reasons.append("mode changed to inject_only")
+    if previous.tools is None and new.tools is not None:
+        reasons.append("tools filter added")
+    elif previous.tools is not None and new.tools is not None:
+        if {t.lower() for t in previous.tools} - {t.lower() for t in new.tools}:
+            reasons.append("tools filter narrowed")
     return reasons
 
 

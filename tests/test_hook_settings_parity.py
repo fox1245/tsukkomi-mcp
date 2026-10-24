@@ -236,6 +236,7 @@ FIELD_KINDS = {
     "integrity_background_idle_sec": "float", "integrity_background_max_scans": "int",
     "audit_incremental": "bool", "audit_shadow_every": "shadow_every", "audit_shadow_idle_sec": "float",
     "audit_incremental_min_events": "int", "sync_slice_bytes": "int",
+    "session_start_max_contracts": "int",
 }
 # SELF_DIRECT_PGVECTOR_SCHEMA: ASCII letters, digits, underscore; at most 63; no leading digit; not pg_* or information_schema.
 PGVECTOR_SCHEMAS = ["tsukkomi", "a_b1", "Tsukkomi", "_x", "x", "public", "x" * 63, "x" * 64, "1abc", "", " tsukkomi", "tsukkomi ",

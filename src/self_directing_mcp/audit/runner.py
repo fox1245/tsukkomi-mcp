@@ -166,9 +166,30 @@ def evidence(chunk, detail="regex match"):
                     snippet=mask_secrets(chunk.text)[:400], match_type="regex", detail=detail)
 
 
+def _tool_matches(chunk, tools) -> bool:
+    if not tools:
+        return True
+    text = getattr(chunk, "text", "") or ""
+    is_call = chunk.kind == "tool_call" or text.startswith("[proposed_tool_call:")
+    if not is_call:
+        return False
+    meta = getattr(chunk, "meta", None) or {}
+    tool_name = str(meta.get("tool_name") or "")
+    native_name = str(meta.get("native_tool_name") or "")
+    if not tool_name and (text.startswith("[tool_call:") or text.startswith("[proposed_tool_call:")):
+        head = text.split("]", 1)[0]
+        tool_name = head.split(":", 1)[1] if ":" in head else ""
+    candidates = {name.lower() for name in (tool_name, native_name) if name}
+    if not candidates:
+        return False
+    return bool(candidates & {item.lower() for item in tools})
+
+
 def _eligible(chunk, rule):
     check_request()
-    return scope_matches(chunk, rule.scope) and chunk.meta.get("role") in rule.roles
+    return (scope_matches(chunk, rule.scope)
+            and chunk.meta.get("role") in rule.roles
+            and _tool_matches(chunk, getattr(rule, "tools", None)))
 
 
 _SCOPE_KINDS = {"tool_call": "tool_call", "tool_result": "tool_result", "message": "turn"}
@@ -184,6 +205,8 @@ def _scope_test(rule):
 def action_applies(rule, proposed) -> bool:
     """Determine action scope without mistaking completion obligations for gates."""
     check_request()
+    if getattr(rule, "mode", "enforced") == "inject_only":
+        return False
     if not _eligible(proposed, rule):
         return False
     if rule.type == "must" and not rule.before_regex:
@@ -250,7 +273,7 @@ def _key(value):
 
 def audit_needs(active, proposed):
     """What the history reader must keep text for: ``(scope, roles)`` pairs and whether call linkage is used."""
-    rules = [r for r in active if r.regex and (r.type == "must" or proposed is None)]
+    rules = [r for r in active if getattr(r, "mode", "enforced") != "inject_only" and r.regex and (r.type == "must" or proposed is None)]
     needs = [(r.scope, tuple(r.roles)) for r in rules] + when_needs(rules)
     if any(_wants_attempts(r) for r in rules):
         needs.append(("attempt", ("runtime",)))  # host-logged model proposals, see agy_evidence_rules
@@ -290,8 +313,9 @@ class _Presence:
         self.hits = hits = []
         search = regex.search
         scope_kind, roles = _scope_test(rule)
+        tools = getattr(rule, "tools", None)
         for index, chunk in enumerate(_checked(active)):
-            if (scope_kind is None or chunk.kind == scope_kind) and chunk.meta.get("role") in roles and search(chunk.text):
+            if (scope_kind is None or chunk.kind == scope_kind) and chunk.meta.get("role") in roles and _tool_matches(chunk, tools) and search(chunk.text):
                 hits.append(index)
 
     def before(self, position):
@@ -367,9 +391,15 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
 
     if not rule.enabled:
         return finding("clean", "contract disabled")
-    chunks = chunks if chunks is not None else store.list_chunks(session_id, provider)
     if (rule.provider and rule.provider != provider) or (rule.session_id and rule.session_id != session_id):
         return finding("clean", "contract outside this provider/session")
+    if getattr(rule, "mode", "enforced") == "inject_only":
+        return finding("clean", "not_applicable: contract mode is inject_only (reminder only)",
+                       basis=f"{rule.id}.mode is inject_only", applicability="not_applicable")
+    if proposed is not None and not _eligible(proposed, rule):
+        return finding("clean", f"not_applicable: contract scope ({rule.scope}) does not apply to proposed action",
+                       basis=f"{rule.id} does not apply to this proposed action", applicability="not_applicable")
+    chunks = chunks if chunks is not None else store.list_chunks(session_id, provider)
     if ids is None:
         ids = {c.chunk_id: i for i, c in enumerate(_checked(chunks))}
     for anchor in (rule.source_event_id, rule.applies_from_event_id):
@@ -395,8 +425,9 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
     if rule.type == "must_not":
         inspected = [proposed] if proposed is not None else active
         scope_kind, roles = _scope_test(rule)
+        tools = getattr(rule, "tools", None)
         hits = [c for c in _checked(inspected)
-                if (scope_kind is None or c.kind == scope_kind) and c.meta.get("role") in roles and regex.search(c.text)]
+                if (scope_kind is None or c.kind == scope_kind) and c.meta.get("role") in roles and _tool_matches(c, tools) and regex.search(c.text)]
         turned = [c for c in hits if rejected and c.chunk_id in rejected]
         if turned:
             # A call the host refused did not run: it is reported apart and never counts as an executed match.
@@ -431,9 +462,10 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
             checkpoints = [(len(active), proposed)] if _eligible(proposed, rule) and trigger.search(proposed.text) else []
         else:
             scope_kind, roles = _scope_test(rule)
+            tools = getattr(rule, "tools", None)
             checkpoints = [(i, c) for i, c in enumerate(_checked(active))
                            if (scope_kind is None or c.kind == scope_kind) and c.meta.get("role") in roles
-                           and trigger.search(c.text)]
+                           and _tool_matches(c, tools) and trigger.search(c.text)]
         if not checkpoints:
             return finding("clean", "no triggering action in inspected events")
         overall, reasons, items = "clean", [], []
@@ -508,7 +540,7 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
         if plan is not None:
             plan.load(active)
             return
-        needs_history = any(r.regex and (r.type == "must" or proposed is None) for r in active)
+        needs_history = any(getattr(r, "mode", "enforced") != "inject_only" and r.regex and (r.type == "must" or proposed is None) for r in active)
         if needs_history:
             chunks = store.list_chunks(session_id, provider)
         else:
@@ -651,9 +683,10 @@ def _window(rule, events, ids, proposed):
         except re.error:
             return start, end
         scope_kind, roles = _scope_test(rule)
+        tools = getattr(rule, "tools", None)
         positions = [i for i in _checked(range(start, end))
                      if (scope_kind is None or events[i].kind == scope_kind) and events[i].meta.get("role") in roles
-                     and trigger.search(events[i].text)]
+                     and _tool_matches(events[i], tools) and trigger.search(events[i].text)]
         if positions:
             end = positions[-1]
     return start, end
@@ -717,6 +750,8 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
     blocked = _blocked_proposals(events) if history and any(_wants_attempts(r) for r in rules) else {}
     for rule, item in zip(rules, findings):
         check_request()
+        if item.applicability == "not_applicable" or getattr(rule, "mode", "enforced") == "inject_only":
+            continue
         start, end = _window(rule, events, ids, proposed)
         deps = _dependencies(rule)
         low, high = bisect_left(truncated_at, start), bisect_left(truncated_at, end)
@@ -799,6 +834,8 @@ def claude_evidence_rules(rules, findings, events, *, proposed=None, coverage=No
     history = proposed is None
     for rule, item in zip(rules, findings):
         check_request()
+        if item.applicability == "not_applicable" or getattr(rule, "mode", "enforced") == "inject_only":
+            continue
         reads = _reads_results(rule)
         if not (reads or rule.requires_success):
             continue
@@ -826,7 +863,8 @@ def _attempted(rule, events, proposals, blocked) -> bool:
         regex = compile_contract(rule.regex)
     except re.error:
         return False
-    return any(i not in blocked and regex.search(events[i].text) for i in proposals)
+    tools = getattr(rule, "tools", None)
+    return any(i not in blocked and _tool_matches(events[i], tools) and regex.search(events[i].text) for i in proposals)
 
 
 def _attempt_hits(rule, item, events, proposals, blocked) -> None:
@@ -838,12 +876,13 @@ def _attempt_hits(rule, item, events, proposals, blocked) -> None:
         exception = compile_contract(rule.exception_regex) if rule.exception_regex else None
     except re.error:
         return
-    refused = [i for i in proposals if i in blocked and regex.search(events[i].text)]
+    tools = getattr(rule, "tools", None)
+    refused = [i for i in proposals if i in blocked and _tool_matches(events[i], tools) and regex.search(events[i].text)]
     if refused:   # reported apart, whatever the verdict ends up being
         item.proposals_rejected = [
             rejected_proposal_item(rule.id, _meta(events[i]).get("tool_name"), _event_byte(events[i]),
                                    _event_byte(events[blocked[i]])) for i in refused[:REJECTED_LIMIT]]
-    hits = [events[i] for i in proposals if i not in blocked and regex.search(events[i].text)]
+    hits = [events[i] for i in proposals if i not in blocked and _tool_matches(events[i], tools) and regex.search(events[i].text)]
     if not hits:
         return
     covered = exception is not None and exception.search(" ".join(h.text for h in hits)) is not None
@@ -871,7 +910,8 @@ def _hidden_trigger(rule, events, legacy_in_window, proposals, cut, blocked):
     except re.error:
         return None
     if legacy_in_window:
-        if any(i not in blocked and trigger.search(events[i].text) for i in proposals):
+        tools = getattr(rule, "tools", None)
+        if any(i not in blocked and _tool_matches(events[i], tools) and trigger.search(events[i].text) for i in proposals):
             return ("unsupported_legacy",
                     "a matching call was proposed but its execution cannot be linked to a legacy result")
     return None

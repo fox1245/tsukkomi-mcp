@@ -80,6 +80,7 @@ DEFAULT_AUDIT_INCREMENTAL_MIN_EVENTS = 500
 DEFAULT_RRF_K = 60
 DEFAULT_RETRIEVE_TOP_K = 20
 DEFAULT_SEARCH_TOP_K = 10
+DEFAULT_SESSION_START_MAX_CONTRACTS = 16
 AGY_APP_DATA_NAMES = ("antigravity", "antigravity-cli", "antigravity-ide")
 
 PATH_FIELDS = frozenset({
@@ -542,6 +543,8 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("sparse_format", _literal(SPARSE_FORMATS), _static(DEFAULT_SPARSE_FORMAT)),
     FieldSpec("project_contracts", _literal(PROJECT_CONTRACT_MODES), _static(DEFAULT_PROJECT_CONTRACTS)),
     FieldSpec("contract_bundle_paths", parse_bundle_paths, lambda: []),
+    FieldSpec("session_start_max_contracts", lambda name, text: _to_int(name, text, 1),
+              _static(DEFAULT_SESSION_START_MAX_CONTRACTS)),
 )
 FIELD_NAMES = tuple(spec.name for spec in FIELDS)
 

@@ -22,7 +22,7 @@ MET, UNMET, INVALID = "met", "unmet", "invalid"
 
 def when_needs(rules):
     """Extra ``(scope, roles)`` pairs the history reader must keep text for, so ``when`` can see tool calls."""
-    if not any(rule.when is not None and rule.regex for rule in rules):
+    if not any(getattr(rule, "mode", "enforced") != "inject_only" and rule.when is not None and rule.regex for rule in rules):
         return []
     return [("tool_call", ("assistant",)), ("any", ("runtime",))]
 
@@ -50,12 +50,20 @@ def not_applicable_reason(rule) -> str:
     return f"not_applicable: the `when` condition (tool call matching /{rule.when.tool_call_regex}/) was not observed in this session"
 
 
+_STATIC_NOT_APPLICABLE_PREFIXES = (
+    "not_applicable: contract mode is inject_only",
+    "not_applicable: contract scope (",
+)
+
+
 def downgrade_unproven_inapplicability(findings) -> bool:
     """With incomplete coverage an unmatched condition may sit in unread or unparsed evidence: unknown, not N/A."""
     changed = False
     for item in findings:
         check_request()
-        if item.applicability == "not_applicable":
+        if item.applicability == "not_applicable" and not (
+            isinstance(item.reason, str) and item.reason.startswith(_STATIC_NOT_APPLICABLE_PREFIXES)
+        ):
             item.verdict, item.applicability = "unknown", "applicable"
             item.reason = "the `when` condition cannot be shown unmet because evidence is incomplete"
             item.basis = (item.basis or "") + "; incomplete coverage prevents proving the condition absent"

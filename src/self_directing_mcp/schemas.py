@@ -15,6 +15,7 @@ ContractRuleType = Literal["must", "must_not"]
 ContractScope = Literal["tool_call", "tool_result", "message", "any"]
 Severity = Literal["critical", "high", "medium", "low"]
 ContractRisk = Literal["normal", "high"]
+ContractMode = Literal["enforced", "inject_only"]
 Applicability = Literal["applicable", "not_applicable"]
 Verdict = Literal["violation", "suspicious", "clean", "unknown"]
 SearchMode = Literal["hybrid", "regex", "sparse", "dense"]
@@ -64,7 +65,7 @@ class ContractWhen(BaseModel):
 
 # Fields added after 1.0. They are omitted from serialized contracts while at their default so files written
 # by this version stay loadable by older processes (extra="forbid") and snapshots of unchanged contracts hold.
-_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None, "origin": None, "path_guard": None}
+_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None, "origin": None, "path_guard": None, "mode": "enforced", "tools": None}
 
 
 class ContractOrigin(BaseModel):
@@ -230,6 +231,16 @@ class ContractRule(BaseModel):
         description="Read-only: set by adopt_contracts when the contract came from a portable bundle file. "
                     "upsert_contracts rejects an origin that the stored contract does not already have.",
     )
+    mode: ContractMode = Field(
+        default="enforced",
+        description="'enforced' (default): evaluated by audit_session and check_action. 'inject_only': injected at "
+                    "SessionStart/PreInvocation as a reminder, never evaluated as a violation or unknown.",
+    )
+    tools: list[str] | None = Field(
+        default=None,
+        description="Optional list of tool names (case-insensitive, e.g. ['Bash', 'run_command']) that a tool_call/any "
+                    "contract applies to. Tool calls for other tools are ignored / not_applicable.",
+    )
 
     @model_serializer(mode="wrap")
     def _omit_default_extensions(self, handler):
@@ -244,11 +255,14 @@ class ContractRule(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _typed_inputs(cls, data):
-        if isinstance(data, dict) and data.get("path_guard") is not None:
-            if data.get("regex") is not None:
-                raise ValueError("path_guard and regex cannot both be set on one contract: path_guard is the single "
-                                 "source of truth and the regex is derived from it")
-            if "scope" not in data:
+        if isinstance(data, dict):
+            if data.get("path_guard") is not None:
+                if data.get("regex") is not None:
+                    raise ValueError("path_guard and regex cannot both be set on one contract: path_guard is the single "
+                                     "source of truth and the regex is derived from it")
+                if "scope" not in data:
+                    data = {**data, "scope": "tool_call"}
+            elif data.get("tools") is not None and "scope" not in data:
                 data = {**data, "scope": "tool_call"}
         return data
 
@@ -284,6 +298,21 @@ class ContractRule(BaseModel):
             raise ValueError("auto_continue requires a must completion obligation with regex and no before_regex")
         if self.when is not None and self.type != "must":
             raise ValueError("when applies only to must rules")
+        if self.tools is not None:
+            if self.scope not in ("tool_call", "any"):
+                raise ValueError("tools filter requires scope 'tool_call' or 'any'")
+            if not (1 <= len(self.tools) <= 32):
+                raise ValueError("tools must contain between 1 and 32 entries")
+            cleaned_tools: list[str] = []
+            seen_tools: set[str] = set()
+            for item in self.tools:
+                if not isinstance(item, str) or not item.strip() or len(item.strip()) > 80:
+                    raise ValueError("tools entries must be non-empty strings up to 80 chars")
+                norm = item.strip()
+                if norm.lower() not in seen_tools:
+                    seen_tools.add(norm.lower())
+                    cleaned_tools.append(norm)
+            self.tools = cleaned_tools
         return self
 
 

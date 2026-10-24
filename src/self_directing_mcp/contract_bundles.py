@@ -60,7 +60,7 @@ SHORT_HASH = 12
 # are plain text kept beside them and never compared (the quote is the author's wording, the claimed event an assertion).
 CONTENT_FIELDS = ("id", "type", "scope", "severity", "description", "regex", "path_guard", "search_query", "enabled",
                   "provider", "roles", "before_regex", "requires_success", "exception_regex", "risk", "auto_continue",
-                  "when")
+                  "when", "mode", "tools")
 PROVENANCE_FIELDS = ("source_quote", "claimed_origin_event_id")
 BUNDLE_CONTRACT_FIELDS = frozenset(CONTENT_FIELDS + PROVENANCE_FIELDS)
 DEVICE_BOUND_FIELDS = ("source_event_id", "applies_from_event_id", "session_id", "revision", "origin")
@@ -115,6 +115,10 @@ def content_of(rule: ContractRule) -> dict[str, Any]:
     }
     if rule.path_guard is not None:
         content["path_guard"] = contract_paths.as_dict(rule.path_guard)      # absent otherwise: old hashes stay as they were
+    if rule.mode != "enforced":
+        content["mode"] = rule.mode
+    if rule.tools is not None:
+        content["tools"] = sorted({t for t in rule.tools})
     if rule.session_id is not None:
         content["session_scoped"] = True
     return content
@@ -252,6 +256,8 @@ def _parse_contract(index: int, item: Any, problems: list[str]) -> BundleContrac
         problems.append(f"{where}: roles must name at most {ROLES_MAX} roles")
         return None
     if not all(_check_text(problems, where, "roles", role, ROLE_MAX, nonempty=True) for role in rule.roles):
+        return None
+    if rule.tools is not None and not all(_check_text(problems, where, "tools", tool, 80, nonempty=True) for tool in rule.tools):
         return None
     try:
         check_rule_patterns(rule)       # the validation upsert_contracts applies, on the same function
@@ -610,6 +616,10 @@ def describe_contract(entry: Entry) -> dict[str, Any]:
         out["path_guard"] = contract_paths.as_dict(rule.path_guard)
     if rule.when:
         out["when"] = {"tool_call_regex": rule.when.tool_call_regex}
+    if rule.mode != "enforced":
+        out["mode"] = rule.mode
+    if rule.tools is not None:
+        out["tools"] = list(rule.tools)
     for name in ("requires_success", "auto_continue"):
         if getattr(rule, name):
             out[name] = True
@@ -666,6 +676,10 @@ def portable_dict(rule: ContractRule) -> dict[str, Any]:
         out["auto_continue"] = True
     if rule.when:
         out["when"] = {"tool_call_regex": rule.when.tool_call_regex}
+    if rule.mode != "enforced":
+        out["mode"] = rule.mode
+    if rule.tools is not None:
+        out["tools"] = list(rule.tools)
     return out
 
 

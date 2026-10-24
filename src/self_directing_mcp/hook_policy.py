@@ -103,6 +103,22 @@ def wants_derived_work(engine: SelfDirectEngine) -> bool:
     return not engine.settings.local_only and engine.settings.dense_backend not in settings_core.REMOTE_DENSE_BACKENDS
 
 
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def select_session_start_contracts(contracts: list, max_contracts: int = 16) -> tuple[list, int]:
+    """Order contracts by (high-risk first, severity critical..low, id) and cap at ``max_contracts``."""
+    ordered = sorted(
+        contracts,
+        key=lambda r: (0 if getattr(r, "risk", "normal") == "high" else 1,
+                       _SEVERITY_ORDER.get(getattr(r, "severity", "medium"), 2),
+                       r.id),
+    )
+    limit = max(1, int(max_contracts))
+    shown = ordered[:limit]
+    return shown, len(ordered) - len(shown)
+
+
 def read_obligations(engine: SelfDirectEngine, provider: str, session_id: str, path: str | None) -> dict:
     try:
         return engine.hook_obligations(session_id, provider=provider, path=path)

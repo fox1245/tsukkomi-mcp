@@ -1211,3 +1211,102 @@ def test_subagent_stop_indexes_subagent_transcript_even_without_active_contracts
                                  mode="regex", scope="family")
     assert hits["ok"] is True
     assert any(h["session_id"] == CHILD for h in hits["hits"])
+
+
+def test_issue_58_and_52_contracts_and_session_start(env):
+    engine, path = env
+    engine.upsert_contracts([
+        {
+            "id": "msg-prose-only",
+            "provider": "claude",
+            "type": "must_not",
+            "scope": "message",
+            "description": "do not use archaic phrasing in prose",
+        },
+        {
+            "id": "inject-reminder",
+            "provider": "claude",
+            "type": "must_not",
+            "mode": "inject_only",
+            "severity": "critical",
+            "description": "explain variables clearly",
+        },
+        {
+            "id": "bash-only-guard",
+            "provider": "claude",
+            "type": "must_not",
+            "tools": ["Bash"],
+            "severity": "high",
+            "risk": "high",
+            "regex": "forbidden-flag",
+            "description": "no forbidden flag in bash",
+        },
+        {
+            "id": "low-priority-rule",
+            "provider": "claude",
+            "type": "must_not",
+            "scope": "tool_call",
+            "severity": "low",
+            "regex": "never-matches-anything",
+            "description": "low priority rule",
+        },
+    ])
+
+    # 1. check_action on Write tool: msg-prose-only (scope=message), inject-reminder (mode=inject_only),
+    # and bash-only-guard (tools=['Bash']) are all not_applicable -> clean!
+    res_write = engine.check_action(
+        session_id=SID,
+        provider="claude",
+        path=str(path),
+        action={"tool_name": "Write", "arguments": {"file_path": "/tmp/a.txt", "content": "forbidden-flag"}},
+    )
+    assert res_write["verdict"] == "clean"
+    assert res_write["action_verdict"] == "clean"
+    assert res_write["session_verdict"] == "clean"
+    assert res_write["requires_attention"] is False
+    by_id = {f["contract_id"]: f for f in res_write["findings"]}
+    assert by_id["msg-prose-only"]["applicability"] == "not_applicable"
+    assert by_id["inject-reminder"]["applicability"] == "not_applicable"
+    assert by_id["bash-only-guard"]["applicability"] == "not_applicable"
+
+    # 2. audit_session also treats inject-reminder as not_applicable (clean)
+    res_audit = engine.audit_session(SID, provider="claude", path=str(path))
+    audit_by_id = {f["contract_id"]: f for f in res_audit["findings"]}
+    assert audit_by_id["inject-reminder"]["verdict"] == "clean"
+    assert audit_by_id["inject-reminder"]["applicability"] == "not_applicable"
+
+    # 3. check_action on Bash tool with forbidden-flag: bash-only-guard triggers violation!
+    res_bash = engine.check_action(
+        session_id=SID,
+        provider="claude",
+        path=str(path),
+        action={"tool_name": "Bash", "arguments": {"command": "echo forbidden-flag"}},
+    )
+    assert res_bash["verdict"] == "violation"
+    assert res_bash["action_verdict"] == "violation"
+    assert res_bash["requires_attention"] is True
+
+    # 4. SessionStart ordering, [inject-only] tag, session_start_max_contracts cap, and compact graph context
+    engine.settings.session_start_max_contracts = 2
+    engine.ensure_ready()
+    engine.graph.apply_proposal(
+        {
+            "nodes": [
+                {"node_id": "mod_auth", "kind": "module", "label": "Auth module"},
+                {"node_id": "mod_db", "kind": "module", "label": "DB module"},
+            ],
+            "edges": [
+                {"src": "mod_auth", "dst": "mod_db", "relation": "depends_on", "evidence_chunk_ids": ["ev1"]},
+            ],
+        },
+        session_id=SID,
+        provider="claude",
+        base_version=0,
+        through_order=1,
+    )
+
+    compact_out = run(engine, path, "SessionStart", source="compact")["hookSpecificOutput"]["additionalContext"]
+    assert "Contract [bash-only-guard][high risk]" in compact_out
+    assert "Contract [inject-reminder][inject-only]" in compact_out
+    assert "Contracts omitted: 2 lower-priority contract(s) not shown" in compact_out
+    assert "Context only: mod_auth -[depends_on]-> mod_db" in compact_out
