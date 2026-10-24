@@ -110,10 +110,12 @@ class HybridRetriever:
         mode: str = "hybrid",
         provider: str | None = None,
         query_vector: np.ndarray | None = None,
+        allowed_ids: set[str] | None = None,
     ) -> list[RRFResult]:
         top_k = top_k if top_k is not None else self.retrieve_top_k
         channel_k = max(self.retrieve_top_k, top_k)
-        allowed = set(self.store.chunk_ids(session_id, provider)) if self.store else None
+        allowed = (set(allowed_ids) if allowed_ids is not None
+                   else (set(self.store.chunk_ids(session_id, provider)) if self.store else None))
         check_request()
         from self_directing_mcp.security.mask import mask_secrets
         query = mask_secrets(query)
@@ -152,6 +154,7 @@ def hits_to_schema(results: list[RRFResult], get_chunk) -> list[SearchHit]:
         out.append(
             SearchHit(
                 chunk_id=r.chunk_id,
+                session_id=chunk.session_id if chunk else None,
                 ranking_score=r.ranking_score,
                 dense_rank=r.dense_rank,
                 sparse_rank=r.sparse_rank,

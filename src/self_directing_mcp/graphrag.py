@@ -231,33 +231,31 @@ class GraphStore:
         return {"ok": True, "status": "applied", "graph_version": version,
                 "processed_through_order": through_order}
 
+    @staticmethod
+    def _session_clause(session_id: str | None, provider: str, include_subagents: bool = False) -> tuple[str, list[Any]]:
+        if not session_id or session_id == "*":
+            return "", []
+        if include_subagents:
+            from self_directing_mcp import claude_ids
+            parts = claude_ids.session_parts(session_id) if provider == "claude" else None
+            parent = parts[0] if parts is not None else session_id
+            return " AND (session_id=? OR (session_id>=? AND session_id<?))", [parent, f"{parent}_", f"{parent}`"]
+        return " AND session_id=?", [session_id]
+
     @request_operation
-    def neighbors(self, session_id: str | None, provider: str, node_id: str, depth: int = 1):
+    def neighbors(self, session_id: str | None, provider: str, node_id: str, depth: int = 1, *,
+                  include_subagents: bool = False):
         seen, frontier, out = {node_id}, [node_id], []
+        clause, clause_params = self._session_clause(session_id, provider, include_subagents)
         for _ in range(max(1, min(depth, 3))):
             check_request()
             placeholders = ",".join("?" for _ in frontier)
-            if session_id and session_id != "*":
-                rows = self._conn.execute(
-                    "SELECT src,dst,relation,origin,evidence_chunk_ids,version_added FROM graph_edges"
-                    " WHERE session_id=? AND provider=? AND src IN (" + placeholders + ")"
-                    " UNION ALL SELECT src,dst,relation,origin,evidence_chunk_ids,version_added"
-                    " FROM graph_edges WHERE session_id=? AND provider=? AND dst IN (" + placeholders + ")",
-                    (session_id, provider, *frontier, session_id, provider, *frontier)).fetchall()
-                if not rows:
-                    rows = self._conn.execute(
-                        "SELECT src,dst,relation,origin,evidence_chunk_ids,version_added FROM graph_edges"
-                        " WHERE provider=? AND src IN (" + placeholders + ")"
-                        " UNION ALL SELECT src,dst,relation,origin,evidence_chunk_ids,version_added"
-                        " FROM graph_edges WHERE provider=? AND dst IN (" + placeholders + ")",
-                        (provider, *frontier, provider, *frontier)).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT src,dst,relation,origin,evidence_chunk_ids,version_added FROM graph_edges"
-                    " WHERE provider=? AND src IN (" + placeholders + ")"
-                    " UNION ALL SELECT src,dst,relation,origin,evidence_chunk_ids,version_added"
-                    " FROM graph_edges WHERE provider=? AND dst IN (" + placeholders + ")",
-                    (provider, *frontier, provider, *frontier)).fetchall()
+            rows = self._conn.execute(
+                f"SELECT src,dst,relation,origin,evidence_chunk_ids,version_added FROM graph_edges"
+                f" WHERE provider=?{clause} AND src IN (" + placeholders + ")"
+                f" UNION ALL SELECT src,dst,relation,origin,evidence_chunk_ids,version_added"
+                f" FROM graph_edges WHERE provider=?{clause} AND dst IN (" + placeholders + ")",
+                (provider, *clause_params, *frontier, provider, *clause_params, *frontier)).fetchall()
             frontier = []
             for src, dst, rel, origin, evidence, ver in rows:
                 check_request()
@@ -276,26 +274,14 @@ class GraphStore:
         return {"nodes": sorted(seen), "edges": out}
 
     @request_operation
-    def get_session_graph(self, session_id: str | None = None, provider: str = "codex", limit: int = 50) -> dict[str, Any]:
-        """Fetch nodes and edges for a session, or across sessions if session has no entries."""
-        where_nodes = "WHERE provider=?"
-        where_edges = "WHERE provider=?"
-        params_nodes: list[Any] = [provider]
-        params_edges: list[Any] = [provider]
-
-        if session_id and session_id != "*":
-            count = self._conn.execute(
-                "SELECT COUNT(*) FROM graph_nodes WHERE session_id=? AND provider=?",
-                (session_id, provider)
-            ).fetchone()[0]
-            if count > 0:
-                where_nodes += " AND session_id=?"
-                where_edges += " AND session_id=?"
-                params_nodes.append(session_id)
-                params_edges.append(session_id)
-
-        params_nodes.append(limit)
-        params_edges.append(limit)
+    def get_session_graph(self, session_id: str | None = None, provider: str = "codex", limit: int = 50, *,
+                          include_subagents: bool = False) -> dict[str, Any]:
+        """Fetch nodes and edges for a session (or session family when ``include_subagents=True``)."""
+        clause, clause_params = self._session_clause(session_id, provider, include_subagents)
+        where_nodes = f"WHERE provider=?{clause}"
+        where_edges = f"WHERE provider=?{clause}"
+        params_nodes: list[Any] = [provider, *clause_params, limit]
+        params_edges: list[Any] = [provider, *clause_params, limit]
 
         nodes_rows = self._conn.execute(
             f"SELECT node_id, provider, session_id, kind, label, version_added FROM graph_nodes {where_nodes} ORDER BY version_added DESC LIMIT ?",
@@ -318,22 +304,17 @@ class GraphStore:
                 pass
             edges.append(d)
 
-        return {"nodes": nodes, "edges": edges}
+        return {"nodes": nodes, "edges": edges, "empty": not nodes and not edges}
 
     @request_operation
-    def find_nodes_like(self, query: str, session_id: str | None = None, provider: str = "codex") -> list[dict[str, Any]]:
-        """Find nodes matching a filename or query."""
+    def find_nodes_like(self, query: str, session_id: str | None = None, provider: str = "codex", *,
+                        include_subagents: bool = False) -> list[dict[str, Any]]:
+        """Find nodes matching a filename or query within the requested session scope."""
         clean_q = f"%{query}%"
-        if session_id and session_id != "*":
-            rows = self._conn.execute(
-                "SELECT node_id, provider, session_id, kind, label, version_added FROM graph_nodes WHERE session_id=? AND provider=? AND (node_id LIKE ? OR label LIKE ?)",
-                (session_id, provider, clean_q, clean_q)
-            ).fetchall()
-            if rows:
-                return [dict(r) for r in rows]
+        clause, clause_params = self._session_clause(session_id, provider, include_subagents)
         rows = self._conn.execute(
-            "SELECT node_id, provider, session_id, kind, label, version_added FROM graph_nodes WHERE provider=? AND (node_id LIKE ? OR label LIKE ?)",
-            (provider, clean_q, clean_q)
+            f"SELECT node_id, provider, session_id, kind, label, version_added FROM graph_nodes WHERE provider=?{clause} AND (node_id LIKE ? OR label LIKE ?)",
+            (provider, *clause_params, clean_q, clean_q)
         ).fetchall()
         return [dict(r) for r in rows]
 

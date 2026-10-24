@@ -86,3 +86,70 @@ def test_failed_write_reports_unclear_not_false_success(tmp_path):
 
 
 
+
+
+def test_empty_session_graph_never_leaks_other_sessions_and_supports_subagent_family(engine):
+    proposal = {
+        "nodes": [
+            {"node_id": "req-parent", "kind": "requirement", "label": "parent req"},
+            {"node_id": "task-parent", "kind": "task", "label": "parent task"},
+        ],
+        "edges": [
+            {
+                "src": "task-parent",
+                "dst": "req-parent",
+                "relation": "IMPLEMENTS",
+                "origin": "observed",
+                "evidence_chunk_ids": ["c000"],
+            }
+        ],
+        "job_id": "job-parent-1",
+    }
+    assert engine.commit_graph_update(SID, proposal, base_graph_version=0)["ok"] is True
+
+    other_sid = "99999999-0000-4000-8000-000000000000"
+    empty_ctx = engine.get_graph_context(other_sid, provider="codex")
+    assert empty_ctx["ok"] is True
+    assert empty_ctx["session_id"] == other_sid
+    assert empty_ctx["nodes"] == []
+    assert empty_ctx["edges"] == []
+    assert empty_ctx["empty"] is True
+
+    # Subagent graph nodes under <SID>_agent-1 are returned when include_subagents=True
+    child_sid = f"{SID}_agent-1"
+    child_chunk = Chunk(
+        chunk_id="c_sub_0",
+        session_id=child_sid,
+        provider="codex",
+        kind="tool_call",
+        text="[tool_call:shell] pytest",
+        content_hash="h_sub_0",
+        meta={"role": "assistant", "tool_name": "shell", "success": True},
+    )
+    engine.store.commit_events([child_chunk], session_id=child_sid, provider="codex",
+                               path=Path("sub.jsonl"), offset=10, digest="d_sub")
+    child_proposal = {
+        "nodes": [
+            {"node_id": "task-child", "kind": "task", "label": "child task"},
+            {"node_id": "req-parent", "kind": "requirement", "label": "parent req"},
+        ],
+        "edges": [
+            {
+                "src": "task-child",
+                "dst": "req-parent",
+                "relation": "IMPLEMENTS",
+                "origin": "observed",
+                "evidence_chunk_ids": ["c_sub_0"],
+            }
+        ],
+        "job_id": "job-child-1",
+    }
+    assert engine.commit_graph_update(child_sid, child_proposal, base_graph_version=0)["ok"] is True
+
+    parent_only = engine.get_graph_context(SID, provider="codex", include_subagents=False)
+    assert {n["node_id"] for n in parent_only["nodes"]} == {"req-parent", "task-parent"}
+    assert parent_only["empty"] is False
+
+    family_ctx = engine.get_graph_context(SID, provider="codex", include_subagents=True)
+    assert family_ctx["include_subagents"] is True
+    assert {n["node_id"] for n in family_ctx["nodes"]} == {"req-parent", "task-parent", "task-child"}

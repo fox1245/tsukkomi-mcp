@@ -30,7 +30,9 @@ from self_directing_mcp.tool_payload import tool_call_parts
 # v2: the ``system`` record ``scheduled_task_fire`` (a cron task fired) as runtime metadata.
 # v3: a tool call's model-written ``description`` is kept out of the call text (``tool_payload``) and recorded in
 #     ``meta.tool_prose``; contracts match the payload only.
-PARSER_VERSION = 3
+# v4: Claude Code 2.1.30x runtime metadata records (``api-request``, ``api-request-blob``, ``api-request-shape``,
+#     ``fork-context-ref``).
+PARSER_VERSION = 4
 
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
 _HOOK_NAME = re.compile(r"[A-Za-z0-9_.:*/@+-]{1,200}\Z")
@@ -176,6 +178,60 @@ def discover_session_files(root: Path, *, include_subagents: bool = True) -> lis
                             and _STEM.fullmatch(child.name[:-len(".jsonl")]):
                         found.append(Path(child.path))
     return sorted(found)
+
+
+def discover_subagent_files(root: Path, session_id: str, *, path: Path | None = None) -> list[tuple[str, Path]]:
+    """Return ``(subagent_session_id, resolved_path)`` pairs for all subagent transcripts of ``session_id``."""
+    parts = session_parts(session_id)
+    if parts is None:
+        return []
+    parent = parts[0]
+    root = Path(root).expanduser().resolve()
+    candidate_dirs: list[Path] = []
+    if path is not None:
+        try:
+            resolved_main = resolve_session_path(root, path=str(path))
+            main_parts = session_parts(peek_session_id(resolved_main))
+            if main_parts is not None and main_parts[0] == parent:
+                sub_dir = resolved_main.parent if main_parts[1] is not None else (resolved_main.parent / parent / SUBAGENTS)
+                candidate_dirs.append(sub_dir)
+        except (ValueError, OSError):
+            pass
+    if not candidate_dirs:
+        try:
+            projects = sorted(entry for entry in root.iterdir() if entry.is_dir() and not _linked(entry))
+        except OSError:
+            projects = []
+        for project in projects:
+            parent_dir = project / parent
+            sub_dir = parent_dir / SUBAGENTS
+            if not _linked(parent_dir) and not _linked(sub_dir) and sub_dir.is_dir():
+                candidate_dirs.append(sub_dir)
+    found: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for sub_dir in candidate_dirs:
+        if _linked(sub_dir) or not sub_dir.is_dir():
+            continue
+        try:
+            entries = sorted(sub_dir.iterdir(), key=lambda e: e.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if _linked(entry) or not entry.is_file() or not entry.name.endswith(".jsonl"):
+                continue
+            stem = entry.name[:-len(".jsonl")]
+            if not _STEM.fullmatch(stem):
+                continue
+            sub_sid = f"{parent}_{stem}"
+            if sub_sid in seen:
+                continue
+            try:
+                resolved = resolve_session_path(root, session_id=sub_sid, path=str(entry))
+            except (ValueError, OSError):
+                continue
+            seen.add(sub_sid)
+            found.append((sub_sid, resolved))
+    return found
 
 
 # ----------------------------------------------------------------------------- shape helpers
@@ -723,8 +779,16 @@ _SYSTEM_SUBTYPES = {"turn_duration", "stop_hook_summary", "away_summary", "compa
                     "informational", "scheduled_task_fire"}
 _QUEUE_OPERATIONS = {"enqueue", "dequeue", "remove"}
 _METADATA = {"mode", "permission-mode", "ai-title", "agent-name", "pr-link", "file-history-snapshot",
-             "file-history-delta", "cost-state", "atis-latch", "last-prompt", "continued-in"}
+             "file-history-delta", "cost-state", "atis-latch", "last-prompt", "continued-in",
+             "api-request", "api-request-blob", "api-request-shape", "fork-context-ref"}
 _SESSION_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+_ENVELOPE_KEYS = {"type", "sessionId", "timestamp", "version", "uuid", "parentUuid", "cwd",
+                  "agentId", "isSidechain", "userType", "promptId", "requestId"}
+_API_REQUEST_KEYS = _ENVELOPE_KEYS | {"id", "base", "tail", "keep", "params", "cacheControl",
+                                      "querySource", "requestDigest", "shapeHash"}
+_API_REQUEST_BLOB_KEYS = _ENVELOPE_KEYS | {"hash", "message"}
+_API_REQUEST_SHAPE_KEYS = _ENVELOPE_KEYS | {"shape", "shapeHash"}
+_FORK_CONTEXT_REF_KEYS = _ENVELOPE_KEYS | {"contextLength", "parentLastUuid", "parentSessionId"}
 
 
 def _scheduled_task_fire(record):
@@ -795,6 +859,47 @@ def _metadata(base, record, state):
             yield _unsupported(base, f"[unsupported_claude_event:continued-in] {_keys(record)}")
             return
         extra["continued_in_session_id"] = target
+    if kind == "api-request":
+        if not (set(record) <= _API_REQUEST_KEYS
+                and _typed(record, id=str, querySource=str, requestDigest=str, shapeHash=str,
+                           base=(str, dict, list, int, type(None)), tail=(str, dict, list, int, type(None)),
+                           keep=(int, list, dict, bool, str, type(None)), params=(dict, type(None)),
+                           cacheControl=(dict, str, bool, type(None)))):
+            yield _unsupported(base, f"[unsupported_claude_event:api-request] {_keys(record)}")
+            return
+        if _label(record.get("querySource")):
+            extra["query_source"] = record["querySource"]
+        if isinstance(record.get("id"), str) and _SESSION_REF.fullmatch(record["id"]):
+            extra["api_request_id"] = record["id"]
+    if kind == "api-request-blob":
+        # ``message`` duplicates turn payloads and must never be indexed as user/assistant text.
+        if not (set(record) <= _API_REQUEST_BLOB_KEYS
+                and isinstance(record.get("hash"), str) and bool(record["hash"])
+                and isinstance(record.get("message"), (dict, list, str))):
+            yield _unsupported(base, f"[unsupported_claude_event:api-request-blob] {_keys(record)}")
+            return
+    if kind == "api-request-shape":
+        if not (set(record) <= _API_REQUEST_SHAPE_KEYS
+                and isinstance(record.get("shapeHash"), str) and bool(record["shapeHash"])
+                and isinstance(record.get("shape"), (dict, list, str))):
+            yield _unsupported(base, f"[unsupported_claude_event:api-request-shape] {_keys(record)}")
+            return
+    if kind == "fork-context-ref":
+        parent_sid = record.get("parentSessionId")
+        parent_last = record.get("parentLastUuid")
+        ctx_len = record.get("contextLength")
+        if not (set(record) <= _FORK_CONTEXT_REF_KEYS
+                and isinstance(parent_sid, str) and _SESSION_REF.fullmatch(parent_sid)
+                and (not state.sub or state.parent is None or parent_sid == state.parent)
+                and (parent_last is None or (isinstance(parent_last, str) and _SESSION_REF.fullmatch(parent_last)))
+                and (ctx_len is None or (_is_int(ctx_len) and ctx_len >= 0))):
+            yield _unsupported(base, f"[unsupported_claude_event:fork-context-ref] {_keys(record)}")
+            return
+        extra["parent_session_id"] = parent_sid
+        if parent_last is not None:
+            extra["parent_last_uuid"] = parent_last
+        if ctx_len is not None:
+            extra["context_length"] = ctx_len
     yield _runtime(base, f"[claude_metadata:{kind}]", "session_metadata", **extra)
 
 

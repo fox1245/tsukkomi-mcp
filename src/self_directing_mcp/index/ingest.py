@@ -734,6 +734,54 @@ class SessionStore:
         with self._read_boundary():
             return self._chunk_ids(session_id, provider)
 
+    @staticmethod
+    def _family_bounds(session_id: str, provider: str) -> tuple[str, str, str]:
+        from self_directing_mcp import claude_ids
+        parts = claude_ids.session_parts(session_id) if provider == "claude" else None
+        parent = parts[0] if parts is not None else session_id
+        return parent, f"{parent}_", f"{parent}`"
+
+    def family_session_ids(self, session_id: str, provider: str) -> list[str]:
+        """Return ``session_id``'s parent and all indexed child subagent session ids for ``provider``."""
+        parent, low, high = self._family_bounds(session_id, provider)
+        with self._read_boundary():
+            rows = self._conn.execute(
+                "SELECT session_id FROM session_cursors WHERE provider=? AND (session_id=? OR (session_id>=? AND session_id<?)) "
+                "UNION "
+                "SELECT DISTINCT session_id FROM session_events WHERE provider=? AND (session_id=? OR (session_id>=? AND session_id<?))",
+                (provider, parent, low, high, provider, parent, low, high),
+            ).fetchall()
+        found = sorted({row[0] for row in rows})
+        return found if found else [parent]
+
+    def family_chunk_ids(self, session_id: str, provider: str) -> set[str]:
+        """Return all ``chunk_id``s in ``session_id``'s parent-and-subagent family in one indexed range scan."""
+        parent, low, high = self._family_bounds(session_id, provider)
+        with self._read_boundary():
+            return {
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT chunk_id FROM session_events WHERE provider=? AND (session_id=? OR (session_id>=? AND session_id<?))",
+                    (provider, parent, low, high),
+                )
+            }
+
+    def capture_family_evidence(self, session_id: str, provider: str) -> AuditEvidenceSnapshot:
+        """Capture all events across ``session_id``'s parent-and-subagent family in a single read boundary."""
+        parent, low, high = self._family_bounds(session_id, provider)
+        with self._read_boundary():
+            check_request()
+            rows = tuple(
+                tuple(row)
+                for row in self._conn.execute(
+                    "SELECT chunk_id, data FROM session_events "
+                    "WHERE provider=? AND (session_id=? OR (session_id>=? AND session_id<?)) "
+                    "ORDER BY session_id, byte_start, sub_index, chunk_id",
+                    (provider, parent, low, high),
+                ).fetchall()
+            )
+            return AuditEvidenceSnapshot(None, provider, rows, len(rows))
+
     def _chunk_ids(self, session_id, provider):
         clauses, params = [], []
         if session_id is not None:

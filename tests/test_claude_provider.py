@@ -1255,3 +1255,93 @@ def test_large_synthetic_session_is_indexed_with_bounded_memory(engine, root):
         tracemalloc.stop()
     assert result["ok"] and result["total_chunks"] == 15000 and result["coverage"]["complete"]
     assert peak < 0.5 * size, (peak, size)
+
+
+# --- Issue #54: Claude Code 2.1.30x runtime metadata records ------------------------------------------------
+
+def test_claude_2_1_30x_runtime_metadata_records_are_supported_and_blobs_are_never_indexed(engine, root):
+    path = main_file(root)
+    sub_path = sub_file(root)
+    secret_turn = "SENTINEL_BLOB_TURN_MUST_NOT_BE_INDEXED_9911"
+    write(
+        path,
+        human("run check"),
+        {
+            "type": "api-request",
+            "sessionId": SID,
+            "timestamp": "2026-10-01T00:01:00.000Z",
+            "version": "2.1.300",
+            "id": "req_meta_1",
+            "querySource": "repl_main_thread",
+            "requestDigest": "sha256:abc",
+            "shapeHash": "shape_1",
+            "base": {"messages": 2},
+            "tail": {"messages": 1},
+            "keep": 1,
+            "params": {"max_tokens": 4096},
+            "cacheControl": {"type": "ephemeral"},
+        },
+        {
+            "type": "api-request-blob",
+            "sessionId": SID,
+            "hash": "blob_hash_1",
+            "message": {"role": "user", "content": secret_turn},
+        },
+        {
+            "type": "api-request-shape",
+            "sessionId": SID,
+            "timestamp": "2026-10-01T00:01:01.000Z",
+            "version": "2.1.300",
+            "shape": {"tools": 12, "system": 3},
+            "shapeHash": "shape_1",
+        },
+        assistant(text("completed")),
+    )
+    write(
+        sub_path,
+        {
+            "type": "fork-context-ref",
+            "agentId": AGENT_ID,
+            "contextLength": 42,
+            "parentLastUuid": "00000000-0000-4000-8000-000000000001",
+            "parentSessionId": SID,
+        },
+        user("inspect sub task", sub=True),
+        assistant(text("subagent finished"), sub=True),
+    )
+
+    res_main = engine.sync_session(session_id=SID, provider="claude", path=str(path), embed=False, include_subagents=True)
+    assert res_main["ok"] is True
+    assert res_main["parser_version"] == 4
+    assert res_main["coverage"]["complete"] is True
+    assert res_main["coverage"]["unsupported_event_count"] == 0
+    assert res_main["subagent_count"] == 1
+    assert res_main["subagents"][0]["session_id"] == CHILD
+    assert res_main["subagents"][0]["ok"] is True
+
+    all_chunks = stored(engine, SID) + stored(engine, CHILD)
+    assert all(not c.meta.get("unsupported_event") for c in all_chunks)
+    assert all(secret_turn not in c.text for c in all_chunks)
+
+    # Family search finds subagent turns from the parent session_id
+    fam = engine.search_history("subagent finished", session_id=SID, provider="claude", mode="sparse", scope="family")
+    assert fam["ok"] is True and fam["scope"] == "family"
+    assert any(h["session_id"] == CHILD for h in fam["hits"])
+
+    # Regex family search also finds subagent turns and interleaves across sessions when top_k is small
+    fam_rx = engine.search_history("completed|subagent finished|run check", session_id=SID, provider="claude",
+                                   mode="regex", scope="family", top_k=2)
+    assert fam_rx["ok"] is True
+    assert {h["session_id"] for h in fam_rx["hits"]} == {SID, CHILD}
+
+
+def test_malformed_claude_2_1_30x_metadata_records_stay_unsupported(engine, root):
+    path = write(
+        main_file(root),
+        human("hello"),
+        {"type": "api-request-blob", "sessionId": SID, "hash": "", "message": 12345},
+        {"type": "fork-context-ref", "parentSessionId": "not_a_valid_ref!"},
+    )
+    res = sync(engine, path)
+    assert res["coverage"]["complete"] is False
+    assert res["coverage"]["unsupported_event_count"] == 2

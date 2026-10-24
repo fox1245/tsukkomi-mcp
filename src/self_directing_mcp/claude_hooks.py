@@ -217,6 +217,9 @@ def handle_stop(engine: SelfDirectEngine, call: HookCall, path: str, *, session_
                 return {"decision": "allow", "reason": note + ("" if mode == "advisory" else " " + BUDGET_NOTE)}
     obligations = hook_policy.read_obligations(engine, "claude", sid, path)
     if not obligations["contracts"] and not obligations["has_checklist"]:
+        if subagent:
+            engine.sync_session(session_id=sid, provider="claude", path=path, embed=False,
+                                derived=hook_policy.wants_derived_work(engine))
         return {"decision": "allow"}
     notes, misses = hook_policy.checkpoint(engine, "claude", sid, path, obligations, "Claude Code")
     if any(rule.scope in _FINAL_MESSAGE_SCOPES for rule, _f in misses) and _transcript_lags(path, call.last_message):

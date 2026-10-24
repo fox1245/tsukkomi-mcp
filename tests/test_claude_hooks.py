@@ -1200,3 +1200,14 @@ def test_demotion_only_touches_history_dependent_must_findings():
         {"contract_id": "n", "verdict": "suspicious", "reason": "s"}]}
     assert demote_history_findings(mixed, obligations, "why")["verdict"] == "suspicious"
     assert demote_history_findings({"ok": True, "verdict": "clean", "findings": []}, obligations, "why")["verdict"] == "clean"
+
+
+def test_subagent_stop_indexes_subagent_transcript_even_without_active_contracts(env):
+    engine, _path = env
+    make_subagent(engine, assistant(text("subagent indexed on stop"), sub=True))
+    response = subagent_stop(engine, agent_id=AGENT_ID)
+    assert response == {}
+    hits = engine.search_history("subagent indexed on stop", session_id=SID, provider="claude",
+                                 mode="regex", scope="family")
+    assert hits["ok"] is True
+    assert any(h["session_id"] == CHILD for h in hits["hits"])

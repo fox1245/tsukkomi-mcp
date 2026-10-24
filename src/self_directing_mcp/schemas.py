@@ -377,6 +377,7 @@ class AuditResult(BaseModel):
 
 class SearchHit(BaseModel):
     chunk_id: str
+    session_id: str | None = None
     ranking_score: float
     dense_rank: int | None = None
     sparse_rank: int | None = None

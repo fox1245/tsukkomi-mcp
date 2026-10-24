@@ -502,13 +502,36 @@ class SelfDirectEngine:
         embed: bool = True,
         verify: str = "full",
         derived: bool = True,
+        include_subagents: bool = False,
     ) -> dict[str, Any]:
         """Index the appended events. ``derived=False`` publishes only the canonical events and the cursor (what every
         audit reads); the sparse and dense search indexes are then left to the next ``derived`` sync or search, which
         materialize whatever they lack (``_repair_sparse_for_search``). Host hooks use it: they judge, they do not search."""
+        checked_verify = _check_verify(verify)
         info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=embed,
-                                  derived=derived, verify=_check_verify(verify))
-        return {key: value for key, value in info.items() if not key.startswith("_")}
+                                  derived=derived, verify=checked_verify)
+        result = {key: value for key, value in info.items() if not key.startswith("_")}
+        if include_subagents and result.get("ok"):
+            subagents: list[dict[str, Any]] = []
+            if result.get("provider") == "claude" and result.get("session_id"):
+                main_path = Path(result["path"]) if result.get("path") else None
+                for sub_sid, sub_path in claude.discover_subagent_files(
+                    self.settings.resolve_claude_projects_dir(), result["session_id"], path=main_path
+                ):
+                    if sub_sid == result["session_id"]:
+                        continue
+                    sub_info = self._sync_session(session_id=sub_sid, path=str(sub_path), provider="claude",
+                                                  embed=embed, derived=derived, verify=checked_verify)
+                    subagents.append({
+                        "session_id": sub_sid,
+                        "ok": bool(sub_info.get("ok")),
+                        "chunks_added": sub_info.get("chunks_added", 0),
+                        "embedded_added": sub_info.get("embedded_added", 0),
+                        "total_chunks": sub_info.get("total_chunks", 0),
+                    })
+            result["subagents"] = subagents
+            result["subagent_count"] = len(subagents)
+        return result
 
     @detached_operation
     def verify_integrity(self, session_id: str, provider: str | None = None, path: str | None = None) -> dict[str, Any]:
@@ -654,46 +677,69 @@ class SelfDirectEngine:
         mode: str = "hybrid",
         top_k: int | None = None,
         provider: str | None = None,
+        scope: str = "session",
     ) -> dict[str, Any]:
         prepared_query = None
         assert self.store and self.sparse
         provider = self._resolve_provider(provider)
         if session_id and provider in ("codex", "agy"):
             session_id = session_id.lower()
+        if scope not in ("session", "family", "all"):
+            raise ValueError("scope must be session|family|all")
+        if scope == "family" and not session_id:
+            raise ValueError("scope='family' requires session_id")
+        target_sid = None if scope == "all" else session_id
         k = top_k if top_k is not None else self.settings.search_top_k
         if mode not in ("hybrid", "regex", "sparse", "dense") or not 1 <= k <= 100:
             raise ValueError("mode must be hybrid|regex|sparse|dense and top_k must be 1..100")
         if self.settings.local_only and mode in ("hybrid", "dense"):
             raise ValueError("dense/hybrid search unavailable in local-only mode")
+        is_family = scope == "family"
         if mode in ("sparse", "hybrid"):
-            self._repair_sparse_for_search(session_id, provider)
+            self._repair_sparse_for_search(target_sid, provider, family=is_family)
         if mode == "regex":
             with self._publication_guard():
-                snapshot = self.store.capture_evidence(session_id, provider)
-            hits = regex_search(snapshot, query, session_id=session_id, top_k=k, provider=provider)
+                snapshot = (self.store.capture_family_evidence(session_id, provider)
+                            if is_family else self.store.capture_evidence(target_sid, provider))
+            hits = regex_search(snapshot, query, session_id=None if is_family else target_sid,
+                                top_k=k, provider=provider)
         else:
             if not self.settings.local_only:
                 prepared_query = self.retriever.prepare_query(query, mode=mode)
             with self._publication_guard():
                 if self.dense is not None and mode in ("dense", "hybrid"):
                     self.dense.refresh()
+                allowed_family: set[str] | None = (
+                    self.store.family_chunk_ids(session_id, provider) if is_family else None
+                )
                 if mode == "sparse" and self.settings.local_only:
                     from self_directing_mcp.retrieve.hybrid import RRFResult
-                    snapshot = self.store.capture_evidence(session_id, provider)
-                    allowed = {cid for cid, _raw in snapshot.rows}
-                    rows = self.sparse.search(mask_secrets(query), top_k=k, session_id=session_id, allowed_ids=allowed)
-                    results = [RRFResult(chunk_id=cid, ranking_score=score, dense_rank=None,
-                                         sparse_rank=rank, sparse_score=score) for cid, score, rank in rows]
+                    if allowed_family is not None:
+                        rows = self.sparse.search(mask_secrets(query), top_k=k, session_id=None, allowed_ids=allowed_family)
+                        results = [RRFResult(chunk_id=cid, ranking_score=score, dense_rank=None,
+                                             sparse_rank=rank, sparse_score=score) for cid, score, rank in rows]
+                        snapshot = self.store.capture_evidence(None, provider, history=False,
+                                                              anchors=(row.chunk_id for row in results))
+                    else:
+                        snapshot = self.store.capture_evidence(target_sid, provider)
+                        allowed = {cid for cid, _raw in snapshot.rows}
+                        rows = self.sparse.search(mask_secrets(query), top_k=k, session_id=target_sid, allowed_ids=allowed)
+                        results = [RRFResult(chunk_id=cid, ranking_score=score, dense_rank=None,
+                                             sparse_rank=rank, sparse_score=score) for cid, score, rank in rows]
                 else:
                     try:
-                        results = self.retriever.retrieve(query, top_k=k, session_id=session_id, mode=mode,
-                                                          provider=provider, query_vector=prepared_query)
+                        results = self.retriever.retrieve(
+                            query, top_k=k, session_id=None if allowed_family is not None else target_sid,
+                            mode=mode, provider=provider, query_vector=prepared_query, allowed_ids=allowed_family
+                        )
                     except DenseBackendError as exc:
                         return self._dense_backend_error(exc, provider)     # never a sparse-only answer in its place
-                    snapshot = self.store.capture_evidence(session_id, provider, history=False,
-                                                          anchors=(row.chunk_id for row in results))
+                    snapshot = self.store.capture_evidence(
+                        None if allowed_family is not None else target_sid, provider, history=False,
+                        anchors=(row.chunk_id for row in results)
+                    )
             hits = hits_to_schema(results, snapshot.get_chunk)
-        return {
+        result = {
             "ok": True,
             "mode": mode,
             "query": mask_secrets(query),
@@ -705,13 +751,16 @@ class SelfDirectEngine:
                 "Call audit_session — contracts/regex are authoritative."
             ),
         }
+        if scope != "session":
+            result["scope"] = scope
+        return result
 
     def _dense_backend_error(self, exc: DenseBackendError, provider) -> dict[str, Any]:
         """The answer of a call whose dense backend is selected but cannot work: the error, its repair, no substitute."""
         return {"ok": False, "error": "dense_backend_unavailable", "dense_backend": self.dense_backend,
                 "message": str(exc), "provider": provider}
 
-    def _repair_sparse_for_search(self, session_id, provider):
+    def _repair_sparse_for_search(self, session_id, provider, *, family: bool = False):
         """Materialize deferred canonical evidence before searching its derived view.
 
         The missing documents are written in bounded batches, each committed on its own, so a repair that the request
@@ -724,8 +773,9 @@ class SelfDirectEngine:
         in the bm25 statistics. A search of one session leaves them alone: the compact index has no index on a document's
         session, so listing one session's ids would scan the whole id map on every such search."""
         with self._publication_guard():
-            allowed = self.store.chunk_ids(session_id, provider)
-            # A session search probes only its own ids; a global search needs every id, so one scan is cheaper.
+            allowed = (self.store.family_chunk_ids(session_id, provider)
+                       if family and session_id else self.store.chunk_ids(session_id, provider))
+            # A session/family search probes only its own ids; a global search needs every id, so one scan is cheaper.
             if session_id:
                 missing, extra = allowed - self.sparse.present(allowed), ()
             else:
@@ -733,7 +783,7 @@ class SelfDirectEngine:
                 missing = allowed - indexed
                 extra = self._sparse_extra_ids(indexed, len(missing))
         if missing:
-            self._fill_sparse(session_id, provider, sorted(missing))
+            self._fill_sparse(None if family else session_id, provider, sorted(missing))
         if extra:
             self._prune_sparse_for_search(extra)
 
@@ -2188,6 +2238,7 @@ class SelfDirectEngine:
         provider: str | None = None,
         depth: int = 1,
         path: str | None = None,
+        include_subagents: bool = False,
     ) -> dict[str, Any]:
         """Fetch GraphRAG context: entity neighbor subgraph or overall session graph."""
         assert self.graph is not None
@@ -2206,16 +2257,26 @@ class SelfDirectEngine:
                 return {"ok": False, "error": "incomplete_history", "nodes": [], "edges": []}
             cursor = self.graph.cursor(sid, resolved_provider)
             if node_id:
-                res = self.graph.neighbors(sid, resolved_provider, node_id, depth=depth)
+                res = self.graph.neighbors(sid, resolved_provider, node_id, depth=depth,
+                                           include_subagents=include_subagents)
                 if not res.get("edges"):
-                    matches = self.graph.find_nodes_like(node_id, sid, resolved_provider)
+                    matches = self.graph.find_nodes_like(node_id, sid, resolved_provider,
+                                                         include_subagents=include_subagents)
                     if matches:
-                        res = self.graph.neighbors(sid, resolved_provider, matches[0]["node_id"], depth=depth)
-                return {"ok": True, "session_id": sid, "provider": resolved_provider,
-                        "node_id": node_id, "subgraph": res, "cursor": cursor}
-            graph_data = self.graph.get_session_graph(sid, resolved_provider)
-            return {"ok": True, "session_id": sid, "provider": resolved_provider,
-                    "nodes": graph_data["nodes"], "edges": graph_data["edges"], "cursor": cursor}
+                        res = self.graph.neighbors(sid, resolved_provider, matches[0]["node_id"], depth=depth,
+                                                   include_subagents=include_subagents)
+                out = {"ok": True, "session_id": sid, "provider": resolved_provider,
+                       "node_id": node_id, "subgraph": res, "cursor": cursor}
+                if include_subagents:
+                    out["include_subagents"] = True
+                return out
+            graph_data = self.graph.get_session_graph(sid, resolved_provider, include_subagents=include_subagents)
+            out = {"ok": True, "session_id": sid, "provider": resolved_provider,
+                   "nodes": graph_data["nodes"], "edges": graph_data["edges"],
+                   "empty": graph_data["empty"], "cursor": cursor}
+            if include_subagents:
+                out["include_subagents"] = True
+            return out
 
     @detached_operation
     @graph_operation("validate_graph_proposal")

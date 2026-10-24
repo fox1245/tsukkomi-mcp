@@ -456,6 +456,7 @@ async def sync_session(
     embed: bool = True,
     timeout_ms: int | None = None,
     verify: Literal["full", "fast"] = "full",
+    include_subagents: bool = False,
 ) -> dict[str, Any]:
     """Index/update local session history when retrieval needs fresh evidence.
 
@@ -477,7 +478,7 @@ async def sync_session(
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.sync_session, session_id=session_id, path=path, provider=provider, embed=embed,
-                           verify=verify, budget_override=budget)
+                           verify=verify, include_subagents=include_subagents, budget_override=budget)
 
 
 @mcp.tool()
@@ -488,6 +489,7 @@ async def search_history(
     top_k: int | None = None,
     provider: str | None = None,
     timeout_ms: int | None = None,
+    scope: Literal["session", "family", "all"] = "session",
 ) -> dict[str, Any]:
     """Search indexed session history (hybrid|regex|sparse|dense).
 
@@ -498,7 +500,7 @@ async def search_history(
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.search_history,
-        query, session_id=session_id, mode=mode, top_k=top_k, provider=provider,
+        query, session_id=session_id, mode=mode, top_k=top_k, provider=provider, scope=scope,
         budget_override=budget
     )
 
@@ -761,14 +763,15 @@ async def analyze_activity(session_id: str, provider: str | None = None,
 @mcp.tool()
 async def get_graph_context(session_id: str, node_id: str | None = None,
                             provider: str | None = None, depth: int = 1,
-                            path: str | None = None) -> dict[str, Any]:
+                            path: str | None = None, include_subagents: bool = False) -> dict[str, Any]:
     """Query the GraphRAG knowledge graph: nodes, edges, and entity dependencies.
 
     If node_id is provided, returns the entity's neighbor subgraph up to depth.
     If node_id is omitted, returns the active session knowledge graph.
     """
     return await _dispatch(_engine.get_graph_context, session_id, node_id=node_id,
-                           provider=provider, depth=depth, path=path, audit=True)
+                           provider=provider, depth=depth, path=path,
+                           include_subagents=include_subagents, audit=True)
 
 
 @mcp.tool()
