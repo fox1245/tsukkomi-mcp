@@ -16,7 +16,9 @@ from self_directing_mcp.tool_payload import tool_call_parts
 # v7: host NUL padding in front of a record, and the IDE's typed result and context steps.
 # v8: a tool call's model-written ``toolAction`` / ``toolSummary`` labels are kept out of the call text
 #     (``tool_payload``) and recorded in ``meta.tool_prose``; contracts match the payload only.
-PARSER_VERSION = 8
+# v9: receipt-linked non-``run_command`` ``GENERIC`` results and modern CLI ``run_command`` exit/background
+#     headers are recognized as shaped host results instead of ``unsupported_event``.
+PARSER_VERSION = 9
 DISPLAY_NAME, FULL_NAME = "transcript.jsonl", "transcript_full.jsonl"
 KNOWN_STATUS = frozenset({"DONE", "RUNNING", "ERROR", "INVALID", "CANCELED"})
 # The result of a tool call. The CLI writes every result as GENERIC; the IDE writes one step type per tool. Both
@@ -404,8 +406,20 @@ class _Truncation:
         return out
 
 
-_EXIT_HEADER = re.compile(r"\ACreated At: [^\n]+\nCompleted At: [^\n]+\n\n"
-                          r"The command exited with code (-?\d+)\.\n(?:Output|Stdout):\n")
+_EXIT_HEADER = re.compile(
+    r"\ACreated At: [^\n]+\nCompleted At: [^\n]+\n"
+    r"(?:\n|"
+    r"The tool's output was truncated due to being too long\. "
+    r"You can find the full output in a file at [^\n]+\n\n"
+    r"Here is a preview with the middle of the output truncated:\n)?"
+    r"(?:The command|Command) exited with code (-?\d+)\.\n"
+    r"(?:(?:Output|Stdout):\n|\n(?:Command output:\n|No output from the command\.(?:\n|\Z)))"
+)
+_BACKGROUND_TASK_HEADER = re.compile(
+    r"\ACreated At: [^\n]+\n"
+    r"Tool is running as a background task with task id: [^\n]+\n"
+    r"Task logs are available at: [^\n]+\n"
+)
 
 
 def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_hashes=None, receipts=None, sink=None,
@@ -580,7 +594,8 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                 else:
                     # Match only the host prefix, never exit-code prose in output.
                     exit_match = _EXIT_HEADER.match(content)
-                    shaped = kind != "GENERIC" or exit_match is not None  # typed IDE results carry no header
+                    shaped = (kind != "GENERIC" or exit_match is not None
+                              or _BACKGROUND_TASK_HEADER.match(content) is not None)
                     success = int(exit_match.group(1)) == 0 if exit_match and status == "DONE" else None
                 if status in ("ERROR", "CANCELED", "INVALID"):
                     success = False  # never success evidence; the call attempt itself is preserved elsewhere
@@ -599,6 +614,8 @@ def parse_session_chunks(path: Path, *, session_id=None, start_byte=0, known_has
                                              {**base, **provenance, "role": "assistant",
                                               "tool_name": name, "call_id": call_id, **prose},
                                              line, start, end, timestamp=timestamp))
+                    if kind == "GENERIC" and name != "run_command":
+                        shaped = True
                     if receipt.get("post_error"):
                         success = False
                     elif kind == "GENERIC" and name != "run_command":

@@ -248,3 +248,156 @@ def test_host_stop_continuation_is_context_not_execution_or_requirement(session)
     assert result["coverage"]["complete"]
     context = next(c for c in engine.store.list_chunks(SID, "agy") if c.meta.get("event_type") == "SYSTEM_MESSAGE")
     assert context.kind == "meta" and context.meta["role"] == "runtime"
+
+
+@pytest.mark.parametrize("tool_name,tool_args,result_text", [
+    ("read_file", {"Path": "/synthetic/project/README.md"}, "# Synthetic Readme\n"),
+    ("call_mcp_tool", {"ServerName": "tsukkomi-mcp", "ToolName": "list_contracts", "Arguments": {}}, "{\"ok\": true}"),
+    ("edit_file", {"Path": "/synthetic/project/app.py", "Target": "a", "Replacement": "b"}, "Edited file"),
+    ("write_file", {"Path": "/synthetic/project/new.py", "Content": "x = 1\n"}, "Created file"),
+])
+def test_receipt_linked_non_command_generic_results_are_supported_and_preserve_complete_coverage(
+    session, tool_name, tool_args, result_text
+):
+    from self_directing_mcp.agy_hooks import handle_pre_invocation
+
+    engine, path = session
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[1]["tool_calls"] = [{"name": tool_name, "args": {k: json.dumps(v) for k, v in tool_args.items()}}]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    payload = {
+        "conversationId": SID,
+        "transcriptPath": str(path),
+        "workspacePaths": ["/synthetic/project"],
+        "stepIdx": 2,
+        "toolCall": {"name": tool_name, "args": tool_args},
+        "error": "",
+    }
+    engine.record_agy_hook(payload, "PreToolUse")
+    with path.open("a") as stream:
+        stream.write(json.dumps({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-10-01T00:00:02Z",
+            "content": result_text,
+        }) + "\n")
+    engine.record_agy_hook(payload, "PostToolUse")
+
+    synced = engine.sync_session(session_id=SID, provider="agy", path=str(path), embed=False)
+    assert synced["coverage"]["complete"] is True
+    assert synced["coverage"]["unsupported_event_count"] == 0
+    assert "unsupported_events" not in synced["coverage"]["issues"]
+
+    chunks = engine.store.list_chunks(SID, "agy")
+    outcome = next(c for c in chunks if c.kind == "tool_result")
+    assert outcome.meta["linkage"] == "host_step_receipt"
+    assert outcome.meta["tool_name"] == tool_name
+    assert outcome.meta["unsupported_event"] is False
+    assert outcome.meta["success"] is None
+
+    ctx = engine.get_graph_context(session_id=SID, provider="agy", path=str(path))
+    assert ctx["ok"] is True
+
+    hook_out = handle_pre_invocation(engine, SID, {
+        "conversationId": SID,
+        "transcriptPath": str(path),
+        "workspacePaths": ["/synthetic/project"],
+        "prompt": "check status",
+    })
+    additional = hook_out.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert "AGY history/context unavailable" not in additional
+
+
+@pytest.mark.parametrize("content,expected_success", [
+    (
+        "Created At: 2026-10-01T00:00:02+09:00\nCompleted At: 2026-10-01T00:00:03+09:00\n"
+        "Command exited with code 0.\n\nCommand output:\nall passed\n",
+        True,
+    ),
+    (
+        "Created At: 2026-10-01T00:00:02+09:00\nCompleted At: 2026-10-01T00:00:03+09:00\n"
+        "Command exited with code 2.\n\nCommand output:\nfailed\n",
+        False,
+    ),
+    (
+        "Created At: 2026-10-01T00:00:02+09:00\nCompleted At: 2026-10-01T00:00:03+09:00\n"
+        "Command exited with code 0.\n\nNo output from the command.",
+        True,
+    ),
+    (
+        "Created At: 2026-10-01T00:00:02+09:00\nCompleted At: 2026-10-01T00:00:03+09:00\n"
+        "The tool's output was truncated due to being too long. "
+        "You can find the full output in a file at file:///synthetic/steps/10/output.txt.\n\n"
+        "Here is a preview with the middle of the output truncated:\n"
+        "Command exited with code 0.\n\nCommand output:\nhead\n<truncated>\ntail\n",
+        True,
+    ),
+    (
+        "Created At: 2026-10-01T00:00:02+09:00\n"
+        "Tool is running as a background task with task id: task-123\n"
+        "Task logs are available at: /synthetic/tasks/task-123.log\n",
+        None,
+    ),
+])
+def test_modern_agy_cli_run_command_headers_and_background_tasks_are_shaped(session, content, expected_success):
+    engine, path = session
+    payload = _receipt_payload(path)
+    engine.record_agy_hook(payload, "PreToolUse")
+    with path.open("a") as stream:
+        stream.write(json.dumps({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-10-01T00:00:02Z",
+            "content": content,
+        }) + "\n")
+    engine.record_agy_hook(payload, "PostToolUse")
+
+    synced = engine.sync_session(session_id=SID, provider="agy", path=str(path), embed=False)
+    assert synced["coverage"]["complete"] is True
+    assert synced["coverage"]["unsupported_event_count"] == 0
+    outcome = next(c for c in engine.store.list_chunks(SID, "agy") if c.kind == "tool_result")
+    assert outcome.meta["unsupported_event"] is False
+    assert outcome.meta["success"] is expected_success
+
+
+def test_unshaped_run_command_generic_result_remains_unsupported_and_never_succeeds(session):
+    engine, path = session
+    payload = _receipt_payload(path)
+    engine.record_agy_hook(payload, "PreToolUse")
+    with path.open("a") as stream:
+        stream.write(json.dumps({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-10-01T00:00:02Z",
+            "content": "Command exited with code 0.\n\nCommand output:\nmissing host timestamps\n",
+        }) + "\n")
+    engine.record_agy_hook(payload, "PostToolUse")
+
+    synced = engine.sync_session(session_id=SID, provider="agy", path=str(path), embed=False)
+    assert synced["coverage"]["complete"] is False
+    assert synced["coverage"]["unsupported_event_count"] == 1
+    outcome = next(c for c in engine.store.list_chunks(SID, "agy") if c.kind == "tool_result")
+    assert outcome.meta["unsupported_event"] is True
+    assert outcome.meta["success"] is None
+
+
+def test_parser_version_9_bump_reindexes_previously_synced_agy_session(session, monkeypatch):
+    from self_directing_mcp import agy
+
+    engine, path = session
+    assert agy.PARSER_VERSION == 9
+    with monkeypatch.context() as old:
+        old.setattr(agy, "PARSER_VERSION", 8)
+        first = engine.sync_session(session_id=SID, provider="agy", path=str(path), embed=False)
+        assert first["parser_version"] == 8
+    second = engine.sync_session(session_id=SID, provider="agy", path=str(path), embed=False)
+    assert second["reindexed"] is True
+    assert second["reindex_reason"] == "parser_updated"
+    assert second["parser_version"] == 9
