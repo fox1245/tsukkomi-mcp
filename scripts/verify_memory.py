@@ -40,7 +40,10 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 # neograph-engine sdists, by the version pinned in pyproject.toml; digests as published on PyPI.
-NEOGRAPH_SDISTS = {"0.14.1": "751cc3de3174840caf497549e2f42dab49a3720e79830ff7a0c3ca4f3431a244"}
+NEOGRAPH_SDISTS = {
+    "0.14.1": "751cc3de3174840caf497549e2f42dab49a3720e79830ff7a0c3ca4f3431a244",
+    "0.16.0": "374f6275abed6f3cd47a3820dda8e2535ed879b5b6b16b5d9d498007928cc9fe",
+}
 # sqliteai/sqlite-vector release tag and the commit it must resolve to (the official 1.1.0 release).
 SQLITE_VECTOR = ("1.1.0", "235a7c51b18858e1fea9fb2895e115e4cbbd9f7d")
 SQLITE_VECTOR_REPO = "https://github.com/sqliteai/sqlite-vector.git"

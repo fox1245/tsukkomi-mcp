@@ -51,10 +51,27 @@ from self_directing_mcp.codex import discover as codex_discover
 from self_directing_mcp.grokbot import discover as grokbot_discover
 from self_directing_mcp import omp, agy, claude, grok
 from self_directing_mcp.embed.embedder import build_embedder
+import threading
 from self_directing_mcp.index.ingest import (
     AmbiguousSessionSource, AuditEventSnapshot, FlightBusy, IntegrityPolicy, SessionStore, SlicePolicy,
-    capture_for_cursor, coverage_from_capture, ingest_session,
+    _provider_parser, capture_for_cursor, coverage_from_capture, get_session_progress, ingest_session,
 )
+from self_directing_mcp.audit.contract_testing import evaluate_contract_cases, merge_contract_cases
+from self_directing_mcp.audit.grants import (
+    apply_grants_to_finding,
+    create_grant_record,
+    extract_canonical_english_candidates,
+    grants_lock,
+    load_grants_doc,
+    parse_expires_in,
+    save_grants_doc,
+    session_grant_contract_ids,
+    validate_grant_action_tokens_and_rule,
+    verify_raw_anchor_approves_grant,
+    verify_user_anchor_approves_grant,
+)
+from self_directing_mcp.audit.runner import rejections
+from self_directing_mcp.request_stats import note_degraded
 from self_directing_mcp.index.sparse import (
     CJK_BUILDING, CJK_TOKENIZATION, CjkSparseIndex, CompactSparseIndex, SparseIndex, look_at_sparse_file, open_sparse_index, sparse_file,
 )
@@ -62,7 +79,14 @@ from self_directing_mcp.index.vector import DenseBackendError, build_vector_inde
 from self_directing_mcp.index.locking import index_lock
 from self_directing_mcp.retrieve.checks import regex_search
 from self_directing_mcp.retrieve.hybrid import HybridRetriever, hits_to_schema
-from self_directing_mcp.schemas import ContractOrigin, ContractRule, ContractsDocument, PendingChange, ProposedAction
+from self_directing_mcp.schemas import (
+    ContractCase,
+    ContractOrigin,
+    ContractRule,
+    ContractsDocument,
+    PendingChange,
+    ProposedAction,
+)
 from self_directing_mcp.security.mask import mask_secrets, mask_value
 from self_directing_mcp.timeseries import analyze_activity
 from self_directing_mcp import graph_batch
@@ -250,6 +274,9 @@ class SelfDirectEngine:
         self.graph: GraphStore | None = None
         self.neograph = None
         self._ready = False
+        self._closing_bg = False
+        self._jobs_lock = threading.Lock()
+        self._sync_jobs: dict[str, dict[str, Any]] = {}
 
     @contextmanager
     def _publication_guard(self):
@@ -506,8 +533,67 @@ class SelfDirectEngine:
                 return "grokbot"
         return self.settings.resolve_session_provider()
 
-    @detached_operation
-    def sync_session(
+    def _resolve_async_target(
+        self,
+        session_id: str | None,
+        path: str | None,
+        provider: str | None,
+    ) -> tuple[str, str, str]:
+        resolved_prov = self._resolve_provider(provider, path=path)
+        sid_norm = (session_id.lower() if (session_id and resolved_prov in ("codex", "agy")) else session_id)
+        norm_path = str(Path(path).resolve()) if path else None
+        if norm_path is not None and not Path(norm_path).is_file():
+            raise FileNotFoundError(norm_path)
+        if norm_path is None and sid_norm is not None:
+            if self.store is not None:
+                with self._publication_guard(), self.store._read_boundary():
+                    rec = self.store.cursor_record(sid_norm, resolved_prov)
+                if rec and rec.get("path"):
+                    cand = Path(rec["path"]).resolve()
+                    if cand.is_file():
+                        norm_path = str(cand)
+            if norm_path is None:
+                if resolved_prov == "agy":
+                    p = agy.resolve_session_path(
+                        self.settings.resolve_agy_app_data_dirs(), session_id=sid_norm, path=None
+                    )
+                elif resolved_prov == "claude":
+                    p = claude.resolve_session_path(
+                        self.settings.resolve_claude_projects_dir(), session_id=sid_norm, path=None
+                    )
+                elif resolved_prov == "grok":
+                    p = grok.resolve_session_path(
+                        self.settings.resolve_grok_sessions_dir(), session_id=sid_norm, path=None
+                    )
+                elif resolved_prov == "omp":
+                    p = omp.resolve_session_path(
+                        self.settings.resolve_omp_sessions_dir(), session_id=sid_norm, path=None
+                    )
+                elif resolved_prov == "grokbot":
+                    p = grokbot_discover.resolve_session_path(
+                        self.settings.resolve_grokbot_transcripts_dirs(), session_id=sid_norm, path=None
+                    )
+                else:
+                    p = codex_discover.resolve_session_path(
+                        self.settings.resolve_sessions_dir(), session_id=sid_norm, path=None
+                    )
+                if p is not None:
+                    norm_path = str(Path(p).resolve())
+        if norm_path is None:
+            raise FileNotFoundError(f"Cannot resolve session transcript path for session_id={session_id!r}")
+        p_obj = Path(norm_path)
+        peek_fn = _provider_parser(resolved_prov)[1]
+        peeked = peek_fn(p_obj)
+        peeked_norm = (peeked.lower() if (peeked and resolved_prov in ("codex", "agy")) else peeked)
+        if sid_norm is None:
+            if not peeked_norm:
+                raise ValueError(f"Cannot resolve session_id from transcript path {norm_path!r}")
+            sid_norm = peeked_norm
+        elif peeked_norm and peeked_norm != sid_norm:
+            raise ValueError(f"session_id {sid_norm!r} does not match transcript session_id {peeked_norm!r} at {norm_path!r}")
+        return resolved_prov, sid_norm, norm_path
+
+    def _run_sync_pass(
         self,
         *,
         session_id: str | None = None,
@@ -517,14 +603,19 @@ class SelfDirectEngine:
         verify: str = "full",
         derived: bool = True,
         include_subagents: bool = False,
+        _partial_sink: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Index the appended events. ``derived=False`` publishes only the canonical events and the cursor (what every
-        audit reads); the sparse and dense search indexes are then left to the next ``derived`` sync or search, which
-        materialize whatever they lack (``_repair_sparse_for_search``). Host hooks use it: they judge, they do not search."""
+        from self_directing_mcp.request_control import RequestStopped, check_request
+        if _partial_sink is not None:
+            check_request()
+        if self._closing or self._closing_bg:
+            raise RequestStopped("cancelled", "engine_closing")
         checked_verify = _check_verify(verify)
         info = self._sync_session(session_id=session_id, path=path, provider=provider, embed=embed,
                                   derived=derived, verify=checked_verify)
         result = {key: value for key, value in info.items() if not key.startswith("_")}
+        if _partial_sink is not None and result.get("ok"):
+            _partial_sink.append(dict(result))
         if include_subagents and result.get("ok"):
             subagents: list[dict[str, Any]] = []
             if result.get("provider") == "claude" and result.get("session_id"):
@@ -532,6 +623,9 @@ class SelfDirectEngine:
                 for sub_sid, sub_path in claude.discover_subagent_files(
                     self.settings.resolve_claude_projects_dir(), result["session_id"], path=main_path
                 ):
+                    check_request()
+                    if self._closing or self._closing_bg:
+                        raise RequestStopped("cancelled", "engine_closing")
                     if sub_sid == result["session_id"]:
                         continue
                     sub_info = self._sync_session(session_id=sub_sid, path=str(sub_path), provider="claude",
@@ -543,9 +637,413 @@ class SelfDirectEngine:
                         "embedded_added": sub_info.get("embedded_added", 0),
                         "total_chunks": sub_info.get("total_chunks", 0),
                     })
+                    if _partial_sink:
+                        _partial_sink[-1]["subagents_partial"] = list(subagents)
             result["subagents"] = subagents
             result["subagent_count"] = len(subagents)
+            if _partial_sink:
+                _partial_sink[-1] = dict(result)
         return result
+
+    @detached_operation
+    def sync_session(
+        self,
+        *,
+        session_id: str | None = None,
+        path: str | None = None,
+        provider: str | None = None,
+        embed: bool = True,
+        verify: str = "full",
+        derived: bool = True,
+        include_subagents: bool = False,
+        async_mode: bool = False,
+    ) -> dict[str, Any]:
+        """Index the appended events. ``derived=False`` publishes only the canonical events and the cursor (what every
+        audit reads); the sparse and dense search indexes are then left to the next ``derived`` sync or search, which
+        materialize whatever they lack (``_repair_sparse_for_search``). Host hooks use it: they judge, they do not search."""
+        checked_verify = _check_verify(verify)
+        if async_mode:
+            import uuid
+            from self_directing_mcp.request_control import IndexBusy, RequestControl, RequestStopped, request_scope
+            resolved_prov, sid_norm, norm_path = self._resolve_async_target(session_id, path, provider)
+            coalesced_resp: dict[str, Any] | None = None
+            with self._jobs_lock:
+                if self._closing or self._closing_bg:
+                    raise IndexBusy()
+                for existing_job in self._sync_jobs.values():
+                    if existing_job.get("status") != "running":
+                        continue
+                    ex_sid = existing_job.get("session_id")
+                    ex_path = existing_job.get("_norm_path")
+                    ex_prov = existing_job.get("provider")
+                    same_sid = (ex_sid == sid_norm and ex_prov == resolved_prov)
+                    same_path = (ex_path == norm_path and ex_prov == resolved_prov)
+                    if same_sid or same_path:
+                        if ex_sid != sid_norm or ex_path != norm_path:
+                            raise IndexBusy()
+                        if embed and not existing_job.get("embed"):
+                            existing_job["_upgrade_embed"] = True
+                        if derived and not existing_job.get("derived"):
+                            existing_job["_upgrade_derived"] = True
+                        if include_subagents and not existing_job.get("include_subagents"):
+                            existing_job["_upgrade_subagents"] = True
+                        if checked_verify == "full" and existing_job.get("verify") != "full":
+                            existing_job["_upgrade_verify"] = True
+                        existing_job["_rerun_requested"] = True
+                        coalesced_resp = {
+                            "ok": True,
+                            "async": True,
+                            "coalesced": True,
+                            "job_id": existing_job["job_id"],
+                            "status": "running",
+                            "session_id": sid_norm,
+                            "provider": resolved_prov,
+                            "embed": bool(existing_job.get("embed") or existing_job.get("_upgrade_embed")),
+                            "verify": "full" if existing_job.get("_upgrade_verify") else existing_job.get("verify", checked_verify),
+                            "derived": bool(existing_job.get("derived") or existing_job.get("_upgrade_derived")),
+                            "include_subagents": bool(existing_job.get("include_subagents") or existing_job.get("_upgrade_subagents")),
+                            "started_at": existing_job["started_at"],
+                        }
+                        break
+                if coalesced_resp is None:
+                    running_count = sum(1 for rec in self._sync_jobs.values() if rec.get("status") == "running")
+                    if running_count >= int(self.settings.sync_bg_max_running_jobs):
+                        raise IndexBusy()
+                    if len(self._sync_jobs) >= int(self.settings.sync_bg_max_retained_jobs):
+                        finished_ids = [
+                            jid for jid, rec in self._sync_jobs.items() if rec.get("status") != "running"
+                        ]
+                        trim_target = int(self.settings.sync_bg_trim_target_jobs)
+                        for stale_id in finished_ids[: max(1, len(self._sync_jobs) - trim_target)]:
+                            self._sync_jobs.pop(stale_id, None)
+                    job_id = f"sync_{uuid.uuid4().hex[:12]}"
+                    started_mono = time.monotonic()
+                    started_iso = datetime.now(timezone.utc).isoformat()
+                    bg_control = RequestControl(deadline=started_mono + float(self.settings.sync_bg_deadline_sec))
+                    job_record: dict[str, Any] = {
+                        "job_id": job_id,
+                        "status": "running",
+                        "session_id": sid_norm,
+                        "provider": resolved_prov,
+                        "path": norm_path,
+                        "_norm_path": norm_path,
+                        "_upgrade_path": None,
+                        "embed": embed,
+                        "_upgrade_embed": False,
+                        "_upgrade_derived": False,
+                        "_upgrade_subagents": False,
+                        "_upgrade_verify": False,
+                        "_rerun_requested": False,
+                        "_cancelled_by_close": False,
+                        "_control": bg_control,
+                        "verify": checked_verify,
+                        "derived": derived,
+                        "include_subagents": include_subagents,
+                        "started_at": started_iso,
+                        "_started_mono": started_mono,
+                        "_thread": None,
+                        "finished_at": None,
+                        "elapsed_ms": 0.0,
+                        "result": None,
+                        "error": None,
+                    }
+
+                    def _run_bg() -> None:
+                        cur_sid = sid_norm
+                        cur_path = norm_path
+                        cur_prov = resolved_prov
+                        cur_embed = bool(embed)
+                        cur_derived = bool(derived)
+                        cur_subagents = bool(include_subagents)
+                        cur_verify = checked_verify
+                        last_ok_res: dict[str, Any] | None = None
+                        pass_partials: list[dict[str, Any]] = []
+
+                        def _merge_pass_partial() -> None:
+                            nonlocal last_ok_res
+                            if not pass_partials:
+                                return
+                            latest = pass_partials.pop()
+                            pass_partials.clear()
+                            if last_ok_res is not None:
+                                for _acc_key in ("new_chunks", "embedded", "dense_restored", "sparse_updated"):
+                                    if isinstance(latest.get(_acc_key), int) and isinstance(last_ok_res.get(_acc_key), int):
+                                        latest[_acc_key] = last_ok_res[_acc_key] + latest[_acc_key]
+                            last_ok_res = latest
+
+                        try:
+                            if bg_control.cancel_event.is_set() or job_record.get("_cancelled_by_close") or self._closing or self._closing_bg:
+                                raise RequestStopped(
+                                    "cancelled",
+                                    "engine_closing" if (job_record.get("_cancelled_by_close") or self._closing or self._closing_bg) else "cancelled",
+                                )
+                            with request_scope(bg_control):
+                                while True:
+                                    if bg_control.cancel_event.is_set() or job_record.get("_cancelled_by_close") or self._closing or self._closing_bg:
+                                        raise RequestStopped(
+                                            "cancelled",
+                                            "engine_closing" if (job_record.get("_cancelled_by_close") or self._closing or self._closing_bg) else "cancelled",
+                                        )
+                                    with self._jobs_lock:
+                                        if job_record.get("status") == "cancelled" or job_record.get("_cancelled_by_close"):
+                                            raise RequestStopped("cancelled", "engine_closing")
+                                        job_record["_rerun_requested"] = False
+                                        if job_record.get("_upgrade_embed"):
+                                            job_record["_upgrade_embed"] = False
+                                            cur_embed = True
+                                            job_record["embed"] = True
+                                        if job_record.get("_upgrade_derived"):
+                                            job_record["_upgrade_derived"] = False
+                                            cur_derived = True
+                                            job_record["derived"] = True
+                                        if job_record.get("_upgrade_subagents"):
+                                            job_record["_upgrade_subagents"] = False
+                                            cur_subagents = True
+                                            job_record["include_subagents"] = True
+                                        if job_record.get("_upgrade_verify"):
+                                            job_record["_upgrade_verify"] = False
+                                            cur_verify = "full"
+                                            job_record["verify"] = "full"
+                                    pass_partials.clear()
+                                    res = self._run_sync_pass(
+                                        session_id=cur_sid,
+                                        path=cur_path,
+                                        provider=cur_prov,
+                                        embed=cur_embed,
+                                        verify=cur_verify,
+                                        derived=cur_derived,
+                                        include_subagents=cur_subagents,
+                                        _partial_sink=pass_partials,
+                                    )
+                                    pass_partials.clear()
+                                    if res.get("ok"):
+                                        if last_ok_res is not None:
+                                            for _acc_key in ("new_chunks", "embedded", "dense_restored", "sparse_updated"):
+                                                if isinstance(res.get(_acc_key), int) and isinstance(last_ok_res.get(_acc_key), int):
+                                                    res[_acc_key] = last_ok_res[_acc_key] + res[_acc_key]
+                                        last_ok_res = res
+                                    with self._jobs_lock:
+                                        is_close_cancel = bool(
+                                            job_record.get("_cancelled_by_close")
+                                            or self._closing
+                                            or self._closing_bg
+                                        )
+                                        is_user_cancel = bool(
+                                            job_record.get("status") == "cancelled"
+                                            or bg_control.cancel_event.is_set()
+                                        )
+                                        is_deadline = bool(
+                                            bg_control.deadline is not None and time.monotonic() >= bg_control.deadline
+                                        )
+                                        needs_upgrade = bool(
+                                            job_record.get("_rerun_requested")
+                                            or job_record.get("_upgrade_embed")
+                                            or job_record.get("_upgrade_derived")
+                                            or job_record.get("_upgrade_subagents")
+                                            or job_record.get("_upgrade_verify")
+                                        )
+                                        if not needs_upgrade:
+                                            # The current sync pass finished all requested work; publish completion even if close() arrived afterward.
+                                            job_record["result"] = res
+                                            if last_ok_res is not None and not res.get("ok"):
+                                                job_record["partial_result"] = last_ok_res
+                                            job_record["status"] = "completed" if res.get("ok") else "failed"
+                                            if not res.get("ok"):
+                                                job_record["error"] = mask_secrets(str(res.get("error") or "sync_failed"))
+                                            job_record["finished_at"] = datetime.now(timezone.utc).isoformat()
+                                            job_record["elapsed_ms"] = round((time.monotonic() - started_mono) * 1000.0, 1)
+                                            break
+                                        if is_close_cancel or is_user_cancel or is_deadline:
+                                            if res.get("ok"):
+                                                job_record["partial_result"] = res
+                                            elif last_ok_res is not None:
+                                                job_record["partial_result"] = last_ok_res
+                                            if is_close_cancel or is_user_cancel:
+                                                job_record["status"] = "cancelled"
+                                                job_record["error"] = job_record.get("error") or (
+                                                    "engine_closed" if is_close_cancel else "cancelled_before_coalesced_upgrade"
+                                                )
+                                            else:
+                                                job_record["status"] = "failed"
+                                                job_record["error"] = job_record.get("error") or "deadline_exceeded_before_coalesced_upgrade"
+                                            job_record["finished_at"] = job_record.get("finished_at") or datetime.now(timezone.utc).isoformat()
+                                            job_record["elapsed_ms"] = round((time.monotonic() - started_mono) * 1000.0, 1)
+                                            break
+                                        continue
+                        except RequestStopped as exc:
+                            _merge_pass_partial()
+                            with self._jobs_lock:
+                                if last_ok_res is not None:
+                                    job_record["partial_result"] = last_ok_res
+                                is_cancel = (
+                                    job_record.get("status") == "cancelled"
+                                    or job_record.get("_cancelled_by_close")
+                                    or exc.reason == "cancelled"
+                                    or bg_control.cancel_event.is_set()
+                                    or self._closing
+                                    or self._closing_bg
+                                )
+                                job_record["status"] = "cancelled" if is_cancel else "failed"
+                                if not (is_cancel and job_record.get("error")):
+                                    job_record["error"] = mask_secrets(f"{type(exc).__name__}: {exc}")
+                                job_record["finished_at"] = job_record.get("finished_at") or datetime.now(timezone.utc).isoformat()
+                                job_record["elapsed_ms"] = round((time.monotonic() - started_mono) * 1000.0, 1)
+                        except Exception as exc:
+                            _merge_pass_partial()
+                            with self._jobs_lock:
+                                if last_ok_res is not None:
+                                    job_record["partial_result"] = last_ok_res
+                                is_cancel = (
+                                    job_record.get("status") == "cancelled"
+                                    or job_record.get("_cancelled_by_close")
+                                    or bg_control.cancel_event.is_set()
+                                    or self._closing
+                                    or self._closing_bg
+                                )
+                                job_record["status"] = "cancelled" if is_cancel else "failed"
+                                if not (is_cancel and job_record.get("error")):
+                                    job_record["error"] = mask_secrets(f"{type(exc).__name__}: {exc}")
+                                job_record["finished_at"] = job_record.get("finished_at") or datetime.now(timezone.utc).isoformat()
+                                job_record["elapsed_ms"] = round((time.monotonic() - started_mono) * 1000.0, 1)
+                        finally:
+                            _merge_pass_partial()
+                            try:
+                                with self._jobs_lock:
+                                    if job_record.get("status") == "running":
+                                        if last_ok_res is not None:
+                                            job_record["partial_result"] = last_ok_res
+                                        is_close_cancel = bool(
+                                            job_record.get("_cancelled_by_close")
+                                            or self._closing
+                                            or self._closing_bg
+                                        )
+                                        is_user_cancel = bool(bg_control.cancel_event.is_set())
+                                        job_record["status"] = "cancelled" if (is_close_cancel or is_user_cancel) else "failed"
+                                        job_record["error"] = job_record.get("error") or (
+                                            "engine_closed" if is_close_cancel else ("cancelled" if is_user_cancel else "background_job_aborted")
+                                        )
+                                        job_record["finished_at"] = datetime.now(timezone.utc).isoformat()
+                                        job_record["elapsed_ms"] = round((time.monotonic() - started_mono) * 1000.0, 1)
+                            finally:
+                                with self._lifetime:
+                                    self._active_operations -= 1
+                                    if not self._active_operations:
+                                        self._lifetime.notify_all()
+
+                    t = threading.Thread(target=_run_bg, name=f"tsukkomi-sync-{job_id}", daemon=True)
+                    job_record["_thread"] = t
+                    with self._lifetime:
+                        if self._closing or self._closing_bg or not self._ready:
+                            raise IndexBusy()
+                        self._active_operations += 1
+                    self._sync_jobs[job_id] = job_record
+                    try:
+                        t.start()
+                    except BaseException:
+                        self._sync_jobs.pop(job_id, None)
+                        with self._lifetime:
+                            self._active_operations -= 1
+                            if not self._active_operations:
+                                self._lifetime.notify_all()
+                        raise
+
+            prog = get_session_progress(sid_norm, resolved_prov)
+            if coalesced_resp is not None:
+                coalesced_resp["sync_progress"] = prog
+                return coalesced_resp
+            return {
+                "ok": True,
+                "async": True,
+                "job_id": job_id,
+                "status": "running",
+                "session_id": sid_norm,
+                "provider": resolved_prov,
+                "embed": embed,
+                "verify": checked_verify,
+                "derived": derived,
+                "include_subagents": include_subagents,
+                "started_at": started_iso,
+                "sync_progress": prog,
+            }
+
+        return self._run_sync_pass(
+            session_id=session_id,
+            path=path,
+            provider=provider,
+            embed=embed,
+            verify=checked_verify,
+            derived=derived,
+            include_subagents=include_subagents,
+        )
+
+    @detached_operation
+    def job_status(
+        self,
+        job_id: str | None = None,
+        session_id: str | None = None,
+        provider: str | None = None,
+    ) -> dict[str, Any]:
+        """Query status and live progress of an async sync_session job or active session sync (#51)."""
+        resolved_prov = None
+        if provider:
+            try:
+                resolved_prov = self._resolve_provider(provider)
+            except Exception:
+                resolved_prov = provider
+        sid_norm = (session_id.lower() if (session_id and resolved_prov in ("codex", "agy")) else session_id)
+        now_mono = time.monotonic()
+        snap: dict[str, Any] | None = None
+        with self._jobs_lock:
+            record = None
+            if job_id is not None:
+                record = self._sync_jobs.get(job_id)
+                if record is None:
+                    return {"ok": False, "error": "job_not_found", "job_id": job_id}
+            elif sid_norm is not None:
+                sid_candidates = {sid_norm, session_id, session_id.lower() if session_id else None} - {None}
+                matching = [
+                    r for r in self._sync_jobs.values()
+                    if r.get("session_id") in sid_candidates
+                    and (resolved_prov is None or r.get("provider") == resolved_prov)
+                ]
+                if matching:
+                    record = next((r for r in reversed(matching) if r.get("status") == "running"), matching[-1])
+            if record is not None:
+                snap = {k: v for k, v in record.items() if not k.startswith("_")}
+                if snap["status"] == "running":
+                    snap["elapsed_ms"] = round((now_mono - record["_started_mono"]) * 1000.0, 1)
+                if record.get("_upgrade_embed"):
+                    snap["embed"] = True
+                if record.get("_upgrade_derived"):
+                    snap["derived"] = True
+                if record.get("_upgrade_subagents"):
+                    snap["include_subagents"] = True
+                if record.get("_upgrade_verify"):
+                    snap["verify"] = "full"
+        if snap is not None:
+            prog = get_session_progress(snap.get("session_id") or sid_norm, snap.get("provider") or resolved_prov)
+            snap["sync_progress"] = prog
+            snap["ok"] = True
+            return snap
+
+        prog = get_session_progress(sid_norm or session_id, resolved_prov)
+        if prog is not None:
+            return {
+                "ok": True,
+                "job_id": None,
+                "status": "running",
+                "session_id": sid_norm or session_id,
+                "provider": resolved_prov,
+                "sync_progress": prog,
+            }
+        return {
+            "ok": True,
+            "job_id": None,
+            "status": "idle",
+            "session_id": sid_norm or session_id,
+            "provider": resolved_prov,
+            "sync_progress": None,
+        }
 
     @detached_operation
     def verify_integrity(self, session_id: str, provider: str | None = None, path: str | None = None) -> dict[str, Any]:
@@ -767,6 +1265,11 @@ class SelfDirectEngine:
         }
         if scope != "session":
             result["scope"] = scope
+        if target_sid:
+            active_prog = get_session_progress(target_sid, provider)
+            if active_prog is not None:
+                result["sync_in_progress"] = True
+                result["sync_progress"] = active_prog
         return result
 
     def _dense_backend_error(self, exc: DenseBackendError, provider) -> dict[str, Any]:
@@ -797,9 +1300,27 @@ class SelfDirectEngine:
                 missing = allowed - indexed
                 extra = self._sparse_extra_ids(indexed, len(missing))
         if missing:
-            self._fill_sparse(None if family else session_id, provider, sorted(missing))
+            try:
+                self._fill_sparse(None if family else session_id, provider, sorted(missing))
+            except FlightBusy:
+                if family or not session_id:
+                    raise
+                with self._publication_guard(), self.store._read_boundary():
+                    has_committed = self.store.cursor_record(session_id, provider) is not None
+                if not has_committed:
+                    raise
+                note_degraded("sparse_sync_in_progress")
         if extra:
-            self._prune_sparse_for_search(extra)
+            try:
+                self._prune_sparse_for_search(extra)
+            except FlightBusy:
+                if family or not session_id:
+                    raise
+                with self._publication_guard(), self.store._read_boundary():
+                    has_committed = self.store.cursor_record(session_id, provider) is not None
+                if not has_committed:
+                    raise
+                note_degraded("sparse_sync_in_progress")
 
     def _sparse_extra_ids(self, indexed, pending):
         """The ids of ``indexed`` (every id of the compact index) that the store lacks; call it under the publication
@@ -1376,6 +1897,55 @@ class SelfDirectEngine:
                 result=result if memoized else None, memo_ids=late_ids if memoized else None)
             if plan.schedule_loaded is not None and schedule_after.dump() == plan.schedule_loaded:
                 schedule_after = None       # nothing to write back
+        if not idle and any(f.verdict in ("violation", "suspicious") for f in result.findings):
+            grants_path = Path(self.settings.index_dir) / "grants.json"
+            if grants_path.exists():
+                try:
+                    with self._publication_guard(), self.store._read_boundary():
+                        full_chunks = self.store.capture_evidence(sid, provider).list_chunks(sid, provider)
+                    rejected_map = rejections(provider, active, full_chunks, None) if planned is None else None
+                    with grants_lock(grants_path):
+                        grants_doc = load_grants_doc(grants_path)
+                        granted_cids = session_grant_contract_ids(grants_doc, sid)
+                        if granted_cids:
+                            rules_by_id = {r.id: r for r in active}
+                            grants_dirty = False
+                            new_findings = []
+                            for f in result.findings:
+                                rule_obj = rules_by_id.get(f.contract_id)
+                                if rule_obj is not None and f.contract_id in granted_cids and f.verdict in ("violation", "suspicious"):
+                                    updated_f, dirty = apply_grants_to_finding(
+                                        rule=rule_obj,
+                                        finding=f,
+                                        doc=grants_doc,
+                                        session_id=sid,
+                                        chunks=full_chunks or [],
+                                        proposed=planned,
+                                        rejected=rejected_map,
+                                        grants_path=None,
+                                    )
+                                    if dirty:
+                                        grants_dirty = True
+                                    new_findings.append(updated_f)
+                                else:
+                                    new_findings.append(f)
+                            if grants_dirty:
+                                save_grants_doc(grants_path, grants_doc)
+                            result.findings = new_findings
+                            if any(f.grants_applied for f in new_findings):
+                                if any(f.verdict == "violation" for f in result.findings):
+                                    result.verdict = "violation"
+                                elif any(f.verdict == "suspicious" for f in result.findings):
+                                    result.verdict = "suspicious"
+                                elif any(f.verdict == "unknown" for f in result.findings):
+                                    result.verdict = "unknown"
+                                elif bool(result.coverage.get("complete", False)):
+                                    result.verdict = "clean"
+                                else:
+                                    result.verdict = "unknown"
+                except (ValueError, OSError):
+                    # Corrupted or unreadable grants store: fail closed (keep original violation/suspicious findings)
+                    note_degraded("grants_store_error")
         payload = result.model_dump(mode="json")
         payload.update(ok=True, provider=provider, action_executed=False,
                        applicable_contracts=len(active), requires_attention=result.verdict != "clean")
@@ -1678,6 +2248,7 @@ class SelfDirectEngine:
                 rules.append(ContractRule.model_validate(c))
         for rule in rules:
             check_rule_patterns(rule)   # compiles every pattern; a high-risk must_not must name its actions
+        case_reports: dict[str, dict[str, Any]] = {}
         # An anchor that resolves to something other than a user message is rejected; one that cannot be resolved
         # (the session is not indexed yet) is accepted and left to the audit (``anchor_not_user`` there).
         anchors = self._anchor_status([rule.source_event_id for rule in rules])
@@ -1695,10 +2266,45 @@ class SelfDirectEngine:
             apply, held = [], []
             for rule in rules:
                 previous = active.get(rule.id)
+                is_user_anchored = anchors.get(rule.source_event_id, ("", ""))[0] == "user"
+                combined_cases = merge_contract_cases(
+                    list(rule.cases or []),
+                    list(previous.cases or []) if previous is not None else [],
+                    allow_id_override=is_user_anchored,
+                )
+                persisted_cases = None
+                if combined_cases:
+                    report = evaluate_contract_cases(
+                        rule,
+                        combined_cases,
+                        baseline_rule=previous,
+                        default_max_ms=float(self.settings.contract_case_max_ms),
+                        provider=rule.provider or self.settings.resolve_session_provider(),
+                    )
+                    case_reports[rule.id] = report
+                    if not report["ok"]:
+                        if report["regressions"]:
+                            reg_ids = ", ".join(r["id"] for r in report["regressions"])
+                            raise ValueError(
+                                f"contract {rule.id!r} regressed against stored revision "
+                                f"{previous.revision if previous is not None else 1} on test case(s): {reg_ids}"
+                            )
+                        failed_msgs = [
+                            f"{item['id']}: {item['failure_reason']}"
+                            for item in report["results"]
+                            if not item["passed"]
+                        ]
+                        raise ValueError(
+                            f"contract {rule.id!r} failed pre-save test cases ({report['failed']}/{report['total']} failed): "
+                            + "; ".join(failed_msgs)
+                        )
+                    persisted_cases = list(combined_cases)
                 reasons = loosening_reasons(previous, rule) if previous is not None else []
-                if reasons and anchors.get(rule.source_event_id, ("", ""))[0] != "user":
+                if reasons and not is_user_anchored:
                     held.append((rule, reasons, previous))     # weakening needs a user anchor: not applied
                     continue
+                if persisted_cases is not None:
+                    rule = rule.model_copy(update={"cases": persisted_cases})
                 apply.append(rule)
                 active[rule.id] = rule
             updated = self.contracts.prepare_upsert(document, apply)
@@ -1732,6 +2338,8 @@ class SelfDirectEngine:
                    "anchor": anchors[rule.source_event_id][0]} for rule in rules if rule.source_event_id]
         if checks:
             result["anchor_checks"] = checks
+        if case_reports:
+            result["case_verification"] = case_reports
         if held:
             result["pending"] = [{"contract_id": rule.id, "reasons": reasons, "active_revision": previous.revision,
                                   "anchor": "unresolved" if rule.source_event_id else "missing"}
@@ -1739,6 +2347,368 @@ class SelfDirectEngine:
             result["counts"]["pending"] = len(held)
             result["nudge"] = PENDING_NUDGE
         return result
+
+    @detached_operation
+    def test_contract(
+        self,
+        contract: dict[str, Any] | ContractRule,
+        cases: list[dict[str, Any] | ContractCase] | None = None,
+        *,
+        baseline: str | dict[str, Any] | ContractRule | None = "current",
+        max_ms: float | None = None,
+        provider: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Test a candidate contract rule against positive/negative cases and optional baseline without saving (#57)."""
+        import math
+        assert self.contracts
+        rule = contract if isinstance(contract, ContractRule) else ContractRule.model_validate(contract)
+        check_rule_patterns(rule)
+        eval_cases: list[ContractCase] = []
+        if cases is not None:
+            eval_cases = [c if isinstance(c, ContractCase) else ContractCase.model_validate(c) for c in cases]
+        elif rule.cases:
+            eval_cases = list(rule.cases)
+
+        resolved_prov = rule.provider or (self._resolve_provider(provider) if provider else self.settings.resolve_session_provider())
+        eff_sid = session_id or rule.session_id
+        if eff_sid and resolved_prov in ("codex", "agy"):
+            eff_sid = eff_sid.lower()
+
+        baseline_rule: ContractRule | None = None
+        if baseline is None or baseline == "none":
+            baseline_rule = None
+        elif isinstance(baseline, ContractRule):
+            baseline_rule = baseline
+        elif isinstance(baseline, dict):
+            baseline_rule = ContractRule.model_validate(baseline)
+        elif isinstance(baseline, str):
+            stored = self._stored_contracts()
+            target_id = rule.id if baseline == "current" else baseline
+            cand_baseline = stored.get(target_id)
+            if cand_baseline is not None:
+                if eff_sid is None:
+                    if cand_baseline.session_id is None:
+                        baseline_rule = cand_baseline
+                else:
+                    vis_ids = {r.id for r in visible_contracts([cand_baseline], eff_sid)}
+                    if cand_baseline.id in vis_ids:
+                        baseline_rule = cand_baseline
+            if baseline != "current" and baseline_rule is None:
+                raise ValueError(f"baseline contract {baseline!r} not found in visible scope")
+        if baseline_rule is not None:
+            check_rule_patterns(baseline_rule)
+
+        if not eval_cases and baseline_rule is not None and baseline_rule.cases:
+            eval_cases = list(baseline_rule.cases)
+        if not eval_cases:
+            raise ValueError("test_contract requires at least one case (via 'cases' argument or 'contract.cases')")
+
+        resolved_prov = rule.provider or (self._resolve_provider(provider) if provider else self.settings.resolve_session_provider())
+        cfg_max_ms = float(self.settings.contract_case_max_ms)
+        if max_ms is not None:
+            if isinstance(max_ms, bool) or not isinstance(max_ms, (int, float)) or not math.isfinite(float(max_ms)) or float(max_ms) <= 0:
+                raise ValueError("max_ms must be a finite positive number")
+            eff_max_ms = min(float(max_ms), cfg_max_ms)
+        else:
+            eff_max_ms = cfg_max_ms
+        if not math.isfinite(eff_max_ms) or eff_max_ms <= 0:
+            raise ValueError("max_ms must be positive")
+        return evaluate_contract_cases(
+            rule,
+            eval_cases,
+            baseline_rule=baseline_rule,
+            default_max_ms=eff_max_ms,
+            provider=resolved_prov,
+        )
+
+    @detached_operation
+    def grant_once(
+        self,
+        contract_id: str,
+        action_regex: str,
+        source_event_id: str,
+        *,
+        session_id: str,
+        path: str | None = None,
+        provider: str | None = None,
+        max_uses: int = 1,
+        expires_in: str | int | float = "15m",
+        canonical_english_quote: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a bounded, user-anchored one-time grant for a must_not contract in session_id (#56)."""
+        assert self.store and self.contracts
+        if not isinstance(source_event_id, str) or not source_event_id.strip():
+            return {
+                "ok": False,
+                "error": "anchor_required",
+                "message": "grant_once requires source_event_id referencing the user message that approved the action.",
+            }
+        if isinstance(max_uses, bool) or not isinstance(max_uses, int) or max_uses != 1:
+            raise ValueError("grant_once only supports max_uses=1")
+        parse_expires_in(expires_in)
+
+        resolved_provider = self._resolve_provider(provider, path=path)
+        sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
+        with self._publication_guard():
+            raw_pre, _ = self.contracts.capture()
+            doc_pre = parse_contracts(raw_pre)
+            visible_pre = {r.id: r for r in visible_contracts(doc_pre.contracts, sid)}
+            rule_pre = visible_pre.get(contract_id)
+            if rule_pre is None:
+                return {
+                    "ok": False,
+                    "error": "contract_not_found",
+                    "contract_id": contract_id,
+                    "message": f"Contract {contract_id!r} was not found for session {sid!r}.",
+                }
+            if rule_pre.type != "must_not":
+                return {
+                    "ok": False,
+                    "error": "invalid_contract_type",
+                    "contract_id": contract_id,
+                    "message": f"grant_once only applies to 'must_not' contracts (got {rule_pre.type!r}).",
+                }
+            if getattr(rule_pre, "path_guard", None) is not None or not rule_pre.regex:
+                return {
+                    "ok": False,
+                    "error": "unsupported_contract",
+                    "contract_id": contract_id,
+                    "message": f"Contract {contract_id!r} uses path_guard or lacks a regex and does not support grant_once.",
+                }
+            validate_grant_action_tokens_and_rule(action_regex, rule_pre)
+            with self.store._read_boundary():
+                committed_rec = self.store.cursor_record(sid, resolved_provider)
+
+        # Require an already-committed session cursor path and verify any caller-supplied path matches it
+        committed_path_str = committed_rec.get("path") if isinstance(committed_rec, dict) else None
+        if not isinstance(committed_path_str, str) or not committed_path_str:
+            return {
+                "ok": False,
+                "error": "session_not_indexed",
+                "contract_id": contract_id,
+                "session_id": sid,
+                "message": f"Session {sid!r} has no committed transcript cursor; sync_session must complete before grant_once.",
+            }
+        try:
+            committed_resolved = Path(committed_path_str).resolve()
+        except OSError:
+            return {
+                "ok": False,
+                "error": "session_not_indexed",
+                "contract_id": contract_id,
+                "session_id": sid,
+                "message": "Committed session transcript path could not be resolved.",
+            }
+        if path is not None:
+            try:
+                path_matches_committed = (Path(path).resolve() == committed_resolved)
+            except OSError:
+                path_matches_committed = False
+            if not path_matches_committed:
+                return {
+                    "ok": False,
+                    "error": "session_path_mismatch",
+                    "contract_id": contract_id,
+                    "session_id": sid,
+                    "message": "Supplied path does not match the committed transcript path for this session.",
+                }
+        effective_path = str(committed_resolved)
+        try:
+            _, resolved_sid_check, effective_path = self._resolve_async_target(sid, effective_path, resolved_provider)
+            if resolved_sid_check != sid:
+                raise ValueError("session_id mismatch")
+            synced = self._refresh_evidence(sid, resolved_provider, effective_path)
+        except (FileNotFoundError, ValueError, OSError):
+            synced = None
+        if synced is None or not synced.get("ok") or not (synced.get("coverage") or {}).get("complete"):
+            return {
+                "ok": False,
+                "error": (synced.get("error") if synced else None) or "transcript_sync_incomplete",
+                "contract_id": contract_id,
+                "session_id": sid,
+                "coverage": synced.get("coverage") if synced else None,
+                "message": "Cannot issue grant_once while session transcript sync is incomplete or source is unavailable.",
+            }
+
+        grants_path = Path(self.settings.index_dir) / "grants.json"
+        with self._publication_guard():
+            raw, _ = self.contracts.capture()
+            doc = parse_contracts(raw)
+            visible = {r.id: r for r in visible_contracts(doc.contracts, sid)}
+            rule = visible.get(contract_id)
+            if rule is None:
+                return {
+                    "ok": False,
+                    "error": "contract_not_found",
+                    "contract_id": contract_id,
+                    "message": f"Contract {contract_id!r} was not found for session {sid!r}.",
+                }
+            if rule.type != "must_not":
+                return {
+                    "ok": False,
+                    "error": "invalid_contract_type",
+                    "contract_id": contract_id,
+                    "message": f"grant_once only applies to 'must_not' contracts (got {rule.type!r}).",
+                }
+            if getattr(rule, "path_guard", None) is not None or not rule.regex:
+                return {
+                    "ok": False,
+                    "error": "unsupported_contract",
+                    "contract_id": contract_id,
+                    "message": f"Contract {contract_id!r} uses path_guard or lacks a regex and does not support grant_once.",
+                }
+            validate_grant_action_tokens_and_rule(action_regex, rule)
+            with self.store._read_boundary():
+                recheck_rec = self.store.cursor_record(sid, resolved_provider)
+                anchor = self.store.get_chunk(source_event_id)
+                session_chunks = self.store.list_chunks(sid, resolved_provider)
+            recheck_path_str = recheck_rec.get("path") if isinstance(recheck_rec, dict) else None
+            try:
+                recheck_ok = bool(recheck_path_str and Path(recheck_path_str).resolve() == committed_resolved)
+            except OSError:
+                recheck_ok = False
+            if not recheck_ok:
+                return {
+                    "ok": False,
+                    "error": "session_path_mismatch",
+                    "contract_id": contract_id,
+                    "session_id": sid,
+                    "message": "Committed session transcript path changed during grant verification.",
+                }
+
+            if anchor is None or anchor.session_id != sid:
+                return {
+                    "ok": False,
+                    "error": "anchor_unresolved",
+                    "source_event_id": source_event_id,
+                    "message": (
+                        f"source_event_id {source_event_id!r} was not found in indexed session {sid!r}. "
+                        "A grant must be anchored to an indexed user message in the same session."
+                    ),
+                }
+            if anchor.kind != "turn" or anchor.meta.get("role") != "user":
+                return {
+                    "ok": False,
+                    "error": "anchor_not_user",
+                    "source_event_id": source_event_id,
+                    "message": (
+                        f"source_event_id {source_event_id!r} is a {anchor.kind} (role={anchor.meta.get('role')!r}), "
+                        "not a user message. Only a user message can authorize grant_once."
+                    ),
+                }
+            chunk_positions = {c.chunk_id: idx for idx, c in enumerate(session_chunks)}
+            anchor_idx = chunk_positions.get(source_event_id, -1)
+            if anchor_idx < 0:
+                return {
+                    "ok": False,
+                    "error": "anchor_unresolved",
+                    "source_event_id": source_event_id,
+                    "message": f"source_event_id {source_event_id!r} was not found in active session chunks.",
+                }
+            if rule.applies_from_event_id:
+                if rule.applies_from_event_id not in chunk_positions or anchor_idx < chunk_positions[rule.applies_from_event_id]:
+                    return {
+                        "ok": False,
+                        "error": "anchor_predates_contract",
+                        "source_event_id": source_event_id,
+                        "message": "source_event_id predates the contract activation event and cannot authorize an exception.",
+                    }
+            user_turn_ids = [
+                c.chunk_id for c in session_chunks
+                if c.kind == "turn" and c.meta.get("role") == "user"
+            ]
+            max_events = int(self.settings.grant_anchor_max_events)
+            max_turns = int(self.settings.grant_anchor_max_user_turns)
+            if (
+                max_events <= 0
+                or max_turns <= 0
+                or (len(session_chunks) - anchor_idx) > max_events
+                or not user_turn_ids
+                or source_event_id not in user_turn_ids[-max_turns:]
+            ):
+                return {
+                    "ok": False,
+                    "error": "anchor_stale",
+                    "source_event_id": source_event_id,
+                    "message": f"source_event_id is stale (must be within the latest {max_turns} user turns and last {max_events} events); grant_once requires a fresh user approval message.",
+                }
+            raw_approved, raw_approval_detail = verify_raw_anchor_approves_grant(
+                anchor_text=anchor.text,
+                action_regex=action_regex,
+                rule=rule,
+            )
+            if not raw_approved:
+                return {
+                    "ok": False,
+                    "error": "anchor_does_not_approve_action",
+                    "source_event_id": source_event_id,
+                    "message": raw_approval_detail,
+                }
+            stored_canon = anchor.meta.get("canonical_english")
+            effective_canon = canonical_english_quote
+            if isinstance(stored_canon, str) and stored_canon.strip():
+                s_clean = stored_canon.strip()
+                s_masked = mask_secrets(s_clean)[:200]
+                if effective_canon is not None and effective_canon.strip() and effective_canon.strip() not in (s_clean, s_masked):
+                    return {
+                        "ok": False,
+                        "error": "anchor_does_not_approve_action",
+                        "source_event_id": source_event_id,
+                        "message": "canonical_english_quote does not match the indexed canonical_english metadata on the user turn",
+                    }
+                effective_canon = s_clean
+            approved, approval_detail = verify_user_anchor_approves_grant(
+                anchor_text=anchor.text,
+                action_regex=action_regex,
+                rule=rule,
+                canonical_english_quote=effective_canon,
+            )
+            if not approved:
+                return {
+                    "ok": False,
+                    "error": "anchor_does_not_approve_action",
+                    "source_event_id": source_event_id,
+                    "message": approval_detail,
+                }
+            with grants_lock(grants_path):
+                grants_doc = load_grants_doc(grants_path)
+                if any(
+                    g.session_id == sid
+                    and g.contract_id == rule.id
+                    and g.source_event_id == source_event_id
+                    for g in grants_doc.grants
+                ):
+                    return {
+                        "ok": False,
+                        "error": "anchor_already_used",
+                        "source_event_id": source_event_id,
+                        "message": f"source_event_id {source_event_id!r} has already been used to authorize a grant for contract {rule.id!r}.",
+                    }
+                issued_after_id = session_chunks[-1].chunk_id if session_chunks else source_event_id
+                record = create_grant_record(
+                    session_id=sid,
+                    rule=rule,
+                    action_regex=action_regex,
+                    source_event_id=source_event_id,
+                    issued_after_event_id=issued_after_id,
+                    source_quote=anchor.text,
+                    canonical_english_quote=effective_canon,
+                    max_uses=max_uses,
+                    expires_in=expires_in,
+                    chunks=session_chunks,
+                    existing_grants=grants_doc,
+                    grants_path=grants_path,
+                    max_anchor_events=max_events,
+                    max_anchor_user_turns=max_turns,
+                )
+
+        return {
+            "ok": True,
+            "grant": record.model_dump(mode="json"),
+            "session_id": sid,
+            "contract_id": rule.id,
+        }
 
     # ------------------------------------------------------------------------------------------------ portable contracts
     # Bundles are files that carry contracts between devices (``contract_bundles``). Finding one enforces nothing:
@@ -1772,7 +2742,8 @@ class SelfDirectEngine:
 
     @detached_operation
     def list_contract_candidates(self, project_dir: str | None = None, session_id: str | None = None,
-                                 provider: str | None = None) -> dict[str, Any]:
+                                 provider: str | None = None,
+                                 translated_turns: dict[str, str] | None = None) -> dict[str, Any]:
         """Contract bundles this device can see, as candidates. Reads files; enforces and writes nothing."""
         from self_directing_mcp import contract_bundles as cb
         assert self.contracts
@@ -1798,6 +2769,43 @@ class SelfDirectEngine:
             result["next"] = ("To enforce a candidate, ask the user, then call adopt_contracts(bundle_id, "
                               "source_event_id=<the user's own message id>); a changed or conflicting contract needs "
                               "replace_ids. Nothing is enforced until then.")
+        if translated_turns and isinstance(translated_turns, dict):
+            turn_candidates: list[dict[str, Any]] = []
+            refused_turns: list[dict[str, Any]] = []
+            if not session_id or not self.store:
+                refused_turns.append({"error": "session_required", "detail": "session_id is required to verify translated_turns anchors"})
+            else:
+                resolved_prov = self._resolve_provider(provider)
+                sid_norm = session_id.lower() if resolved_prov in ("codex", "agy") else session_id
+                with self._publication_guard(), self.store._read_boundary():
+                    by_id = {c.chunk_id: c for c in self.store.list_chunks(sid_norm, resolved_prov)}
+                for ev_id, eng_text in list(translated_turns.items())[: int(self.settings.max_translated_turns)]:
+                    chunk = by_id.get(ev_id)
+                    if chunk is None:
+                        refused_turns.append({"source_event_id": ev_id, "error": "anchor_unresolved", "detail": "not found in indexed session"})
+                        continue
+                    if chunk.kind != "turn" or chunk.meta.get("role") != "user":
+                        refused_turns.append({"source_event_id": ev_id, "error": "anchor_not_user", "detail": "only user messages can anchor contract candidates"})
+                        continue
+                    stored_turn_canon = chunk.meta.get("canonical_english")
+                    eff_eng_text = str(eng_text or "")
+                    if isinstance(stored_turn_canon, str) and stored_turn_canon.strip():
+                        s_clean = stored_turn_canon.strip()
+                        s_masked = mask_secrets(s_clean)[:200]
+                        if eff_eng_text.strip() and eff_eng_text.strip() not in (s_clean, s_masked):
+                            refused_turns.append({"source_event_id": ev_id, "error": "canonical_english_mismatch", "detail": "supplied translation does not match indexed canonical_english metadata"})
+                            continue
+                        eff_eng_text = s_clean
+                    turn_candidates.extend(
+                        extract_canonical_english_candidates(
+                            source_event_id=chunk.chunk_id,
+                            raw_quote=chunk.text,
+                            canonical_english=eff_eng_text,
+                        )
+                    )
+            result["turn_candidates"] = turn_candidates
+            if refused_turns:
+                result["refused_turns"] = refused_turns
         return result
 
     def _bundle_counts(self, session_id, provider) -> dict[str, Any]:
@@ -2268,10 +3276,34 @@ class SelfDirectEngine:
         assert self.graph is not None
         resolved_provider = self._resolve_provider(provider)
         sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
+        sync_busy_prog = None
+        sync_busy = False
         if path is not None:
             synced = self._refresh_evidence(sid, resolved_provider, path)
-            if not synced.get("ok") or not synced.get("coverage", {}).get("complete"):
-                return {"ok": False, "error": synced.get("error", "incomplete_history"), "nodes": [], "edges": []}
+            if not synced.get("ok") or not (synced.get("coverage") or {}).get("complete"):
+                cov_dict = synced.get("coverage") if isinstance(synced.get("coverage"), dict) else {}
+                raw_issues = cov_dict.get("issues")
+                issues = raw_issues if isinstance(raw_issues, list) else []
+                is_sync_busy = (
+                    synced.get("error") == "sync_in_progress"
+                    or issues == ["sync_in_progress"]
+                )
+                committed_rec = None
+                if is_sync_busy:
+                    with self._publication_guard(), self.store._read_boundary():
+                        committed_rec = self.store.cursor_record(sid, resolved_provider)
+                committed_path_str = committed_rec.get("path") if isinstance(committed_rec, dict) else None
+                if not isinstance(committed_path_str, str) or not committed_path_str:
+                    return {"ok": False, "error": synced.get("error", "incomplete_history"), "nodes": [], "edges": []}
+                try:
+                    if Path(path).resolve() != Path(committed_path_str).resolve():
+                        return {"ok": False, "error": "source_changed", "nodes": [], "edges": []}
+                    obs = capture_for_cursor(Path(committed_path_str), committed_rec)
+                    synced["_source_observation"] = obs
+                except (FileNotFoundError, OSError, ValueError):
+                    return {"ok": False, "error": "source_changed", "nodes": [], "edges": []}
+                sync_busy = True
+                sync_busy_prog = get_session_progress(sid, resolved_provider) or synced.get("sync_progress")
 
         source_ok = True
         if path is not None and synced.get("_source_observation") is not None:
@@ -2293,13 +3325,21 @@ class SelfDirectEngine:
                        "node_id": node_id, "subgraph": res, "cursor": cursor}
                 if include_subagents:
                     out["include_subagents"] = True
-                return out
-            graph_data = self.graph.get_session_graph(sid, resolved_provider, include_subagents=include_subagents)
-            out = {"ok": True, "session_id": sid, "provider": resolved_provider,
-                   "nodes": graph_data["nodes"], "edges": graph_data["edges"],
-                   "empty": graph_data["empty"], "cursor": cursor}
-            if include_subagents:
-                out["include_subagents"] = True
+            else:
+                graph_data = self.graph.get_session_graph(sid, resolved_provider, include_subagents=include_subagents)
+                out = {"ok": True, "session_id": sid, "provider": resolved_provider,
+                       "nodes": graph_data["nodes"], "edges": graph_data["edges"],
+                       "empty": graph_data["empty"], "cursor": cursor}
+                if include_subagents:
+                    out["include_subagents"] = True
+            active_prog = sync_busy_prog or get_session_progress(sid, resolved_provider)
+            if sync_busy or active_prog is not None:
+                out["sync_in_progress"] = True
+                if sync_busy:
+                    out["coverage"] = {"complete": False, "issues": ["sync_in_progress"]}
+                    note_degraded("graph_sync_in_progress")
+                if active_prog is not None:
+                    out["sync_progress"] = active_prog
             return out
 
     @detached_operation
@@ -2954,13 +3994,47 @@ class SelfDirectEngine:
         )
         return status, raw_contracts, record, metrics, metadata_token, receipt_token
 
+    @contextmanager
+    def _closing_bg_guard(self):
+        cur_thread = threading.current_thread()
+        with self._jobs_lock:
+            running_recs = [
+                rec for rec in self._sync_jobs.values()
+                if rec.get("status") == "running"
+                or (isinstance(rec.get("_thread"), threading.Thread) and rec["_thread"].is_alive())
+            ]
+            if any(rec.get("_thread") is cur_thread for rec in running_recs):
+                raise RuntimeError("cannot call close() from inside a background sync worker")
+            self._closing_bg = True
+            for rec in running_recs:
+                rec["_cancelled_by_close"] = True
+        try:
+            for rec in running_recs:
+                ctrl = rec.get("_control")
+                if ctrl is not None and hasattr(ctrl, "cancel"):
+                    try:
+                        ctrl.cancel()
+                    except Exception:
+                        pass
+            yield running_recs
+        finally:
+            with self._jobs_lock:
+                self._closing_bg = False
+
     def close(self) -> None:
         """Wait for request-owned snapshots/preparation, then release local handles."""
-        with self._lifetime:
+        with self._closing_bg_guard() as running_recs, self._lifetime:
             self._closing = True
             try:
+                # Every background sync worker increments _active_operations before t.start()
+                # and decrements it only at the end of its outer finally block, so waiting for
+                # _active_operations == 0 guarantees all background workers have exited.
                 while self._active_operations:
                     self._lifetime.wait()
+                for rec in running_recs:
+                    bg_t = rec.get("_thread")
+                    if isinstance(bg_t, threading.Thread) and bg_t.is_alive():
+                        bg_t.join()
                 if self.store is not None and self._ready and self.store.has_pending_derived():
                     try:
                         with self._publication_guard():

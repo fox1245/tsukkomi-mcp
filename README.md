@@ -347,6 +347,9 @@ Codex CLI 0.156 compresses older rollouts in place: `sessions/YYYY/MM/DD/rollout
 | | `check_action` | Pre-flight test of a proposed action against current contracts. `verify="fast"` selects the hook-time source verification; the result's `integrity` says what was compared. |
 | | `audit_session` | Audit executed session history against active contracts (always a full source verification). |
 | | `audit_status` | Health check: vector extension, index schema, degraded flags, per-session coverage, and `ops`, the [request statistics](#timeouts-and-what-a-deadline-leaves-behind) of the process (answered even while the engine is busy). |
+| | `job_status` | Poll live progress (`stage`, `bytes_done`, `chunks_done`, `embedded_done`, `elapsed_ms`, `eta_ms`) for an in-flight session sync or background embedding job (`#51`). |
+| | `test_contract` | Pre-save dry-run harness for candidate contract rules: evaluates positive/negative `cases`, synthesizes canonical tool calls, checks per-case `max_ms`, and reports baseline diffs/regressions (`#57`). |
+| | `grant_once` | Create a scoped, bounded one-time grant for a `must_not` contract anchored to an indexed user approval message (`source_event_id`) and verified against Canonical English (`#56`). |
 | **Checklist & Evidence** | `update_checklist` | Update requirements; enforces evidence gating for completion. |
 | | `get_checklist` | Inspect checklist status, history and linked evidence. |
 | **GraphRAG & Architecture** | `get_graph_context` | Query entity dependencies and the active knowledge graph. |

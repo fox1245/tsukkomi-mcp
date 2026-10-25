@@ -31,7 +31,7 @@ import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
 from urllib.parse import urlsplit
 
 from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES
@@ -86,6 +86,15 @@ DEFAULT_RRF_K = 60
 DEFAULT_RETRIEVE_TOP_K = 20
 DEFAULT_SEARCH_TOP_K = 10
 DEFAULT_SESSION_START_MAX_CONTRACTS = 16
+DEFAULT_SYNC_BG_MAX_RUNNING_JOBS = 16
+DEFAULT_SYNC_BG_MAX_RETAINED_JOBS = 128
+DEFAULT_SYNC_BG_TRIM_TARGET_JOBS = 96
+DEFAULT_SYNC_BG_DEADLINE_SEC = 300.0
+DEFAULT_SYNC_BG_SHUTDOWN_JOIN_SEC = 10.0
+DEFAULT_GRANT_ANCHOR_MAX_EVENTS = 20
+DEFAULT_GRANT_ANCHOR_MAX_USER_TURNS = 2
+DEFAULT_MAX_TRANSLATED_TURNS = 100
+DEFAULT_CONTRACT_CASE_MAX_MS = 250.0
 AGY_APP_DATA_NAMES = ("antigravity", "antigravity-cli", "antigravity-ide")
 
 PATH_FIELDS = frozenset({
@@ -326,6 +335,16 @@ def codex_environment_settings() -> dict[str, object]:
 
 class SettingsAccessors:
     """The ``resolve_*`` methods of ``Settings``; mixed into the pydantic model and into ``LightSettings``."""
+
+    sync_bg_max_running_jobs: ClassVar[int] = DEFAULT_SYNC_BG_MAX_RUNNING_JOBS
+    sync_bg_max_retained_jobs: ClassVar[int] = DEFAULT_SYNC_BG_MAX_RETAINED_JOBS
+    sync_bg_trim_target_jobs: ClassVar[int] = DEFAULT_SYNC_BG_TRIM_TARGET_JOBS
+    sync_bg_deadline_sec: ClassVar[float] = DEFAULT_SYNC_BG_DEADLINE_SEC
+    sync_bg_shutdown_join_sec: ClassVar[float] = DEFAULT_SYNC_BG_SHUTDOWN_JOIN_SEC
+    grant_anchor_max_events: ClassVar[int] = DEFAULT_GRANT_ANCHOR_MAX_EVENTS
+    grant_anchor_max_user_turns: ClassVar[int] = DEFAULT_GRANT_ANCHOR_MAX_USER_TURNS
+    max_translated_turns: ClassVar[int] = DEFAULT_MAX_TRANSLATED_TURNS
+    contract_case_max_ms: ClassVar[float] = DEFAULT_CONTRACT_CASE_MAX_MS
 
     def resolve_api_key(self) -> str | None:
         if self.openrouter_api_key_file is not None:

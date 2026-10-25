@@ -41,9 +41,10 @@ class AuditEvent:
 
     ``text`` is empty for events no contract can inspect; nothing else of the stored chunk is kept.
     """
-    __slots__ = ("chunk_id", "kind", "text", "meta", "key")
+    __slots__ = ("chunk_id", "kind", "text", "meta", "key", "session_id")
 
-    def __init__(self, chunk_id, kind, text, meta, key=None):
+    def __init__(self, chunk_id, kind, text, meta, key=None, session_id=None):
+        self.session_id = session_id if session_id is not None else (meta.get("session_id") if isinstance(meta, dict) else None)
         # ``key`` is the event's place in the session order, ``(byte_start, sub_index)``; incremental monitors
         # compare keys, never row numbers. Events built without a store carry ``None``.
         self.chunk_id, self.kind, self.text, self.meta, self.key = chunk_id, kind, text, meta, key
@@ -144,6 +145,26 @@ def _checked(check, *args, **kwargs):
         raise ValueError(str(exc)) from None
 
 
+class ContractCase(BaseModel):
+    """A positive or negative test case for verifying a contract rule (#57)."""
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    id: str | None = Field(default=None, max_length=120)
+    kind: ChunkKind | None = Field(default=None)
+    role: str = Field(default="assistant", min_length=1, max_length=40)
+    tool_name: str = Field(default="Bash", min_length=1, max_length=80)
+    command: str | None = Field(default=None)
+    arguments: dict[str, Any] | str | None = Field(default=None)
+    text: str | None = Field(default=None)
+    expect: Literal["match", "no_match"] | bool = Field(default="match")
+    max_ms: float | None = Field(default=None, gt=0.0, le=10000.0)
+
+    @property
+    def expected_match(self) -> bool:
+        if isinstance(self.expect, bool):
+            return self.expect
+        return self.expect == "match"
+
+
 class ContractRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(description="Stable unique contract id used for updates (revision increments).")
@@ -241,10 +262,16 @@ class ContractRule(BaseModel):
         description="Optional list of tool names (case-insensitive, e.g. ['Bash', 'run_command']) that a tool_call/any "
                     "contract applies to. Tool calls for other tools are ignored / not_applicable.",
     )
+    cases: list[ContractCase] = Field(
+        default_factory=list,
+        description="Optional positive and negative test cases verified before saving (#57).",
+    )
 
     @model_serializer(mode="wrap")
     def _omit_default_extensions(self, handler):
         data = handler(self)
+        if not data.get("cases"):
+            data.pop("cases", None)
         for name, default in _OPTIONAL_DEFAULTS.items():
             if name in data and data[name] == default:
                 del data[name]
@@ -385,11 +412,18 @@ class Finding(BaseModel):
                     "while empty.",
     )
 
+    grants_applied: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Scoped one-time grants applied during evaluation (#56); omitted while empty.",
+    )
+
     @model_serializer(mode="wrap")
     def _omit_empty_rejections(self, handler):
         data = handler(self)
         if not data.get("proposals_rejected"):
             data.pop("proposals_rejected", None)
+        if not data.get("grants_applied"):
+            data.pop("grants_applied", None)
         return data
 
 

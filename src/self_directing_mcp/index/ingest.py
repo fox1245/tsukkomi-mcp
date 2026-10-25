@@ -279,6 +279,154 @@ class RowSpool:
 
 
 _flights, _flights_gate = {}, threading.Lock()
+_embed_flights, _embed_flights_gate = {}, threading.Lock()
+_progress_map, _progress_lock = {}, threading.Lock()
+
+
+def _format_progress_entry(entry: dict, now: float) -> dict:
+    res = {k: v for k, v in entry.items() if not k.startswith("_")}
+    elapsed_ms = round(max(0.0, (now - entry["_started_mono"]) * 1000.0), 1)
+    res["elapsed_ms"] = elapsed_ms
+    eta_ms = None
+    if res.get("stage") == "embedding" and res.get("embedded_total", 0) > 0 and res.get("embedded_done", 0) > 0:
+        rem = max(0, res["embedded_total"] - res["embedded_done"])
+        embed_start = entry.get("_embed_started_mono", entry["_started_mono"])
+        embed_elapsed_ms = max(0.0, (now - embed_start) * 1000.0)
+        eta_ms = round((embed_elapsed_ms / res["embedded_done"]) * rem, 1)
+    elif res.get("bytes_total", 0) > 0 and res.get("bytes_done", 0) > 0 and res["bytes_done"] < res["bytes_total"]:
+        rem = max(0, res["bytes_total"] - res["bytes_done"])
+        eta_ms = round((elapsed_ms / res["bytes_done"]) * rem, 1)
+    res["eta_ms"] = eta_ms
+    return res
+
+
+def update_session_progress(
+    session_id: str | None,
+    provider: str | None,
+    *,
+    flight_key=None,
+    owner: str | None = None,
+    stage: str | None = None,
+    bytes_done: int | None = None,
+    bytes_total: int | None = None,
+    chunks_done: int | None = None,
+    chunks_total: int | None = None,
+    embedded_done: int | None = None,
+    embedded_total: int | None = None,
+    started_at: float | None = None,
+    clear: bool = False,
+    force: bool = False,
+) -> dict | None:
+    keys = []
+    if session_id and provider:
+        sid_norm = session_id.lower() if provider in ("codex", "agy") else session_id
+        keys.append(("session", provider, sid_norm))
+    if flight_key is not None:
+        keys.append(("flight", flight_key))
+    if not keys:
+        return None
+    now = time.monotonic()
+    with _progress_lock:
+        existing = None
+        for k in keys:
+            if k in _progress_map:
+                existing = _progress_map[k]
+                break
+        if clear:
+            if existing is not None and existing.get("stage") == "embedding" and not force:
+                return None
+            for k in keys:
+                cur = _progress_map.get(k)
+                if cur is not None and owner is not None and cur.get("_owner") not in (None, owner):
+                    continue
+                _progress_map.pop(k, None)
+            return None
+        if existing is not None and existing.get("stage") == "embedding" and stage not in (None, "embedding") and not force:
+            return _format_progress_entry(existing, now)
+        base = dict(existing) if existing is not None else {
+            "stage": stage or "syncing",
+            "bytes_done": 0,
+            "bytes_total": 0,
+            "chunks_done": 0,
+            "chunks_total": 0,
+            "embedded_done": 0,
+            "embedded_total": 0,
+            "_started_mono": started_at if started_at is not None else now,
+        }
+        if session_id:
+            base["session_id"] = session_id
+        if provider:
+            base["provider"] = provider
+        if owner is not None:
+            base["_owner"] = owner
+        base["_updated_mono"] = now
+        if stage is not None:
+            if stage == "embedding" and (base.get("stage") != "embedding" or "_embed_started_mono" not in base or embedded_done == 0):
+                base["_embed_started_mono"] = now
+            base["stage"] = stage
+        if bytes_done is not None:
+            base["bytes_done"] = max(0, int(bytes_done))
+        if bytes_total is not None:
+            base["bytes_total"] = max(0, int(bytes_total))
+        if chunks_done is not None:
+            base["chunks_done"] = max(0, int(chunks_done))
+        if chunks_total is not None:
+            base["chunks_total"] = max(0, int(chunks_total))
+        if embedded_done is not None:
+            base["embedded_done"] = max(0, int(embedded_done))
+        if embedded_total is not None:
+            base["embedded_total"] = max(0, int(embedded_total))
+        formatted = _format_progress_entry(base, now)
+        base["elapsed_ms"] = formatted["elapsed_ms"]
+        base["eta_ms"] = formatted["eta_ms"]
+        for k in keys:
+            cur = _progress_map.get(k)
+            if (
+                cur is not None
+                and k[0] == "session"
+                and owner is not None
+                and cur.get("_owner") not in (None, owner)
+                and cur.get("stage") == "embedding"
+                and stage != "embedding"
+            ):
+                continue
+            _progress_map[k] = dict(base)
+        return formatted
+
+
+def get_session_progress(session_id: str | None, provider: str | None = None) -> dict | None:
+    if not session_id:
+        return None
+    now = time.monotonic()
+    with _progress_lock:
+        if provider:
+            sid_norm = session_id.lower() if provider in ("codex", "agy") else session_id
+            entry = _progress_map.get(("session", provider, sid_norm))
+            return _format_progress_entry(entry, now) if entry is not None else None
+        matches = [
+            entry
+            for k, entry in _progress_map.items()
+            if k[0] == "session"
+            and (
+                k[2] == session_id
+                or (k[1] in ("codex", "agy") and k[2] == session_id.lower())
+            )
+        ]
+        if matches:
+            best = max(matches, key=lambda e: e.get("_updated_mono", e.get("_started_mono", 0.0)))
+            return _format_progress_entry(best, now)
+    return None
+
+
+def get_flight_progress(flight_key) -> dict | None:
+    now = time.monotonic()
+    with _progress_lock:
+        entry = _progress_map.get(("flight", flight_key))
+        if entry is None and isinstance(flight_key, tuple) and len(flight_key) >= 4 and flight_key[2] == "session":
+            entry = _progress_map.get(("session", flight_key[1], flight_key[3]))
+        if entry is not None:
+            return _format_progress_entry(entry, now)
+    return None
 
 
 class FlightBusy(IndexBusy):
@@ -290,18 +438,16 @@ class FlightBusy(IndexBusy):
     """
     reason = "sync_in_progress"
 
+    def __init__(self, message: str = "", *, progress: dict | None = None):
+        super().__init__()
+        if message:
+            self.args = (message,)
+        self.progress = progress
+
 
 @contextmanager
 def session_flight(key, *, max_wait=None):
-    """Single-flight per (index, provider, session): at most one capture/parse/publish at a time.
-
-    Waiters poll with their own request control, so a waiter's deadline or cancellation raises for that waiter
-    only, and a leader's failure just passes the baton: the next caller becomes leader and finds the cursor
-    current (no second parse) or retries. Cross-process safety is still the state token/CAS at publication.
-
-    ``max_wait`` (seconds; None waits for the leader, as before): a request that may slice does not hold a heavy-call
-    slot idle behind a leader that is committing slices; after that long it raises ``FlightBusy``.
-    """
+    """Single-flight per (index, provider, session): at most one capture/parse/publish at a time."""
     with _flights_gate:
         entry = _flights.setdefault(key, [threading.Lock(), 0])
         entry[1] += 1
@@ -310,7 +456,7 @@ def session_flight(key, *, max_wait=None):
         while not entry[0].acquire(timeout=0.05 if patience is None else max(0.0, min(0.05, patience - time.monotonic()))):
             check_request()
             if patience is not None and time.monotonic() >= patience:
-                raise FlightBusy()
+                raise FlightBusy(progress=get_flight_progress(key))
         try:
             check_request()
             yield
@@ -321,6 +467,86 @@ def session_flight(key, *, max_wait=None):
             entry[1] -= 1
             if not entry[1] and _flights.get(key) is entry:
                 del _flights[key]
+
+
+_embed_commit_seq = 0
+
+
+def _notify_embed_flight_commit(key, state_snapshot: tuple, *, request_embed: bool = False) -> int:
+    global _embed_commit_seq
+    with _embed_flights_gate:
+        _embed_commit_seq += 1
+        seq = _embed_commit_seq
+        if key is not None:
+            entry = _embed_flights.get(key)
+            if entry is not None:
+                if seq >= entry[7]:
+                    entry[4] = state_snapshot
+                    entry[7] = seq
+                if entry[2]:
+                    entry[3] = True
+                    if request_embed:
+                        entry[5] = True
+        return seq
+
+
+@contextmanager
+def _embed_flight(key, *, blocking: bool = True, state_snapshot: tuple | None = None, commit_seq: int = 0):
+    """Separate single-flight for dense embedding so remote embedding never blocks canonical/sparse syncs."""
+    with _embed_flights_gate:
+        # entry layout: [0:Lock, 1:refs, 2:active, 3:rerun_requested, 4:latest_state_snapshot, 5:rerun_embed, 6:cache_pass_after_fail, 7:latest_commit_seq]
+        entry = _embed_flights.setdefault(key, [threading.Lock(), 0, False, False, state_snapshot, False, False, commit_seq])
+        entry[1] += 1
+        if state_snapshot is not None and (entry[4] is None or commit_seq >= entry[7]):
+            entry[4] = state_snapshot
+            entry[7] = max(entry[7], commit_seq)
+        if entry[2]:
+            entry[3] = True
+            if blocking:
+                entry[5] = True
+            if not blocking:
+                busy_fast = True
+            else:
+                busy_fast = False
+        else:
+            busy_fast = False
+            if not blocking:
+                acquired_fast = entry[0].acquire(blocking=False)
+                if acquired_fast:
+                    entry[2] = True
+                    entry[3] = False
+                    entry[6] = False
+                else:
+                    entry[3] = True
+                    busy_fast = True
+    holder_state = [False]
+    try:
+        if busy_fast:
+            yield False, entry, holder_state
+            return
+        if not blocking:
+            holder_state[0] = True
+            yield True, entry, holder_state
+            return
+        while not entry[0].acquire(timeout=0.05):
+            check_request()
+        holder_state[0] = True
+        with _embed_flights_gate:
+            if state_snapshot is not None and (entry[4] is None or commit_seq >= entry[7]):
+                entry[4] = state_snapshot
+                entry[7] = max(entry[7], commit_seq)
+            entry[2] = True
+            entry[6] = False
+        yield True, entry, holder_state
+    finally:
+        with _embed_flights_gate:
+            if holder_state[0]:
+                holder_state[0] = False
+                entry[2] = False
+                entry[0].release()
+            entry[1] -= 1
+            if not entry[1] and _embed_flights.get(key) is entry:
+                del _embed_flights[key]
 
 
 _STATE_FIELDS = ("monitor_id", "contract_revision", "fingerprint", "parser_version", "evaluator_version", "generation",
@@ -947,7 +1173,7 @@ class SessionStore:
                 if packed is not None:
                     meta.update((key, value) for key, value in zip(packed_keys, json.loads(packed))
                                 if value is not None)
-                events.append(AuditEvent(cid, kind, text or "", meta, (byte_start, sub_index)))
+                events.append(AuditEvent(cid, kind, text or "", meta, (byte_start, sub_index), session_id=session_id))
             self.audit_rows_fetched += len(page)
         return events
 
@@ -2041,32 +2267,65 @@ def ingest_session(*, path, session_id, store, sparse, dense, embedder, provider
     policy = policy or IntegrityPolicy()
     requested = Path(path).resolve()
     wait = _flight_wait(slicing, requested)
-    with session_flight(_flight_key(store, provider, requested, session_id), **({} if wait is None else {"max_wait": wait})):
+    f_key = _flight_key(store, provider, requested, session_id)
+    owner_token = f"{f_key}:{time.monotonic_ns()}"
+    info = None
+    with session_flight(f_key, **({} if wait is None else {"max_wait": wait})):
+        try:
+            init_bytes = requested.stat().st_size if requested.exists() else 0
+        except OSError:
+            init_bytes = 0
+        update_session_progress(session_id, provider, flight_key=f_key, owner=owner_token, stage="capturing", bytes_done=0, bytes_total=init_bytes)
         seen, target, captured = [], requested, None
         attempt, whole = 0, False
-        while attempt < _RECAPTURE_ATTEMPTS:
-            attempt += 1
-            handed, captured = captured, None
-            try:
-                info = _ingest_session(path=target, session_id=session_id, store=store, sparse=sparse, dense=dense,
-                                       embedder=embedder, provider=provider, embed=embed, derived=derived,
-                                       guard=guard, seen=seen, observation=handed, verify=verify, policy=policy,
-                                       retain_dense_deletions=retain_dense_deletions, slicing=slicing, whole=whole)
-            except _NeedsWholeCapture:
-                whole, attempt = True, attempt - 1   # not a lost race: the next observation is simply not cut short
-                continue
-            except _StaleObservation:
-                continue  # another process published past our capture: observe the file again
-            except _IndexedElsewhere as elsewhere:
-                target, captured = elsewhere.path, elsewhere.observation  # a strict prefix: report the indexed source
-                continue
-            except SourceChanged:
-                verify = "full"  # whatever moved, the next attempt does not rest on a cheap check
-                continue
-            if target != requested:
-                _mark_prefix_alias(info, requested)
-            return info
-        raise SourceChanged("source changed during preparation")
+        try:
+            while attempt < _RECAPTURE_ATTEMPTS:
+                attempt += 1
+                handed, captured = captured, None
+                try:
+                    info = _ingest_session(path=target, session_id=session_id, store=store, sparse=sparse, dense=dense,
+                                           embedder=embedder, provider=provider, embed=embed, derived=derived,
+                                           guard=guard, seen=seen, observation=handed, verify=verify, policy=policy,
+                                           retain_dense_deletions=retain_dense_deletions, slicing=slicing, whole=whole,
+                                           f_key=f_key, owner_token=owner_token)
+                except _NeedsWholeCapture:
+                    whole, attempt = True, attempt - 1   # not a lost race: the next observation is simply not cut short
+                    continue
+                except _StaleObservation:
+                    continue  # another process published past our capture: observe the file again
+                except _IndexedElsewhere as elsewhere:
+                    target, captured = elsewhere.path, elsewhere.observation  # a strict prefix: report the indexed source
+                    continue
+                except SourceChanged:
+                    verify = "full"  # whatever moved, the next attempt does not rest on a cheap check
+                    continue
+                if target != requested:
+                    _mark_prefix_alias(info, requested)
+                break
+            else:
+                raise SourceChanged("source changed during preparation")
+        except BaseException:
+            update_session_progress(session_id, provider, flight_key=f_key, owner=owner_token, clear=True, force=False)
+            raise
+    deferred = info.pop("_deferred_dense", None) if info is not None else None
+    if deferred is not None:
+        sid_resolved, prov_resolved, f_key_used, state_snap_used, receipt_store_used, owner_token_used, commit_seq_used = deferred
+        return _ingest_dense(
+            info=info,
+            sid=sid_resolved,
+            provider=prov_resolved,
+            f_key=f_key_used,
+            state_snapshot=state_snap_used,
+            receipt_store=receipt_store_used,
+            owner_token=owner_token_used,
+            commit_seq=commit_seq_used,
+            store=store,
+            dense=dense,
+            embedder=embedder,
+            embed=embed,
+            guard=guard,
+        )
+    return info
 
 
 _RECAPTURE_ATTEMPTS = 3
@@ -2195,7 +2454,7 @@ def _capture_observation(path, provider, known, record, hint, verify, policy, ma
 
 def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provider, embed, derived, guard, seen,
                     observation=None, retain_dense_deletions=False, verify="full", policy=None, slicing=None,
-                    whole=False):
+                    whole=False, f_key=None, owner_token=None):
     if embed and (dense is None or embedder is None):
         raise ValueError("embedding unavailable in local-only mode")
     parse_session_chunks, peek_session_id = _provider_parser(provider)
@@ -2254,6 +2513,7 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         if not sid:
             raise ValueError("cannot determine session id")
         sid = sid.lower() if provider in ("codex", "agy") else sid
+        update_session_progress(sid, provider, flight_key=f_key, owner=owner_token, stage="parsing", bytes_done=0, bytes_total=observation.target_end)
         claimed = peek_session_id(path)
         if claimed is not None and (claimed.lower() if provider in ("codex", "agy") else claimed) != sid:
             raise ValueError("session identity differs from observed source")
@@ -2538,7 +2798,21 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
         info["integrity"]["reindex_reason"] = reindex_reason
     if alias:
         info["alias_of"] = committed_cursor["path"]
+    state_snap = (committed_token, observation, receipt_authority, offset)
+    commit_seq = _notify_embed_flight_commit(f_key, state_snap, request_embed=bool(derived and embed))
+    update_session_progress(
+        sid,
+        provider,
+        flight_key=f_key,
+        owner=owner_token,
+        stage="sparse_indexing" if derived else "done",
+        bytes_done=offset,
+        bytes_total=observation.target_end,
+        chunks_done=coverage["chunk_count"],
+        chunks_total=coverage["chunk_count"],
+    )
     if not derived:
+        update_session_progress(sid, provider, flight_key=f_key, owner=owner_token, clear=True)
         return info
 
     def finish():
@@ -2585,56 +2859,276 @@ def _ingest_session(*, path, session_id, store, sparse, dense, embedder, provide
             if documents:
                 sparse.upsert_many(documents)
         info["sparse_updated"] += len(documents)
+    # Sparse index deletions and upserts above are completed strictly inside session_flight.
+    update_session_progress(sid, provider, flight_key=f_key, owner=owner_token, clear=True, force=False)
     if embedder is None:
         return finish()
+    info["_deferred_dense"] = (sid, provider, f_key, state_snap, receipt_store, owner_token, commit_seq)
+    return info
+
+
+def _finalize_post_derived_coverage(
+    info: dict,
+    *,
+    sid: str,
+    provider: str,
+    store,
+    guard,
+    expected_token,
+    observation,
+    receipt_store,
+    receipt_authority,
+    offset: int,
+) -> dict:
+    source_ok = True if observation is None else observation.validate_prefix()
     with guard():
-        dense.refresh()
-        session_ids = sorted(store.chunk_ids(sid, provider))
-        indexed = dense.present(session_ids)
-        candidate_ids = [cid for cid in session_ids if cid not in indexed]
-    cache_key = embedder.cache_key
-    embedding_failed = False
-    for batch in _batches(candidate_ids):
-        with guard():
-            snapshot = store.capture_evidence(sid, provider, history=False, anchors=batch)
-        candidates = snapshot.list_chunks(sid, provider)
-        text_by_hash, chunk_hashes = {}, {}
-        for chunk in candidates:
-            check_request()
-            sanitized = mask_secrets(chunk.text)
-            key = hashlib.sha256(sanitized.encode("utf-8")).hexdigest()
-            text_by_hash[key], chunk_hashes[chunk.chunk_id] = sanitized, key
-        with guard():
-            vectors = {key: store.cached_vector(cache_key, key) for key in text_by_hash}
-        missing = [key for key, value in vectors.items() if value is None]
-        try:
-            for start_idx in range(0, len(missing) if embed and not embedding_failed else 0, 32):
-                check_request()
-                keys = missing[start_idx:start_idx + 32]
-                values = embedder.embed_documents([text_by_hash[key] for key in keys])
-                check_request()
-                if len(values) != len(keys):
-                    raise ValueError("embedding response count mismatch")
-                if any(np.asarray(v).shape != (embedder.dim,) or not np.isfinite(v).all() for v in values):
-                    raise ValueError("invalid embedding shape or values")
-                with guard():
-                    store.cache_vectors(cache_key, zip(keys, values))
-                vectors.update(zip(keys, (np.asarray(v, dtype=np.float32) for v in values)))
-                info["embedded"] += len(keys)
-        except (RequestStopped, IndexBusy):
-            raise
-        except Exception as exc:
-            info["embedding_error"] = type(exc).__name__
-            embedding_failed = True
-        restored = [(c.chunk_id, vectors[chunk_hashes[c.chunk_id]]) for c in candidates
-                    if vectors[chunk_hashes[c.chunk_id]] is not None]
-        with guard():
-            check_request()
-            live = store.live_ids(sid, provider, [cid for cid, _ in restored])
-            restored = [pair for pair in restored if pair[0] in live]
-            if restored:
+        issues = []
+        if store.state_token(sid, provider) != expected_token:
+            issues.append("metadata_changed_during_derived_work")
+        if observation is not None:
+            if not (source_ok and observation.validate_prefix(locked=True)):
+                issues.append("source_changed_during_derived_work")
+            elif observation.current_size() > info["coverage"].get("file_size", 0) and "unread_bytes" not in info["coverage"]["issues"]:
+                info["coverage"]["pending_bytes"] = max(0, observation.current_size() - offset)
+                issues.append("unread_bytes")
+        if receipt_store is not None and receipt_store.authority_token(sid) != receipt_authority:
+            issues.append("receipts_changed_during_derived_work")
+        if issues:
+            info["coverage"]["complete"] = False
+            for iss in issues:
+                if iss not in info["coverage"]["issues"]:
+                    info["coverage"]["issues"].append(iss)
+    return info
+
+
+def _ingest_dense(
+    *,
+    info,
+    sid,
+    provider,
+    f_key,
+    state_snapshot,
+    receipt_store,
+    owner_token,
+    commit_seq=0,
+    store,
+    dense,
+    embedder,
+    embed,
+    guard,
+):
+    caller_token, caller_obs, caller_receipt_auth, caller_offset = state_snapshot
+    with _embed_flight(f_key, blocking=embed, state_snapshot=state_snapshot, commit_seq=commit_seq) as (acquired, flight_entry, holder_state):
+        if not acquired:
+            with guard():
                 dense.refresh()
-                dense.upsert_many(restored)
-        info["dense_restored"] += len(restored)
-        info["embedding_pending"] += len(candidates) - len(restored)
-    return finish()
+                session_ids = sorted(store.chunk_ids(sid, provider))
+                indexed = dense.present(session_ids)
+                info["embedding_pending"] = sum(1 for cid in session_ids if cid not in indexed)
+            prog = get_session_progress(sid, provider)
+            if prog is None and info["embedding_pending"] > 0:
+                prog = {
+                    "stage": "embedding",
+                    "session_id": sid,
+                    "provider": provider,
+                    "embedded_done": 0,
+                    "embedded_total": info["embedding_pending"],
+                    "elapsed_ms": 0.0,
+                    "eta_ms": None,
+                }
+            if prog is not None:
+                info["sync_progress"] = prog
+            return _finalize_post_derived_coverage(
+                info,
+                sid=sid,
+                provider=provider,
+                store=store,
+                guard=guard,
+                expected_token=caller_token,
+                observation=caller_obs,
+                receipt_store=receipt_store,
+                receipt_authority=caller_receipt_auth,
+                offset=caller_offset,
+            )
+        active_embed = bool(embed)
+        try:
+            cache_key = embedder.cache_key
+            embedding_failed = False
+            stale_abort = False
+            newer_commit_restarts = 0
+            while True:
+                check_request()
+                with _embed_flights_gate:
+                    if active_embed:
+                        flight_entry[3] = False
+                        flight_entry[5] = False
+                    latest_snap = flight_entry[4] or state_snapshot
+                active_token, active_obs, active_receipt_auth, active_offset = latest_snap
+                with guard():
+                    dense.refresh()
+                    session_ids = sorted(store.chunk_ids(sid, provider))
+                    indexed = dense.present(session_ids)
+                    candidate_ids = [cid for cid in session_ids if cid not in indexed]
+                if active_embed:
+                    update_session_progress(
+                        sid,
+                        provider,
+                        flight_key=f_key,
+                        owner=owner_token,
+                        stage="embedding",
+                        embedded_done=0,
+                        embedded_total=len(candidate_ids),
+                        force=True,
+                    )
+                restored_in_pass = 0
+                restart_for_newer_commit = False
+                for batch in _batches(candidate_ids):
+                    with guard():
+                        snapshot = store.capture_evidence(sid, provider, history=False, anchors=batch)
+                    candidates = snapshot.list_chunks(sid, provider)
+                    text_by_hash, chunk_hashes = {}, {}
+                    for chunk in candidates:
+                        check_request()
+                        sanitized = mask_secrets(chunk.text)
+                        key = hashlib.sha256(sanitized.encode("utf-8")).hexdigest()
+                        text_by_hash[key], chunk_hashes[chunk.chunk_id] = sanitized, key
+                    with guard():
+                        vectors = {key: store.cached_vector(cache_key, key) for key in text_by_hash}
+                    missing = [key for key, value in vectors.items() if value is None]
+                    try:
+                        for start_idx in range(0, len(missing) if active_embed and not embedding_failed else 0, 32):
+                            check_request()
+                            keys = missing[start_idx:start_idx + 32]
+                            values = embedder.embed_documents([text_by_hash[key] for key in keys])
+                            check_request()
+                            if len(values) != len(keys):
+                                raise ValueError("embedding response count mismatch")
+                            if any(np.asarray(v).shape != (embedder.dim,) or not np.isfinite(v).all() for v in values):
+                                raise ValueError("invalid embedding shape or values")
+                            with guard():
+                                store.cache_vectors(cache_key, zip(keys, values))
+                            vectors.update(zip(keys, (np.asarray(v, dtype=np.float32) for v in values)))
+                            info["embedded"] += len(keys)
+                            if active_embed:
+                                batch_done = sum(1 for c in candidates if vectors.get(chunk_hashes[c.chunk_id]) is not None)
+                                update_session_progress(
+                                    sid,
+                                    provider,
+                                    flight_key=f_key,
+                                    owner=owner_token,
+                                    stage="embedding",
+                                    embedded_done=min(len(candidate_ids), restored_in_pass + batch_done),
+                                    embedded_total=len(candidate_ids),
+                                    force=True,
+                                )
+                    except (RequestStopped, IndexBusy):
+                        raise
+                    except Exception as exc:
+                        info["embedding_error"] = type(exc).__name__
+                        embedding_failed = True
+                    restored_all = [(c.chunk_id, vectors[chunk_hashes[c.chunk_id]]) for c in candidates
+                                    if vectors[chunk_hashes[c.chunk_id]] is not None]
+                    obs_ok_unlocked = True if active_obs is None else active_obs.validate_prefix()
+                    with _embed_flights_gate:
+                        newest_snap = flight_entry[4]
+                    newest_obs = newest_snap[1] if newest_snap is not None else None
+                    newest_obs_ok_unlocked = True if newest_obs is None else newest_obs.validate_prefix()
+                    with guard():
+                        check_request()
+                        dense.refresh()
+                        cur_store_token = store.state_token(sid, provider)
+                        token_ok = (cur_store_token == active_token)
+                        obs_ok = obs_ok_unlocked and (True if active_obs is None else active_obs.validate_prefix(locked=True))
+                        all_cand_ids = [c.chunk_id for c in candidates]
+                        live = store.live_ids(sid, provider, all_cand_ids)
+                        already = dense.present(all_cand_ids)
+                        if token_ok and obs_ok:
+                            restored = [pair for pair in restored_all if pair[0] in live and pair[0] not in already]
+                            if restored:
+                                dense.upsert_many(restored)
+                        elif (
+                            active_embed
+                            and not token_ok
+                            and newest_snap is not None
+                            and newest_snap[0] == cur_store_token
+                            and cur_store_token is not None
+                            and newest_obs_ok_unlocked
+                            and (True if newest_obs is None else newest_obs.validate_prefix(locked=True))
+                            and newer_commit_restarts < 8
+                        ):
+                            # An in-process follower committed a strictly newer session state while we were embedding.
+                            # Verify live chunk hashes against the current store snapshot before upserting, then restart pass on newest_snap.
+                            cur_snap = store.capture_evidence(sid, provider, history=False, anchors=all_cand_ids)
+                            cur_hashes = {
+                                c.chunk_id: hashlib.sha256(mask_secrets(c.text).encode("utf-8")).hexdigest()
+                                for c in cur_snap.list_chunks(sid, provider)
+                            }
+                            restored = [
+                                pair for pair in restored_all
+                                if pair[0] in live
+                                and pair[0] not in already
+                                and cur_hashes.get(pair[0]) == chunk_hashes.get(pair[0])
+                            ]
+                            if restored:
+                                dense.upsert_many(restored)
+                            restart_for_newer_commit = True
+                            newer_commit_restarts += 1
+                        else:
+                            restored = []
+                            stale_abort = True
+                    info["dense_restored"] += len(restored)
+                    restored_in_pass += len(restored)
+                    if active_embed:
+                        update_session_progress(
+                            sid,
+                            provider,
+                            flight_key=f_key,
+                            owner=owner_token,
+                            stage="embedding",
+                            embedded_done=min(len(candidate_ids), restored_in_pass),
+                            embedded_total=len(candidate_ids),
+                            force=True,
+                        )
+                    if stale_abort or restart_for_newer_commit:
+                        break
+                if restart_for_newer_commit and not stale_abort:
+                    continue
+                with guard():
+                    dense.refresh()
+                    final_sids = sorted(store.chunk_ids(sid, provider))
+                    final_indexed = dense.present(final_sids)
+                    info["embedding_pending"] = sum(1 for cid in final_sids if cid not in final_indexed)
+                with _embed_flights_gate:
+                    can_rerun = (
+                        active_embed
+                        and not stale_abort
+                        and bool(flight_entry[3])
+                        and (not embedding_failed or not flight_entry[6])
+                        and newer_commit_restarts < 8
+                    )
+                    if can_rerun:
+                        newer_commit_restarts += 1
+                        if embedding_failed:
+                            flight_entry[6] = True
+                        continue
+                    # Atomically clear holder_state, active flag, and release lock under _embed_flights_gate so finally will not touch successor's lock.
+                    if holder_state[0]:
+                        holder_state[0] = False
+                        flight_entry[2] = False
+                        flight_entry[0].release()
+                    break
+            return _finalize_post_derived_coverage(
+                info,
+                sid=sid,
+                provider=provider,
+                store=store,
+                guard=guard,
+                expected_token=caller_token,
+                observation=caller_obs,
+                receipt_store=receipt_store,
+                receipt_authority=caller_receipt_auth,
+                offset=caller_offset,
+            )
+        finally:
+            if active_embed or embed:
+                update_session_progress(sid, provider, flight_key=f_key, owner=owner_token, clear=True, force=True)

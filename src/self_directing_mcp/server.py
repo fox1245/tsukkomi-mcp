@@ -164,11 +164,13 @@ def _format_contract_errors(contracts, exc: ValidationError) -> str:
         lines.append(f"{target}.{field_path}: {msg}")
     return "Invalid contracts input; nothing was saved. " + "; ".join(lines)
 
-def _incomplete_response(reason, trace=None):
+def _incomplete_response(reason, trace=None, sync_progress=None):
     payload = {"ok": False, "verdict": "unknown", "error": reason,
                "coverage": {"complete": False, "issues": [reason]},
                "action_executed": False, "requires_attention": True,
                "nudge": "Local work did not complete; this is not compliance or proof of rollback."}
+    if sync_progress is not None:
+        payload["sync_progress"] = sync_progress
     if trace is not None:     # where the time went: waiting for a heavy-call slot, then the whole request, against its budget
         payload["timings_ms"] = trace.timings_ms()
         payload["budget_ms"] = round(trace.budget * 1000)
@@ -348,11 +350,13 @@ async def _await_request(work, control, budget, heavy=True, trace=None):
 async def _serve(trace, work, control, notes, *, heavy=True, keep=frozenset(), incomplete):
     """Run ``work`` under ``control`` and answer within its deadline. The request is counted once, here, at its response:
     ``incomplete(reason)`` builds the answer of a request that did not complete."""
+    sync_progress = None
     try:
         result = await _await_request(work, control, trace.budget, heavy, trace)
         response = _stamp(mask_value(result, skip_keys=keep))
     except (IndexBusy, RequestStopped) as exc:
         reason = exc.reason
+        sync_progress = getattr(exc, "progress", None)
     except TimeoutError:
         reason = "operation_timeout"
     except asyncio.CancelledError:
@@ -366,7 +370,13 @@ async def _serve(trace, work, control, notes, *, heavy=True, keep=frozenset(), i
         trace.count("degraded" if degraded else "ok", degraded)
         return response
     trace.count("incomplete", reason)
-    return _stamp(incomplete(reason))
+    try:
+        inc_payload = incomplete(reason, sync_progress)
+    except TypeError:
+        inc_payload = incomplete(reason)
+        if isinstance(inc_payload, dict) and sync_progress is not None:
+            inc_payload["sync_progress"] = sync_progress
+    return _stamp(inc_payload)
 
 
 async def _dispatch(method, *args, audit=False, **kwargs):
@@ -394,7 +404,7 @@ async def _dispatch(method, *args, audit=False, **kwargs):
             return result
 
     return await _serve(trace, work, control, notes, heavy=heavy, keep=keep,
-                        incomplete=lambda reason: _incomplete_response(reason, trace))
+                        incomplete=lambda reason, prog=None: _incomplete_response(reason, trace, prog))
 
 
 def _resolve_timeout_sec(timeout_ms: int | None, *, audit: bool) -> float:
@@ -457,6 +467,7 @@ async def sync_session(
     timeout_ms: int | None = None,
     verify: Literal["full", "fast"] = "full",
     include_subagents: bool = False,
+    async_mode: bool = False,
 ) -> dict[str, Any]:
     """Index/update local session history when retrieval needs fresh evidence.
 
@@ -478,7 +489,18 @@ async def sync_session(
     """
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.sync_session, session_id=session_id, path=path, provider=provider, embed=embed,
-                           verify=verify, include_subagents=include_subagents, budget_override=budget)
+                           verify=verify, include_subagents=include_subagents, async_mode=async_mode,
+                           heavy=(embed and not async_mode), budget_override=budget)
+
+
+@mcp.tool()
+async def job_status(
+    job_id: str | None = None,
+    session_id: str | None = None,
+    provider: str | None = None,
+) -> dict[str, Any]:
+    """Check the status and live progress (bytes, chunks, embeddings, elapsed_ms, eta_ms) of an async sync_session job or active session sync."""
+    return await _dispatch(_engine.job_status, job_id=job_id, session_id=session_id, provider=provider, heavy=False)
 
 
 @mcp.tool()
@@ -501,7 +523,7 @@ async def search_history(
     budget = _resolve_timeout_sec(timeout_ms, audit=False)
     return await _dispatch(_engine.search_history,
         query, session_id=session_id, mode=mode, top_k=top_k, provider=provider, scope=scope,
-        budget_override=budget
+        heavy=(mode != "sparse"), budget_override=budget
     )
 
 
@@ -706,6 +728,68 @@ if _upsert_contract_tool is not None:
 
 
 @mcp.tool()
+async def test_contract(
+    contract: dict[str, Any],
+    cases: list[dict[str, Any]] | None = None,
+    baseline: str | dict[str, Any] | None = "current",
+    max_ms: float | None = None,
+    provider: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Test a candidate contract rule (and its regex/before_regex/exception_regex) against positive and negative test cases before saving (#57).
+
+    Synthesizes canonical tool_call text when a case provides 'command' or 'arguments', measures per-case evaluation
+    latency against max_ms, and compares side-by-side against the stored baseline rule (when baseline='current' or a
+    contract id/dict is supplied), reporting any differences or regressions on critical contracts.
+    """
+    return await _dispatch(
+        _engine.test_contract,
+        contract,
+        cases,
+        baseline=baseline,
+        max_ms=max_ms,
+        provider=provider,
+        session_id=session_id,
+        heavy=False,
+    )
+
+
+@mcp.tool()
+async def grant_once(
+    contract_id: str,
+    action_regex: str,
+    source_event_id: str,
+    session_id: str,
+    path: str | None = None,
+    provider: str | None = None,
+    max_uses: int = 1,
+    expires_in: str | int = "15m",
+    canonical_english_quote: str | None = None,
+) -> dict[str, Any]:
+    """Create a scoped, bounded one-time grant for a must_not contract anchored to an indexed user approval message (#56).
+
+    Does not weaken or modify the global/session contract rule itself. Instead, records a session-scoped grant anchored
+    to source_event_id (which must be a user message in session_id that explicitly references the target action) that
+    allows at most max_uses (default 1) matching action(s) within expires_in (default '15m', max '1h') and records an
+    audit receipt under grants_applied. When the user speaks in a non-English language or personal phrasing, pass
+    canonical_english_quote translated by the orchestration LLM into Canonical English.
+    """
+    return await _dispatch(
+        _engine.grant_once,
+        contract_id,
+        action_regex,
+        source_event_id,
+        session_id=session_id,
+        path=path,
+        provider=provider,
+        max_uses=max_uses,
+        expires_in=expires_in,
+        canonical_english_quote=canonical_english_quote,
+        heavy=False,
+    )
+
+
+@mcp.tool()
 async def audit_status(session_id: str | None = None, provider: str | None = None,
                        timeout_ms: int | None = None) -> dict[str, Any]:
     """Index health: cursor, chunk counts, degraded flags (numpy/fake embedder).
@@ -742,7 +826,7 @@ async def update_checklist(
 @mcp.tool()
 async def get_checklist(session_id: str, provider: str | None = None) -> dict[str, Any]:
     """Read the requirement checklist: statuses, evidence links and history."""
-    return await _dispatch(_engine.get_checklist, session_id, provider=provider)
+    return await _dispatch(_engine.get_checklist, session_id, provider=provider, heavy=False)
 
 
 @mcp.tool()
@@ -771,7 +855,7 @@ async def get_graph_context(session_id: str, node_id: str | None = None,
     """
     return await _dispatch(_engine.get_graph_context, session_id, node_id=node_id,
                            provider=provider, depth=depth, path=path,
-                           include_subagents=include_subagents, audit=True)
+                           include_subagents=include_subagents, heavy=False, audit=True)
 
 
 @mcp.tool()
