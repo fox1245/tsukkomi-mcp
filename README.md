@@ -84,7 +84,7 @@ Version 0.7.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly makes big sessions conve
 
 Version 0.6.0 (see [CHANGELOG.md](CHANGELOG.md)) mainly fixes memory growth, append handling and concurrency in long-running servers. It also adds a Claude Code integration, a shared hook policy and an egress masking contract.
 
-- **Dependency:** `neograph-engine>=0.16.0` (was 0.12.1). `zstandard>=0.23` is new on Python before 3.14, for compressed Codex sessions.
+- **Dependency:** `neograph-engine==0.14.1` (was 0.12.1). `zstandard>=0.23` is new on Python before 3.14, for compressed Codex sessions.
 - **Compressed Codex sessions.** Codex CLI 0.156 compresses older rollouts in place to `rollout-*.jsonl.zst`. They are discovered, synced, audited and searched like plain rollouts, streamed through a bounded decoder and never held in memory. See [Compressed Codex sessions](#compressed-codex-sessions).
 - **Appending sessions sync normally ([#4](https://github.com/fox1245/tsukkomi-mcp/issues/4)).** Source capture streams a SHA-256 over the file up to its length at the first measurement and keeps no bytes. Records appended afterwards are reported as `unread_bytes` instead of failing the sync.
 - **Audits judge a growing session as of the captured offset.** Results carry `judged_through_byte`, `unread_bytes` and `judged_prefix`; absence-based `must` obligations stay `unknown` while bytes are unread. See [Coverage and verdicts](#coverage-and-verdicts).
