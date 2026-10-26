@@ -10,14 +10,16 @@ from self_directing_mcp import contract_bundles as cb
 from self_directing_mcp import server, settings_core
 
 ROOT = Path(__file__).resolve().parents[1]
-README = (ROOT / "README.md").read_text(encoding="utf-8")
+TOP_README = (ROOT / "README.md").read_text(encoding="utf-8")
+README = (ROOT / "docs" / "reference.md").read_text(encoding="utf-8")
 SECTION = README[README.index("#### Sharing contracts across devices"):README.index("### 2. Checklist with evidence gating")]
 
 
 def test_every_registered_tool_is_in_the_readmes_tool_reference():
     reference = README[README.index("## MCP tools reference"):README.index("### Host-side GraphRAG extraction")]
+    top_ref = TOP_README[TOP_README.index("## MCP tools reference"):TOP_README.index("## Documentation")]
     for tool in asyncio.run(server.mcp.list_tools()):
-        assert f"`{tool.name}`" in reference, tool.name
+        assert f"`{tool.name}`" in reference and f"`{tool.name}`" in top_ref, tool.name
 
 
 def test_the_status_table_lists_exactly_the_statuses_the_code_reports():

@@ -1250,7 +1250,7 @@ def test_classify_submission_decides_what_a_submit_asks_for():
 
 
 def test_the_readme_states_the_limits_the_code_enforces():
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    readme = (Path(__file__).resolve().parents[1] / "docs" / "reference.md").read_text(encoding="utf-8")
     section = readme[readme.index("### Host-side GraphRAG extraction"):readme.index("## Quickstart")]
     limits = graph_batch
     assert (f"up to {limits.HOST_BATCH_MAX_EVENTS} complete events and {limits.HOST_BATCH_MAX_CHARS:,} characters "

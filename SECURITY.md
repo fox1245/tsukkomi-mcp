@@ -7,7 +7,7 @@
 | 0.6.x   | Yes       |
 | < 0.6   | No        |
 
-Security fixes are made on the latest 0.6.x release. Upgrade before reporting an issue found in an older version, and read the upgrade notes in the [README](README.md#upgrading-to-060).
+Security fixes are made on the latest 0.6.x release. Upgrade before reporting an issue found in an older version, and read the upgrade notes in the [README](docs/reference.md#upgrading-to-060).
 
 ## Reporting a Vulnerability
 
@@ -23,7 +23,7 @@ This is a small project maintained on a best-effort basis; no response time is g
 
 The project's data-handling model is part of what this policy covers:
 
-- Session transcripts, the index and contracts stay on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter and only with a key the owner configured, and, only when the owner selects the opt-in `pgvector` dense backend, chunk ids and embedding vectors (never text) sent to the PostgreSQL server named in a private connection-string file (see [Dense backends](README.md#dense-backends); vectors are not anonymous, a server that is not this machine needs `sslmode=verify-full`, and a real remote server needs the owner's approval). With `SELF_DIRECT_LOCAL_ONLY=true`, embeddings and LLM graph updates are rejected, and workflow classification stays off unless the workflow owner approves remote synthetic context.
+- Session transcripts, the index and contracts stay on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter and only with a key the owner configured, and, only when the owner selects the opt-in `pgvector` dense backend, chunk ids and embedding vectors (never text) sent to the PostgreSQL server named in a private connection-string file (see [Dense backends](docs/reference.md#dense-backends); vectors are not anonymous, a server that is not this machine needs `sslmode=verify-full`, and a real remote server needs the owner's approval). With `SELF_DIRECT_LOCAL_ONLY=true`, embeddings and LLM graph updates are rejected, and workflow classification stays off unless the workflow owner approves remote synthetic context.
 - Known secret patterns are masked before embedding and graph extraction and in everything the server and its hooks return, and the workflow classifier refuses context in which a secret pattern is found. Masking is pattern-based; it does not guarantee that every secret format or all personal data is removed. See the [masking contract](#masking-contract).
 
 In scope, for example: leaking a credential or session text outside the documented remote calls, a bypass of secret masking for a known pattern, a project-controlled file (such as a `.env` in the working directory) that changes the index, contracts or mode a lifecycle hook reads, an escape from the configured session roots or sandbox, a way for an agent to forge host receipts or workflow approvals through the MCP API, and a verdict reported as `clean` when the evidence is changed or unread.
@@ -44,7 +44,7 @@ Hosts run lifecycle hooks inside the project being edited, so anything in the wo
 
 The index is a local evidence store, and the audit needs the truth, so what is stored and what leaves are treated differently.
 
-**Stored raw.** The canonical event store (`meta.sqlite`), the original session files, the checklist and contract files keep text as the host or caller wrote it, so a regular expression audit can see a secret that a session contains. Anyone who can read the index directory can read those secrets. Keep the index private and outside agent-writable workspaces. While a re-index is staged, the same raw rows are also in `<index dir>/reindex/*.spool` (a 0600 file in a 0700 directory on POSIX; deleted when the re-index is published or discarded; see [Re-indexing](README.md#re-indexing)): it is part of the index directory for everything said here.
+**Stored raw.** The canonical event store (`meta.sqlite`), the original session files, the checklist and contract files keep text as the host or caller wrote it, so a regular expression audit can see a secret that a session contains. Anyone who can read the index directory can read those secrets. Keep the index private and outside agent-writable workspaces. While a re-index is staged, the same raw rows are also in `<index dir>/reindex/*.spool` (a 0600 file in a 0700 directory on POSIX; deleted when the re-index is published or discarded; see [Re-indexing](docs/reference.md#re-indexing)): it is part of the index directory for everything said here.
 
 **Masked on every way out.** Text passes through `security/mask.py` (`mask_secrets` for strings, `mask_value` for JSON-like values) before it leaves the evidence store:
 

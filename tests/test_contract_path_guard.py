@@ -415,7 +415,7 @@ def test_each_documented_false_positive_is_a_match(key, text, paths, mode, why):
 
 
 def test_the_limits_are_documented_in_the_readme_and_the_module():
-    readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").lower().split())
+    readme = " ".join(((ROOT / "README.md").read_text(encoding="utf-8") + " " + (ROOT / "docs" / "reference.md").read_text(encoding="utf-8")).lower().split())
     section = readme[readme.index("#### typed path contracts (`path_guard`)"):]
     section = section[:section.index("#### contract fragility report")].replace("`", "")
     assert len(LIMITS) == 12 and len(KNOWN_HITS) == 3
@@ -781,7 +781,7 @@ def test_every_tool_map_entry_names_its_source_and_the_untraced_ones_are_listed(
         ("claude", "NotebookRead"), ("agy", "multi_replace_file_content"), ("agy", "write_to_file"),
         ("agy", "grep_search"), ("agy", "find_by_name"), ("omp", "write"), ("omp", "edit"), ("omp", "grep"),
         ("omp", "find"), ("omp", "ls"), ("codex", "powershell"), ("codex", "read_file"), ("codex", "apply_patch")}
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8") + "\n" + (ROOT / "docs" / "reference.md").read_text(encoding="utf-8")
     for host, tool in contract_paths.untraced():
         assert f"`{tool}`" in readme, f"README must list the untraced tool {host} {tool}"
 

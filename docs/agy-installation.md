@@ -122,7 +122,7 @@ stores separate host receipts in `SELF_DIRECT_INDEX_DIR/agy-receipts.sqlite`.
 The native transcript is never modified or replaced with hook payloads.
 The receipts database is an authority record: copy it with SQLite's backup API, not as a bare file,
 whenever `SELF_DIRECT_SQLITE_JOURNAL=auto` may have left commits in its `-wal` file (see
-[SQLite journal mode, index files and backups](../README.md#sqlite-journal-mode-index-files-and-backups)).
+[SQLite journal mode, index files and backups](reference.md#sqlite-journal-mode-index-files-and-backups)).
 
 Pre/Post receipts bind the conversation UUID, actual execution `stepIdx`, exact
 canonical tool name/arguments, transcript path, and hash of complete native
