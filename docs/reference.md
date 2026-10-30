@@ -1,6 +1,6 @@
 # Tsukkomi MCP (ツッコミ)
 
-> A deterministic governance and evidence server for autonomous coding agents, version 0.10.0.
+> A deterministic governance and evidence server for autonomous coding agents, version 0.11.0.
 > The distribution is `tsukkomi-mcp`; the Python package is `self_directing_mcp`.
 
 ## Overview
@@ -32,6 +32,18 @@ Every check returns one of four verdicts: `clean`, `violation`, `suspicious` or 
 ```
 
 Session evidence stays on the local machine. Remote calls are limited to embeddings, GraphRAG extraction and the opt-in workflow classifier, all sent to OpenRouter. The canonical index keeps raw text so audits see the truth; everything that leaves it (tool results, errors, hook output, logs, remote payloads) is masked for known secret patterns, and the workflow classifier refuses context in which a secret pattern is found. See the [masking contract](../SECURITY.md#masking-contract), [SECURITY.md](../SECURITY.md) and [Verification scope](#verification-scope).
+
+## What is new in 0.11.0
+
+Version 0.11.0 (see [CHANGELOG.md](../CHANGELOG.md)) lets a contract say where it applies, adds a way to test a contract and to record one approved call, and keeps more of a session on the machine.
+
+- **Where a contract applies.** `"mode": "inject_only"` injects a contract as a reminder and never judges it; `"tools": ["Bash"]` limits a `tool_call` or `any` contract to the calls of those tools, so a rule about a command no longer judges the text of a document that a `Write` call carries. `check_action` answers `action_verdict` (the contracts that apply to the action) next to `session_verdict`. `SessionStart` and the AGY pre-invocation hook inject up to 16 contracts (`SELF_DIRECT_SESSION_START_MAX_CONTRACTS`), high risk and severe first, and say how many were left out. Making a contract `inject_only` or adding or narrowing `tools` is a weakening and needs a user anchor.
+- **Testing and approving.** `test_contract` (and the `cases` of a contract, which `upsert_contracts` runs before it saves) checks positive and negative examples and compares them with the stored version; a save is refused when a case fails or when the stored revision passed a case that the new one fails. `grant_once` records one approved call for a `must_not` contract in `grants.json` of the index directory: the user's message in the same session is the anchor, the grant is used up by one matching call or by its expiry (at most one hour), and the contract stays enabled.
+- **Less leaves the machine.** `SELF_DIRECT_MASK_PII=email,phone` (or a word to mask) applies to remote embedding, remote GraphRAG extraction and the workflow classifier only; the index and the regex audits are untouched. `OPENROUTER_API_KEY` is sent to OpenRouter hosts only; a custom embedding endpoint gets `SELF_DIRECT_EMBEDDING_API_KEY` or `SELF_DIRECT_EMBEDDING_API_KEY_FILE`, or no `Authorization` header.
+- **GraphRAG model.** `SELF_DIRECT_GRAPH_MODEL`, `SELF_DIRECT_GRAPH_MAX_OUTPUT_TOKENS` and `SELF_DIRECT_GRAPH_REASONING_EFFORT` (or a `[graph]` table in the TOML file) choose the extraction model; the model is checked against the OpenRouter catalog, the input budget follows its context window, and a failed extraction names its reason (`graph_input_too_large`, `completion_not_stopped`, `invalid_json`).
+- **Hosts.** Claude Code 2.1.30x metadata records are supported (parser version 4); a Claude Code session and its subagents are indexed, searched (`scope="family"`) and read as a graph (`include_subagents`) together; AGY results that a host receipt links no longer keep a session from `complete` (parser version 9). `sync_session(async_mode=true)` starts the sync in the background and `job_status` reports its progress.
+
+---
 
 ## What is new in 0.10.0
 
@@ -1374,6 +1386,17 @@ A parser upgrade (the AGY parser moved to version 8 and the Claude Code parser t
 `tests/test_reindex_spool.py`, `test_reindex_equivalence.py`, `test_reindex_staging.py`, `test_reindex_faults.py` (a stop at every cooperative check of a Codex re-index and at a sample of the others, a process that is killed after the row frames, after the trailer, with the spool complete, inside the commit transaction and after the commit, and a request that is stopped right after a spooled slice or after the commit) and `test_reindex_convergence.py` (a 150,000-event session with budgets of about 4 and 8 seconds on the development machine; on any other they are multiples of the time the one-shot re-index took there, so that a sanitizer build, which is three to four times slower, gives the same answer) pin all of this on synthetic sessions.
 
 `scripts/bench_eval_converge.py` measures what follows the sync, the judging: repeated `audit_session` calls under a budget of 8 or 45 seconds on synthetic sessions of 150,000 and 300,000 events, for a cold session and for one that is indexed but has no monitor state, with two, six and eighteen contracts (`--tool check` repeats `check_action` for a gated action instead, and the scenarios `cold+idle` and `synced+idle` give a resident server's idle comparison its turn after every call that did not complete); it reports the calls needed (K), the seconds of every call (a call the deadline cut is marked `x`), whether every call stayed inside its budget, and whether the final answer equals the unbounded one-shot answer, finding for finding. It resets the cost model before every run (the first request of a freshly started server) and also runs on a checkout without it, which is how the numbers of a change are compared with those before it. `tests/test_eval_converges.py` runs the same questions in virtual time (a price in seconds for parsing a record, folding an event, running the full evaluator; the deadlines read that clock), so that the calls, the stops and the answers do not depend on the machine. `tests/test_eval_reindex.py` pins how this fits with a staged re-index: a staged slice never reads the sizing numbers, the appended slice of the same session afterwards is cost-limited, and a request that stops while it stages is not noted to the idle comparison (scripted clocks, no wall clock).
+
+---
+
+## Upgrading to 0.11.0
+
+1. **Restart every process that uses the index, and upgrade all of them together.** The audit evaluator version is 12: the first audit after the upgrade rebuilds the saved incremental monitor state of each contract once, and processes on different evaluator versions rebuild each other's saved state, so hooks, the MCP bridge and other hosts must not run side by side on 0.10.0 and 0.11.0. The AGY parser is version 9 and the Claude Code parser version 4; a session of those providers is re-parsed on its first touch.
+2. **Register a contract with `mode`, `tools` or `cases` only after every process is upgraded.** A 0.10.0 process refuses a contracts file that holds one of these fields (`ContractRule` rejects unknown keys) and reports all of its contracts unavailable, visibly and fail-safe. A contracts file without them is byte-identical to the 0.10.0 file. Nothing is registered for you.
+3. **Grants are not in the contracts file.** `grant_once` writes `grants.json` in the index directory, which a 0.10.0 process never reads; it keeps judging the call by its contract.
+4. **The engine reads the OpenRouter model catalog at start** when it has a real embedder, is not local-only and `SELF_DIRECT_GRAPH_EXTRACTOR` is `openrouter` (the default), and it refuses to start when the catalog cannot be read or does not list `SELF_DIRECT_GRAPH_MODEL` with `response_format`. On a machine without access to it, set `SELF_DIRECT_GRAPH_EXTRACTOR=host` or `SELF_DIRECT_LOCAL_ONLY=true`.
+5. **Embedding keys.** A custom `SELF_DIRECT_EMBEDDING_BASE_URL` no longer receives `OPENROUTER_API_KEY`. Set `SELF_DIRECT_EMBEDDING_API_KEY` or `SELF_DIRECT_EMBEDDING_API_KEY_FILE` if that server needs a key; with neither the request has no `Authorization` header.
+6. **Nothing else changes by itself.** The first 16 contracts (was 8) are injected at session start; masking of e-mail addresses and phone numbers is off until `SELF_DIRECT_MASK_PII` is set. Setting it changes the embedder's cache key: the file backends start a new vector file (documents are embedded again on the next sync) and the `pgvector` backend reports a policy mismatch until it is repaired.
 
 ---
 
