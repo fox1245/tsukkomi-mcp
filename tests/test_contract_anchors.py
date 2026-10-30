@@ -24,8 +24,8 @@ from self_directing_mcp.config import Settings
 from self_directing_mcp.engine import SelfDirectEngine
 from self_directing_mcp.schemas import ContractRule, ContractsDocument
 from semantic_support import (
-    SID, Claude, assistant, bash, call, env_record, evaluate, event, finding, human, injected, one, result, text,
-    tool_result, use, user_turn,
+    PROJECT, SID, Claude, assistant, bash, call, env_record, evaluate, event, finding, human, injected, one, result, text,
+    tool_result, use, user_turn, write,
 )
 
 PROVIDERS = ["claude", "codex", "agy", "omp"]
@@ -481,3 +481,265 @@ def test_loosening_reasons_for_the_other_contract_fields():
 def test_the_revoke_tool_takes_the_anchor():
     from self_directing_mcp import server
     assert "source_event_id" in inspect.signature(server.revoke_contract).parameters
+
+
+# ---------------------------------------------------------------- a global contract anchored in another session
+#
+# A global contract (no session id) is judged in every session, but its source and activation event usually belong to
+# the session it was written in. The engine resolves such an anchor from the whole index once per build and hands it to
+# both evaluators (``audit.anchors``); a session contract never takes its anchor from another session.
+
+from self_directing_mcp.audit import runner                                                      # noqa: E402
+from self_directing_mcp.audit.anchors import Anchor, parse_time                                # noqa: E402
+from self_directing_mcp.audit import incremental as inc                                         # noqa: E402
+
+DEPLOY = {"id": "no-deploy", "type": "must_not", "scope": "tool_call", "regex": r"terraform\s+apply"}
+OTHER = "claude:other-session:0:0:abcd"          # an event of a session that is not the one judged
+NOT_HERE = "contract source or activation event is not in this session"
+
+
+def foreign(user=True, at=None, event_id=OTHER, cut_user=False):
+    return {event_id: Anchor(event_id, user, cut_user, parse_time(at))}
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_global_contract_takes_a_user_source_from_another_session(provider):
+    events = [user_turn(), call("terraform apply -auto-approve", "c1")]
+    rule = {**DEPLOY, "source_event_id": OTHER}
+    item = one(rule, events, provider, anchors=foreign())
+    assert item.verdict == "violation" and "terraform apply" in item.evidence[0].snippet
+    proposed = event("tool_call", "[tool_call:Bash] " + json.dumps({"command": "terraform apply"}), "assistant",
+                     tool_name="Bash", proposed=True)
+    assert one(rule, [user_turn()], provider, proposed=proposed, anchors=foreign()).verdict == "violation"
+    assert one(rule, [user_turn(), call("ls", "c1")], provider, anchors=foreign()).verdict == "clean"
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_global_contract_whose_source_in_another_session_is_not_a_user_message_is_unknown(provider):
+    events = [user_turn(), call("terraform apply", "c1")]
+    item = one({**DEPLOY, "source_event_id": OTHER}, events, provider, anchors=foreign(user=False))
+    assert item.verdict == "unknown" and item.reason.startswith("anchor_not_user:") and item.evidence == []
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_an_anchor_that_is_in_no_session_of_the_index_stays_unknown(provider):
+    events = [user_turn(), call("terraform apply", "c1")]
+    for extra in ({"source_event_id": OTHER}, {"applies_from_event_id": OTHER},
+                  {"source_event_id": OTHER, "applies_from_event_id": "claude:elsewhere:0:0:ef01"}):
+        for anchors in (None, {}, foreign(event_id="claude:unrelated:0:0:2345")):
+            item = one({**DEPLOY, **extra}, events, provider, anchors=anchors)
+            assert item.verdict == "unknown" and item.reason == NOT_HERE, (extra, anchors)
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_session_contract_never_takes_its_anchor_from_another_session(provider):
+    events = [user_turn(), call("terraform apply", "c1")]
+    mine = {**DEPLOY, "source_event_id": OTHER, "session_id": "s"}      # the audit judges session "s"
+    item = one(mine, events, provider, anchors=foreign())
+    assert item.verdict == "unknown" and item.reason == NOT_HERE
+    # a contract of another session is not selected by the engine at all; the reference says so for itself
+    (elsewhere,) = runner.full_findings([ContractRule(**{**mine, "session_id": "some-other-session"})], events,
+                                        session_id="s", store=None, provider=provider, proposed=None, coverage={},
+                                        anchors=foreign())
+    assert elsewhere.verdict == "clean" and elsewhere.reason == "contract outside this provider/session"
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_an_anchor_in_the_judged_session_is_unchanged_whatever_the_map_says(provider):
+    user = user_turn()
+    events = [user, call("terraform apply", "c1")]
+    # the map speaks about an id that this session also holds: the session's own event decides
+    claimed = foreign(user=False, event_id=user.chunk_id)
+    assert one({**DEPLOY, "source_event_id": user.chunk_id}, events, provider, anchors=claimed).verdict == "violation"
+    tool = result("c1", True)
+    mixed = [user, call("ls", "c1"), tool, call("terraform apply", "c2")]
+    claimed = foreign(user=True, event_id=tool.chunk_id)
+    assert one({**DEPLOY, "source_event_id": tool.chunk_id}, mixed, provider, anchors=claimed).reason.startswith(
+        "anchor_not_user:")
+
+
+T0 = "2026-10-01T12:00:00Z"
+
+
+def stamped(builder, at, *args, **kwargs):
+    item = builder(*args, **kwargs)
+    item.timestamp = at
+    return item
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_global_contract_that_starts_in_another_session_judges_the_events_from_that_time(provider):
+    before = stamped(call, "2026-10-01T11:59:59Z", "terraform apply before", "c1")
+    after = stamped(call, "2026-10-01T12:00:01+00:00", "terraform apply after", "c2")
+    events = [stamped(user_turn, "2026-10-01T11:00:00Z"), before, after]
+    rule = {**DEPLOY, "applies_from_event_id": OTHER}
+    item = one(rule, events, provider, anchors=foreign(at=T0))
+    assert item.verdict == "violation" and len(item.evidence) == 1 and "apply after" in item.evidence[0].snippet
+    assert one(rule, events[:2], provider, anchors=foreign(at=T0)).verdict == "clean"      # only an earlier match
+    # an offset spelling of an instant orders like Z
+    late = stamped(call, "2026-10-01T20:59:59+09:00", "terraform apply late", "c3")
+    assert one(rule, [events[0], before, late], provider, anchors=foreign(at=T0)).verdict == "clean"
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_when_the_time_cannot_be_compared_the_whole_session_is_judged(provider):
+    applies = [stamped(call, at, "terraform apply x", f"c{n}") for n, at in
+               enumerate(("2026-10-01T11:00:00Z", None, "not a time", "2026-10-01T11:00:00"))]   # the last: no offset
+    rule = {**DEPLOY, "applies_from_event_id": OTHER}
+    # the first event is before the time and is not judged; those without a comparable time are (judge more, never less)
+    item = one(rule, [stamped(user_turn, "2026-10-01T10:00:00Z"), *applies], provider, anchors=foreign(at=T0))
+    assert item.verdict == "violation" and len(item.evidence) == 3
+    # the anchor itself has no comparable time: nothing is cut
+    for anchor_time in (None, "garbage", "2026-10-01T12:00:00"):
+        item = one(rule, [stamped(call, "2000-01-01T00:00:00Z", "terraform apply old", "c1")], provider,
+                   anchors=foreign(at=anchor_time))
+        assert item.verdict == "violation", anchor_time
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_an_obligation_that_starts_in_another_session_counts_only_evidence_from_that_time(provider):
+    gate = {"id": "gate", "type": "must", "scope": "tool_call", "regex": "pytest", "before_regex": "git commit",
+            "requires_success": True, "applies_from_event_id": OTHER}
+    old = stamped(call, "2026-10-01T10:00:00Z", "pytest", "c1")
+    old_ok = stamped(result, "2026-10-01T10:00:01Z", "c1", True)
+    commit = stamped(call, "2026-10-01T13:00:00Z", "git commit -m x", "c2")
+    new = stamped(call, "2026-10-01T12:30:00Z", "pytest", "c3")
+    new_ok = stamped(result, "2026-10-01T12:30:01Z", "c3", True)
+    stale = one(gate, [old, old_ok, commit], provider, anchors=foreign(at=T0))
+    assert stale.verdict == "violation"                    # a run from before the activation does not count
+    fresh = one(gate, [old, old_ok, new, new_ok, commit], provider, anchors=foreign(at=T0))
+    assert fresh.verdict == "clean"
+    assert one(gate, [old, old_ok, commit], provider, anchors=foreign(at=None)).verdict == "clean"
+
+
+def test_both_evaluators_agree_when_a_foreign_window_opens_in_a_later_feed():
+    events = [stamped(call, "2026-10-01T11:00:00Z", "terraform apply 1", "c1"),
+              stamped(call, "2026-10-01T11:30:00Z", "ls", "c2"),
+              stamped(call, "2026-10-01T12:30:00Z", "terraform apply 2", "c3"),
+              stamped(call, "2026-10-01T12:40:00Z", "ls", "c4")]
+    rules = [{**DEPLOY, "applies_from_event_id": OTHER}, {**DEPLOY, "id": "src", "source_event_id": OTHER},
+             {**DEPLOY, "id": "both", "source_event_id": OTHER, "applies_from_event_id": OTHER}]
+    findings = evaluate(rules, events, chunk_sizes=(None, 1, 2, 3), anchors=foreign(at=T0))
+    assert [f.verdict for f in findings] == ["violation"] * 3
+    assert [len(f.evidence) for f in findings] == [1, 2, 1]
+
+
+def test_a_stored_monitor_state_is_keyed_by_the_foreign_anchor_it_was_built_under():
+    rule = ContractRule(**{**DEPLOY, "source_event_id": OTHER, "applies_from_event_id": OTHER})
+    plain = ContractRule(**DEPLOY)
+    keys = [inc.rule_fingerprint(rule, "claude", 1, "d", anchors) for anchors in
+            (None, {}, foreign(), foreign(user=False), foreign(at=T0), foreign(at="2026-10-01T12:00:01Z"))]
+    assert keys[0] == keys[1] and len(set(keys[1:])) == 5       # none, user, other, two times
+    mine = ContractRule(**{**DEPLOY, "source_event_id": OTHER, "session_id": "s"})
+    assert (inc.rule_fingerprint(mine, "claude", 1, "d", foreign()) == inc.rule_fingerprint(mine, "claude", 1, "d", None))
+    assert inc.rule_fingerprint(plain, "claude", 1, "d", foreign()) == inc.rule_fingerprint(plain, "claude", 1, "d")
+
+
+# ---------------------------------------------------------------- the same through the engine: two indexed sessions
+
+SID_B = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+APPLY = "terraform apply -auto-approve"
+
+
+@pytest.fixture
+def pair(tmp_path):
+    """Session A (the contract's origin) and session B in one index; the engine audits B with incremental state."""
+    world = Claude(tmp_path, audit_incremental_min_events=0, audit_shadow_every=1)
+    path_b = world.root / PROJECT / f"{SID_B}.jsonl"
+
+    class Pair:
+        a = world
+
+        def write_b(self, *records, mode="w"):
+            write(path_b, *records, mode=mode)
+            world.engine.sync_session(session_id=SID_B, provider="claude", path=str(path_b), embed=False)
+
+        def audit_b(self):
+            return world.engine.audit_session(SID_B, provider="claude", path=str(path_b))
+
+        def check_b(self, command):
+            return world.engine.check_action(SID_B, {"tool_name": "Bash", "arguments": {"command": command}},
+                                             provider="claude", path=str(path_b))
+
+        def hook_b(self, command):
+            payload = {"session_id": SID_B, "transcript_path": str(path_b), "cwd": "/synthetic/project",
+                       "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
+            return run_hook("PreToolUse", payload, engine=world.engine)
+
+    yield Pair()
+    world.close()
+
+
+def in_b(builder, *args, **extra):
+    return builder(*args, sessionId=SID_B, **extra)
+
+
+def prepare_a(pair):
+    """Session A: a user message, a tool call and its result; returns their event ids."""
+    pair.a.write(human("never apply terraform"), bash("t1", "ls"), tool_result("t1", "file"))
+    pair.a.sync()
+    chunks = pair.a.chunks()
+    return {"user": next(c.chunk_id for c in chunks if c.meta.get("role") == "user"),
+            "result": next(c.chunk_id for c in chunks if c.kind == "tool_result"),
+            "call": next(c.chunk_id for c in chunks if c.kind == "tool_call")}
+
+
+def test_a_global_contract_anchored_in_session_a_blocks_the_same_action_in_session_b(pair):
+    ids = prepare_a(pair)
+    pair.a.upsert({**DEPLOY, "source_event_id": ids["user"]})
+    assert finding(pair.a.check("Bash", {"command": APPLY}), "no-deploy")["verdict"] == "violation"
+    pair.write_b(in_b(human, "carry on"), in_b(bash, "b1", "ls"), in_b(tool_result, "b1", "file"))
+    assert finding(pair.check_b(APPLY), "no-deploy")["verdict"] == "violation"
+    assert finding(pair.check_b("ls -la"), "no-deploy")["verdict"] == "clean"
+    response = pair.hook_b(APPLY)
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny", response
+    # the history audit: nothing applied yet, then a call is appended and the stored state moves on
+    first = pair.audit_b()
+    assert finding(first, "no-deploy")["verdict"] == "clean" and "incremental_mismatch" not in first["incremental"]
+    pair.write_b(in_b(bash, "b2", APPLY), mode="a")
+    second = pair.audit_b()
+    assert finding(second, "no-deploy")["verdict"] == "violation"
+    assert "incremental_mismatch" not in second["incremental"] and second["incremental"]["mode"] == "delta"
+
+
+def test_a_non_user_anchor_in_session_a_is_not_a_source_in_session_b(pair):
+    ids = prepare_a(pair)
+    pair.a.engine.contracts.upsert([ContractRule(**{**DEPLOY, "source_event_id": ids["result"]})])   # an old store
+    pair.write_b(in_b(human, "carry on"), in_b(bash, "b1", APPLY))
+    for outcome in (pair.check_b(APPLY), pair.audit_b()):
+        item = finding(outcome, "no-deploy")
+        assert item["verdict"] == "unknown" and item["reason"].startswith("anchor_not_user:")
+    assert pair.hook_b(APPLY).get("hookSpecificOutput", {}).get("permissionDecision", "none") == "none"
+
+
+def test_an_anchor_in_no_indexed_session_is_unknown_in_session_b(pair):
+    prepare_a(pair)
+    pair.a.engine.contracts.upsert([ContractRule(**{**DEPLOY, "source_event_id": "claude:nowhere:0:0:abcd"})])
+    pair.write_b(in_b(human, "carry on"), in_b(bash, "b1", APPLY))
+    for outcome in (pair.check_b(APPLY), pair.audit_b()):
+        item = finding(outcome, "no-deploy")
+        assert item["verdict"] == "unknown" and item["reason"] == NOT_HERE
+
+
+def test_a_session_contract_anchored_in_session_a_is_not_applied_in_session_b(pair):
+    ids = prepare_a(pair)
+    pair.a.upsert({**DEPLOY, "source_event_id": ids["user"], "session_id": SID})
+    pair.write_b(in_b(human, "carry on"), in_b(bash, "b1", APPLY))
+    assert not [f for f in pair.audit_b()["findings"] if f["contract_id"] == "no-deploy"]
+    assert not [f for f in pair.check_b(APPLY)["findings"] if f["contract_id"] == "no-deploy"]
+
+
+def test_a_global_contract_that_starts_in_session_a_judges_session_b_from_that_time(pair):
+    ids = prepare_a(pair)
+    started = next(c for c in pair.a.chunks() if c.chunk_id == ids["call"]).timestamp
+    assert parse_time(started) is not None
+    pair.a.engine.contracts.upsert([ContractRule(**{**DEPLOY, "applies_from_event_id": ids["call"]})])
+    old, new = "2020-01-01T00:00:00.000Z", "2099-01-01T00:00:00.000Z"
+    pair.write_b(in_b(human, "carry on", timestamp=old), in_b(bash, "b1", APPLY + " old", timestamp=old))
+    quiet = pair.audit_b()
+    assert finding(quiet, "no-deploy")["verdict"] == "clean" and "incremental_mismatch" not in quiet["incremental"]
+    pair.write_b(in_b(bash, "b2", APPLY + " new", timestamp=new), mode="a")
+    loud = pair.audit_b()
+    item = finding(loud, "no-deploy")
+    assert item["verdict"] == "violation" and len(item["evidence"]) == 1 and "apply" in item["evidence"][0]["snippet"]
+    assert "-auto-approve new" in item["evidence"][0]["snippet"] and "incremental_mismatch" not in loud["incremental"]

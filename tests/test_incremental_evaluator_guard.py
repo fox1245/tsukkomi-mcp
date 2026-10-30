@@ -16,10 +16,10 @@ import hashlib
 import inspect
 
 from self_directing_mcp import agy
-from self_directing_mcp.audit import applicability, hostblocks, patterns, runner, shellstatus
+from self_directing_mcp.audit import anchors, applicability, hostblocks, patterns, runner, shellstatus
 from self_directing_mcp.retrieve import checks
 
-DIGEST = "fe926763ba27f919"
+DIGEST = "e2f4565a99287e3f"
 
 MIRRORED = [
     runner.audit_contract, runner._Presence, runner._tool_matches, runner._eligible, runner._worse, runner.evidence, runner._key,
@@ -35,7 +35,8 @@ MIRRORED = [
     # a success that a masked exit status cannot vouch for is unknown (``success_unverifiable``): one function, both evaluators
     runner.success_unverifiable, shellstatus,
     # a contract anchored to something other than a user message is unknown (``anchor_not_user``)
-    runner.is_user_event,
+    runner.is_user_event, anchors.is_user_event, anchors.truncated_user, anchors.parse_time, anchors.in_window,
+    anchors.foreign_anchors, runner._start,
     # a call the host refused is a rejected proposal, never an executed match (Claude Code ``permission_decision``)
     runner.rejected_calls, runner._host_denied, runner._denial_source, runner.rejection_entry, runner._wants_rejections, runner.rejections, runner.rejected_item,
     runner.rejected_clean, runner._event_byte, runner.rejected_proposal_item,

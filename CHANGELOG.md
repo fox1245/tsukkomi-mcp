@@ -2,6 +2,12 @@
 
 Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions follow `pyproject.toml`. Releases before 0.6.0 are not itemized here; see the git history.
 
+## Unreleased
+
+### Fixed
+
+- **A global contract with a `source_event_id` or `applies_from_event_id` of another session is judged.** The audit found such an anchor only among the events of the audited session, so a global `must_not` contract anchored to a user message of the session it was written in ended `unknown` ("contract source or activation event is not in this session") everywhere else, and a hook lets `unknown` through: the contract never fired outside that one session, while registration accepted the same anchor from anywhere in the index. The engine now resolves the anchors of the global contracts once per audit (the same `get_chunk` lookup registration uses) and gives them to the reference evaluator and the incremental monitors alike. A source that is a user message is verified; one that is not stays `anchor_not_user`; one found in no session stays `unknown`. An activation event of another session starts the window at the first event of the audited session that is not before it in time, and an event whose time cannot be compared is judged (judge more, never less). A contract with a `session_id` is unchanged. The audit evaluator version is 12 (saved monitor state is rebuilt once), and a saved state is keyed by the resolved anchors, so it is rebuilt when they change.
+
 ## 0.10.0 - 2026-10-17
 
 **Highlights.** One thing since 0.9.0: **a contract about a file can name the file.** A `must_not` contract can carry `path_guard` (`paths`, `except`, `modes` `any` or `read`) instead of a regex. A regex such as `(cat|head|tail|less)\s+\S*\.env` never matches a host's own file-read tool (`Read`, `view_file`, `read`), which is how a "never print the secrets in `.env`" rule is bypassed in practice; a typed path contract is matched through every host's tool vocabulary, and the server derives the regex itself when it loads the contract. Class D routes (a shell variable, a `cd` chain, string building in an interpreter, symbolic links, ...) are not seen and are listed with a test each.

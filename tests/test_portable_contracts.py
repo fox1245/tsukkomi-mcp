@@ -330,8 +330,8 @@ def test_adoption_stores_ordinary_global_contracts_with_an_origin_and_this_devic
 
 
 def test_an_adopted_contract_is_enforced_in_every_session_of_the_device_not_only_the_one_that_adopted_it(world):
-    """The adoption anchor lives in the origin, not in source_event_id: a global contract anchored to one session's
-    event is judged ``unknown`` in every other session (the audit cannot find its source event there)."""
+    """The adoption anchor lives in the origin, not in source_event_id, so the adopted contract is global and carries no
+    anchor of its own session."""
     device, project, bundle_id = first_candidate(world, RM)
     anchor = device.say(SID_B, "adopt it")
     device.engine.adopt_contracts(bundle_id, anchor, project_dir=str(project))
@@ -341,9 +341,10 @@ def test_an_adopted_contract_is_enforced_in_every_session_of_the_device_not_only
         item = finding(verdict, "no-rm")
         assert item["verdict"] == "violation", (sid, item)
         assert item["contract_revision"] == 1
-    # the contrast that decided the design: the same contract anchored through source_event_id is unknown elsewhere
+    # a global contract anchored through source_event_id to a user message of another session is judged there too
+    # (the audit resolves the anchor from the index, as registration does)
     device.engine.upsert_contracts([{**RM, "id": "anchored", "source_event_id": anchor}])
-    assert finding(device.check(SID_B2, "rm -rf /x"), "anchored")["verdict"] == "unknown"
+    assert finding(device.check(SID_B2, "rm -rf /x"), "anchored")["verdict"] == "violation"
     assert finding(device.check(SID_B, "rm -rf /x"), "anchored")["verdict"] == "violation"
 
 

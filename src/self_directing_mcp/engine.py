@@ -32,6 +32,7 @@ from self_directing_mcp.audit.contracts import (
     scope_counts,
     visible_contracts,
 )
+from self_directing_mcp.audit import anchors as anchor_audit
 from self_directing_mcp.audit import incremental
 from self_directing_mcp.audit import shadow as shadow_policy
 from self_directing_mcp import eval_cost
@@ -1696,6 +1697,9 @@ class SelfDirectEngine:
                         coverage["complete"] = False
                         coverage["issues"].append("metadata_changed_before_capture")
                     plan = None
+                    # The anchors of global contracts that live in another session, resolved once per build here, where
+                    # the session store can be read; the audit stages below get detached snapshots (see audit/anchors.py).
+                    foreign_anchors = anchor_audit.resolve(self.store, active, sid, provider)
                     if history:
                         # Only events some contract can inspect keep their text; rows are paged, never held as JSON.
                         needs, link_calls = audit_needs(active, planned)
@@ -1713,7 +1717,8 @@ class SelfDirectEngine:
                                     self.store, session_id=sid, provider=provider, active=active, planned=planned,
                                     needs=needs, link_calls=link_calls, shadow_every=every, force_full=force_full,
                                     report=report, premise_rules=premise_rules, force=force, idle=idle,
-                                    cost_key=cost_key, defer=self._shadow_worker is not None and not idle)
+                                    cost_key=cost_key, defer=self._shadow_worker is not None and not idle,
+                                    foreign=foreign_anchors)
                             except (RequestStopped, IndexBusy):
                                 raise
                             except Exception as exc:  # the cache could not even be read: evaluate everything in full
@@ -1722,7 +1727,9 @@ class SelfDirectEngine:
                         if plan is not None:
                             evidence = AuditEventSnapshot(sid, provider, tuple(plan.events), plan.count)
                         else:
-                            evidence = self.store.capture_audit_events(sid, provider, needs, link_calls=link_calls)
+                            evidence = self.store.capture_audit_events(
+                                sid, provider, needs, link_calls=link_calls,
+                                times=anchor_audit.wants_times(history_rules, foreign_anchors))
                     else:
                         evidence = self.store.capture_evidence(sid, provider, history=False, anchors=anchors)
                     receipt_token = self._receipt_token(sid, provider)
@@ -1739,7 +1746,8 @@ class SelfDirectEngine:
                     # The actual native stages, model decoding and regex evaluation own no
                     # engine lease, shared SQLite handle or open read transaction.
                     result = run_audit(session_id=sid, contracts=contracts, store=evidence,
-                                       provider=provider, proposed=planned, coverage=coverage, plan=plan)
+                                       provider=provider, proposed=planned, coverage=coverage, plan=plan,
+                                       anchors=foreign_anchors)
                 except incremental.PlanRetry as retry:
                     # A summary could not hold some input: those rules run on the full evaluator in a second pass, and
                     # the limit is remembered so later audits do not fail the same way.
@@ -1778,7 +1786,7 @@ class SelfDirectEngine:
                         try:
                             with self._comparison_scope() if planned_pass else nullcontext():
                                 full = run_audit(session_id=sid, contracts=subject, store=reference, provider=provider,
-                                                 proposed=planned, coverage=reference_coverage)
+                                                 proposed=planned, coverage=reference_coverage, anchors=foreign_anchors)
                         except RequestStopped:
                             if not planned_pass or _request_over(current_request()):
                                 raise
@@ -2192,10 +2200,8 @@ class SelfDirectEngine:
                 chunk = self.store.get_chunk(event_id)
                 if chunk is None:
                     found[event_id] = ("unresolved", "not in the index")
-                elif chunk.meta.get("role") == "user":
-                    found[event_id] = ("user", "user message")
                 else:
-                    found[event_id] = ("other", f"a {chunk.kind} event with role {chunk.meta.get('role')!r}")
+                    found[event_id] = anchor_audit.anchor_status(chunk)
         return found
 
     @staticmethod
