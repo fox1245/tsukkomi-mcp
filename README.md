@@ -1,6 +1,6 @@
 # Tsukkomi MCP (ツッコミ)
 
-> Deterministic governance, verifiable checklists, and session GraphRAG for autonomous coding agents (`v0.10.0`).
+> Deterministic governance, verifiable checklists, and session GraphRAG for autonomous coding agents (`v0.11.0`).
 > Distribution: `tsukkomi-mcp` · Python package: `self_directing_mcp`
 
 ## Overview
@@ -179,7 +179,7 @@ Build and query a session knowledge graph (`run_neograph_update`, `propose_graph
 | [docs/local-embeddings.md](docs/local-embeddings.md) | Running local embedding servers (TEI, vLLM, Ollama) with Tsukkomi MCP |
 | [docs/reliability-spec.md](docs/reliability-spec.md) | Reliability and fault-handling specification |
 | [docs/timeout-fix.md](docs/timeout-fix.md) | Bounded slice deadlines and timeout architecture |
-| [CHANGELOG.md](CHANGELOG.md) | Release history and upgrade notes (`0.6.0` – `0.10.0`) |
+| [CHANGELOG.md](CHANGELOG.md) | Release history and upgrade notes (`0.6.0` – `0.11.0`) |
 | [SECURITY.md](SECURITY.md) | Secret/PII egress masking contract and security policy |
 
 ## License
