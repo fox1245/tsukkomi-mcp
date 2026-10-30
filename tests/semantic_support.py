@@ -142,11 +142,12 @@ def finding(result, contract_id):
 _serial = itertools.count(1)
 
 
-def event(kind, text_, role, *, call_id=None, success=None, **meta):
-    """A slim audit event as ``capture_audit_events`` produces it; the key is its place in the session."""
+def event(kind, text_, role, *, call_id=None, success=None, timestamp=None, **meta):
+    """A slim audit event as ``capture_audit_events`` produces it; the key is its place in the session.
+    ``timestamp`` is kept the way ``capture_audit_events(..., times=True)`` keeps it."""
     number = next(_serial)
     return AuditEvent(f"claude:s:{number}", kind, text_, {"role": role, "call_id": call_id, "success": success, **meta},
-                      (number * 100, 0))
+                      (number * 100, 0), timestamp=timestamp)
 
 
 def user_turn(text_="please do it", **meta):
@@ -162,25 +163,26 @@ def result(call_id, success, text_="done", **meta):
     return event("tool_result", f"[tool_result] {text_}", "tool", call_id=call_id, success=success, **meta)
 
 
-def evaluate(rules, events, provider="claude", *, proposed=None, chunk_sizes=(None, 1, 3)):
+def evaluate(rules, events, provider="claude", *, proposed=None, chunk_sizes=(None, 1, 3), anchors=None):
     """Findings of ``rules`` over ``events`` by the reference; every monitor feed must agree exactly.
 
     ``chunk_sizes``: how the events are fed to the monitors (all at once, one by one, in threes), and each time the
-    state is round-tripped through JSON between feeds as the store does.
+    state is round-tripped through JSON between feeds as the store does. ``anchors``: ``{event id: audit.anchors.Anchor}``
+    for the anchors of global rules that live in another session (the engine resolves them from the index).
     """
     rules = [ContractRule(**rule) if isinstance(rule, dict) else rule for rule in rules]
     expected = runner.full_findings(rules, list(events), session_id="s", store=None, provider=provider,
-                                    proposed=proposed, coverage={})
+                                    proposed=proposed, coverage={}, anchors=anchors)
     needs, _link = runner.audit_needs(rules, proposed)
     for size in chunk_sizes:
-        monitors = {r.id: inc.RuleMonitor(r, provider) for r in rules}
+        monitors = {r.id: inc.RuleMonitor(r, provider, anchors) for r in rules}
         facts = inc.make_facts(provider, needs, rules)
         step = size or max(1, len(events))
         for start in range(0, len(events), step):
             segment = list(events[start:start + step])
             pools = _prior(events[:start])
             inc.fold(segment, [(m, 0) for m in monitors.values()], (facts, 0) if facts.needed else None, pools)
-            monitors, facts = _reload(monitors, facts, provider, rules, needs)
+            monitors, facts = _reload(monitors, facts, provider, rules, needs, anchors)
         for rule, want in zip(rules, expected):
             got = monitors[rule.id].finding(proposed, facts)
             assert got.model_dump() == want.model_dump(), (
@@ -207,11 +209,11 @@ def _prior(previous, lookback=4096):
     return pools
 
 
-def _reload(monitors, facts, provider, rules, needs):
+def _reload(monitors, facts, provider, rules, needs, anchors=None):
     by_id = {r.id: r for r in rules}
     fresh = {}
     for rule_id, monitor in monitors.items():
-        copy = inc.RuleMonitor(by_id[rule_id], provider)
+        copy = inc.RuleMonitor(by_id[rule_id], provider, anchors)
         copy.load(json.loads(json.dumps(monitor.dump())))
         fresh[rule_id] = copy
     shared = inc.make_facts(provider, needs, rules)

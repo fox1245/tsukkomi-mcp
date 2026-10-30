@@ -16,7 +16,7 @@ from self_directing_mcp.security.mask import mask_secrets
 from self_directing_mcp.neograph_runtime import run_stages
 from self_directing_mcp.request_control import check_request, current_request, request_operation
 
-from self_directing_mcp.audit import hostblocks, shellstatus
+from self_directing_mcp.audit import anchors as anchor_module, hostblocks, shellstatus
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 
 REGEX_TIMEOUT = "regex_timeout: a contract pattern exceeded its time limit, so this contract could not be evaluated"
@@ -130,7 +130,7 @@ def rejected_clean(count) -> str:
 
 def is_user_event(event) -> bool:
     """A user message: what the parser marked ``role == "user"`` (never runtime, injected or tool text)."""
-    return (getattr(event, "meta", None) or {}).get("role") == "user"
+    return anchor_module.is_user_event(event)
 
 
 def success_unverifiable(why) -> str:
@@ -376,11 +376,13 @@ def audit_contract(rule, **kwargs):
 
 
 def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, proposed=None, chunks=None,
-                    rejected=None, ids=None, linked=None):
+                    rejected=None, ids=None, linked=None, anchors=None):
     """Regex checks operate on events. Retrieval ranks are never verification evidence.
 
     ``rejected`` (Claude Code and Grok history audits): the calls the host refused, see ``rejected_calls`` and
-    ``blocked_calls``.
+    ``blocked_calls``. ``anchors``: the anchors of global contracts that belong to another session, resolved from the
+    index by the caller (``audit.anchors.resolve``); a global contract takes its source and activation event from there
+    when they are not among this session's events. A session contract never does.
     """
     check_request()
     def finding(verdict, reason, items=None, basis=None, applicability="applicable", stopped=None):
@@ -402,10 +404,12 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
     chunks = chunks if chunks is not None else store.list_chunks(session_id, provider)
     if ids is None:
         ids = {c.chunk_id: i for i, c in enumerate(_checked(chunks))}
+    foreign = anchor_module.foreign_anchors(rule, anchors)
     for anchor in (rule.source_event_id, rule.applies_from_event_id):
-        if anchor and anchor not in ids:
+        if anchor and anchor not in ids and anchor not in foreign:
             return finding("unknown", "contract source or activation event is not in this session")
-    if rule.source_event_id and not is_user_event(chunks[ids[rule.source_event_id]]):
+    if rule.source_event_id and not (is_user_event(chunks[ids[rule.source_event_id]]) if rule.source_event_id in ids
+                                     else foreign[rule.source_event_id].user):
         return finding("unknown", ANCHOR_NOT_USER)
     if not rule.regex:
         return finding("unknown", "description-only contract needs a verifier; retrieval is not proof")
@@ -414,7 +418,7 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
         trigger = compile_contract(rule.before_regex) if rule.before_regex else None
     except re.error:
         return finding("unknown", "invalid contract regex")
-    start = ids[rule.applies_from_event_id] + 1 if rule.applies_from_event_id else 0
+    start = _start(rule, chunks, ids, anchors) if rule.applies_from_event_id else 0
     active = chunks[start:]
     condition = when_state(rule, active)
     if condition == INVALID:
@@ -503,23 +507,24 @@ def _post_process(evidence_rules, rules, findings, events, **kwargs) -> None:
         return
 
 
-def full_findings(active, chunks, *, session_id, store, provider, proposed, coverage):
+def full_findings(active, chunks, *, session_id, store, provider, proposed, coverage, anchors=None):
     """The reference evaluation: every rule over the whole event list, then the provider's evidence classes."""
     rejected = rejections(provider, active, chunks, proposed)
     ids = {c.chunk_id: i for i, c in enumerate(_checked(chunks))}     # one position index for every rule
     linked = {}                                                         # and one call/result table per activation point
     findings = [audit_contract(r, session_id=session_id, store=store, provider=provider, proposed=proposed,
-                               chunks=chunks, rejected=rejected, ids=ids, linked=linked) for r in _checked(active)]
+                               chunks=chunks, rejected=rejected, ids=ids, linked=linked, anchors=anchors)
+                for r in _checked(active)]
     # Provider-specific partial-observation passes post-process the findings; other providers have none.
     evidence_rules = _EVIDENCE_RULES.get(provider)
     if evidence_rules is not None:
-        _post_process(evidence_rules, active, findings, chunks, proposed=proposed, coverage=coverage)
+        _post_process(evidence_rules, active, findings, chunks, proposed=proposed, coverage=coverage, anchors=anchors)
     return findings
 
 
 @request_operation
 def run_audit(*, session_id, contracts, store, retriever=None, provider=None, proposed=None, coverage=None,
-              plan=None):
+              plan=None, anchors=None):
     """``plan`` (see ``audit.incremental``) replaces how events are loaded and rules evaluated; the stage graph, the
     selection and the aggregation are the same. Without a plan every rule runs over the whole event list."""
     snapshot = hashlib.sha256(json.dumps([c.model_dump(mode="json") for c in _checked(contracts)],
@@ -553,7 +558,7 @@ def run_audit(*, session_id, contracts, store, retriever=None, provider=None, pr
             findings = plan.evaluate(active, proposed=proposed, coverage=coverage)
             return
         findings = full_findings(active, chunks, session_id=session_id, store=store, provider=provider,
-                                 proposed=proposed, coverage=coverage)
+                                 proposed=proposed, coverage=coverage, anchors=anchors)
     def aggregate_findings():
         nonlocal overall
         if coverage and not coverage.get("complete"):
@@ -673,9 +678,23 @@ def _blocked_proposals(events) -> dict:
     return blocked
 
 
-def _window(rule, events, ids, proposed):
+def _start(rule, events, ids, anchors) -> int:
+    """The first position a rule judges: right after its activation anchor when that is among ``events``.
+
+    An activation anchor of another session (a global contract, resolved in ``anchors``) starts the window at the first
+    event that is not before it in time; with no comparable time the whole session is judged."""
+    anchor = rule.applies_from_event_id
+    if anchor in ids:
+        return ids[anchor] + 1
+    found = anchor_module.foreign_anchors(rule, anchors).get(anchor)
+    if found is None or found.at is None:
+        return 0
+    return next((i for i, event in enumerate(_checked(events)) if anchor_module.in_window(found.at, event)), len(events))
+
+
+def _window(rule, events, ids, proposed, anchors=None):
     """Events a rule judges: after its activation anchor, and before its last triggering action."""
-    start = ids[rule.applies_from_event_id] + 1 if rule.applies_from_event_id in ids else 0
+    start = _start(rule, events, ids, anchors) if rule.applies_from_event_id else 0
     end = len(events)
     if rule.type == "must" and rule.before_regex and proposed is None:
         try:
@@ -723,7 +742,7 @@ def _in_window(indices, start, end):
     return indices[bisect_left(indices, start):bisect_left(indices, end)]
 
 
-def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None) -> None:
+def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None, anchors=None) -> None:
     """Apply the partial-observation, pending and legacy rules above to ``findings`` (mutated in place)."""
     events = list(events)
     check_request()
@@ -752,7 +771,7 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
         check_request()
         if item.applicability == "not_applicable" or getattr(rule, "mode", "enforced") == "inject_only":
             continue
-        start, end = _window(rule, events, ids, proposed)
+        start, end = _window(rule, events, ids, proposed, anchors)
         deps = _dependencies(rule)
         low, high = bisect_left(truncated_at, start), bisect_left(truncated_at, end)
         cut = [(events[index], field) for index, event_type, fields in truncated[low:high] for field in fields
@@ -764,9 +783,10 @@ def agy_evidence_rules(rules, findings, events, *, proposed=None, coverage=None)
                 _cut_unknown(rule, item, _TRUNCATED_CODE.get(cut[0][1], "truncated_" + cut[0][1]),
                              f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{cut[0][1]} may hide a match",
                              history=history)
-            if item.verdict == "suspicious" and rule.exception_regex and rule.source_event_id in ids:
-                source = _meta(events[ids[rule.source_event_id]])
-                if source.get("event_type") == "USER_INPUT" and "content" in (source.get("truncated_fields") or ()):
+            if item.verdict == "suspicious" and rule.exception_regex and (rule.source_event_id in ids or (
+                    rule.source_event_id in anchor_module.foreign_anchors(rule, anchors))):
+                if (anchor_module.truncated_user(_meta(events[ids[rule.source_event_id]]))
+                        if rule.source_event_id in ids else anchors[rule.source_event_id].cut_user):
                     item.verdict = "violation"
                     item.reason = ("truncated_content: the exception comes from a truncated user message and "
                                    "cannot waive the match; " + item.reason)
@@ -823,7 +843,7 @@ def _cut_results(events) -> list:
             if e.kind == "tool_result" and isinstance(_meta(e).get("call_id"), str) and _meta(e)["call_id"] in targets]
 
 
-def claude_evidence_rules(rules, findings, events, *, proposed=None, coverage=None) -> None:
+def claude_evidence_rules(rules, findings, events, *, proposed=None, coverage=None, anchors=None) -> None:
     """Apply the cut-result rules above to ``findings`` (mutated in place)."""
     events = list(events)
     check_request()
@@ -839,7 +859,7 @@ def claude_evidence_rules(rules, findings, events, *, proposed=None, coverage=No
         reads = _reads_results(rule)
         if not (reads or rule.requires_success):
             continue
-        start, end = _window(rule, events, ids, proposed)
+        start, end = _window(rule, events, ids, proposed, anchors)
         cut = [events[i] for i in cut_at if start <= i < end]
         if not cut:
             continue

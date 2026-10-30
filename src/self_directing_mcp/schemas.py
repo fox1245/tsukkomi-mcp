@@ -41,9 +41,10 @@ class AuditEvent:
 
     ``text`` is empty for events no contract can inspect; nothing else of the stored chunk is kept.
     """
-    __slots__ = ("chunk_id", "kind", "text", "meta", "key", "session_id")
+    __slots__ = ("chunk_id", "kind", "text", "meta", "key", "session_id", "timestamp")
 
-    def __init__(self, chunk_id, kind, text, meta, key=None, session_id=None):
+    def __init__(self, chunk_id, kind, text, meta, key=None, session_id=None, timestamp=None):
+        self.timestamp = timestamp      # the host's timestamp, kept only when a window in time needs it
         self.session_id = session_id if session_id is not None else (meta.get("session_id") if isinstance(meta, dict) else None)
         # ``key`` is the event's place in the session order, ``(byte_start, sub_index)``; incremental monitors
         # compare keys, never row numbers. Events built without a store carry ``None``.

@@ -37,7 +37,7 @@ from bisect import bisect_left
 
 from self_directing_mcp import contract_paths
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES
-from self_directing_mcp.audit import hostblocks, runner, shellstatus
+from self_directing_mcp.audit import anchors as anchor_module, hostblocks, runner, shellstatus
 from self_directing_mcp.audit import shadow as shadow_module
 from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
 from self_directing_mcp.audit import patterns as _patterns
@@ -53,8 +53,10 @@ from self_directing_mcp.security.mask import mask_secrets
 # tests/test_incremental_evaluator_guard.py asks for a bump whenever a mirrored function changes. 9: Grok's blocked
 # calls are rejected proposals too (``runner.blocked_calls`` / ``GrokFacts``). 10: the reason and basis of a typed
 # ``path_guard`` contract name the guarded path (``contract_paths.forbidden_label`` / ``verifier_basis``), and the
-# fingerprint of its saved state includes the regex derived from it; regex contracts judge and read exactly as before.)
-EVALUATOR_VERSION = 11
+# fingerprint of its saved state includes the regex derived from it; regex contracts judge and read exactly as before. 12: a global contract takes its source and activation
+# event from another session when they are not in the one judged (``audit.anchors``); a state stored before judged such a
+# contract as unknown and folded none of the session's events.)
+EVALUATOR_VERSION = 12
 STATE_VERSION = 1
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
@@ -375,11 +377,18 @@ def make_facts(provider, needs=(), rules=()):
 class RuleMonitor:
     """The summary of one rule over the events fed so far, and the finding the reference would give for them."""
 
-    def __init__(self, rule, provider):
+    def __init__(self, rule, provider, anchors=None):
+        """``anchors``: the anchors of another session that this global rule takes its source and activation event from
+        (``audit.anchors.resolve``). They are facts of the event, not of the fed prefix: they are never stored with the
+        state, the state is keyed by them instead (``rule_fingerprint``)."""
         self.rule, self.provider = rule, provider
         self.agy, self.claude = provider == "agy", provider == "claude"
         self.refusing = provider in runner.REFUSAL_PROVIDERS       # the host's own records can tell a refused call
         self.src_id, self.from_id = rule.source_event_id, rule.applies_from_event_id
+        foreign = anchor_module.foreign_anchors(rule, anchors)
+        self.foreign_src = foreign.get(self.src_id) if self.src_id else None
+        self.foreign_from = foreign.get(self.from_id) if self.from_id else None
+        self.from_at = self.foreign_from.at if self.foreign_from is not None else None
         self.roles = frozenset(rule.roles)
         self.kind = _SCOPE_KIND.get(rule.scope)
         self.rs = bool(rule.requires_success)
@@ -406,8 +415,8 @@ class RuleMonitor:
         # state
         self.src = False
         self.src_user = False  # the source event was seen and is a user message
-        self.started = self.from_id is None
-        self.from_key = None
+        self.started = self.from_id is None or (self.foreign_from is not None and self.from_at is None)
+        self.from_key = None   # the activation event, or (a foreign time) the last event before the window
         self.when_met = False
         self.hits, self.hit_ev, self.exc, self.exc_chars = 0, [], [], 0
         self.exc_ids = []     # chunk id of each ``exc`` text, to drop the refused calls' texts
@@ -493,7 +502,13 @@ class RuleMonitor:
         if not self.started:
             if event.chunk_id == self.from_id:
                 self.started, self.from_key = True, event.key
-            return
+                return
+            if self.from_at is None:     # a local activation event that has not arrived yet
+                return
+            if not anchor_module.in_window(self.from_at, event):
+                self.from_key = event.key
+                return
+            self.started = True          # the first event that is not before the foreign activation event in time
         if self.inert:
             return
         text = event.text
@@ -644,9 +659,10 @@ class RuleMonitor:
         if proposed is not None and not self.eligible(proposed):
             return self._make("clean", f"not_applicable: contract scope ({rule.scope}) does not apply to proposed action",
                               basis=f"{rule.id} does not apply to this proposed action", applicability="not_applicable")
-        if (self.src_id and not self.src) or (self.from_id and not self.started):
+        if ((self.src_id and not self.src and self.foreign_src is None)
+                or (self.from_id and not self.started and self.foreign_from is None)):
             return self._make("unknown", "contract source or activation event is not in this session")
-        if self.src_id and not self.src_user:
+        if self.src_id and not (self.src_user if self.src or self.foreign_src is None else self.foreign_src.user):
             return self._make("unknown", runner.ANCHOR_NOT_USER)
         if self.regex_invalid:
             return self._make("unknown", "invalid contract regex")
@@ -782,7 +798,8 @@ class RuleMonitor:
             if cut:
                 runner._cut_unknown(rule, item, runner._TRUNCATED_CODE.get(cut[2], "truncated_" + cut[2]),
                                     f"a still-truncated {cut[1]}.{cut[2]} may hide a match", history=history)
-            if item.verdict == "suspicious" and rule.exception_regex and self.src and self.src_tu:
+            if item.verdict == "suspicious" and rule.exception_regex and (
+                    (self.src and self.src_tu) or (self.foreign_src is not None and self.foreign_src.cut_user)):
                 item.verdict = "violation"
                 item.reason = ("truncated_content: the exception comes from a truncated user message and "
                                "cannot waive the match; " + item.reason)
@@ -882,9 +899,14 @@ def needs_digest(needs, link_calls, provider) -> str:
     return hashlib.sha256(json.dumps([items, bool(link_calls), provider]).encode()).hexdigest()[:24]
 
 
-def rule_fingerprint(rule, provider, parser_version, digest) -> str:
+def rule_fingerprint(rule, provider, parser_version, digest, anchors=None) -> str:
     parts = [EVALUATOR_VERSION, STATE_VERSION, provider, parser_version, mask_fingerprint(), digest,
              rule.model_dump(mode="json")]
+    foreign = anchor_module.fingerprint(rule, anchors)
+    if foreign is not None:
+        # What the anchors of another session say (user message or not, cut or not, when) decides which events the
+        # monitor folded; a state made under other facts is not this monitor's.
+        parts.append(foreign)
     if rule.path_guard is not None:
         # The stored form of a typed contract is its guard, but the monitor runs the regex derived from it under the
         # tool map of this version: a changed map is a changed monitor, so the derived regex is part of the key.
@@ -1007,8 +1029,9 @@ class AuditPlan:
     def __init__(self, *, session_id, provider, mode, events, count, history_ids, monitors, offsets, facts,
                  facts_offset, facts_new, pools, routes, rebuilds, support, snapshot, shadow, digest,
                  parser_version, report, reference, comparison=None, schedule=None, schedule_loaded=None,
-                 risky=frozenset(), prior=None):
+                 risky=frozenset(), prior=None, anchors=None):
         self.session_id, self.provider, self.mode = session_id, provider, mode
+        self.anchors = anchors or {}
         self.events, self.count, self.reference = events, count, reference
         self.history_ids, self.monitors, self.offsets = history_ids, monitors, offsets
         self.facts, self.facts_offset, self.facts_new = facts, facts_offset, facts_new
@@ -1032,7 +1055,7 @@ class AuditPlan:
     @classmethod
     def prepare(cls, store, *, session_id, provider, active, planned, needs, link_calls, shadow_every,
                 force_full=frozenset(), report=None, premise_rules=None, force=None, idle=False, cost_key=None,
-                defer=False):
+                defer=False, foreign=None):
         """Decide how to evaluate and read the events needed; ``None`` means evaluate everything the old way.
 
         ``shadow_every``: ``None`` for the adaptive schedule, else the fixed legacy rate (``audit.shadow``).
@@ -1041,10 +1064,14 @@ class AuditPlan:
         schedule). ``force``: comparisons a previous pass of this request found necessary (``shadow.Comparison``).
         ``idle``: the idle comparison of a resident engine, which compares everything. ``cost_key``: the key of this
         contract set in ``eval_cost.COSTS`` (what a comparison is expected to cost, once this process has measured the set);
-        ``defer``: a resident engine can verify a skipped comparison later, and the report then says ``deferred``."""
+        ``defer``: a resident engine can verify a skipped comparison later, and the report then says ``deferred``.
+        ``foreign``: the anchors of other sessions that the global contracts take their source and activation event from
+        (``audit.anchors.resolve``, made once for this build inside the same read boundary); they are part of each state's key
+        and the events carry their timestamps when one of them starts a window in time."""
         report = {} if report is None else report
         history = [r for r in active if getattr(r, "mode", "enforced") != "inject_only" and r.regex and (r.type == "must" or planned is None)]
         history_ids = {r.id for r in history}
+        times = anchor_module.wants_times(history, foreign)       # events carry timestamps only when a window needs them
         lineage = store.audit_lineage(session_id, provider)
         cursor, generation, latest = lineage["cursor"], lineage["generation"], lineage["latest"]
         if cursor is None or not history:
@@ -1099,7 +1126,7 @@ class AuditPlan:
                 routes[rule.id] = "contract id is not unique or reserved"
             else:
                 row = states.get(rule.id)
-                why = reject(row, rule_fingerprint(rule, provider, parser_version, digest), rule.revision)
+                why = reject(row, rule_fingerprint(rule, provider, parser_version, digest, foreign), rule.revision)
                 if why is None:
                     try:
                         RuleMonitor(rule, provider).load(row["state"])
@@ -1232,11 +1259,11 @@ class AuditPlan:
                 scoped = [r for r in history if r.id in comparison.scope]
                 scoped_needs, scoped_links = runner.audit_needs(scoped, planned)
                 snapshot_events = timed("reference", store.capture_audit_events, session_id, provider, scoped_needs,
-                                        link_calls=scoped_links)
+                                        link_calls=scoped_links, times=times)
                 partial = True
             else:
                 snapshot_events = timed("reference", store.capture_audit_events, session_id, provider, needs,
-                                        link_calls=link_calls)
+                                        link_calls=link_calls, times=times)
             reference = list(snapshot_events.events)
             if not full:
                 bad = tail_mismatch(reference, "full")
@@ -1248,13 +1275,13 @@ class AuditPlan:
                         shadow = True
                     if partial:       # the monitors about to be rebuilt need the text of every rule
                         snapshot_events = timed("reference", store.capture_audit_events, session_id, provider, needs,
-                                                link_calls=link_calls)
+                                                link_calls=link_calls, times=times)
                         reference, partial = list(snapshot_events.events), False
         events, mode, count = [], "delta", latest["event_count"] if chain_ok else 0
         if not full:
             from_byte = min([*offsets.values(), *([facts_row["byte_offset"]] if facts_row is not None else [])])
             events = timed("tail", store.capture_audit_tail, session_id, provider, needs, link_calls=link_calls,
-                           from_byte=from_byte)
+                           from_byte=from_byte, times=times)
             bad = tail_mismatch(events, "delta")
             if bad:
                 drop(bad)
@@ -1264,7 +1291,7 @@ class AuditPlan:
                     shadow = True
                 if reference is None or partial:
                     snapshot_events = timed("reference", store.capture_audit_events, session_id, provider, needs,
-                                            link_calls=link_calls)
+                                            link_calls=link_calls, times=times)
                     reference, partial = list(snapshot_events.events), False
         if full:
             events, mode = reference, "full"
@@ -1279,7 +1306,7 @@ class AuditPlan:
         for rule in history:
             if rule.id in routes:
                 continue
-            monitor = RuleMonitor(rule, provider)
+            monitor = RuleMonitor(rule, provider, foreign)
             if rule.id in deltas:
                 monitor.load(deltas[rule.id]["state"])
             monitor.new = rule.id not in deltas
@@ -1342,7 +1369,8 @@ class AuditPlan:
                    facts_offset=facts_offset, facts_new=facts_row is None, pools=pools, routes=routes,
                    rebuilds=rebuilds, support=support, snapshot=snapshot, shadow=shadow, digest=digest,
                    parser_version=parser_version, report=report, reference=reference, comparison=comparison,
-                   schedule=schedule, schedule_loaded=schedule_loaded, risky=risky & set(monitors), prior=prior)
+                   schedule=schedule, schedule_loaded=schedule_loaded, risky=risky & set(monitors), prior=prior,
+                   anchors=foreign)
         plan.cost_key = cost_key
         plan.load_seconds = loading["tail"] if mode == "delta" else loading["reference"]
         return plan
@@ -1467,10 +1495,12 @@ class AuditPlan:
             rules = [active[i] for i in group]
             rejected = runner.rejections(self.provider, rules, chunks, proposed)
             found = [runner.audit_contract(r, session_id=self.session_id, store=None, provider=self.provider,
-                                           proposed=proposed, chunks=chunks, rejected=rejected) for r in rules]
+                                           proposed=proposed, chunks=chunks, rejected=rejected, anchors=self.anchors)
+                     for r in rules]
             evidence_rules = runner._EVIDENCE_RULES.get(self.provider)
             if evidence_rules is not None:
-                runner._post_process(evidence_rules, rules, found, chunks, proposed=proposed, coverage=None)
+                runner._post_process(evidence_rules, rules, found, chunks, proposed=proposed, coverage=None,
+                                     anchors=self.anchors)
             for index, item in zip(group, found):
                 findings[index] = item
         if self.provider == "agy" and coverage is not None:
@@ -1494,7 +1524,7 @@ class AuditPlan:
                 continue
             if monitor.dirty or monitor.new or monitor.overflow:
                 rows.append({"monitor_id": rule_id, "contract_revision": monitor.rule.revision,
-                             "fingerprint": rule_fingerprint(monitor.rule, self.provider, self.parser_version, self.digest),
+                             "fingerprint": rule_fingerprint(monitor.rule, self.provider, self.parser_version, self.digest, self.anchors),
                              "parser_version": self.parser_version, "evaluator_version": EVALUATOR_VERSION,
                              "state": monitor.dump()})
         if self.facts.needed and (self.facts.dirty or self.facts_new or self.facts.overflow):

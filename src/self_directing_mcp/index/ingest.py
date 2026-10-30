@@ -1106,26 +1106,27 @@ class SessionStore:
 
     audit_rows_fetched = 0  # slim audit rows read by this store object; tests and benchmarks read it
 
-    def capture_audit_events(self, session_id, provider, needs, *, link_calls=False):
+    def capture_audit_events(self, session_id, provider, needs, *, link_calls=False, times=False):
         """Ordered slim events; text is loaded only for events some ``(scope, roles)`` need can inspect.
 
-        ``link_calls`` also keeps text for tool calls/results (evidence of success-linked obligations).
+        ``link_calls`` also keeps text for tool calls/results (evidence of success-linked obligations). ``times`` also
+        keeps each event's timestamp (only a window that starts at a point in time compares them).
         Rows are paged through a cursor and never held as raw JSON or pydantic models.
         """
         with self._read_boundary():
             count = self.chunk_count(session_id, provider)
-            events = self._fetch_audit_events(session_id, provider, needs, link_calls, None)
+            events = self._fetch_audit_events(session_id, provider, needs, link_calls, None, times)
             return AuditEventSnapshot(session_id, provider, tuple(events), count)
 
-    def capture_audit_tail(self, session_id, provider, needs, *, link_calls=False, from_byte=0):
+    def capture_audit_tail(self, session_id, provider, needs, *, link_calls=False, from_byte=0, times=False):
         """The slim events whose records start at ``from_byte`` or later, in order; call inside a read boundary.
 
         Reads rows in proportion to the appended records, not to the session: the range is served by the
         ``(provider, session_id, byte_start, sub_index)`` index.
         """
-        return self._fetch_audit_events(session_id, provider, needs, link_calls, from_byte)
+        return self._fetch_audit_events(session_id, provider, needs, link_calls, from_byte, times)
 
-    def _fetch_audit_events(self, session_id, provider, needs, link_calls, from_byte):
+    def _fetch_audit_events(self, session_id, provider, needs, link_calls, from_byte, times=False):
         terms, term_params = [], []
         for scope, roles in needs:
             if scope == "attempt":
@@ -1154,7 +1155,8 @@ class SessionStore:
             "SELECT chunk_id, json_extract(data,'$.kind'), json_extract(data,'$.meta.role'),"
             " json_extract(data,'$.meta.call_id'), json_type(data,'$.meta.success'),"
             " json_extract(data,'$.meta.success'), CASE WHEN " + wanted + " THEN json_extract(data,'$.text') END,"
-            " " + extra + ", byte_start, sub_index FROM session_events WHERE session_id=? AND provider=?" + tail
+            " " + extra + ", byte_start, sub_index, " + ("json_extract(data,'$.timestamp')" if times else "NULL")
+            + " FROM session_events WHERE session_id=? AND provider=?" + tail
             + " ORDER BY provider,session_id,byte_start,sub_index", term_params + [session_id, provider] + tail_params)
         events = []
         while True:
@@ -1162,7 +1164,7 @@ class SessionStore:
             page = cursor.fetchmany(512)
             if not page:
                 break
-            for cid, kind, role, call_id, success_type, success, text, packed, byte_start, sub_index in page:
+            for cid, kind, role, call_id, success_type, success, text, packed, byte_start, sub_index, stamp in page:
                 if success_type == "true":
                     success = True
                 elif success_type == "false":
@@ -1173,7 +1175,8 @@ class SessionStore:
                 if packed is not None:
                     meta.update((key, value) for key, value in zip(packed_keys, json.loads(packed))
                                 if value is not None)
-                events.append(AuditEvent(cid, kind, text or "", meta, (byte_start, sub_index), session_id=session_id))
+                events.append(AuditEvent(cid, kind, text or "", meta, (byte_start, sub_index), session_id=session_id,
+                                         timestamp=stamp))
             self.audit_rows_fetched += len(page)
         return events
 
