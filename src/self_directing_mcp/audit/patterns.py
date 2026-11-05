@@ -24,6 +24,8 @@ import time
 
 import regex as _regex
 
+from self_directing_mcp.audit import shellview
+
 SEARCH_TIMEOUT_SEC = 0.25
 CONTRACT_BUDGET_SEC = 2.0
 _FLAGS = _regex.IGNORECASE | _regex.MULTILINE | _regex.VERSION0
@@ -39,12 +41,16 @@ class ContractRegexTimeout(RuntimeError):
 
 
 class GuardedPattern:
-    __slots__ = ("pattern", "_compiled")
+    """A contract pattern with a time limit. ``command``: the text it is matched against is first reduced to the command
+    view of a shell call (``audit.shellview``); any other text is matched as it is."""
+    __slots__ = ("pattern", "_compiled", "command")
 
-    def __init__(self, pattern: str, compiled):
-        self.pattern, self._compiled = pattern, compiled
+    def __init__(self, pattern: str, compiled, command: bool = False):
+        self.pattern, self._compiled, self.command = pattern, compiled, command
 
     def search(self, text: str):
+        if self.command:
+            text = shellview.tool_view(text)
         remaining = _remaining.get()
         limit = SEARCH_TIMEOUT_SEC if remaining is None else min(SEARCH_TIMEOUT_SEC, remaining)
         if limit <= 0:
@@ -60,14 +66,22 @@ class GuardedPattern:
 
 
 @functools.lru_cache(maxsize=1024)
-def compile_contract(pattern: str) -> GuardedPattern:
-    """Compile a contract pattern (case-insensitive, multiline). Raises ``re.error`` for invalid syntax."""
+def compile_contract(pattern: str, command: bool = False) -> GuardedPattern:
+    """Compile a contract pattern (case-insensitive, multiline). Raises ``re.error`` for invalid syntax.
+
+    ``command``: match shell calls by their command view (see ``GuardedPattern``)."""
     re.compile(pattern, re.IGNORECASE | re.MULTILINE)       # the documented syntax gate
     try:
         compiled = _regex.compile(pattern, _FLAGS)
     except _regex.error as exc:                            # accepted by ``re`` but not by ``regex``: still invalid here
         raise re.error(str(exc)) from None
-    return GuardedPattern(pattern, compiled)
+    return GuardedPattern(pattern, compiled, command)
+
+
+def compile_rule_pattern(rule, pattern: str) -> GuardedPattern:
+    """The pattern of one field of ``rule`` (regex, before_regex, exception_regex, when) compiled for what the rule
+    targets: the command view of shell calls for a contract about commands, the whole text otherwise."""
+    return compile_contract(pattern, shellview.targets_command(rule))
 
 
 def search(pattern: str, text: str):

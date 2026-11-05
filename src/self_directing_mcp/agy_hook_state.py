@@ -38,6 +38,11 @@ except ImportError:   # a standalone copy next to a broken package: prose fields
             arguments, ensure_ascii=False, sort_keys=True))
 
 try:
+    from self_directing_mcp.audit import shellview     # standard library only: the command view contracts about commands match
+except ImportError:                                    # a standalone copy: the whole text is matched (asks more)
+    shellview = None
+
+try:
     from self_directing_mcp import contract_paths      # standard library only: lowers a typed ``path_guard`` to its regex
 except ImportError:                                    # a standalone copy: a typed high-risk contract then always asks
     contract_paths = None
@@ -323,7 +328,8 @@ def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy"
                     return str(rule.get("id"))
                 continue
             try:
-                if not pattern or re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+                judged = shellview.tool_view(text) if shellview is not None and shellview.targets_command(rule) else text
+                if not pattern or re.search(pattern, judged, re.IGNORECASE | re.MULTILINE):
                     return str(rule.get("id"))
             except re.error:
                 return str(rule.get("id"))

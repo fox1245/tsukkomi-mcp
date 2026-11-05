@@ -17,7 +17,7 @@ from self_directing_mcp.neograph_runtime import run_stages
 from self_directing_mcp.request_control import check_request, current_request, request_operation
 
 from self_directing_mcp.audit import anchors as anchor_module, hostblocks, shellstatus
-from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
+from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, compile_rule_pattern, contract_budget
 
 REGEX_TIMEOUT = "regex_timeout: a contract pattern exceeded its time limit, so this contract could not be evaluated"
 SUCCESS_UNVERIFIABLE = "success_unverifiable"
@@ -215,7 +215,7 @@ def action_applies(rule, proposed) -> bool:
     if not pattern:
         return True
     try:
-        applies = compile_contract(pattern).search(proposed.text) is not None
+        applies = compile_rule_pattern(rule, pattern).search(proposed.text) is not None
         check_request()
         return applies
     except (re.error, ContractRegexTimeout):
@@ -414,8 +414,8 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
     if not rule.regex:
         return finding("unknown", "description-only contract needs a verifier; retrieval is not proof")
     try:
-        regex = compile_contract(rule.regex)
-        trigger = compile_contract(rule.before_regex) if rule.before_regex else None
+        regex = compile_rule_pattern(rule, rule.regex)
+        trigger = compile_rule_pattern(rule, rule.before_regex) if rule.before_regex else None
     except re.error:
         return finding("unknown", "invalid contract regex")
     start = _start(rule, chunks, ids, anchors) if rule.applies_from_event_id else 0
@@ -447,7 +447,7 @@ def _audit_contract(rule, *, session_id, store, retriever=None, provider=None, p
         exception = None
         if rule.exception_regex:
             try:
-                exception = compile_contract(rule.exception_regex)
+                exception = compile_rule_pattern(rule, rule.exception_regex)
             except re.error:
                 return finding("unknown", "invalid exception_regex",
                                basis=f"{rule.id}.exception_regex failed to compile")
@@ -698,7 +698,7 @@ def _window(rule, events, ids, proposed, anchors=None):
     end = len(events)
     if rule.type == "must" and rule.before_regex and proposed is None:
         try:
-            trigger = compile_contract(rule.before_regex)
+            trigger = compile_rule_pattern(rule, rule.before_regex)
         except re.error:
             return start, end
         scope_kind, roles = _scope_test(rule)
@@ -880,7 +880,7 @@ def _attempted(rule, events, proposals, blocked) -> bool:
     """Whether one of ``proposals`` (positions of the host-logged model proposals in the rule's window) that was not
     blocked matches the rule's regex."""
     try:
-        regex = compile_contract(rule.regex)
+        regex = compile_rule_pattern(rule, rule.regex)
     except re.error:
         return False
     tools = getattr(rule, "tools", None)
@@ -892,8 +892,8 @@ def _attempt_hits(rule, item, events, proposals, blocked) -> None:
     preserves the proposal and its arguments. Proposals the Pre hook blocked never ran and are not counted.
     ``proposals``: the positions of the host-logged model proposals in the rule's window, in order."""
     try:
-        regex = compile_contract(rule.regex)
-        exception = compile_contract(rule.exception_regex) if rule.exception_regex else None
+        regex = compile_rule_pattern(rule, rule.regex)
+        exception = compile_rule_pattern(rule, rule.exception_regex) if rule.exception_regex else None
     except re.error:
         return
     tools = getattr(rule, "tools", None)
@@ -926,7 +926,7 @@ def _hidden_trigger(rule, events, legacy_in_window, proposals, cut, blocked):
         return (_TRUNCATED_CODE.get(field, "truncated_" + field),
                 f"a still-truncated {_meta(cut[0][0]).get('event_type')}.{field} may hide the triggering call")
     try:
-        trigger = compile_contract(rule.before_regex)
+        trigger = compile_rule_pattern(rule, rule.before_regex)
     except re.error:
         return None
     if legacy_in_window:

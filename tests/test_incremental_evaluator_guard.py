@@ -16,10 +16,10 @@ import hashlib
 import inspect
 
 from self_directing_mcp import agy
-from self_directing_mcp.audit import anchors, applicability, hostblocks, patterns, runner, shellstatus
+from self_directing_mcp.audit import anchors, applicability, hostblocks, patterns, runner, shellstatus, shellview
 from self_directing_mcp.retrieve import checks
 
-DIGEST = "e2f4565a99287e3f"
+DIGEST = "56c49aa369b2d525"
 
 MIRRORED = [
     runner.audit_contract, runner._Presence, runner._tool_matches, runner._eligible, runner._worse, runner.evidence, runner._key,
@@ -31,7 +31,9 @@ MIRRORED = [
     applicability.when_needs, checks.scope_matches,
     # contract patterns run on the guarded ``regex`` engine; a timeout makes the contract unknown (never clean)
     runner._audit_contract, runner._post_process, runner._regex_timeout_finding, runner._patterns,
-    patterns.compile_contract, patterns.GuardedPattern.search,
+    patterns.compile_contract, patterns.GuardedPattern.search, patterns.compile_rule_pattern,
+    # a contract about commands is matched against the command view of a shell call: one module, both evaluators
+    shellview,
     # a success that a masked exit status cannot vouch for is unknown (``success_unverifiable``): one function, both evaluators
     runner.success_unverifiable, shellstatus,
     # a contract anchored to something other than a user message is unknown (``anchor_not_user``)

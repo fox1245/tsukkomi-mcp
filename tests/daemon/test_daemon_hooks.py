@@ -203,7 +203,7 @@ def test_when_the_daemon_cannot_start_the_hook_fails_open_within_its_budget(worl
 
 
 @pytest.mark.parametrize("host,expect_key", [("claude", "hookSpecificOutput"), ("agy", "decision")])
-def test_a_matching_high_risk_contract_asks_when_the_daemon_is_unavailable(world, runtime, failing_python, host,
+def test_a_matching_high_risk_contract_is_not_waved_through_when_the_daemon_is_unavailable(world, runtime, failing_python, host,
                                                                            expect_key):
     index = world.new_index("risk", [*CONTRACTS, HIGH_RISK])
     asked = world.hook(host, "PreToolUse", "deploy --prod", flag="on", index=index,
@@ -211,14 +211,16 @@ def test_a_matching_high_risk_contract_asks_when_the_daemon_is_unavailable(world
     response = asked.json
     decision = (response["hookSpecificOutput"]["permissionDecision"] if host == "claude" else response["decision"])
     reason = (response["hookSpecificOutput"]["permissionDecisionReason"] if host == "claude" else response["reason"])
-    assert decision == "ask" and "no-prod-deploy" in reason and "daemon_unavailable" in reason
+    # Claude Code refuses (the audit that would judge the action did not run); AGY still asks the user.
+    assert decision == ("deny" if host == "claude" else "ask") and "no-prod-deploy" in reason and "daemon_unavailable" in reason
     other = world.hook(host, "PreToolUse", "ls", flag="on", index=index, SELF_DIRECT_DAEMON_PYTHON=failing_python)
-    assert "ask" not in json.dumps(other.json) and "daemon_unavailable" in json.dumps(other.json)
+    assert "ask" not in json.dumps(other.json) and "deny" not in json.dumps(other.json) and "daemon_unavailable" in json.dumps(other.json)
     advisory = world.hook(host, "PreToolUse", "deploy --prod", flag="on", index=index,
                           SELF_DIRECT_DAEMON_PYTHON=failing_python,
                           **{"SELF_DIRECT_CLAUDE_ENFORCEMENT" if host == "claude" else "SELF_DIRECT_AGY_ENFORCEMENT":
                              "advisory"})
     assert "ask" not in json.dumps(advisory.json).replace("fail-open", "")        # advisory mode never asks
+    assert '"deny"' not in json.dumps(advisory.json)
 
 
 RUNNER = r"""
