@@ -555,7 +555,10 @@ def _apply(src: str, edits: list[tuple[int, int, str]]) -> str:
 
 def command_view(command: str) -> str:
     """``command`` with the data a shell does not run taken out (see the module text). Unchanged when it cannot be parsed."""
-    return _view(command, 0, semantics())
+    try:
+        return _view(command, 0, semantics())
+    except (RecursionError, ValueError, IndexError):
+        return command          # a construct the parser cannot take (nesting deeper than the interpreter allows): as it is
 
 
 # ------------------------------------------------------------------------------------------------- tool-call text

@@ -93,6 +93,11 @@ def test_a_command_that_does_not_parse_or_is_too_large_is_returned_unchanged():
     assert command_view(huge) == huge
 
 
+def test_nesting_deeper_than_the_interpreter_allows_is_returned_unchanged_not_raised():
+    nested = '"$(' * 3000 + GATED + ')"' * 3000
+    assert command_view(nested) == nested
+
+
 def test_an_unlisted_program_is_a_data_consumer_and_listing_it_makes_its_arguments_commands(monkeypatch):
     unlisted = f"watchdog-runner '{GATED}'"
     assert GATED not in command_view(unlisted)
