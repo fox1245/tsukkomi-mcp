@@ -313,6 +313,26 @@ def test_suspicious_beside_an_unknown_prerequisite_asks_in_confirmed_only_and_de
     assert permission(run(engine, path, "PreToolUse", tool_input=action)) == "deny"
 
 
+def test_a_transcript_path_through_a_linked_project_directory_is_judged_like_the_real_one(env):
+    """Claude Code can name a project directory that is a link to another one; the hook must still judge the call."""
+    engine, path = env
+    engine.upsert_contracts([{"id": "gate", "type": "must_not", "scope": "tool_call", "provider": "claude",
+                              "regex": "deploy"}])
+    alias = path.parent.parent / "-alias-project"
+    alias.symlink_to(path.parent, target_is_directory=True)
+    shown = alias / path.name
+    for event in ("PreToolUse", "Stop"):
+        assert run(engine, shown, event, tool_input={"command": "ls"}) == run(engine, path, event,
+                                                                                tool_input={"command": "ls"})
+    assert permission(run(engine, shown, "PreToolUse", tool_input={"command": "deploy now"})) == "deny"
+    # A link that leaves the projects root is still refused, which the hook reports as an unavailable check.
+    outside = path.parent.parent.parent / "outside-project"
+    outside.mkdir()
+    (path.parent.parent / "-escape").symlink_to(outside, target_is_directory=True)
+    refused = run(engine, path.parent.parent / "-escape" / path.name, "PreToolUse", tool_input={"command": "deploy now"})
+    assert permission(refused) != "deny" and "PathTraversalError" in refused["systemMessage"]
+
+
 def test_no_exemption_for_reads_or_for_names_that_look_like_this_server(env):
     engine, path = env
     engine.upsert_contracts([{"id": "c", "type": "must_not", "scope": "tool_call", "provider": "claude",

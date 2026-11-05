@@ -79,6 +79,34 @@ def _linked(path: Path) -> bool:
     return path.is_symlink() or os.path.isjunction(path)
 
 
+def _linked_project_target(link: Path, *roots: Path) -> Path:
+    """The real project directory a linked project directory stands for, or PathTraversalError.
+
+    Exactly one hop is read (``os.readlink``; a relative target is taken against the link's own directory). The
+    target must be spelled as a direct child of the projects root (``roots``: its resolved and configured
+    spellings) with no ``..`` and no other link in its path, and must be an existing directory that is
+    not itself a link. A chain, a hop that leaves the root, the root itself, a directory deeper down and a
+    dangling link are refused: every extra hop is a path another party may control and may change between this
+    check and the read. Returns the target in the resolved root's spelling.
+    """
+    refused = PathTraversalError("Claude Code transcript path may not contain symlinks")
+    try:
+        hop = os.readlink(link)
+    except OSError as exc:
+        raise refused from exc
+    target = Path(os.path.join(link.parent, hop))
+    if not target.is_absolute() or target.name in ("", ".", ".."):
+        raise refused
+    if target.parent not in roots or _linked(target):
+        raise refused
+    try:
+        if not target.is_dir():
+            raise refused
+    except OSError as exc:
+        raise refused from exc
+    return roots[0] / target.name
+
+
 def _find_by_id(root: Path, session_id: str) -> list[Path]:
     parent, stem = session_parts(session_id)
     found: list[Path] = []
@@ -104,6 +132,10 @@ def resolve_session_path(root: Path, *, session_id: str | None = None, path: str
     The path must be absolute, free of ``..``, inside the configured root, in an official layout, and no
     component below the root may be a symlink or junction (a link could redirect the evidence file or change
     which session it claims). The root itself may be a link.
+
+    One link is accepted: the project directory, the first component below the root, when it resolves to an
+    existing real directory that is a direct child of the resolved root (see ``_linked_project_target``). The
+    answer is then the canonical path through that target, so a file has one spelling whichever way it was named.
     """
     if session_id is not None and not valid_id(session_id):
         raise ValueError("invalid Claude Code session id")
@@ -126,10 +158,20 @@ def resolve_session_path(root: Path, *, session_id: str | None = None, path: str
     else:
         raise PathTraversalError("Claude Code transcript is outside the configured projects root")
     current = prefix
-    for part in below:
+    for index, part in enumerate(below):
         current = current / part
-        if _linked(current):
+        if not _linked(current):
+            continue
+        if index != 0 or len(below) < 2:  # only the project directory, never the transcript or anything deeper
             raise PathTraversalError("Claude Code transcript path may not contain symlinks")
+        target = _linked_project_target(current, root, configured)
+        below = (target.name, *below[1:])
+        current = target
+        for rest in below[1:]:
+            current = current / rest
+            if _linked(current):
+                raise PathTraversalError("Claude Code transcript path may not contain symlinks")
+        break
     resolved = root.joinpath(*below)
     try:
         _codex_discover.ensure_under_root(resolved, root)

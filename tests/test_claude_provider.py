@@ -1113,6 +1113,145 @@ def test_path_validation_rejects_traversal_escapes_symlinks_and_foreign_layouts(
         claude.resolve_session_path(root, path=str(root))
 
 
+def _linked_project(root, name="-alias-project", target=PROJECT):
+    """A project directory that is a link to a sibling project directory (same projects root)."""
+    link = root / name
+    link.symlink_to(root / target, target_is_directory=True)
+    return link
+
+
+def test_a_project_directory_link_to_a_sibling_resolves_to_the_canonical_path(root):
+    real = write(main_file(root), human("main"))
+    child = write(sub_file(root), user("task", sub=True))
+    alias = _linked_project(root)
+    # The link is only another spelling of the project directory: the answer is the real file, the id is the file name.
+    assert claude.resolve_session_path(root, path=str(alias / real.name)) == real
+    assert claude.resolve_session_path(root, session_id=SID, path=str(alias / real.name)) == real
+    assert claude.resolve_session_path(root, path=str(alias / SID / "subagents" / child.name)) == child
+    assert claude.resolve_session_path(root, session_id=CHILD, path=str(alias / SID / "subagents" / child.name)) == child
+    # A transcript that is not written yet (a first hook before the first flush) is accepted when not required.
+    assert claude.resolve_session_path(root, path=str(alias / f"{OTHER}.jsonl"), require_exists=False) \
+        == root / PROJECT / f"{OTHER}.jsonl"
+    with pytest.raises(FileNotFoundError):
+        claude.resolve_session_path(root, path=str(alias / f"{OTHER}.jsonl"))
+    # The id still has to match the file name, whichever way the path was spelled.
+    with pytest.raises(ValueError):
+        claude.resolve_session_path(root, session_id=OTHER, path=str(alias / real.name))
+    # A link in the configured root and a link to a project directory can be combined.
+    alias_root = root.parent / "alias-root"
+    alias_root.symlink_to(root, target_is_directory=True)
+    assert claude.resolve_session_path(alias_root, path=str(alias_root / alias.name / real.name)) == real
+
+
+def test_a_project_directory_link_is_one_hop_to_a_sibling_directory_never_a_chain(root, tmp_path):
+    real = write(main_file(root), human("main"))
+    # One hop, absolute or relative to the link's own directory, is the accepted shape.
+    (root / "-absolute").symlink_to(root / PROJECT, target_is_directory=True)
+    (root / "-relative").symlink_to(PROJECT, target_is_directory=True)
+    for name in ("-absolute", "-relative"):
+        assert claude.resolve_session_path(root, path=str(root / name / real.name)) == real
+    # A chain is refused even though it ends in the same sibling directory: the middle hop is a path
+    # someone else may control and may change between the check and the use.
+    (root / "-second").symlink_to(root / "-absolute", target_is_directory=True)
+    (root / "-second-relative").symlink_to("-relative", target_is_directory=True)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "back").symlink_to(root / PROJECT, target_is_directory=True)
+    (root / "-via-foreign").symlink_to(foreign / "back", target_is_directory=True)
+    for name in ("-second", "-second-relative", "-via-foreign"):
+        for required in (True, False):
+            with pytest.raises(claude.PathTraversalError):
+                claude.resolve_session_path(root, path=str(root / name / real.name), require_exists=required)
+    # A single hop whose target is spelled with `..`, or through another link to the root, is refused as well.
+    (root.parent / "alias-root-for-hop").symlink_to(root, target_is_directory=True)
+    (root / "-dotdot").symlink_to(Path("..") / root.name / PROJECT, target_is_directory=True)
+    (root / "-through-root-link").symlink_to(root.parent / "alias-root-for-hop" / PROJECT, target_is_directory=True)
+    for name in ("-dotdot", "-through-root-link"):
+        with pytest.raises(claude.PathTraversalError):
+            claude.resolve_session_path(root, path=str(root / name / real.name))
+    # The configured root may itself be a link: a relative or absolute hop beside it still works.
+    alias_root = tmp_path / "alias-root"
+    alias_root.symlink_to(root, target_is_directory=True)
+    assert claude.resolve_session_path(alias_root, path=str(alias_root / "-relative" / real.name)) == real
+    assert claude.resolve_session_path(alias_root, path=str(alias_root / "-absolute" / real.name)) == real
+
+
+def test_a_linked_project_directory_is_refused_unless_it_is_a_real_sibling_directory(root, tmp_path):
+    inside = write(main_file(root), human("main"))
+    outside = write(tmp_path / "elsewhere" / PROJECT / f"{OTHER}.jsonl", human("outside"))
+    nested = write(root / "-outer" / "-inner" / f"{OTHER}.jsonl", human("nested"))
+    (root / "-to-outside").symlink_to(outside.parent, target_is_directory=True)
+    (root / "-to-root").symlink_to(root, target_is_directory=True)
+    (root / "-to-nested").symlink_to(nested.parent, target_is_directory=True)
+    (root / "-to-parent").symlink_to(root.parent, target_is_directory=True)
+    (root / "-dangling").symlink_to(root / "-never-created", target_is_directory=True)
+    (root / "-to-file").symlink_to(inside)
+    (root / "-loop-a").symlink_to(root / "-loop-b", target_is_directory=True)
+    (root / "-loop-b").symlink_to(root / "-loop-a", target_is_directory=True)
+    cases = {"-to-outside": OTHER, "-to-root": SID, "-to-nested": OTHER, "-to-parent": SID, "-dangling": SID,
+             "-to-file": SID, "-loop-a": SID}
+    for link, sid in cases.items():
+        for required in (True, False):
+            with pytest.raises(claude.PathTraversalError):
+                claude.resolve_session_path(root, path=str(root / link / f"{sid}.jsonl"), require_exists=required)
+    # Even with the directory reached through the root's own spelling, nothing below a refused link is read.
+    with pytest.raises(claude.PathTraversalError):
+        claude.resolve_session_path(root, session_id=OTHER, path=str(root / "-to-outside" / f"{OTHER}.jsonl"))
+
+
+def test_only_the_project_directory_may_be_a_link_even_when_that_directory_is_one(root, tmp_path):
+    real = write(main_file(root), human("main"))
+    child = write(sub_file(root), user("task", sub=True))
+    alias = _linked_project(root)
+    # The transcript file is a link, in a real project directory and in a linked one.
+    other_file = root / PROJECT / f"{OTHER}.jsonl"
+    other_file.symlink_to(real)
+    for shown in (root / PROJECT, alias):
+        with pytest.raises(claude.PathTraversalError):
+            claude.resolve_session_path(root, path=str(shown / other_file.name))
+        with pytest.raises(claude.PathTraversalError):
+            claude.resolve_session_path(root, session_id=OTHER, path=str(shown / other_file.name))
+    # A link deeper than the project directory: the session directory and the subagents directory.
+    third = "cccccccc-3333-4333-8333-cccccccccccc"
+    (root / PROJECT / third).symlink_to(root / PROJECT / SID, target_is_directory=True)
+    with pytest.raises(claude.PathTraversalError):
+        claude.resolve_session_path(root, path=str(alias / third / "subagents" / child.name))
+    fourth = "dddddddd-4444-4444-8444-dddddddddddd"
+    (root / PROJECT / fourth).mkdir()
+    (root / PROJECT / fourth / "subagents").symlink_to(root / PROJECT / SID / "subagents", target_is_directory=True)
+    with pytest.raises(claude.PathTraversalError):
+        claude.resolve_session_path(root, path=str(alias / fourth / "subagents" / child.name))
+    # A subagent transcript file that is a link.
+    (root / PROJECT / SID / "subagents" / "agent-linked.jsonl").symlink_to(child)
+    with pytest.raises(claude.PathTraversalError):
+        claude.resolve_session_path(root, path=str(alias / SID / "subagents" / "agent-linked.jsonl"))
+    # Traversal is refused before any link is looked at.
+    with pytest.raises(claude.PathTraversalError):
+        claude.resolve_session_path(root, path=str(alias / ".." / PROJECT / real.name))
+    with pytest.raises(claude.PathTraversalError):
+        claude.resolve_session_path(root, path=str(root / ".." / "projects" / alias.name / real.name))
+    # A link to the project directory does not make a foreign layout official.
+    write(root / PROJECT / "notes.jsonl", human("x"))
+    with pytest.raises(ValueError):
+        claude.resolve_session_path(root, path=str(alias / "notes.jsonl"))
+    with pytest.raises(claude.PathTraversalError):
+        claude.resolve_session_path(root, path=str(alias))        # the link is the whole path: the transcript is a link
+
+
+def test_a_session_under_a_linked_project_directory_is_found_once_by_id_and_by_discovery(root):
+    real = write(main_file(root), human("main"))
+    child = write(sub_file(root), user("task", sub=True))
+    _linked_project(root)
+    _linked_project(root, "-another-alias")
+    # The link is skipped as a project directory: its target is scanned as itself, so there is one match, not three.
+    assert claude.resolve_session_path(root, session_id=SID) == real
+    assert claude.resolve_session_path(root, session_id=CHILD) == child
+    assert claude.discover_session_files(root) == sorted([real, child])
+    assert claude.discover_subagent_files(root, SID) == [(CHILD, child)]
+    via_link = claude.discover_subagent_files(root, SID, path=root / "-alias-project" / real.name)
+    assert via_link == [(CHILD, child)]
+
+
 def test_engine_reports_path_errors_without_reading_outside_the_root(engine, root, tmp_path):
     outside = write(tmp_path / "elsewhere" / PROJECT / f"{OTHER}.jsonl", human("outside"))
     assert engine.sync_session(session_id=OTHER, provider="claude", path=str(outside), embed=False)["error"] == "path_traversal"
@@ -1121,6 +1260,21 @@ def test_engine_reports_path_errors_without_reading_outside_the_root(engine, roo
     write(main_file(root), human("hello"))
     by_id = engine.sync_session(session_id=SID, provider="claude", embed=False)
     assert by_id["ok"] and by_id["provider"] == "claude" and by_id["path"] == str(main_file(root))
+
+
+def test_engine_syncs_a_transcript_named_through_a_linked_project_directory(engine, root):
+    real = write(main_file(root), human("hello"))
+    alias = _linked_project(root)
+    for provider in ("claude", None):
+        result = engine.sync_session(session_id=SID, provider=provider, path=str(alias / real.name), embed=False)
+        assert result["ok"] and result["provider"] == "claude" and result["path"] == str(real), provider
+    assert len(stored(engine)) == 1                       # one session, however the file was named
+    refused = root.parent / "outside-project"
+    refused.mkdir()
+    (root / "-escape").symlink_to(refused, target_is_directory=True)
+    write(refused / f"{OTHER}.jsonl", human("outside", sid=OTHER))
+    assert engine.sync_session(session_id=OTHER, provider="claude", path=str(root / "-escape" / f"{OTHER}.jsonl"),
+                               embed=False)["error"] == "path_traversal"
 
 
 def test_discovery_lists_only_valid_unlinked_transcripts(root, tmp_path):
