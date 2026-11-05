@@ -1069,8 +1069,8 @@ class AuditPlan:
         ``defer``: a resident engine can verify a skipped comparison later, and the report then says ``deferred``.
         ``hook``: a hook process that hands its planned comparisons (warm-up, rebuild, sampled) to a detached verifier
         (``verify_job``) instead of making the request wait for them; comparisons that an answer calls for or that a
-        high-risk contract needs (``force``, ``high_risk``) still run in the request. The report then says
-        ``shadow_skipped: "verifier"``.
+        high-risk contract needs (``force``, ``high_risk``) still run in the request, and so does every comparison when
+        ``shadow_every`` is 1 (the setting that compares every audit). The report then says ``shadow_skipped: "verifier"``.
         ``foreign``: the anchors of other sessions that the global contracts take their source and activation event from
         (``audit.anchors.resolve``, made once for this build inside the same read boundary); they are part of each state's key
         and the events carry their timestamps when one of them starts a window in time."""
@@ -1205,7 +1205,7 @@ class AuditPlan:
                 comparison.add(reason, force.scope)
         shadow = comparison.active
         total = store.session_metrics(session_id, provider)[0]
-        if shadow and hook and not idle and force is None and "high_risk" not in comparison.reasons:
+        if shadow and hook and shadow_every != 1 and not idle and force is None and "high_risk" not in comparison.reasons:
             shadow, comparison = False, shadow_module.Comparison()       # nothing is compared in this request (yet)
             report["shadow_skipped"] = VERIFIER_SKIP
         elif shadow and not _shadow_affordable(total):

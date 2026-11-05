@@ -26,6 +26,12 @@ def _grow(engine, path, count=4):
         write(path, assistant(use(f"c{n}", "Bash", command=f"echo step {n}")), tool_result(f"c{n}", "ok"), mode="a")
 
 
+def _hook(engine):
+    """What the hook process does to its engine, on the production schedule (the suite compares every audit)."""
+    engine.settings.audit_shadow_every = "adaptive"
+    engine.defer_comparisons = True
+
+
 def _audit(engine, path):
     return engine.audit_session(SID, provider="claude", path=str(path))
 
@@ -45,7 +51,7 @@ def test_a_hook_engine_leaves_the_planned_comparison_to_the_verifier_and_reads_n
     _grow(engine, path)
     _audit(engine, path)                                              # states exist now: the next audits are deltas
     write(path, assistant(use("c9", "Bash", command="echo more")), tool_result("c9", "ok"), mode="a")
-    engine.defer_comparisons = True
+    _hook(engine)
     reads = []
     original = engine.store.capture_audit_events
     engine.store.capture_audit_events = lambda *a, **k: (reads.append(1), original(*a, **k))[1]
@@ -57,12 +63,11 @@ def test_a_hook_engine_leaves_the_planned_comparison_to_the_verifier_and_reads_n
 
 def test_a_violation_is_still_compared_in_the_request(env):
     engine, path = env
-    engine.settings.audit_shadow_every = "adaptive"                  # the production schedule (the suite compares every audit)
     engine.upsert_contracts([RULE])
     _grow(engine, path)
     _audit(engine, path)
     write(path, assistant(use("bad", "Bash", command="deploy --prod now")), tool_result("bad", "ok"), mode="a")
-    engine.defer_comparisons = True
+    _hook(engine)
     result = _audit(engine, path)
     assert result["verdict"] == "violation"
     assert result["incremental"].get("shadow_compared") is True       # the answer called for a comparison
@@ -70,14 +75,26 @@ def test_a_violation_is_still_compared_in_the_request(env):
 
 def test_a_high_risk_contract_that_applies_to_the_action_is_still_compared_in_the_request(env):
     engine, path = env
-    engine.settings.audit_shadow_every = "adaptive"
     engine.upsert_contracts([dict(RULE, id="gate", type="must", scope="tool_call", before_regex="deploy --prod",
                                   regex="echo step 0", risk="high")])
     _grow(engine, path)
-    engine.defer_comparisons = True
+    _hook(engine)
     action = {"tool_name": "Bash", "arguments": {"command": "deploy --prod"}}
     result = engine.check_action(SID, action, provider="claude", path=str(path))
     assert result["incremental"].get("shadow_compared") is True
+
+
+def test_the_setting_that_compares_every_audit_keeps_every_comparison_in_the_request(env):
+    engine, path = env
+    engine.settings.audit_shadow_every = 1
+    engine.upsert_contracts([dict(RULE, id="gate", type="must", scope="tool_call", before_regex="deploy --prod",
+                                  regex="echo step 0", risk="high")])
+    _grow(engine, path)
+    engine.defer_comparisons = True                                   # a hook engine, but the setting is explicit
+    action = {"tool_name": "Bash", "arguments": {"command": "deploy --prod"}}
+    result = engine.check_action(SID, action, provider="claude", path=str(path))
+    assert result["incremental"].get("shadow_compared") is True
+    assert engine.deferred_comparisons == {}
 
 
 def test_the_hook_starts_the_verifier_detached_after_it_has_answered(env, monkeypatch):
@@ -85,7 +102,7 @@ def test_the_hook_starts_the_verifier_detached_after_it_has_answered(env, monkey
     engine.upsert_contracts([RULE])
     _grow(engine, path)
     _audit(engine, path)
-    engine.defer_comparisons = True
+    _hook(engine)
     started = []
     monkeypatch.setattr(subprocess, "Popen", lambda argv, **kwargs: started.append((argv, kwargs)))
     write(path, assistant(use("c8", "Bash", command="echo again")), tool_result("c8", "ok"), mode="a")
@@ -104,7 +121,7 @@ def test_a_failure_to_start_the_verifier_does_not_fail_the_hook(env, monkeypatch
     engine.upsert_contracts([RULE])
     _grow(engine, path)
     _audit(engine, path)
-    engine.defer_comparisons = True
+    _hook(engine)
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(OSError("no fork")))
     write(path, assistant(use("c7", "Bash", command="echo again")), tool_result("c7", "ok"), mode="a")
     assert "FAILED" not in str(stop(engine, path))
@@ -115,7 +132,7 @@ def test_the_verifier_compares_the_session_and_records_a_match(env):
     engine.upsert_contracts([RULE])
     _grow(engine, path)
     _audit(engine, path)
-    engine.defer_comparisons = True
+    _hook(engine)
     write(path, assistant(use("c6", "Bash", command="echo again")), tool_result("c6", "ok"), mode="a")
     _audit(engine, path)
     assert engine.deferred_comparisons
