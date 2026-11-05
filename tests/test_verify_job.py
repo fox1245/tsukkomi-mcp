@@ -61,7 +61,7 @@ def test_a_hook_engine_leaves_the_planned_comparison_to_the_verifier_and_reads_n
     assert engine.deferred_comparisons == {("claude", SID): str(path)}
 
 
-def test_a_violation_is_still_compared_in_the_request(env):
+def test_a_violation_that_only_makes_a_note_is_compared_by_the_verifier_not_in_the_request(env):
     engine, path = env
     engine.upsert_contracts([RULE])
     _grow(engine, path)
@@ -70,7 +70,53 @@ def test_a_violation_is_still_compared_in_the_request(env):
     _hook(engine)
     result = _audit(engine, path)
     assert result["verdict"] == "violation"
-    assert result["incremental"].get("shadow_compared") is True       # the answer called for a comparison
+    assert result["incremental"]["shadow_skipped"] == incremental.VERIFIER_SKIP
+    assert not result["incremental"].get("shadow_compared")
+    assert engine.deferred_comparisons == {("claude", SID): str(path)}
+
+
+def test_a_miss_that_can_resume_the_agent_is_still_compared_in_the_request(env):
+    engine, path = env
+    engine.upsert_contracts([{"id": "ack", "type": "must", "scope": "message", "provider": "claude", "regex": "VERIFIED",
+                              "auto_continue": True, "description": "state VERIFIED when done"}])
+    _grow(engine, path)
+    _audit(engine, path)
+    write(path, assistant({"type": "text", "text": "done, nothing stated"}), mode="a")
+    _hook(engine)
+    result = _audit(engine, path)
+    assert result["incremental"].get("shadow_compared") is True       # a block rests on it
+    assert set(result["incremental"].get("shadow_scope") or ["ack"]) <= {"ack"}   # only what the block rests on
+
+
+def test_a_violation_of_a_proposed_action_is_still_compared_in_the_request(env):
+    engine, path = env
+    engine.upsert_contracts([dict(RULE, id="gate", type="must", before_regex="deploy --prod", regex="tests passed")])
+    _grow(engine, path)
+    _hook(engine)
+    engine.check_action(SID, {"tool_name": "Bash", "arguments": {"command": "echo hi"}}, provider="claude", path=str(path))
+    engine.deferred_comparisons.clear()
+    write(path, assistant(use("c8", "Bash", command="echo again")), tool_result("c8", "ok"), mode="a")
+    action = {"tool_name": "Bash", "arguments": {"command": "deploy --prod"}}
+    result = engine.check_action(SID, action, provider="claude", path=str(path))
+    assert result["verdict"] == "violation"                            # a deny rests on it
+    assert result["incremental"].get("shadow_compared") is True
+
+
+def test_a_high_risk_contract_that_applies_to_an_unchanged_summary_is_compared_in_the_request_not_left_to_the_verifier(env):
+    engine, path = env
+    engine.upsert_contracts([dict(RULE, id="gate", type="must", before_regex="deploy --prod", regex="tests passed",
+                                  risk="high")])
+    engine.settings.audit_incremental_min_events = 1
+    write(path, assistant(use("t0", "Bash", command="echo tests passed")), tool_result("t0", "ok"), mode="a")
+    _grow(engine, path)
+    _hook(engine)
+    action = {"tool_name": "Bash", "arguments": {"command": "deploy --prod"}}
+    engine.check_action(SID, action, provider="claude", path=str(path))        # builds the state
+    write(path, assistant(use("c8", "Bash", command="echo unrelated")), tool_result("c8", "ok"), mode="a")
+    engine.deferred_comparisons.clear()
+    result = engine.check_action(SID, action, provider="claude", path=str(path))
+    assert result["verdict"] == "clean"
+    assert result["incremental"].get("shadow_compared") is True       # no answer called for it, the contract's risk did
 
 
 def test_a_high_risk_contract_that_applies_to_the_action_is_still_compared_in_the_request(env):
@@ -86,15 +132,34 @@ def test_a_high_risk_contract_that_applies_to_the_action_is_still_compared_in_th
 
 def test_the_setting_that_compares_every_audit_keeps_every_comparison_in_the_request(env):
     engine, path = env
-    engine.settings.audit_shadow_every = 1
-    engine.upsert_contracts([dict(RULE, id="gate", type="must", scope="tool_call", before_regex="deploy --prod",
-                                  regex="echo step 0", risk="high")])
+    engine.upsert_contracts([RULE])
     _grow(engine, path)
+    _audit(engine, path)
+    write(path, assistant(use("c8", "Bash", command="echo again")), tool_result("c8", "ok"), mode="a")
+    engine.settings.audit_shadow_every = 1                            # explicit: compare every audit, in the request
     engine.defer_comparisons = True                                   # a hook engine, but the setting is explicit
-    action = {"tool_name": "Bash", "arguments": {"command": "deploy --prod"}}
-    result = engine.check_action(SID, action, provider="claude", path=str(path))
-    assert result["incremental"].get("shadow_compared") is True
+    report = _audit(engine, path)["incremental"]
+    assert report.get("shadow_compared") is True and report.get("shadow_skipped") != incremental.VERIFIER_SKIP
     assert engine.deferred_comparisons == {}
+
+
+def test_a_hook_does_not_start_another_process_while_a_verifier_runs(env, monkeypatch):
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    _audit(engine, path)
+    _hook(engine)
+    started = []
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kwargs: started.append(argv))
+    write(path, assistant(use("c8", "Bash", command="echo again")), tool_result("c8", "ok"), mode="a")
+    index = engine.settings.index_dir
+    index.mkdir(parents=True, exist_ok=True)
+    with open(verify_job.lock_path(index), "a+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert verify_job.running(index) is True
+        stop(engine, path)
+    assert started == []
+    assert verify_job.running(index) is False
 
 
 def test_the_hook_starts_the_verifier_detached_after_it_has_answered(env, monkeypatch):

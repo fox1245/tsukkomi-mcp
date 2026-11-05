@@ -372,7 +372,10 @@ def spawn_verifier(engine: SelfDirectEngine) -> None:
     Nothing waits for it: its standard streams are closed and it is its own session, so the host sees this hook finish
     as soon as it has answered. A failure to start it is not a failure of the hook (the next planned comparison covers the
     session)."""
+    from self_directing_mcp import verify_job
     pending, engine.deferred_comparisons = dict(engine.deferred_comparisons), {}
+    if pending and verify_job.running(engine.settings.index_dir):
+        return                 # one verifier at a time per index; the next hook starts another when this one is done
     for (provider, session_id), path in pending.items():
         argv = [sys.executable, "-m", "self_directing_mcp.verify_job", "--provider", provider,
                 "--session-id", session_id, "--index-dir", str(engine.settings.index_dir)]

@@ -36,6 +36,23 @@ def lock_path(index_dir) -> Path:
     return Path(index_dir) / LOCK_NAME
 
 
+def running(index_dir) -> bool:
+    """Whether a verifier holds the lock of this index right now (a hook then does not start another process that would
+    only find the lock taken)."""
+    if fcntl is None:
+        return False
+    try:
+        with open(lock_path(index_dir), "a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False
+
+
 def run(provider: str, session_id: str, path: str | None, index_dir) -> str:
     """Compare one session. Returns what happened: ``"busy"`` (another verifier holds the lock), ``"compared"``,
     ``"mismatch"`` or ``"not_compared"``."""

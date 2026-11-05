@@ -22,8 +22,8 @@ import os
 import sys
 
 from self_directing_mcp.agy_hook_state import (  # noqa: F401  (re-exported for the fallback script)
-    AUDIT_UNAVAILABLE, CHECK_FAILED, DEFAULT_MODE, MODES, HookState, high_risk_match, resolve_contracts_path,
-    resolve_index_dir, warning_text,
+    AUDIT_UNAVAILABLE, CHECK_FAILED, DEFAULT_MODE, MODES, HookState, high_risk_hit, high_risk_match,
+    resolve_contracts_path, resolve_index_dir, warning_text,
 )
 
 STATE_FILE = "claude-hook-state.sqlite"
@@ -55,18 +55,19 @@ NOTICE_DEGRADED = "hook_degraded"        # the kind of the one-per-session degra
 _REPEATING_EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop", "SubagentStop")
 
 
-def fail_open_response(event, reason: str, *, refuse: str | None = None, banner: str | None = None,
-                       quiet: bool = False) -> dict:
-    """Never block a stop and never deny by accident. PreToolUse is refused only when ``refuse`` says that a
-    user-selected high-risk contract applies to this very action and could not be checked.
+def fail_open_response(event, reason: str, *, refuse: str | None = None, ask: str | None = None,
+                       banner: str | None = None, quiet: bool = False) -> dict:
+    """Never block a stop and never deny by accident. PreToolUse is refused only when ``refuse`` says that the trigger of
+    a user-selected high-risk ``must_not`` contract matches this very action and could not be checked; ``ask`` (a ``must``
+    prerequisite that history may already satisfy) asks the user instead.
 
     ``quiet``: the same degraded-hook notice was already shown in this session; a refusal is still said every time."""
     if event in CONTEXT_EVENTS:
         text = reason + " Contract context was not injected; do not claim compliance."
         return _context(event, text + (("\n" + banner) if banner else ""), notice=reason)
-    if event == "PreToolUse" and refuse:
-        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                       "permissionDecisionReason": reason + " " + refuse}}
+    if event == "PreToolUse" and (refuse or ask):
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny" if refuse else "ask",
+                                       "permissionDecisionReason": reason + " " + (refuse or ask)}}
     return {} if quiet else {"systemMessage": reason}
 
 
@@ -95,17 +96,20 @@ def fail_open(event, payload, error_class: str, kind: str = CHECK_FAILED, *, mod
                 health.queue_warning(session, reason)
     except Exception:
         pass
-    refuse = None
+    refuse = ask = None
     if event == "PreToolUse" and mode != "advisory" and isinstance(payload, dict):
         try:
-            matched = high_risk_match(contracts_path if contracts_path is not None else resolve_contracts_path(),
-                                      payload.get("session_id"),
-                                      {"name": payload.get("tool_name"), "args": payload.get("tool_input")},
-                                      provider="claude")
+            hit = high_risk_hit(contracts_path if contracts_path is not None else resolve_contracts_path(),
+                                payload.get("session_id"),
+                                {"name": payload.get("tool_name"), "args": payload.get("tool_input")},
+                                provider="claude")
         except Exception:
-            matched = None
-        if matched:
-            refuse = (f"Refused: high-risk contract [{matched}] applies to this action and could not be verified. "
+            hit = None
+        if hit and hit[1] == "must_not":
+            refuse = (f"Refused: high-risk contract [{hit[0]}] forbids what this action matches and could not be verified. "
                       "Fix the audit (see the error class above) or confirm the action with the owner and retry.")
+        elif hit:
+            ask = (f"High-risk contract [{hit[0]}] asks for a prerequisite of this action that could not be checked; "
+                   "confirm manually.")
     print(reason + ("" if recorded else " (hook health not recorded)"), file=sys.stderr)
-    return fail_open_response(event, reason, refuse=refuse, banner=banner, quiet=quiet)
+    return fail_open_response(event, reason, refuse=refuse, ask=ask, banner=banner, quiet=quiet)

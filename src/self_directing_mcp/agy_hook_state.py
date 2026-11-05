@@ -299,24 +299,36 @@ def _stamp(epoch: float) -> str:
 # --- user-selected high-risk policy without the runtime ----------------------------------------------------
 
 def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy") -> str | None:
-    """Id of an enabled ``risk: high`` contract that applies to this call, or None.
+    """Id of an enabled ``risk: high`` contract that applies to this call, or None (see ``high_risk_hit``)."""
+    hit = high_risk_hit(contracts_path, session_id, tool_call, provider)
+    return hit[0] if hit else None
+
+
+def high_risk_hit(contracts_path, session_id, tool_call, provider: str = "agy") -> tuple[str, str] | None:
+    """``(id, type)`` of an enabled ``risk: high`` contract that applies to this call, or None.
 
     Reads the contracts file with ``json`` only. An unreadable file means "unknown", never a guess. A
-    high-risk contract with no usable pattern applies to every call, as it does in the audit itself.
+    high-risk contract with no usable pattern applies to every call, as it does in the audit itself. ``type`` says what
+    an unchecked match means: a ``must_not`` trigger is what the contract forbids, a ``must`` trigger only asks for a
+    prerequisite that history may already satisfy.
     """
     try:
         document = json.loads(Path(contracts_path).read_text(encoding="utf-8"))
         name, args = tool_call["name"], tool_call["args"]
         text = tool_call_text(provider, name, args)   # the text the audit matches: prose fields excluded
+        # The name the contract's ``tools`` filter is compared with: the host's own, and the one the text carries (Grok's
+        # calls are rendered with Claude Code's tool names), as the audit's ``_tool_matches`` does.
+        names = {str(name).lower(), text[text.index(":") + 1:text.index("]")].lower()} if text.startswith("[") else {str(name).lower()}
         sid = session_id.lower() if isinstance(session_id, str) else None
         for rule in document.get("contracts", []):
             if (not isinstance(rule, dict) or rule.get("enabled", True) is not True or rule.get("risk") != "high"
-                    or rule.get("provider") not in (None, provider) or rule.get("session_id") not in (None, sid)
+                    or rule.get("provider") not in (None, provider)
+                    or rule.get("session_id") not in (None, sid, session_id)
                     or rule.get("scope", "any") not in ("tool_call", "any")
                     or "assistant" not in (rule.get("roles") or ["assistant"])):
                 continue
             tools = rule.get("tools")        # the audit's own filter: a contract naming tools applies to those only
-            if isinstance(tools, list) and tools and str(name).lower() not in {str(item).lower() for item in tools}:
+            if isinstance(tools, list) and tools and not names & {str(item).lower() for item in tools}:
                 continue
             pattern = rule.get("regex") if rule.get("type") == "must_not" else rule.get("before_regex")
             if rule.get("type") == "must" and not pattern:
@@ -325,14 +337,14 @@ def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy"
                 # A typed contract stores no regex: it is derived from the guard (the same function the engine loads
                 # it with) and run on the contract engine, whose time limit a hook needs.
                 if _typed_match(rule["path_guard"], text):
-                    return str(rule.get("id"))
+                    return str(rule.get("id")), "must_not"
                 continue
             try:
                 judged = shellview.tool_view(text) if shellview is not None and shellview.targets_command(rule) else text
                 if not pattern or re.search(pattern, judged, re.IGNORECASE | re.MULTILINE):
-                    return str(rule.get("id"))
+                    return str(rule.get("id")), str(rule.get("type"))
             except re.error:
-                return str(rule.get("id"))
+                return str(rule.get("id")), str(rule.get("type"))
     except Exception:
         return None
     return None

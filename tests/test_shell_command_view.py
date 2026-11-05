@@ -68,6 +68,16 @@ RUN = {
     "sh reading a dash": f"sh - <<'EOF'\n{GATED}\nEOF",
     "bash reading /dev/stdin": f"bash /dev/stdin <<'EOF'\n{GATED}\nEOF",
     "bash with a long option and stdin": f"bash --noprofile <<'EOF'\n{GATED}\nEOF",
+    "node with the code attached to the flag": f"node --eval=\"require('child_process').execSync('{GATED}')\"",
+    "python with clustered flags": f"python3 -uc \"import os; os.system('{GATED}')\"",
+    "perl with clustered flags": f"perl -le 'system(\"{GATED}\")'",
+    "bash with an option that takes an argument": f"bash -O extglob -c '{GATED}'",
+    "script on stdin with positional arguments": f"echo '{GATED}' | bash -s arg1",
+    "shell in the middle of a pipeline": f"echo '{GATED}' | bash | cat",
+    "heredoc into a shell in the middle of a pipeline": f"cat <<'EOF' | bash | tee out.log\n{GATED}\nEOF",
+    "double-quoted expansion with quotes inside, then a command": f"echo \"${{a:-'\"'}}\" && {GATED} && echo done",
+    "ANSI-C quoting inside a substitution, then a command": f"echo \"$(echo $'\\')' && {GATED})\"",
+    "parameter expansion with a parenthesis inside a substitution": f"echo \"$(echo ${{x%)*}} && {GATED})\"",
     "while loop body": f"while true; do {GATED}; done",
 }
 
@@ -113,6 +123,27 @@ def test_a_here_document_that_never_ends_is_not_guessed_at_the_command_is_return
 
 def test_a_here_document_opened_on_the_last_line_has_no_body_and_is_fine():
     assert command_view("cat <<EOF") == "cat <<EOF"
+
+
+@pytest.mark.parametrize("command", [
+    'gh "pr" "create"', "gh 'pr' 'create'", '"gh" pr create', "cd \"/mnt/some/dir\" && git -C '/p' push origin main",
+    'tool --flag="value" --other=\'x\'',
+])
+def test_a_quoted_word_the_shell_reads_as_if_it_were_unquoted_is_left_as_written(command):
+    assert command_view(command) == command
+
+
+def test_what_is_piped_into_xargs_becomes_words_of_a_command():
+    assert "pr create" in command_view("echo 'pr create' | xargs gh")
+    assert "pr create" not in command_view("echo 'pr create' | wc -c")
+
+
+def test_a_typed_path_contract_is_matched_against_the_whole_text_even_with_a_shell_tool():
+    from self_directing_mcp.schemas import ContractRule
+    rule = ContractRule(id="p", type="must_not", tools=["Bash"], scope="tool_call", path_guard={"paths": ["**/.env"]})
+    assert not targets_command(rule)
+    assert targets_command(ContractRule(id="p", type="must_not", tools=["Bash"], scope="tool_call",
+                                        path_guard={"paths": ["**/.env"]}, target="command"))
 
 
 def test_nesting_deeper_than_the_interpreter_allows_is_returned_unchanged_not_raised():

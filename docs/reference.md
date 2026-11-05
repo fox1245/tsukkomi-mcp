@@ -485,6 +485,7 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_EMBEDDING_MODEL`, `SELF_DIRECT_EMBEDDING_DIM`, `SELF_DIRECT_EMBEDDING_BASE_URL` | `qwen/qwen3-embedding-8b`, `1024`, `https://openrouter.ai/api/v1` | Embedding model, dimension and endpoint. |
 | `SELF_DIRECT_LOCK_WAIT_TIMEOUT_SEC` | `1` | Combined process/file writer-lease wait. |
 | `SELF_DIRECT_AUDIT_TIMEOUT_SEC` | `8` | Response budget for audits and hooks. |
+| `SELF_DIRECT_AUDIT_FOLD_BUDGET_SEC` | `60` | The most one fold of stored events into the incremental monitors may spend in contract patterns, in seconds, however many monitors it feeds (it is never less than 2 s per monitor). A monitor that is built from nothing, after a contract change or an evaluator upgrade, reads the whole history; a budget that is too small drops it every time and the audit falls back to the full evaluator on every Stop. |
 | `SELF_DIRECT_REQUEST_TIMEOUT_SEC` | `45` | Response budget for ordinary calls. |
 | `SELF_DIRECT_GRAPH_UPDATE_TIMEOUT_SEC` | `300` | Budget for `run_neograph_update`. |
 | `SELF_DIRECT_GRAPH_EXTRACTOR` | `openrouter` | Who extracts for `run_neograph_update`: `openrouter` (an OpenRouter model) or `host`, which disables that tool (`extractor_disabled`; the key and the network are not touched). `graph_next_batch` and `graph_submit_batch` work with either value, also with `SELF_DIRECT_LOCAL_ONLY=true`. An unknown value is an error. See [Host-side GraphRAG extraction](#host-side-graphrag-extraction). |

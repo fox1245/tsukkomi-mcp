@@ -1722,7 +1722,8 @@ class SelfDirectEngine:
                                     needs=needs, link_calls=link_calls, shadow_every=every, force_full=force_full,
                                     report=report, premise_rules=premise_rules, force=force, idle=idle,
                                     cost_key=cost_key, defer=self._shadow_worker is not None and not idle,
-                                    foreign=foreign_anchors, hook=self.defer_comparisons)
+                                    foreign=foreign_anchors, hook=self.defer_comparisons,
+                                    fold_budget=self.settings.audit_fold_budget_sec)
                             except (RequestStopped, IndexBusy):
                                 raise
                             except Exception as exc:  # the cache could not even be read: evaluate everything in full
@@ -1813,7 +1814,10 @@ class SelfDirectEngine:
                         report["shadow_skipped"] = "reference_regex_timeout"
                         report["regex_timeout"] = timed_out
                         for contract_id in timed_out:
-                            if contract_id in plan.monitors:
+                            if contract_id in plan.monitors and not idle:
+                                # The idle comparison only verifies; its answer is thrown away, so a contract it cannot
+                                # compare keeps the state it has (dropping it would make the next request rebuild it, and
+                                # the next comparison drop it again).
                                 plan.monitors[contract_id].timed_out = True
                                 plan.timeouts.add(contract_id)
                         report["shadow"] = False
@@ -1845,6 +1849,14 @@ class SelfDirectEngine:
                     # turned clean (a missed one), a high-risk contract whose summary changed.
                     late = plan.late_reasons(result, request_key, applies)
                     wanted = {reason: ids for reason, ids in late.items() if ids and not plan.comparison.covers(ids)}
+                    if wanted and self.defer_comparisons and planned is None and not idle and every != 1:
+                        # A hook's audit of the history gates nothing but a completion obligation that may resume the
+                        # agent (``auto_continue``); for every other contract the answer is a note, so its comparison
+                        # goes to the detached verifier, which compares the latest state of the session at its own pace.
+                        gating = {rule.id for rule in active if rule.auto_continue and rule.type == "must"}
+                        if set().union(*wanted.values()) - gating:
+                            report["shadow_skipped"] = incremental.VERIFIER_SKIP
+                        wanted = {reason: ids & gating for reason, ids in wanted.items() if ids & gating}
                     if wanted and plan.schedule is not None and not idle:
                         wanted_ids = set().union(*wanted.values())
                         if shadow_policy.memo_covers(plan.schedule, plan.state_key(), request_key, result, wanted_ids):

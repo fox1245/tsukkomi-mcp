@@ -98,6 +98,12 @@ def _close_quote(src: str, i: int, quote: str) -> int:
                 return -1
             j = nested
             continue
+        if quote == '"' and c == "$" and src[j + 1:j + 2] == "{":
+            nested = _close_brace(src, j + 1)
+            if nested < 0:
+                return -1
+            j = nested
+            continue
         if quote == '"' and c == "`":
             nested = _close_quote(src, j, "`")
             if nested < 0:
@@ -117,6 +123,19 @@ def _close_paren(src: str, i: int) -> int:
         c = src[j]
         if c == "\\":
             j += 2
+            continue
+        if c == "$" and src[j + 1:j + 2] == "'":                       # $'...' honours backslash escapes
+            k = j + 2
+            while k < n and src[k] != "'":
+                k += 2 if src[k] == "\\" else 1
+            if k >= n:
+                return -1
+            j = k + 1
+            continue
+        if c == "$" and src[j + 1:j + 2] == "{":
+            j = _close_brace(src, j + 1)
+            if j < 0:
+                return -1
             continue
         if c in "'\"`":
             j = _close_quote(src, j, c)
@@ -374,6 +393,16 @@ def _parse(src: str) -> tuple[list[_Command], list[tuple[int, int]]] | None:
 
 # ------------------------------------------------------------------------------------------------------ planning
 
+# A quoted word made only of these characters is read by the shell exactly as it would be unquoted (``gh "pr" "create"``,
+# ``cd "/some/dir"``, ``--flag="value"``): quote removal changes nothing, so it is a command word or a plain argument and
+# stays in the view. Anything else (spaces, pattern or shell metacharacters, expansions) is text passed along.
+_PLAIN = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:=@+-~%,")
+
+
+def _plain(raw: str) -> bool:
+    return all(ch in _PLAIN for ch in raw)
+
+
 def _word_text(src: str, word: _Word) -> str:
     """The text a shell would read the word as, for deciding which program it names (quotes removed, no expansion)."""
     out = []
@@ -450,15 +479,20 @@ class _Plan:
         shells = set(sem["shells"])
         interpreters = {name: [flag.lower() for flag in flags] for name, flags in sem["interpreters"].items()}
         carriers = set(sem["string_carriers"])
+        stdin_carriers = set(sem.get("stdin_carriers", ()))
+        option_arguments = tuple(sem.get("shell_option_arguments", ("-o", "+o")))
         for index in range(first, len(texts)):
             program = _program(texts[index])
+            if program in stdin_carriers:
+                self.stdin_kind = self.stdin_kind or "code"        # what is piped into it becomes words of a command
             if program in carriers:
                 self.shell_words.update(w for w in range(index + 1, len(texts)) if _quoted(cmd.words[w]))
                 if program == "eval":
                     self.shell_words.update(range(index + 1, len(texts)))
             if program in shells or program in interpreters:
                 is_shell = program in shells
-                script = self._script_word(texts, index, is_shell, ["-c"] if is_shell else interpreters[program])
+                script = self._script_word(texts, index, is_shell, ["-c"] if is_shell else interpreters[program],
+                                           option_arguments)
                 if script is not None:
                     (self.shell_words if is_shell else self.code_words).add(script)
                 elif self._reads_stdin(texts, cmd, index, is_shell):
@@ -482,8 +516,10 @@ class _Plan:
         return is_shell and any(o[1:2] != "-" and "s" in o[1:] for o in options)
 
     @staticmethod
-    def _script_word(texts, index, is_shell, flags):
+    def _script_word(texts, index, is_shell, flags, option_arguments=("-o", "+o")):
+        """Index of the word that holds the inline script or code of a shell or interpreter, or None."""
         position = index + 1
+        letters = {flag[1] for flag in flags if len(flag) == 2 and flag.startswith("-")}
         while position < len(texts):
             option = texts[position]
             if is_shell:
@@ -491,11 +527,16 @@ class _Plan:
                     return None                  # a script file or another operand: nothing inline
                 if len(option) > 1 and option[1] != "-" and "c" in option[1:]:
                     return position + 1 if position + 1 < len(texts) else None
-                position += 2 if option in ("-o", "+o") else 1
+                position += 2 if option in option_arguments else 1
             else:
                 lowered = option.lower()
-                if lowered in flags or (lowered.startswith("--") and lowered.split("=")[0] in flags and "=" in lowered):
+                name, equals, _value = lowered.partition("=")
+                if lowered in flags:
                     return position + 1 if position + 1 < len(texts) else None
+                if equals and name.startswith("--") and name in flags:
+                    return position                  # ``--eval="code"``: the code is part of this word
+                if len(option) > 2 and option[0] == "-" and option[1] != "-" and letters & set(option[1:]):
+                    return position + 1 if position + 1 < len(texts) else None      # ``python -uc "code"``
                 if not option.startswith("-"):
                     return None
                 position += 1
@@ -527,8 +568,9 @@ def _view(src: str, depth: int, sem: dict) -> str:
         end = start
         while end < len(cmds) - 1 and cmds[end].op in ("|", "|&"):
             end += 1
-        if plans[end].stdin_kind is not None and end > start:
-            feeds[start:end] = [True] * (end - start)
+        readers = [k for k in range(start, end + 1) if plans[k].stdin_kind is not None]
+        if readers and readers[-1] > start:
+            feeds[start:readers[-1]] = [True] * (readers[-1] - start)
         start = end + 1
     for cmd, plan, fed in zip(cmds, plans, feeds):
         for number, word in enumerate(cmd.words):
@@ -538,8 +580,8 @@ def _view(src: str, depth: int, sem: dict) -> str:
                                   _view(src[part.inner_start:part.inner_end], depth + 1, sem)))
                 elif part.kind in ("single", "double", "ansi"):
                     raw = src[part.inner_start:part.inner_end]
-                    if number in plan.code_words or fed:
-                        continue                                      # code or a script's input: kept as it is
+                    if number in plan.code_words or fed or _plain(raw):
+                        continue                                      # code, a script's input or a plain word: kept
                     if number in plan.shell_words:
                         edits.append((part.inner_start, part.inner_end,
                                       _view(_unquote(raw, part.kind), depth + 1, sem)))
@@ -591,6 +633,8 @@ def targets_command(rule: Any) -> bool:
     target = get("target")
     if target is not None:
         return target == "command"
+    if get("path_guard") is not None:
+        return False                      # a typed path contract reads paths wherever they are written, quoted or not
     tools = get("tools")
     shell = {name.lower() for name in shell_tools()}
     return bool(tools) and all(str(tool).lower() in shell for tool in tools)
