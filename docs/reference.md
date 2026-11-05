@@ -846,7 +846,7 @@ evaluation, which remains the reference. The audit still runs through the native
     `N` about one audit in `N` (`16` was the previous default). `audit_status` reports the policy, the schedule of a session
     (`rate`, `streak`, `forced_comparisons_left`, `last_match_*`, `reset_reason`), the contracts whose incremental path is switched off and
     the ranges that need review under `incremental_verification`.
-  - **Idle comparison (resident engines only).** The daemon's engines and the stdio MCP server (never a hook process) compare the latest state of a
+  - **Idle comparison (resident engines, and the detached verifier of a command hook).** The daemon's engines and the stdio MCP server compare the latest state of a
     session with a full evaluation once the engine has been idle for `SELF_DIRECT_AUDIT_SHADOW_IDLE_SEC` seconds (default 2; `0` switches
     it off), if the session answered requests without a full comparison since its last match (a comparison skipped for lack of time is such a
     request, `"deferred"`), or if an audit of it was cut by its deadline before its monitor states existed: the job audits the session with the budget of
@@ -868,8 +868,8 @@ evaluation, which remains the reference. The audit still runs through the native
     then answered `index_busy`, which a hook treats as unknown. It does not retroactively guarantee earlier responses: a match says
     the latest state agrees with the full evaluator, nothing about the answers given before it.
   - **What this does not promise.** Not every response equals the full evaluation. An answer that is wrongly **clean** passes between
-    two comparisons unnoticed; a violation, a violation that turns clean and a high-risk contract are checked in the request that
-    carries them, a silent miss is not. Fault injection (`scripts/measure_shadow_detection.py`: a monitor that ignores forbidden
+    two comparisons unnoticed; in a resident engine a violation, a violation that turns clean and a high-risk contract are checked in the request that
+    carries them (a command hook checks in the request only what a block or a refusal rests on: the proposed action's violation, a high-risk contract that applies to it and an `auto_continue` obligation; the other comparisons go to the detached verifier, see below), a silent miss is not. Fault injection (`scripts/measure_shadow_detection.py`: a monitor that ignores forbidden
     events, in a synthetic Codex session with five contracts; requests counted from the one that carries the violation,
     1 = noticed in it) gives, as median / p95 / max requests until the defect was noticed (the wrong answers returned before that
     are one fewer). Engine runs use 200 seeds; `--simulate` plays the schedule alone for 20,000 draws, which is what the tails need:
@@ -911,9 +911,18 @@ evaluation, which remains the reference. The audit still runs through the native
   the old digest are rebuilt and never reused.
 - **With contract time limits.** Contract patterns run on the time-limited engine. A monitor whose pattern times out
   takes no more events and is dropped for that run; its contract is judged (`unknown`, never `clean`) by the full
-  evaluator, its stored state is deleted and nothing is marked unhealthy. When a shadow run's full evaluation itself
-  times out for a contract, the full (`unknown`) answer is returned, the contract's state is dropped, and it is reported as
-  `incremental.shadow_skipped: "reference_regex_timeout"`, not as a mismatch.
+  evaluator, its stored state is deleted and nothing is marked unhealthy. The fold of the stored events into the monitors has its own
+  budget (`SELF_DIRECT_AUDIT_FOLD_BUDGET_SEC`, never less than 2 s per monitor), because a monitor built from the whole history needs more than
+  one delta does. When a shadow run's full evaluation itself times out for a contract, the full (`unknown`) answer is returned, the contract's
+  state is dropped, and it is reported as `incremental.shadow_skipped: "reference_regex_timeout"`, not as a mismatch; the idle comparison, which
+  only verifies, keeps the state of a contract it cannot compare.
+- **Command hooks and the detached verifier.** A hook process answers one event and exits, so its engine (`defer_comparisons`) does not wait for the
+  comparison that the schedule planned (warm-up, rebuild, sampled): the report says `shadow_skipped: "verifier"`, no reference events are read, and
+  the hook starts `python -m self_directing_mcp.verify_job` detached, one at a time per index (a lock file next to the index, and a hook does not start a
+  second while one runs), which compares the latest state of the session like an idle comparison and gives up after `SELF_DIRECT_REQUEST_TIMEOUT_SEC`.
+  A comparison that the answer of a proposed action rests on, one that a high-risk contract that applies to the action needs, one that can gate a
+  Stop (an `auto_continue` obligation), and every comparison under `SELF_DIRECT_AUDIT_SHADOW_EVERY=1` still run in the request. A hook waits for the
+  index lease as long as `SELF_DIRECT_AUDIT_TIMEOUT_SEC` (the verifier holds it while it reads the events). Systems without `fcntl` keep their comparisons in the request.
 - **What it does not do.** It does not make an unknown clean and does not change coverage: unread bytes, parse errors,
   unsupported events and rewrites are judged by the unchanged ingestion and coverage code, and a state describes the index,
   not the source file. The source verification (hashing) that precedes every audit is a separate cost; see
