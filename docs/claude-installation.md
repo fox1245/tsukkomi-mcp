@@ -249,7 +249,7 @@ The hooks follow the same rule. `UserPromptSubmit` fires for typed prompts and a
 
 The default projects root is `~/.claude/projects`. When `CLAUDE_CONFIG_DIR` is set in the process environment, the default becomes `$CLAUDE_CONFIG_DIR/projects`. The precedence is `SELF_DIRECT_CLAUDE_PROJECTS_DIR`, then the TOML key `claude_projects_dir`, then that default. The hook processes and the MCP server inherit Claude Code's environment, but verify that both resolve to the same root.
 
-A transcript is accepted only if it is an absolute path without `..`, inside the configured root, in one of the two official layouts above, with no symlink or junction below the root. Anything else is an error: for a hook that means a fail-open warning, so a wrong root shows up as repeated `check_failed` health entries and then the banner.
+A transcript is accepted only if it is an absolute path without `..`, inside the configured root, in one of the two official layouts above, with no symlink or junction below the root. One exception: the project directory itself (the first component below the root) may be a link when it resolves to an existing real directory that is a direct child of the root; the link must be a single hop (a chain is refused) and the transcript is then read from, and reported at, that real directory, and a link to the root, to a directory outside it, to a directory deeper down or to nothing is refused, as is any link below the project directory. Anything else is an error: for a hook that means a fail-open warning, so a wrong root shows up as repeated `check_failed` health entries and then the banner.
 
 ---
 
