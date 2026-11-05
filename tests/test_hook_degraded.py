@@ -95,3 +95,25 @@ def test_a_path_error_on_every_call_of_a_session_refuses_the_gated_ones_and_is_n
     answers = [_call(engine, path, GATED if n % 2 else "echo ok") for n in range(6)]
     assert [permission(a) for a in answers] == ["none", "deny", "none", "deny", "none", "deny"]
     assert sum("systemMessage" in a for a in answers) == 1
+
+
+def test_a_high_risk_prerequisite_is_asked_not_refused_because_history_may_already_satisfy_it(env, monkeypatch):
+    engine, path = env
+    engine.upsert_contracts([{"id": "tests-first", "type": "must", "scope": "tool_call", "provider": "claude",
+                              "before_regex": "git push", "regex": "pytest", "risk": "high"}])
+    monkeypatch.setattr(claude_hooks, "handle_pre_tool_use", _raising)
+    response = _call(engine, path, "git push origin x")
+    assert permission(response) == "ask" and "tests-first" in response["hookSpecificOutput"]["permissionDecisionReason"]
+    assert permission(_call(engine, path, "ls")) == "none"
+
+
+def test_the_tools_filter_knows_the_canonical_tool_name_of_a_grok_call(tmp_path):
+    import json
+    from self_directing_mcp.agy_hook_state import high_risk_hit
+    contracts = {"contracts": [{"id": "gate", "type": "must_not", "scope": "tool_call", "regex": "git push --force",
+                                "risk": "high", "tools": ["Bash"], "provider": "grok"}]}
+    path = tmp_path / "contracts.json"
+    path.write_text(json.dumps(contracts), encoding="utf-8")
+    call = {"name": "run_terminal_command", "args": {"command": GATED}}
+    assert high_risk_hit(path, "s", call, provider="grok") == ("gate", "must_not")
+    assert high_risk_hit(path, "s", {"name": "read_file", "args": {"path": GATED}}, provider="grok") is None
