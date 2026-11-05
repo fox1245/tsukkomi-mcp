@@ -217,8 +217,9 @@ def miss_key(misses: list, prefix: str = "") -> str:
 def checkpoint(engine: SelfDirectEngine, provider: str, session_id: str, path: str, obligations: dict,
                label: str) -> tuple[list[str], list]:
     """Refresh history and gather ``(notes, confirmed_misses)`` for a Stop checkpoint. Notes never block."""
+    # The audit below verifies the whole source in full (a restart rests on that); this sync only takes in new records.
     synced = engine.sync_session(session_id=session_id, provider=provider, path=path, embed=False,
-                                 derived=wants_derived_work(engine))
+                                 derived=wants_derived_work(engine), verify="fast")
     notes = []
     coverage = synced.get("coverage", {})
     # Records the host is still appending are judged next time; any other gap leaves completion unverified.
