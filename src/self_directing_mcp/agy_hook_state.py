@@ -310,6 +310,9 @@ def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy"
                     or rule.get("scope", "any") not in ("tool_call", "any")
                     or "assistant" not in (rule.get("roles") or ["assistant"])):
                 continue
+            tools = rule.get("tools")        # the audit's own filter: a contract naming tools applies to those only
+            if isinstance(tools, list) and tools and str(name).lower() not in {str(item).lower() for item in tools}:
+                continue
             pattern = rule.get("regex") if rule.get("type") == "must_not" else rule.get("before_regex")
             if rule.get("type") == "must" and not pattern:
                 continue                      # a completion obligation does not gate actions

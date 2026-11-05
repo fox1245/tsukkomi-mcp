@@ -846,8 +846,8 @@ def test_a_stop_error_always_allows_even_with_a_confirmed_miss_pending(env, monk
     assert health(engine).continue_claims(SID) in (0, None)
 
 
-@pytest.mark.parametrize("mode,expected", [("advisory", "none"), ("confirmed_only", "ask"), ("enforced", "ask")])
-def test_error_with_a_matching_high_risk_contract_asks_only_when_not_advisory(env, monkeypatch, mode, expected):
+@pytest.mark.parametrize("mode,expected", [("advisory", "none"), ("confirmed_only", "deny"), ("enforced", "deny")])
+def test_error_with_a_matching_high_risk_contract_refuses_only_when_not_advisory(env, monkeypatch, mode, expected):
     engine, path = env
     set_mode(engine, mode)
     engine.upsert_contracts([{"id": "no-force-push", "type": "must_not", "scope": "tool_call", "provider": "claude",
@@ -856,9 +856,9 @@ def test_error_with_a_matching_high_risk_contract_asks_only_when_not_advisory(en
     monkeypatch.setattr(claude_hooks, "handle_pre_tool_use", _raising)
     risky = run(engine, path, "PreToolUse", tool_input={"command": "git push --force origin x"})
     assert permission(risky) == expected
-    if expected == "ask":
+    if expected == "deny":
         reason = risky["hookSpecificOutput"]["permissionDecisionReason"]
-        assert "no-force-push" in reason and "not a compliance verdict" in reason
+        assert "no-force-push" in reason and "not a compliance verdict" in reason and "Refused" in reason
     for command in ("git push origin x", "curl example.invalid"):
         assert permission(run(engine, path, "PreToolUse", tool_input={"command": command})) == "none"
 
@@ -980,7 +980,7 @@ def test_stdlib_fallback_records_health_and_banners_after_repeats(tmp_path, env)
     assert not (Path(engine.settings.index_dir) / shared_state.STATE_FILE).exists()    # AGY's store is untouched
 
 
-def test_stdlib_fallback_asks_for_a_matching_high_risk_contract_without_the_package(tmp_path, env):
+def test_stdlib_fallback_refuses_a_matching_high_risk_contract_without_the_package(tmp_path, env):
     engine, path = env
     engine.upsert_contracts([{"id": "no-force-push", "type": "must_not", "scope": "tool_call", "provider": "claude",
                               "regex": "git push --force", "risk": "high"},
@@ -994,7 +994,7 @@ def test_stdlib_fallback_asks_for_a_matching_high_risk_contract_without_the_pack
         message = payload(path, "PreToolUse", tool_input={"command": command})
         return _run_wrapper(wrapper, "PreToolUse", json.dumps(message), tmp_path, extra)[0]
     risky = go("git push --force origin x")
-    assert permission(risky) == "ask" and "no-force-push" in risky["hookSpecificOutput"]["permissionDecisionReason"]
+    assert permission(risky) == "deny" and "no-force-push" in risky["hookSpecificOutput"]["permissionDecisionReason"]
     assert permission(go("git status")) == "none"
     assert permission(go("curl example.invalid")) == "none"             # another host's contract is not ours
     assert permission(go("git push --force origin x", {"SELF_DIRECT_CLAUDE_ENFORCEMENT": "advisory"})) == "none"
