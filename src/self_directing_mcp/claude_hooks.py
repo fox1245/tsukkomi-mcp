@@ -363,6 +363,11 @@ def _new_engine():
         raise HookRuntimeError("settings or engine unavailable") from exc
     # This process answers one event and exits: the shadow comparisons its audits plan are left to a detached verifier.
     engine.defer_comparisons = verify_job.supported()
+    # A hook has the response budget of an audit (``audit_timeout_sec``) to get the index: waiting for the lease that the
+    # detached verifier or another hook holds for a moment is better than answering "index busy", which is an unverified
+    # call (and a refusal when a high-risk contract applies).
+    settings = engine.settings
+    settings.lock_wait_timeout_sec = max(settings.lock_wait_timeout_sec, settings.audit_timeout_sec)
     return engine
 
 
@@ -377,7 +382,7 @@ def spawn_verifier(engine: SelfDirectEngine) -> None:
     if pending and verify_job.running(engine.settings.index_dir):
         return                 # one verifier at a time per index; the next hook starts another when this one is done
     for (provider, session_id), path in pending.items():
-        argv = [sys.executable, "-m", "self_directing_mcp.verify_job", "--provider", provider,
+        argv = [sys.executable, "-I", "-m", "self_directing_mcp.verify_job", "--provider", provider,
                 "--session-id", session_id, "--index-dir", str(engine.settings.index_dir)]
         if path:
             argv += ["--path", path]

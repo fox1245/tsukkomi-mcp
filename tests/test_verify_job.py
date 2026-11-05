@@ -175,7 +175,7 @@ def test_the_hook_starts_the_verifier_detached_after_it_has_answered(env, monkey
     assert "decision" not in response                                  # the answer did not wait for any comparison
     assert len(started) == 1
     argv, kwargs = started[0]
-    assert argv[1:4] == ["-m", "self_directing_mcp.verify_job", "--provider"] and "claude" in argv and SID in argv
+    assert argv[1:5] == ["-I", "-m", "self_directing_mcp.verify_job", "--provider"] and "claude" in argv and SID in argv
     assert argv[argv.index("--index-dir") + 1] == str(engine.settings.index_dir)
     assert kwargs["start_new_session"] is True and kwargs["stdout"] is subprocess.DEVNULL
     assert engine.deferred_comparisons == {}
@@ -227,3 +227,36 @@ def test_the_verifier_entry_point_reports_only_the_error_class(env, monkeypatch,
     assert verify_job.main(["--provider", "claude", "--session-id", SID, "--index-dir", str(engine.settings.index_dir)]) == 1
     captured = capsys.readouterr()
     assert captured.err.strip() == "RuntimeError" and "SENTINEL" not in captured.out + captured.err
+
+
+def test_a_hook_waits_for_the_index_as_long_as_its_audit_budget_instead_of_answering_busy(env):
+    import threading
+    import time
+    from self_directing_mcp.claude_hooks import _new_engine
+    from self_directing_mcp.request_control import IndexBusy
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    hook = _new_engine()
+    try:
+        assert hook.settings.lock_wait_timeout_sec >= hook.settings.audit_timeout_sec
+        hook.settings.audit_timeout_sec = 30.0
+        hook.settings.lock_wait_timeout_sec = 30.0               # what the hook engine derives from its budget
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with engine._publication_guard():                    # the lease another process (a verifier) holds
+                held.set()
+                release.wait(10)
+        thread = threading.Thread(target=hold)
+        thread.start()
+        held.wait(5)
+        threading.Timer(1.5, release.set).start()
+        started = time.monotonic()
+        result = hook.check_action(SID, {"tool_name": "Bash", "arguments": {"command": "echo hi"}}, provider="claude",
+                                   path=str(path))
+        assert result["ok"] is True and time.monotonic() - started >= 1.0       # it waited, longer than the old second
+        thread.join()
+    except IndexBusy:
+        raise AssertionError("the hook answered index busy instead of waiting for the lease")
+    finally:
+        hook.close()
