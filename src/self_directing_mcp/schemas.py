@@ -67,7 +67,7 @@ class ContractWhen(BaseModel):
 
 # Fields added after 1.0. They are omitted from serialized contracts while at their default so files written
 # by this version stay loadable by older processes (extra="forbid") and snapshots of unchanged contracts hold.
-_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None, "origin": None, "path_guard": None, "mode": "enforced", "tools": None}
+_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None, "origin": None, "path_guard": None, "mode": "enforced", "tools": None, "target": None}
 
 
 class ContractOrigin(BaseModel):
@@ -262,6 +262,15 @@ class ContractRule(BaseModel):
         default=None,
         description="Optional list of tool names (case-insensitive, e.g. ['Bash', 'run_command']) that a tool_call/any "
                     "contract applies to. Tool calls for other tools are ignored / not_applicable.",
+    )
+    target: Literal["command", "text"] | None = Field(
+        default=None,
+        description="What a tool_call/any contract is matched against for a shell tool. 'command' (the default for a "
+                    "contract whose tools are all shell tools, such as ['Bash']): the command positions of the parsed "
+                    "shell command, leaving here-document bodies, quoted arguments and comments out (a command a shell "
+                    "would run, never text that is only passed along; scripts given to bash -c, eval, ssh or an "
+                    "interpreter still count). 'text': the whole text of the call. Every other contract is matched "
+                    "against the whole text.",
     )
     cases: list[ContractCase] = Field(
         default_factory=list,

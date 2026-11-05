@@ -103,6 +103,7 @@ class Settings(SettingsAccessors, BaseSettings):
     seed_example_contracts: bool = False
     lock_wait_timeout_sec: float = Field(default=settings_core.DEFAULT_LOCK_WAIT_TIMEOUT_SEC, gt=0)
     audit_timeout_sec: float = Field(default=settings_core.DEFAULT_AUDIT_TIMEOUT_SEC, gt=0)
+    audit_fold_budget_sec: float = Field(default=settings_core.DEFAULT_AUDIT_FOLD_BUDGET_SEC, gt=0, allow_inf_nan=False)
     request_timeout_sec: float = Field(default=settings_core.DEFAULT_REQUEST_TIMEOUT_SEC, gt=0)
     graph_update_timeout_sec: float = Field(default=settings_core.DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC, gt=0,
                                             allow_inf_nan=False)

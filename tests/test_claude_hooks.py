@@ -277,7 +277,9 @@ def test_unknown_warning_is_delivered_at_user_prompt_submit_and_session_start_wh
     assert submit["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert "Unverified tool call allowed" in submit["hookSpecificOutput"]["additionalContext"]
     assert run(engine, path, "UserPromptSubmit") == {}
-    run(engine, path, "PreToolUse", tool_input={"command": "echo again"})
+    engine.upsert_contracts([{"id": "d", "type": "must_not", "provider": "claude", "regex": "echo",
+                              "applies_from_event_id": "not-in-this-session", "description": "another unverified rule"}])
+    run(engine, path, "PreToolUse", tool_input={"command": "echo again"})      # the set of notices changed
     start = run(engine, path, "SessionStart")
     assert "Unverified tool call allowed" in start["hookSpecificOutput"]["additionalContext"]
 
@@ -437,10 +439,13 @@ def test_stop_blocks_once_per_session_for_a_confirmed_auto_continue_obligation(e
     engine.upsert_contracts([ACK])
     first = stop(engine, path)
     assert first["decision"] == "block" and "ack" in first["reason"] and "hookSpecificOutput" not in first
+    again = stop(engine, path)
+    assert "decision" not in again                            # another turn: the budget is not reset
+    assert "budget" in again["systemMessage"].lower()         # said once: the situation does not change after that
     for _ in range(2):
-        again = stop(engine, path)
-        assert "decision" not in again                        # another turn: the budget is not reset
-    assert "budget" in stop(engine, path)["systemMessage"].lower()
+        later = stop(engine, path)
+        assert "decision" not in later
+        assert "budget" not in later["systemMessage"].lower() and "violation" in later["systemMessage"]   # a verdict stays
 
 
 def test_budget_survives_a_process_restart_and_is_per_session(env, tmp_path):
@@ -698,9 +703,11 @@ def test_contracts_scoped_to_the_parent_session_do_not_apply_to_a_subagent_trans
 def test_subagent_stop_without_a_locatable_transcript_allows_with_a_note(env):
     engine, path = env
     engine.upsert_contracts([ACK])
-    for extra in ({}, {"agent_id": AGENT_ID}):        # no ids at all / id of a transcript that does not exist
-        response = subagent_stop(engine, **extra)
-        assert "decision" not in response and "unavailable" in response["systemMessage"]
+    first, *rest = ({}, {"agent_id": AGENT_ID})       # no ids at all / id of a transcript that does not exist
+    response = subagent_stop(engine, **first)
+    assert "decision" not in response and "unavailable" in response["systemMessage"]
+    for extra in rest:                                # the same note is not repeated for the same session
+        assert subagent_stop(engine, **extra) == {}
     assert health(engine).health() == []               # not an error: older hosts send no subagent identifiers
 
 
@@ -839,8 +846,8 @@ def test_a_stop_error_always_allows_even_with_a_confirmed_miss_pending(env, monk
     assert health(engine).continue_claims(SID) in (0, None)
 
 
-@pytest.mark.parametrize("mode,expected", [("advisory", "none"), ("confirmed_only", "ask"), ("enforced", "ask")])
-def test_error_with_a_matching_high_risk_contract_asks_only_when_not_advisory(env, monkeypatch, mode, expected):
+@pytest.mark.parametrize("mode,expected", [("advisory", "none"), ("confirmed_only", "deny"), ("enforced", "deny")])
+def test_error_with_a_matching_high_risk_contract_refuses_only_when_not_advisory(env, monkeypatch, mode, expected):
     engine, path = env
     set_mode(engine, mode)
     engine.upsert_contracts([{"id": "no-force-push", "type": "must_not", "scope": "tool_call", "provider": "claude",
@@ -849,9 +856,9 @@ def test_error_with_a_matching_high_risk_contract_asks_only_when_not_advisory(en
     monkeypatch.setattr(claude_hooks, "handle_pre_tool_use", _raising)
     risky = run(engine, path, "PreToolUse", tool_input={"command": "git push --force origin x"})
     assert permission(risky) == expected
-    if expected == "ask":
+    if expected == "deny":
         reason = risky["hookSpecificOutput"]["permissionDecisionReason"]
-        assert "no-force-push" in reason and "not a compliance verdict" in reason
+        assert "no-force-push" in reason and "not a compliance verdict" in reason and "Refused" in reason
     for command in ("git push origin x", "curl example.invalid"):
         assert permission(run(engine, path, "PreToolUse", tool_input={"command": command})) == "none"
 
@@ -973,7 +980,7 @@ def test_stdlib_fallback_records_health_and_banners_after_repeats(tmp_path, env)
     assert not (Path(engine.settings.index_dir) / shared_state.STATE_FILE).exists()    # AGY's store is untouched
 
 
-def test_stdlib_fallback_asks_for_a_matching_high_risk_contract_without_the_package(tmp_path, env):
+def test_stdlib_fallback_refuses_a_matching_high_risk_contract_without_the_package(tmp_path, env):
     engine, path = env
     engine.upsert_contracts([{"id": "no-force-push", "type": "must_not", "scope": "tool_call", "provider": "claude",
                               "regex": "git push --force", "risk": "high"},
@@ -987,7 +994,7 @@ def test_stdlib_fallback_asks_for_a_matching_high_risk_contract_without_the_pack
         message = payload(path, "PreToolUse", tool_input={"command": command})
         return _run_wrapper(wrapper, "PreToolUse", json.dumps(message), tmp_path, extra)[0]
     risky = go("git push --force origin x")
-    assert permission(risky) == "ask" and "no-force-push" in risky["hookSpecificOutput"]["permissionDecisionReason"]
+    assert permission(risky) == "deny" and "no-force-push" in risky["hookSpecificOutput"]["permissionDecisionReason"]
     assert permission(go("git status")) == "none"
     assert permission(go("curl example.invalid")) == "none"             # another host's contract is not ours
     assert permission(go("git push --force origin x", {"SELF_DIRECT_CLAUDE_ENFORCEMENT": "advisory"})) == "none"

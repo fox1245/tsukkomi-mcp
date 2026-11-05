@@ -10,6 +10,7 @@ import time
 from typing import Protocol, runtime_checkable
 
 from self_directing_mcp import contract_paths
+from self_directing_mcp.audit import shellview
 from self_directing_mcp.audit.patterns import compile_contract
 from self_directing_mcp.schemas import ContractRule, ContractsDocument
 from self_directing_mcp.request_control import check_request, publication
@@ -111,6 +112,8 @@ def loosening_reasons(previous: ContractRule, new: ContractRule) -> list[str]:
         reasons.append("auto_continue removed")
     if previous.mode == "enforced" and new.mode != "enforced":
         reasons.append("mode changed to inject_only")
+    if shellview.targets_command(new) and not shellview.targets_command(previous):
+        reasons.append("matched against the command view of shell calls instead of the whole text (target)")
     if previous.tools is None and new.tools is not None:
         reasons.append("tools filter added")
     elif previous.tools is not None and new.tools is not None:

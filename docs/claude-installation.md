@@ -209,7 +209,7 @@ The hook always exits with code 0 and prints one JSON object. Exit code 2, which
 
 | Event | Response on error |
 |---|---|
-| `PreToolUse` | `systemMessage` with the warning and no decision. Only when the mode is not `advisory` and an enabled `risk: "high"` contract applies to the call (read with the standard library, without the package), the answer is `ask` instead. Unreadable contracts never ask or deny. |
+| `PreToolUse` | `systemMessage` with the warning and no decision. Only when the mode is not `advisory` and an enabled `risk: "high"` contract applies to the call (its trigger matches, its `tools` filter and its `target` honoured; read with the standard library, without the package), the call is **refused** (`deny`, naming the contract and the error class): the audit that would have judged it did not run. Unreadable contracts never deny. The warning is said once per session and event (the user at once, the model at the next `PostToolUse`); a refusal is said every time. |
 | `Stop`, `SubagentStop`, `PostToolUse`, `PostToolUseFailure` | `systemMessage` with the warning. |
 | `SessionStart`, `UserPromptSubmit` | Context stating `Contract context was not injected; do not claim compliance.` plus the warning and, when due, the banner. |
 

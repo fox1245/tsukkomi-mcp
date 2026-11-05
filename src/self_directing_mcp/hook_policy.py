@@ -35,6 +35,15 @@ class InfoNote(str):
     """A Stop note that reports something already settled (a refused call): information, not an unmet check."""
 
 
+class VerdictNote(str):
+    """A Stop note that reports a verdict (a violation or a suspicious finding), not a gap in the evidence. A verdict is
+    shown every time; the other notes describe a situation that stays the same until the evidence changes."""
+
+
+def verdict_note(finding_verdict: Any, text: str) -> str:
+    return VerdictNote(text) if finding_verdict in ("violation", "suspicious") else text
+
+
 def rejected_note(finding: dict) -> InfoNote:
     """What a Stop checkpoint says about calls the host refused: rejected proposals, never executed violations."""
     count = len(finding.get("proposals_rejected") or ())
@@ -208,8 +217,10 @@ def miss_key(misses: list, prefix: str = "") -> str:
 def checkpoint(engine: SelfDirectEngine, provider: str, session_id: str, path: str, obligations: dict,
                label: str) -> tuple[list[str], list]:
     """Refresh history and gather ``(notes, confirmed_misses)`` for a Stop checkpoint. Notes never block."""
+    # When contracts are audited below, that audit verifies the whole source in full (a restart rests on it) and this sync
+    # only takes in new records; with nothing to audit, this sync is the verification.
     synced = engine.sync_session(session_id=session_id, provider=provider, path=path, embed=False,
-                                 derived=wants_derived_work(engine))
+                                 derived=wants_derived_work(engine), verify="fast" if obligations["contracts"] else "full")
     notes = []
     coverage = synced.get("coverage", {})
     # Records the host is still appending are judged next time; any other gap leaves completion unverified.
@@ -223,9 +234,9 @@ def checkpoint(engine: SelfDirectEngine, provider: str, session_id: str, path: s
     if obligations["contracts"]:
         audit = engine.audit_session(session_id, provider=provider, path=path)
         if audit.get("ok") is not True or audit.get("verdict") != "clean":
-            notes.append("Contract checkpoint is " + str(audit.get("verdict", "unknown")) + ".")
-        notes.extend(f"[{f['contract_id']}] {short(f.get('reason', ''))}" for f in audit.get("findings", [])
-                     if f.get("verdict") != "clean")
+            notes.append(verdict_note(audit.get("verdict"), "Contract checkpoint is " + str(audit.get("verdict", "unknown")) + "."))
+        notes.extend(verdict_note(f.get("verdict"), f"[{f['contract_id']}] {short(f.get('reason', ''))}")
+                     for f in audit.get("findings", []) if f.get("verdict") != "clean")
         notes.extend(rejected_note(f) for f in audit.get("findings", []) if f.get("proposals_rejected"))
         misses = confirmed_misses(obligations, audit)
     return notes, misses

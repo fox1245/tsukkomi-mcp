@@ -15,6 +15,7 @@ from self_directing_mcp.audit.patterns import (
     compile_contract,
     contract_budget,
 )
+from self_directing_mcp.audit import shellview
 from self_directing_mcp.audit.runner import _eligible
 from self_directing_mcp.tool_payload import tool_call_parts
 from self_directing_mcp.schemas import AuditEvent, ContractCase, ContractRule
@@ -482,17 +483,19 @@ def evaluate_rule_on_event(rule: ContractRule, event: AuditEvent) -> tuple[bool,
     with _ensure_eval_budget():
         if not _eligible(event, rule):
             return False, "not_eligible"
+        # The text the audit matches: the command view of a shell call for a contract about commands.
+        text = shellview.tool_view(event.text) if shellview.targets_command(rule) else event.text
         if rule.before_regex and rule.type != "must":
             raise ValueError(f"before_regex is only supported on 'must' contracts (got {rule.type!r})")
         if rule.type == "must" and rule.before_regex:
             if rule.exception_regex:
                 exc_compiled = compile_contract(rule.exception_regex)
                 _require_non_nullable(exc_compiled, "exception_regex")
-                if _search_nonempty_at(exc_compiled, event.text, label="exception_regex") is not None:
+                if _search_nonempty_at(exc_compiled, text, label="exception_regex") is not None:
                     return False, "exception_matched"
             before_compiled = compile_contract(rule.before_regex)
             _require_non_nullable(before_compiled, "before_regex")
-            m_before = _search_nonempty_at(before_compiled, event.text, label="before_regex")
+            m_before = _search_nonempty_at(before_compiled, text, label="before_regex")
             before_hit = m_before is not None
             if not rule.regex:
                 if not before_hit:
@@ -500,7 +503,7 @@ def evaluate_rule_on_event(rule: ContractRule, event: AuditEvent) -> tuple[bool,
                 return True, "matched_before_regex"
             req_compiled = compile_contract(rule.regex)
             _require_non_nullable(req_compiled, "regex")
-            m_req = _search_nonempty_at(req_compiled, event.text, label="regex")
+            m_req = _search_nonempty_at(req_compiled, text, label="regex")
             req_hit = m_req is not None
             if req_hit and not before_hit:
                 return True, "matched"
@@ -508,24 +511,24 @@ def evaluate_rule_on_event(rule: ContractRule, event: AuditEvent) -> tuple[bool,
                 assert m_req is not None and m_before is not None
                 prev_end = 0
                 pos = 0
-                text_len = len(event.text)
+                text_len = len(text)
                 found_trigger = False
                 trigger_steps = 0
                 while pos <= text_len:
                     trigger_steps += 1
                     if trigger_steps > MAX_PREREQ_PROBES:
                         return False, "too_many_before_regex_triggers"
-                    m_tr = _search_nonempty_at(before_compiled, event.text, pos=pos, label="before_regex")
+                    m_tr = _search_nonempty_at(before_compiled, text, pos=pos, label="before_regex")
                     if m_tr is None:
                         break
                     found_trigger = True
                     t_start, t_end = m_tr.start(), m_tr.end()
-                    if not _segment_has_prerequisite(req_compiled, event.text, prev_end, t_start):
+                    if not _segment_has_prerequisite(req_compiled, text, prev_end, t_start):
                         return False, "matched_both_prerequisite_and_before_regex"
                     prev_end = t_end
                     pos = t_end
                 if not found_trigger:
-                    if not _segment_has_prerequisite(req_compiled, event.text, 0, m_before.start()):
+                    if not _segment_has_prerequisite(req_compiled, text, 0, m_before.start()):
                         return False, "matched_both_prerequisite_and_before_regex"
                 return True, "matched_prerequisite_before_trigger"
             if before_hit:
@@ -536,12 +539,12 @@ def evaluate_rule_on_event(rule: ContractRule, event: AuditEvent) -> tuple[bool,
             return False, "no_regex"
         compiled = compile_contract(pattern_text)
         _require_non_nullable(compiled, "regex")
-        if _search_nonempty_at(compiled, event.text, label="regex") is None:
+        if _search_nonempty_at(compiled, text, label="regex") is None:
             return False, "no_match"
         if rule.exception_regex:
             exc = compile_contract(rule.exception_regex)
             _require_non_nullable(exc, "exception_regex")
-            if _search_nonempty_at(exc, event.text, label="exception_regex") is not None:
+            if _search_nonempty_at(exc, text, label="exception_regex") is not None:
                 return False, "exception_matched"
         return True, "matched"
 

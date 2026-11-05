@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from self_directing_mcp.audit.patterns import compile_contract
+from self_directing_mcp.audit.patterns import compile_rule_pattern
 
 from self_directing_mcp.request_control import check_request
 
@@ -36,7 +36,7 @@ def when_state(rule, events) -> str:
     if rule.when is None:
         return MET
     try:
-        condition = compile_contract(rule.when.tool_call_regex)   # a timeout propagates to the contract's finding
+        condition = compile_rule_pattern(rule, rule.when.tool_call_regex)   # a timeout propagates to the contract's finding
     except re.error:
         return INVALID
     for event in events:

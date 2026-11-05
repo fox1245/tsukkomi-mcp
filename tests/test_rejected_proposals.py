@@ -209,7 +209,7 @@ def test_end_to_end_the_stop_note_tells_a_rejected_proposal_from_an_executed_vio
     session.append(bash("t2", "rm -rf /y"), tool_result("t2", "removed"))
     both = stop(session)["systemMessage"]
     assert "forbidden regex matched 1 event(s)" in both                       # the executed one is a violation
-    assert "rejected proposals, not executed violations" in both               # ...and the refused one is apart
+    assert "Rejected by the host" not in both                                   # the refusal was said at the first Stop and is unchanged
 
 
 def test_end_to_end_an_executed_rm_rf_is_a_violation_with_no_rejection_note(session):

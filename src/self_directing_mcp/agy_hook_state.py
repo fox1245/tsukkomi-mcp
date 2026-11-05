@@ -6,7 +6,7 @@ high-risk contracts after an import failure. It therefore imports nothing outsid
 from ``tool_payload`` (itself standard-library only, and the one builder of the tool-call text) and
 ``contract_paths`` (standard library only; it lowers a stored typed ``path_guard`` to its regex), which a copy of
 this module without its package does without: it then matches the unfiltered text, and a typed high-risk contract
-always asks, the more cautious sides.
+always matches (a Claude Code hook then refuses it, AGY asks), the more cautious sides.
 
 Persistent state lives in ``<index_dir>/agy-hook-state.sqlite``:
 
@@ -20,6 +20,7 @@ A hook must never fail because bookkeeping did, and an unreadable budget means "
 from __future__ import annotations
 
 from contextlib import closing
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,11 @@ except ImportError:   # a standalone copy next to a broken package: prose fields
     def tool_call_text(provider, tool_name, arguments, *, label="tool_call"):
         return f"[{label}:{tool_name}] " + (arguments if isinstance(arguments, str) else json.dumps(
             arguments, ensure_ascii=False, sort_keys=True))
+
+try:
+    from self_directing_mcp.audit import shellview     # standard library only: the command view contracts about commands match
+except ImportError:                                    # a standalone copy: the whole text is matched (asks more)
+    shellview = None
 
 try:
     from self_directing_mcp import contract_paths      # standard library only: lowers a typed ``path_guard`` to its regex
@@ -121,7 +127,12 @@ class HookState:
                     last_success_at REAL, PRIMARY KEY (kind, event));
                 CREATE TABLE IF NOT EXISTS pending_warnings (
                     conversation_id TEXT NOT NULL, text TEXT NOT NULL, created_at REAL NOT NULL,
-                    PRIMARY KEY (conversation_id, text));""")
+                    PRIMARY KEY (conversation_id, text));
+                CREATE TABLE IF NOT EXISTS verifier_state (
+                    session_key TEXT PRIMARY KEY, streak INTEGER NOT NULL, last_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS notice_state (
+                    conversation_id TEXT NOT NULL, kind TEXT NOT NULL, notice_key TEXT NOT NULL, shown_at REAL NOT NULL,
+                    PRIMARY KEY (conversation_id, kind));""")
         except BaseException:
             conn.close()
             raise
@@ -225,6 +236,64 @@ class HookState:
                 "Those checks are not being applied; do not claim compliance for them.")
         return "\n".join(lines) or None
 
+    # The detached verifier (``verify_job``): when a hook may start the next one for a session.
+    def verifier_ready(self, session_key: str, base: float, cap: float, now: float | None = None) -> bool:
+        """True when a verifier for ``session_key`` may be started: its last run compared the session, or it did not and
+        ``base`` seconds, doubled for every run in a row that could not compare, up to ``cap``, have passed since. An
+        unreadable state allows it (a hook is never held back by its bookkeeping)."""
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute("SELECT streak, last_at FROM verifier_state WHERE session_key=?", (session_key,)).fetchone()
+        except Exception:
+            return True
+        if row is None or row[0] <= 0:
+            return True
+        wait = min(base * (2 ** min(row[0] - 1, 30)), cap)
+        return (time.time() if now is None else now) - row[1] >= wait
+
+    def verifier_done(self, session_key: str, compared: bool, now: float | None = None) -> bool:
+        """Record how a verifier run for ``session_key`` ended: a comparison that ran clears the streak, anything else
+        (nothing to compare, out of time, an error) lengthens the wait before the next one."""
+        stamp = time.time() if now is None else now
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("INSERT INTO verifier_state VALUES (?,?,?) ON CONFLICT(session_key) DO UPDATE SET "
+                             "streak=CASE WHEN ? THEN 0 ELSE streak+1 END, last_at=excluded.last_at",
+                             (session_key, 0 if compared else 1, stamp, 1 if compared else 0))
+                conn.execute("COMMIT")
+            return True
+        except Exception:
+            return False
+
+    # Notices that carry no new information when repeated.
+    def claim_notice(self, conversation_id: str, kind: str, notice: str) -> bool:
+        """True when ``notice`` differs from the last one of this ``kind`` shown in this conversation (and records it).
+
+        A notice about an unchanged situation (the same unverifiable contracts, the same incomplete history) costs
+        the model tokens on every call and says nothing new after the first time. It is shown again only when its
+        text changes. Anything but a clean, recorded comparison answers True: when the state cannot be read the
+        notice is shown, never silently dropped. Verdicts (a denial, a violation) never go through this."""
+        key = hashlib.sha256(notice.encode("utf-8", "replace")).hexdigest()
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute("SELECT notice_key FROM notice_state WHERE conversation_id=? AND kind=?",
+                                       (conversation_id, kind)).fetchone()
+                    if row is not None and row[0] == key:
+                        conn.execute("ROLLBACK")
+                        return False
+                    conn.execute("INSERT OR REPLACE INTO notice_state VALUES (?,?,?,?)",
+                                 (conversation_id, kind, key, time.time()))
+                    conn.execute("COMMIT")
+                    return True
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+        except Exception:
+            return True
+
     # Warnings for the next PreInvocation (the host-supported injection channel).
     def queue_warning(self, conversation_id: str, text: str) -> bool:
         try:
@@ -262,21 +331,37 @@ def _stamp(epoch: float) -> str:
 # --- user-selected high-risk policy without the runtime ----------------------------------------------------
 
 def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy") -> str | None:
-    """Id of an enabled ``risk: high`` contract that applies to this call, or None.
+    """Id of an enabled ``risk: high`` contract that applies to this call, or None (see ``high_risk_hit``)."""
+    hit = high_risk_hit(contracts_path, session_id, tool_call, provider)
+    return hit[0] if hit else None
+
+
+def high_risk_hit(contracts_path, session_id, tool_call, provider: str = "agy") -> tuple[str, str] | None:
+    """``(id, type)`` of an enabled ``risk: high`` contract that applies to this call, or None.
 
     Reads the contracts file with ``json`` only. An unreadable file means "unknown", never a guess. A
-    high-risk contract with no usable pattern applies to every call, as it does in the audit itself.
+    high-risk contract with no usable pattern applies to every call, as it does in the audit itself. ``type`` says what
+    an unchecked match means: a ``must_not`` trigger is what the contract forbids, a ``must`` trigger only asks for a
+    prerequisite that history may already satisfy.
     """
     try:
         document = json.loads(Path(contracts_path).read_text(encoding="utf-8"))
         name, args = tool_call["name"], tool_call["args"]
         text = tool_call_text(provider, name, args)   # the text the audit matches: prose fields excluded
+        # The name the contract's ``tools`` filter is compared with: the host's own, and the one the text carries (Grok's
+        # calls are rendered with Claude Code's tool names), as the audit's ``_tool_matches`` does.
+        carried = text[1:].partition("]")[0].partition(":")[2].lower() if text.startswith("[") else ""
+        names = {str(name).lower()} | ({carried} if carried else set())
         sid = session_id.lower() if isinstance(session_id, str) else None
         for rule in document.get("contracts", []):
             if (not isinstance(rule, dict) or rule.get("enabled", True) is not True or rule.get("risk") != "high"
-                    or rule.get("provider") not in (None, provider) or rule.get("session_id") not in (None, sid)
+                    or rule.get("provider") not in (None, provider)
+                    or rule.get("session_id") not in (None, sid, session_id)
                     or rule.get("scope", "any") not in ("tool_call", "any")
                     or "assistant" not in (rule.get("roles") or ["assistant"])):
+                continue
+            tools = rule.get("tools")        # the audit's own filter: a contract naming tools applies to those only
+            if isinstance(tools, list) and tools and not names & {str(item).lower() for item in tools}:
                 continue
             pattern = rule.get("regex") if rule.get("type") == "must_not" else rule.get("before_regex")
             if rule.get("type") == "must" and not pattern:
@@ -285,13 +370,14 @@ def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy"
                 # A typed contract stores no regex: it is derived from the guard (the same function the engine loads
                 # it with) and run on the contract engine, whose time limit a hook needs.
                 if _typed_match(rule["path_guard"], text):
-                    return str(rule.get("id"))
+                    return str(rule.get("id")), "must_not"
                 continue
             try:
-                if not pattern or re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
-                    return str(rule.get("id"))
+                judged = shellview.tool_view(text) if shellview is not None and shellview.targets_command(rule) else text
+                if not pattern or re.search(pattern, judged, re.IGNORECASE | re.MULTILINE):
+                    return str(rule.get("id")), str(rule.get("type"))
             except re.error:
-                return str(rule.get("id"))
+                return str(rule.get("id")), str(rule.get("type"))
     except Exception:
         return None
     return None

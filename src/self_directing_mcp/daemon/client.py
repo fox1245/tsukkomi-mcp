@@ -14,8 +14,9 @@ fallback on the hot path:
    for ``PreToolUse`` / ``PostToolUse`` / ``UserPromptSubmit`` / ``PreInvocation``, ``AVAILABILITY_SLOW_SEC`` for
    ``Stop`` / ``SubagentStop`` / ``SessionStart``).
 3. Still unavailable, a dead daemon mid-request, ``queue_full``, ``version_mismatch``: the host's fail-open response
-   from ``claude_hook_state.fail_open`` / ``agy_hook_state.fail_open`` (never a deny; ``ask`` only when a matching
-   contract is marked ``risk: high``; a visible warning with the reason; the failure is recorded in ``hook_health``).
+   from ``claude_hook_state.fail_open`` / ``agy_hook_state.fail_open`` (no deny except for Claude Code, which refuses a call
+   that matches the trigger of a contract marked ``risk: high`` because the audit did not run, and AGY asks; a visible
+   warning with the reason; the failure is recorded in ``hook_health``).
 
 Guards. More than ``CRASH_LOOP_SPAWNS`` spawns within ``CRASH_LOOP_WINDOW_SEC`` (recorded in the runtime directory)
 stops spawning: the reason becomes ``daemon_unavailable:crash-loop`` and a warning is printed. A daemon started less

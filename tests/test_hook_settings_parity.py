@@ -234,7 +234,7 @@ FIELD_KINDS = {
     "use_fake_embedder": "bool", "local_only": "bool", "seed_example_contracts": "bool", "pgvector_hnsw": "bool",
     "embedding_dim": "int", "max_concurrent_calls": "int", "max_decompressed_session_bytes": "int", "rrf_k": "int",
     "retrieve_top_k": "int", "search_top_k": "int",
-    "lock_wait_timeout_sec": "float", "audit_timeout_sec": "float", "request_timeout_sec": "float",
+    "lock_wait_timeout_sec": "float", "audit_timeout_sec": "float", "audit_fold_budget_sec": "float", "request_timeout_sec": "float",
     "graph_update_timeout_sec": "float", "max_tool_timeout_sec": "float",
     "integrity_fast_recent_blocks": "int", "integrity_fast_sample_blocks": "int",
     "integrity_full_verify_interval_sec": "float", "integrity_background_verify": "bool",

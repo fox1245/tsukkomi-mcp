@@ -203,7 +203,7 @@ def test_when_the_daemon_cannot_start_the_hook_fails_open_within_its_budget(worl
 
 
 @pytest.mark.parametrize("host,expect_key", [("claude", "hookSpecificOutput"), ("agy", "decision")])
-def test_a_matching_high_risk_contract_asks_when_the_daemon_is_unavailable(world, runtime, failing_python, host,
+def test_a_matching_high_risk_contract_is_not_waved_through_when_the_daemon_is_unavailable(world, runtime, failing_python, host,
                                                                            expect_key):
     index = world.new_index("risk", [*CONTRACTS, HIGH_RISK])
     asked = world.hook(host, "PreToolUse", "deploy --prod", flag="on", index=index,
@@ -211,14 +211,17 @@ def test_a_matching_high_risk_contract_asks_when_the_daemon_is_unavailable(world
     response = asked.json
     decision = (response["hookSpecificOutput"]["permissionDecision"] if host == "claude" else response["decision"])
     reason = (response["hookSpecificOutput"]["permissionDecisionReason"] if host == "claude" else response["reason"])
-    assert decision == "ask" and "no-prod-deploy" in reason and "daemon_unavailable" in reason
+    # Claude Code refuses (the audit that would judge the action did not run); AGY still asks the user.
+    assert decision == ("deny" if host == "claude" else "ask") and "no-prod-deploy" in reason and "daemon_unavailable" in reason
     other = world.hook(host, "PreToolUse", "ls", flag="on", index=index, SELF_DIRECT_DAEMON_PYTHON=failing_python)
-    assert "ask" not in json.dumps(other.json) and "daemon_unavailable" in json.dumps(other.json)
+    # the degraded notice was said with the refusal; it is not repeated for the same session and event
+    assert "ask" not in json.dumps(other.json) and "deny" not in json.dumps(other.json)
     advisory = world.hook(host, "PreToolUse", "deploy --prod", flag="on", index=index,
                           SELF_DIRECT_DAEMON_PYTHON=failing_python,
                           **{"SELF_DIRECT_CLAUDE_ENFORCEMENT" if host == "claude" else "SELF_DIRECT_AGY_ENFORCEMENT":
                              "advisory"})
     assert "ask" not in json.dumps(advisory.json).replace("fail-open", "")        # advisory mode never asks
+    assert '"deny"' not in json.dumps(advisory.json)
 
 
 RUNNER = r"""
@@ -329,9 +332,11 @@ def test_more_than_three_spawns_in_five_minutes_stops_spawning_and_warns(world, 
     for run in runs[:4]:
         assert "crash-loop" not in run.stderr
     for run in runs[4:]:
-        assert "crash-loop" in run.stderr
-        assert "daemon_unavailable:crash-loop" in run.stdout and "fail-open" in run.stdout
+        assert "crash-loop" in run.stderr and "daemon_unavailable:crash-loop" in run.stderr
         assert run.ms < 1500
+    # The user is told once per session and event (the hook payload here is the same session each time).
+    assert "daemon_unavailable:crash-loop" in runs[4].stdout and "fail-open" in runs[4].stdout
+    assert all(run.stdout.strip() == "{}" for run in runs[5:])
     # Old entries age out: the window is five minutes.
     for record in spawns:
         record["t"] -= client.CRASH_LOOP_WINDOW_SEC + 5
@@ -348,7 +353,8 @@ def test_a_daemon_that_is_still_starting_is_waited_for_not_started_twice(world, 
     first = world.hook("claude", "PreToolUse", "ls", flag="on", index=index, **env)
     second = world.hook("claude", "PreToolUse", "ls", flag="on", index=index, **env)
     third = world.hook("agy", "PreToolUse", "ls", flag="on", index=index, **env)
-    assert all("daemon_unavailable" in r.stdout for r in (first, second, third))
+    assert "daemon_unavailable" in first.stdout and "daemon_unavailable" in third.stdout      # AGY keeps its own state
+    assert second.stdout.strip() == "{}"                  # the same notice for the same Claude Code session and event
     assert len(json.loads((runtime.dir / rundir.SPAWNS_NAME).read_text())) == 1     # one start, two waits
     runtime.kill_leftovers()
 

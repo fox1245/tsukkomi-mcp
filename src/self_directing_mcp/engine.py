@@ -58,19 +58,18 @@ from self_directing_mcp.index.ingest import (
     _provider_parser, capture_for_cursor, coverage_from_capture, get_session_progress, ingest_session,
 )
 from self_directing_mcp.audit.contract_testing import evaluate_contract_cases, merge_contract_cases
-from self_directing_mcp.audit.grants import (
-    apply_grants_to_finding,
-    create_grant_record,
-    extract_canonical_english_candidates,
-    grants_lock,
-    load_grants_doc,
-    parse_expires_in,
-    save_grants_doc,
-    session_grant_contract_ids,
-    validate_grant_action_tokens_and_rule,
-    verify_raw_anchor_approves_grant,
-    verify_user_anchor_approves_grant,
-)
+
+
+class _LazyGrants:
+    """The grant machinery (``audit.grants``: about 100 compiled patterns, 30 ms to import) is needed only when a
+    grants file exists or ``grant_once`` runs; a hook process that has no grants never imports it."""
+
+    def __getattr__(self, name):
+        from self_directing_mcp.audit import grants
+        return getattr(grants, name)
+
+
+_grants = _LazyGrants()
 from self_directing_mcp.audit.runner import rejections
 from self_directing_mcp.request_stats import note_degraded
 from self_directing_mcp.index.sparse import (
@@ -254,6 +253,11 @@ class SelfDirectEngine:
         self._last_activity = time.monotonic()
         self._integrity_worker = None  # set only by a resident server (see integrity_worker)
         self._shadow_worker = None     # likewise: the idle comparison of incremental audits (see shadow_worker)
+        # A hook process (one event, then exit) sets ``defer_comparisons``: its planned shadow comparisons are left to a
+        # detached verifier (``verify_job``) instead of delaying the answer; ``deferred_comparisons`` collects what the
+        # verifier is to compare: ``{(provider, session id): transcript path}``.
+        self.defer_comparisons = False
+        self.deferred_comparisons: dict[tuple[str, str], str | None] = {}
         self.integrity_policy: IntegrityPolicy | None = None  # tests may inject a clock / randomness
         self.slice_policy: SlicePolicy | None = None  # tests may inject forced stops / a clock (default: the settings)
         if settings is None:
@@ -1718,7 +1722,8 @@ class SelfDirectEngine:
                                     needs=needs, link_calls=link_calls, shadow_every=every, force_full=force_full,
                                     report=report, premise_rules=premise_rules, force=force, idle=idle,
                                     cost_key=cost_key, defer=self._shadow_worker is not None and not idle,
-                                    foreign=foreign_anchors)
+                                    foreign=foreign_anchors, hook=self.defer_comparisons,
+                                    fold_budget=self.settings.audit_fold_budget_sec)
                             except (RequestStopped, IndexBusy):
                                 raise
                             except Exception as exc:  # the cache could not even be read: evaluate everything in full
@@ -1809,7 +1814,10 @@ class SelfDirectEngine:
                         report["shadow_skipped"] = "reference_regex_timeout"
                         report["regex_timeout"] = timed_out
                         for contract_id in timed_out:
-                            if contract_id in plan.monitors:
+                            if contract_id in plan.monitors and not idle:
+                                # The idle comparison only verifies; its answer is thrown away, so a contract it cannot
+                                # compare keeps the state it has (dropping it would make the next request rebuild it, and
+                                # the next comparison drop it again).
                                 plan.monitors[contract_id].timed_out = True
                                 plan.timeouts.add(contract_id)
                         report["shadow"] = False
@@ -1841,11 +1849,26 @@ class SelfDirectEngine:
                     # turned clean (a missed one), a high-risk contract whose summary changed.
                     late = plan.late_reasons(result, request_key, applies)
                     wanted = {reason: ids for reason, ids in late.items() if ids and not plan.comparison.covers(ids)}
+                    gating, deferred_late = frozenset(), False
+                    if wanted and self.defer_comparisons and planned is None and not idle and every != 1:
+                        # A hook's audit of the history gates nothing but a completion obligation that may resume the
+                        # agent (``auto_continue``); for every other contract the answer is a note, so its comparison
+                        # goes to the detached verifier, which compares the latest state of the session at its own pace.
+                        gating = {rule.id for rule in active if rule.auto_continue and rule.type == "must"}
+                        if set().union(*wanted.values()) - gating:
+                            report["shadow_skipped"] = incremental.VERIFIER_SKIP
+                            deferred_late = True
+                        wanted = {reason: ids & gating for reason, ids in wanted.items() if ids & gating}
                     if wanted and plan.schedule is not None and not idle:
                         wanted_ids = set().union(*wanted.values())
                         if shadow_policy.memo_covers(plan.schedule, plan.state_key(), request_key, result, wanted_ids):
-                            report["shadow_skipped"] = "verified_before"
-                            late = {}
+                            if deferred_late:
+                                # What was compared before covers the gating contracts only; the late reasons of the others
+                                # (a flip, a violation) were left to the verifier and stay remembered for it.
+                                late = {reason: ids - gating for reason, ids in late.items() if ids - gating}
+                            else:
+                                report["shadow_skipped"] = "verified_before"
+                                late = {}
                         elif (attempt < 3 and report.get("shadow_skipped") not in ("deadline", "deferred")
                               and incremental._shadow_affordable(plan.count)):
                             # (A planned comparison that this pass just declined for lack of room is not asked for again:
@@ -1912,9 +1935,9 @@ class SelfDirectEngine:
                     with self._publication_guard(), self.store._read_boundary():
                         full_chunks = self.store.capture_evidence(sid, provider).list_chunks(sid, provider)
                     rejected_map = rejections(provider, active, full_chunks, None) if planned is None else None
-                    with grants_lock(grants_path):
-                        grants_doc = load_grants_doc(grants_path)
-                        granted_cids = session_grant_contract_ids(grants_doc, sid)
+                    with _grants.grants_lock(grants_path):
+                        grants_doc = _grants.load_grants_doc(grants_path)
+                        granted_cids = _grants.session_grant_contract_ids(grants_doc, sid)
                         if granted_cids:
                             rules_by_id = {r.id: r for r in active}
                             grants_dirty = False
@@ -1922,7 +1945,7 @@ class SelfDirectEngine:
                             for f in result.findings:
                                 rule_obj = rules_by_id.get(f.contract_id)
                                 if rule_obj is not None and f.contract_id in granted_cids and f.verdict in ("violation", "suspicious"):
-                                    updated_f, dirty = apply_grants_to_finding(
+                                    updated_f, dirty = _grants.apply_grants_to_finding(
                                         rule=rule_obj,
                                         finding=f,
                                         doc=grants_doc,
@@ -1938,7 +1961,7 @@ class SelfDirectEngine:
                                 else:
                                     new_findings.append(f)
                             if grants_dirty:
-                                save_grants_doc(grants_path, grants_doc)
+                                _grants.save_grants_doc(grants_path, grants_doc)
                             result.findings = new_findings
                             if any(f.grants_applied for f in new_findings):
                                 if any(f.verdict == "violation" for f in result.findings):
@@ -1971,6 +1994,8 @@ class SelfDirectEngine:
             payload["sync"] = sync       # how far the index got and what sized the slice; a finished sync adds nothing to coverage
         if report:
             payload["incremental"] = report
+            if self.defer_comparisons and report.get("shadow_skipped") == incremental.VERIFIER_SKIP:
+                self.deferred_comparisons[(provider, sid)] = coverage.get("path")
         payload["nudge"] = (
             "Detect only. violation/suspicious: STOP and report; unknown: resolve missing evidence. "
             "clean is limited to the reported contracts and history snapshot, not execution authorization.")
@@ -2452,7 +2477,7 @@ class SelfDirectEngine:
             }
         if isinstance(max_uses, bool) or not isinstance(max_uses, int) or max_uses != 1:
             raise ValueError("grant_once only supports max_uses=1")
-        parse_expires_in(expires_in)
+        _grants.parse_expires_in(expires_in)
 
         resolved_provider = self._resolve_provider(provider, path=path)
         sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
@@ -2482,7 +2507,7 @@ class SelfDirectEngine:
                     "contract_id": contract_id,
                     "message": f"Contract {contract_id!r} uses path_guard or lacks a regex and does not support grant_once.",
                 }
-            validate_grant_action_tokens_and_rule(action_regex, rule_pre)
+            _grants.validate_grant_action_tokens_and_rule(action_regex, rule_pre)
             with self.store._read_boundary():
                 committed_rec = self.store.cursor_record(sid, resolved_provider)
 
@@ -2564,7 +2589,7 @@ class SelfDirectEngine:
                     "contract_id": contract_id,
                     "message": f"Contract {contract_id!r} uses path_guard or lacks a regex and does not support grant_once.",
                 }
-            validate_grant_action_tokens_and_rule(action_regex, rule)
+            _grants.validate_grant_action_tokens_and_rule(action_regex, rule)
             with self.store._read_boundary():
                 recheck_rec = self.store.cursor_record(sid, resolved_provider)
                 anchor = self.store.get_chunk(source_event_id)
@@ -2639,7 +2664,7 @@ class SelfDirectEngine:
                     "source_event_id": source_event_id,
                     "message": f"source_event_id is stale (must be within the latest {max_turns} user turns and last {max_events} events); grant_once requires a fresh user approval message.",
                 }
-            raw_approved, raw_approval_detail = verify_raw_anchor_approves_grant(
+            raw_approved, raw_approval_detail = _grants.verify_raw_anchor_approves_grant(
                 anchor_text=anchor.text,
                 action_regex=action_regex,
                 rule=rule,
@@ -2664,7 +2689,7 @@ class SelfDirectEngine:
                         "message": "canonical_english_quote does not match the indexed canonical_english metadata on the user turn",
                     }
                 effective_canon = s_clean
-            approved, approval_detail = verify_user_anchor_approves_grant(
+            approved, approval_detail = _grants.verify_user_anchor_approves_grant(
                 anchor_text=anchor.text,
                 action_regex=action_regex,
                 rule=rule,
@@ -2677,8 +2702,8 @@ class SelfDirectEngine:
                     "source_event_id": source_event_id,
                     "message": approval_detail,
                 }
-            with grants_lock(grants_path):
-                grants_doc = load_grants_doc(grants_path)
+            with _grants.grants_lock(grants_path):
+                grants_doc = _grants.load_grants_doc(grants_path)
                 if any(
                     g.session_id == sid
                     and g.contract_id == rule.id
@@ -2692,7 +2717,7 @@ class SelfDirectEngine:
                         "message": f"source_event_id {source_event_id!r} has already been used to authorize a grant for contract {rule.id!r}.",
                     }
                 issued_after_id = session_chunks[-1].chunk_id if session_chunks else source_event_id
-                record = create_grant_record(
+                record = _grants.create_grant_record(
                     session_id=sid,
                     rule=rule,
                     action_regex=action_regex,
@@ -2803,7 +2828,7 @@ class SelfDirectEngine:
                             continue
                         eff_eng_text = s_clean
                     turn_candidates.extend(
-                        extract_canonical_english_candidates(
+                        _grants.extract_canonical_english_candidates(
                             source_event_id=chunk.chunk_id,
                             raw_quote=chunk.text,
                             canonical_english=eff_eng_text,

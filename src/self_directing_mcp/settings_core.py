@@ -69,6 +69,11 @@ DEFAULT_EMBEDDING_DIM = 1024
 DEFAULT_EMBEDDING_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_LOCK_WAIT_TIMEOUT_SEC = 1.0
 DEFAULT_AUDIT_TIMEOUT_SEC = 8.0
+# The time one fold of stored events into the incremental monitors may spend in contract patterns (seconds), however
+# many monitors it feeds; it is never less than 2 s per monitor. A monitor that is built from nothing (a new session
+# state, a changed contract, a new evaluator version) reads the whole history, which a loaded machine can take longer
+# than 2 s per contract for; a monitor that runs out is dropped and never kept.
+DEFAULT_AUDIT_FOLD_BUDGET_SEC = 60.0
 DEFAULT_REQUEST_TIMEOUT_SEC = 45.0
 DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC = 300.0
 DEFAULT_MAX_TOOL_TIMEOUT_SEC = 600.0
@@ -619,6 +624,8 @@ FIELDS: tuple[FieldSpec, ...] = (
               _static(DEFAULT_LOCK_WAIT_TIMEOUT_SEC)),
     FieldSpec("audit_timeout_sec", lambda name, text: _to_float(name, text, positive=True),
               _static(DEFAULT_AUDIT_TIMEOUT_SEC)),
+    FieldSpec("audit_fold_budget_sec", lambda name, text: _to_float(name, text, positive=True, finite=True),
+              _static(DEFAULT_AUDIT_FOLD_BUDGET_SEC)),
     FieldSpec("request_timeout_sec", lambda name, text: _to_float(name, text, positive=True),
               _static(DEFAULT_REQUEST_TIMEOUT_SEC)),
     FieldSpec("graph_update_timeout_sec", lambda name, text: _to_float(name, text, positive=True, finite=True),

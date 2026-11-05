@@ -1,0 +1,115 @@
+{
+  "comment": "What the command view needs to know about programs, as data (see audit/shellview.py). A quoted argument or a here-document is data unless the program that receives it runs it. 'shell_tools' maps a host tool to the argument that holds a shell command line; 'shells' run a script given with -c, as an operand or on standard input; 'interpreters' run code given with one of their flags, as an operand or on standard input; 'string_carriers' run the words they are given as a command line (their quoted arguments are read as shell). Extend a list to teach the view a program; a program that is not listed is treated as a data consumer. 'shell_option_arguments' are the shell options that take the next word as their argument (so it is not mistaken for a script operand); 'stdin_carriers' turn what is piped into them into words of a command. 'interpreter_option_arguments' are the interpreter options that take the next word; 'script_readers' read the files or process substitutions they are given as scripts.",
+  "shell_tools": {
+    "Bash": "command",
+    "Monitor": "command"
+  },
+  "shells": [
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "ksh",
+    "ash",
+    "fish",
+    "csh",
+    "tcsh"
+  ],
+  "interpreters": {
+    "python": [
+      "-c"
+    ],
+    "node": [
+      "-e",
+      "-p",
+      "--eval",
+      "--print"
+    ],
+    "deno": [
+      "eval"
+    ],
+    "perl": [
+      "-e",
+      "-E"
+    ],
+    "ruby": [
+      "-e"
+    ],
+    "php": [
+      "-r"
+    ],
+    "lua": [
+      "-e"
+    ],
+    "pwsh": [
+      "-c",
+      "-command"
+    ],
+    "powershell": [
+      "-c",
+      "-command"
+    ],
+    "nodejs": [
+      "-e",
+      "-p",
+      "--eval",
+      "--print"
+    ]
+  },
+  "string_carriers": [
+    "eval",
+    "ssh",
+    "watch",
+    "su",
+    "flock",
+    "script",
+    "parallel",
+    "tmux",
+    "screen",
+    "nsenter"
+  ],
+  "shell_option_arguments": [
+    "-o",
+    "+o",
+    "-O",
+    "+O",
+    "--rcfile",
+    "--init-file"
+  ],
+  "stdin_carriers": [
+    "xargs"
+  ],
+  "interpreter_option_arguments": {
+    "python": [
+      "-W",
+      "-X",
+      "-Q"
+    ],
+    "perl": [
+      "-I",
+      "-M",
+      "-m"
+    ],
+    "node": [
+      "-r",
+      "--require",
+      "--import"
+    ],
+    "nodejs": [
+      "-r",
+      "--require",
+      "--import"
+    ],
+    "ruby": [
+      "-I",
+      "-r"
+    ],
+    "php": [
+      "-d"
+    ]
+  },
+  "script_readers": [
+    ".",
+    "source"
+  ]
+}

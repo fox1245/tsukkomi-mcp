@@ -39,7 +39,7 @@ from self_directing_mcp import contract_paths
 from self_directing_mcp.agy import JUDGED_FIELDS, RESULT_TYPES
 from self_directing_mcp.audit import anchors as anchor_module, hostblocks, runner, shellstatus
 from self_directing_mcp.audit import shadow as shadow_module
-from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, contract_budget
+from self_directing_mcp.audit.patterns import ContractRegexTimeout, compile_contract, compile_rule_pattern, contract_budget
 from self_directing_mcp.audit import patterns as _patterns
 from self_directing_mcp.audit.applicability import PROPOSED_CALL_PREFIX, not_applicable_reason
 from self_directing_mcp.eval_cost import COSTS, REFERENCE_PER_EVAL
@@ -55,9 +55,11 @@ from self_directing_mcp.security.mask import mask_secrets
 # ``path_guard`` contract name the guarded path (``contract_paths.forbidden_label`` / ``verifier_basis``), and the
 # fingerprint of its saved state includes the regex derived from it; regex contracts judge and read exactly as before. 12: a global contract takes its source and activation
 # event from another session when they are not in the one judged (``audit.anchors``); a state stored before judged such a
-# contract as unknown and folded none of the session's events.)
-EVALUATOR_VERSION = 12
+# contract as unknown and folded none of the session's events. 13: a contract about commands (``target``, or only shell
+# tools in ``tools``) is matched against the command view of a shell call, ``audit.shellview``.)
+EVALUATOR_VERSION = 13
 STATE_VERSION = 1
+VERIFIER_SKIP = "verifier"      # ``report["shadow_skipped"]`` of a planned comparison that a hook left to the detached verifier
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
 # is skipped when the request's remaining budget cannot cover it with margin; it must never turn a request that
@@ -102,14 +104,14 @@ RegexTimeout = ContractRegexTimeout
 TIMEOUTS = (ContractRegexTimeout,)
 
 
-def _compile(pattern):
+def _compile(rule, pattern):
     """The only place this module compiles a contract pattern (same flags as the reference evaluator).
 
     A pattern that times out never produces a finding or a stored state here: the monitor is dropped for the run
     (``RuleMonitor.timed_out``), the rule is judged by the full evaluator, and ``AuditPlan.evaluate`` is the one
     place that handles it.
     """
-    return compile_contract(pattern)
+    return compile_rule_pattern(rule, pattern)
 
 
 def _k(value):
@@ -395,14 +397,14 @@ class RuleMonitor:
         self.regex = self.trigger = self.when_re = None
         self.regex_invalid = self.when_invalid = False
         try:
-            self.regex = _compile(rule.regex)
-            self.trigger = _compile(rule.before_regex) if rule.before_regex else None
+            self.regex = _compile(rule, rule.regex)
+            self.trigger = _compile(rule, rule.before_regex) if rule.before_regex else None
         except re.error:
             self.regex = self.trigger = None
             self.regex_invalid = True
         if rule.when is not None:
             try:
-                self.when_re = _compile(rule.when.tool_call_regex)
+                self.when_re = _compile(rule, rule.when.tool_call_regex)
             except re.error:
                 self.when_invalid = True
         self.static_unknown = self.regex_invalid or self.when_invalid
@@ -724,7 +726,7 @@ class RuleMonitor:
             exception = None
             if rule.exception_regex:
                 try:
-                    exception = _compile(rule.exception_regex)
+                    exception = _compile(rule, rule.exception_regex)
                 except re.error:
                     return self._make("unknown", "invalid exception_regex",
                                       basis=f"{rule.id}.exception_regex failed to compile"), {}
@@ -845,7 +847,7 @@ class RuleMonitor:
     def _attempt_hits(self, item, blocked):
         rule = self.rule
         try:
-            exception = _compile(rule.exception_regex) if rule.exception_regex else None
+            exception = _compile(rule, rule.exception_regex) if rule.exception_regex else None
         except re.error:
             return
         refused = sorted((key, name, denied) for key, (name, text, denied) in blocked.items()
@@ -1049,13 +1051,14 @@ class AuditPlan:
         # What this pass measured about itself (see ``eval_cost``): seconds to read the events the fold consumes
         # (``load_seconds``, set by ``prepare``), seconds to fold them and how many were folded (``load``).
         self.cost_key, self.load_seconds, self.fold_seconds, self.fold_events = None, 0.0, 0.0, 0
+        self.fold_budget = 0.0      # seconds (``audit_fold_budget_sec``): the least the fold of this plan may spend in patterns
 
     # --- preparation (inside the read boundary) ---
 
     @classmethod
     def prepare(cls, store, *, session_id, provider, active, planned, needs, link_calls, shadow_every,
                 force_full=frozenset(), report=None, premise_rules=None, force=None, idle=False, cost_key=None,
-                defer=False, foreign=None):
+                defer=False, foreign=None, hook=False, fold_budget=0.0):
         """Decide how to evaluate and read the events needed; ``None`` means evaluate everything the old way.
 
         ``shadow_every``: ``None`` for the adaptive schedule, else the fixed legacy rate (``audit.shadow``).
@@ -1065,6 +1068,11 @@ class AuditPlan:
         ``idle``: the idle comparison of a resident engine, which compares everything. ``cost_key``: the key of this
         contract set in ``eval_cost.COSTS`` (what a comparison is expected to cost, once this process has measured the set);
         ``defer``: a resident engine can verify a skipped comparison later, and the report then says ``deferred``.
+        ``hook``: a hook process that hands its planned comparisons (warm-up, rebuild, sampled) to a detached verifier
+        (``verify_job``) instead of making the request wait for them; comparisons that an answer calls for or that a
+        high-risk contract needs (``force``, ``high_risk``) still run in the request, and so does every comparison when
+        ``shadow_every`` is 1 (the setting that compares every audit). The report then says ``shadow_skipped: "verifier"``.
+        ``fold_budget``: ``audit_fold_budget_sec``, the least the fold of the events into the monitors may spend in patterns.
         ``foreign``: the anchors of other sessions that the global contracts take their source and activation event from
         (``audit.anchors.resolve``, made once for this build inside the same read boundary); they are part of each state's key
         and the events carry their timestamps when one of them starts a window in time."""
@@ -1190,15 +1198,25 @@ class AuditPlan:
         if drawn:
             comparison.add("sampled")
         risky = frozenset(r.id for r in history if r.risk == "high" and r.id not in routes)
-        if planned is not None and risky and not comparison.full:
-            applies = {r.id for r in history if r.id in risky and runner.action_applies(r, planned)}
-            if applies:
-                comparison.add("high_risk", applies)
+        high_risk_applies = ({r.id for r in history if r.id in risky and runner.action_applies(r, planned)}
+                             if planned is not None and risky else set())
+        if high_risk_applies and not comparison.full:
+            comparison.add("high_risk", high_risk_applies)
+        planned_active = comparison.active              # what the schedule asked for, before an answer's own request
         if force is not None:
             for reason in force.reasons:
                 comparison.add(reason, force.scope)
         shadow = comparison.active
         total = store.session_metrics(session_id, provider)[0]
+        if shadow and planned_active and hook and shadow_every != 1 and not idle and not high_risk_applies:
+            # The comparisons that were only planned are left to the verifier; one that an answer called for (``force``)
+            # still runs, and so does every comparison while a high-risk contract applies to the proposed action.
+            comparison = shadow_module.Comparison()
+            if force is not None:
+                for reason in force.reasons:
+                    comparison.add(reason, force.scope)
+            shadow = comparison.active
+            report["shadow_skipped"] = VERIFIER_SKIP
         if shadow and not _shadow_affordable(total):
             shadow = False
             report["shadow_skipped"] = "deferred" if defer else "deadline"
@@ -1372,6 +1390,7 @@ class AuditPlan:
                    schedule=schedule, schedule_loaded=schedule_loaded, risky=risky & set(monitors), prior=prior,
                    anchors=foreign)
         plan.cost_key = cost_key
+        plan.fold_budget = fold_budget
         plan.load_seconds = loading["tail"] if mode == "delta" else loading["reference"]
         return plan
 
@@ -1427,7 +1446,7 @@ class AuditPlan:
         try:
             # One pooled budget for the walk (a per-event, per-monitor budget would cost more than the walk). A monitor
             # that runs out is dropped and its rule is judged by the reference evaluator with its own budget.
-            with contract_budget(_patterns.CONTRACT_BUDGET_SEC * max(1, len(self.monitors))):
+            with contract_budget(max(_patterns.CONTRACT_BUDGET_SEC * max(1, len(self.monitors)), self.fold_budget)):
                 fold(self.events, [(monitor, self.offsets[monitor.rule.id]) for monitor in self.monitors.values()],
                      (self.facts, self.facts_offset) if self.facts.needed else None, self.pools, progress)
         except (RequestStopped, IndexBusy):
