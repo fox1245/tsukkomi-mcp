@@ -268,7 +268,6 @@ def _parse(src: str) -> tuple[list[_Command], list[tuple[int, int]]] | None:
             add(_Part("double", i, close, i + 1, close - 1))
             i = close
         elif c == "$" and src[i + 1:i + 2] == "'":
-            close = _close_quote(src, i + 1, "'")
             j = i + 2
             while j < n and src[j] != "'":          # $'...' honours backslash escapes
                 j += 2 if src[j] == "\\" else 1
