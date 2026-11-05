@@ -66,10 +66,10 @@ class _Word:
 
 
 class _Heredoc:
-    __slots__ = ("delimiter", "strip_tabs", "body_start", "body_end", "terminator_end")
+    __slots__ = ("delimiter", "strip_tabs", "quoted", "body_start", "body_end", "terminator_end")
 
-    def __init__(self, delimiter, strip_tabs):
-        self.delimiter, self.strip_tabs = delimiter, strip_tabs
+    def __init__(self, delimiter, strip_tabs, quoted=False):
+        self.delimiter, self.strip_tabs, self.quoted = delimiter, strip_tabs, quoted     # quoted: the body is not expanded
         self.body_start = self.body_end = self.terminator_end = 0
 
 
@@ -159,7 +159,7 @@ def _close_paren(src: str, i: int) -> int:
                         return -1
                 else:
                     k += 2 if src[k] == "\\" else 1
-            doc = _Heredoc(_delimiter_text(src[start:k]), strip)
+            doc = _Heredoc(_delimiter_text(src[start:k]), strip, any(ch in src[start:k] for ch in "'\"\\"))
             pending.append(doc)
             j = k
             continue
@@ -248,8 +248,9 @@ def _parse(src: str) -> tuple[list[_Command], list[tuple[int, int]]] | None:
             return
         word.end = at
         if want_delimiter is not None:
-            text = "".join(src[p.inner_start:p.inner_end] if p.kind != "lit" else src[p.start:p.end] for p in word.parts)
-            want_delimiter.delimiter = text
+            raw = src[word.start:at]
+            want_delimiter.delimiter = _delimiter_text(raw)
+            want_delimiter.quoted = any(ch in raw for ch in "'\"\\")
             want_delimiter = None
             word = None
             return
@@ -419,7 +420,8 @@ def _word_text(src: str, word: _Word) -> str:
 
 def _program(text: str) -> str:
     """The program name of a word: its last path component without a trailing version (``python3.12`` is ``python``)."""
-    return text.rsplit("/", 1)[-1].rstrip("0123456789.")
+    base = text.rsplit("/", 1)[-1]
+    return base.rstrip("0123456789.") or base
 
 
 def _unquote(raw: str, kind: str) -> str:
@@ -480,19 +482,25 @@ class _Plan:
         interpreters = {name: [flag.lower() for flag in flags] for name, flags in sem["interpreters"].items()}
         carriers = set(sem["string_carriers"])
         stdin_carriers = set(sem.get("stdin_carriers", ()))
+        script_readers = set(sem.get("script_readers", ()))
+        interpreter_options = sem.get("interpreter_option_arguments", {})
         option_arguments = tuple(sem.get("shell_option_arguments", ("-o", "+o")))
+        self.keep_words: set[int] = set()          # words whose substitutions are read as scripts: kept as they are
         for index in range(first, len(texts)):
             program = _program(texts[index])
             if program in stdin_carriers:
                 self.stdin_kind = self.stdin_kind or "code"        # what is piped into it becomes words of a command
+            if program in script_readers:
+                self.keep_words.update(range(index + 1, len(texts)))       # ``source <(...)``: the substitution is the script
             if program in carriers:
                 self.shell_words.update(w for w in range(index + 1, len(texts)) if _quoted(cmd.words[w]))
                 if program == "eval":
                     self.shell_words.update(range(index + 1, len(texts)))
             if program in shells or program in interpreters:
                 is_shell = program in shells
-                script = self._script_word(texts, index, is_shell, ["-c"] if is_shell else interpreters[program],
-                                           option_arguments)
+                script = self._script_word(
+                    texts, cmd, index, is_shell, ["-c"] if is_shell else interpreters[program],
+                    option_arguments if is_shell else tuple(interpreter_options.get(program, ())))
                 if script is not None:
                     (self.shell_words if is_shell else self.code_words).add(script)
                 elif self._reads_stdin(texts, cmd, index, is_shell):
@@ -516,27 +524,38 @@ class _Plan:
         return is_shell and any(o[1:2] != "-" and "s" in o[1:] for o in options)
 
     @staticmethod
-    def _script_word(texts, index, is_shell, flags, option_arguments=("-o", "+o")):
+    def _script_word(texts, cmd, index, is_shell, flags, option_arguments=("-o", "+o")):
         """Index of the word that holds the inline script or code of a shell or interpreter, or None."""
         position = index + 1
         letters = {flag[1] for flag in flags if len(flag) == 2 and flag.startswith("-")}
         while position < len(texts):
             option = texts[position]
+            attached = _quoted(cmd.words[position])
+            # The part of the word before its first quote is the option; a quote after it is the script (``-c'code'``).
+            head = option
+            if attached:
+                first = next(part for part in cmd.words[position].parts if part.kind != "lit")
+                head = texts[position][:max(0, first.start - cmd.words[position].start)]
             if is_shell:
                 if option == "--" or not option.startswith(("-", "+")):
                     return None                  # a script file or another operand: nothing inline
-                if len(option) > 1 and option[1] != "-" and "c" in option[1:]:
+                if len(head) > 1 and head[1] != "-" and "c" in head[1:]:
+                    if attached and head.endswith("c"):
+                        return position          # the script is the quoted part of this very word
                     return position + 1 if position + 1 < len(texts) else None
                 position += 2 if option in option_arguments else 1
             else:
-                lowered = option.lower()
+                lowered = head.lower()
                 name, equals, _value = lowered.partition("=")
-                if lowered in flags:
-                    return position + 1 if position + 1 < len(texts) else None
+                if lowered in flags or (attached and lowered[:2] in flags and len(lowered) == 2):
+                    return position if attached and lowered in flags else (position + 1 if position + 1 < len(texts) else None)
                 if equals and name.startswith("--") and name in flags:
                     return position                  # ``--eval="code"``: the code is part of this word
-                if len(option) > 2 and option[0] == "-" and option[1] != "-" and letters & set(option[1:]):
+                if len(option) > 2 and option[0] == "-" and option[1] != "-" and letters & set(head[1:]):
                     return position + 1 if position + 1 < len(texts) else None      # ``python -uc "code"``
+                if option in option_arguments:
+                    position += 2                    # ``python -W ignore -c ...``: the next word belongs to the option
+                    continue
                 if not option.startswith("-"):
                     return None
                 position += 1
@@ -576,6 +595,8 @@ def _view(src: str, depth: int, sem: dict) -> str:
         for number, word in enumerate(cmd.words):
             for part in word.parts:
                 if part.kind == "subst":
+                    if number in plan.keep_words:
+                        continue                                      # read as a script by the program: kept as it is
                     edits.append((part.inner_start, part.inner_end,
                                   _view(src[part.inner_start:part.inner_end], depth + 1, sem)))
                 elif part.kind in ("single", "double", "ansi"):
@@ -583,8 +604,10 @@ def _view(src: str, depth: int, sem: dict) -> str:
                     if number in plan.code_words or fed or _plain(raw):
                         continue                                      # code, a script's input or a plain word: kept
                     if number in plan.shell_words:
-                        edits.append((part.inner_start, part.inner_end,
-                                      _view(_unquote(raw, part.kind), depth + 1, sem)))
+                        script = _unquote(raw, part.kind)
+                        if _substitutions_in_double(script):
+                            continue                  # the script is built from what a command prints: kept as it is
+                        edits.append((part.inner_start, part.inner_end, _view(script, depth + 1, sem)))
                     elif part.kind == "double":
                         kept = "".join("$(" + _view(raw[a:b], depth + 1, sem) + ")"
                                        for _s, _e, a, b in _substitutions_in_double(raw))
@@ -597,8 +620,12 @@ def _view(src: str, depth: int, sem: dict) -> str:
                 continue                                  # an interpreter reads it, or a later stage does: kept
             if plan.stdin_kind == "shell":
                 edits.append((doc.body_start, doc.body_end, _view(body, depth + 1, sem)))
-            else:
+            elif doc.quoted:
                 edits.append((doc.body_start, doc.body_end, ""))
+            else:
+                # An unquoted delimiter: the shell expands the body, so its command substitutions run.
+                kept = "".join("$(" + _view(body[a:b], depth + 1, sem) + ")" for _s, _e, a, b in _substitutions_in_double(body))
+                edits.append((doc.body_start, doc.body_end, kept))
     return _apply(src, edits)
 
 
@@ -619,8 +646,8 @@ def command_view(command: str) -> str:
     """``command`` with the data a shell does not run taken out (see the module text). Unchanged when it cannot be parsed."""
     try:
         return _view(command, 0, semantics())
-    except (RecursionError, ValueError, IndexError):
-        return command          # a construct the parser cannot take (nesting deeper than the interpreter allows): as it is
+    except (RecursionError, ValueError, IndexError, KeyError, TypeError, OSError):
+        return command          # nesting deeper than the interpreter allows, a semantics file that cannot be read: as it is
 
 
 # ------------------------------------------------------------------------------------------------- tool-call text
@@ -656,7 +683,11 @@ def tool_view(text: str) -> str:
     if close < 0:
         return text
     name = text[text.index(":") + 1:close]
-    field = shell_tools().get(next((tool for tool in shell_tools() if tool.lower() == name.lower()), ""))
+    try:
+        tools = shell_tools()
+    except (OSError, KeyError, ValueError, TypeError):
+        return text                       # a semantics file that cannot be read: the whole text, as before
+    field = tools.get(next((tool for tool in tools if tool.lower() == name.lower()), ""))
     if field is None:
         return text
     try:

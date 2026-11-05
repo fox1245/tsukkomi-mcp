@@ -6,7 +6,7 @@ high-risk contracts after an import failure. It therefore imports nothing outsid
 from ``tool_payload`` (itself standard-library only, and the one builder of the tool-call text) and
 ``contract_paths`` (standard library only; it lowers a stored typed ``path_guard`` to its regex), which a copy of
 this module without its package does without: it then matches the unfiltered text, and a typed high-risk contract
-always asks, the more cautious sides.
+always matches (a Claude Code hook then refuses it, AGY asks), the more cautious sides.
 
 Persistent state lives in ``<index_dir>/agy-hook-state.sqlite``:
 

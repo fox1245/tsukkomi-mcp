@@ -19,6 +19,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import time
 
 LOCK_NAME = "verify-job.lock"
 
@@ -71,7 +72,9 @@ def run(provider: str, session_id: str, path: str | None, index_dir) -> str:
         engine = SelfDirectEngine(load_hook_settings())
         try:
             engine.ensure_ready()                  # a background operation never initializes an engine itself
-            result = engine.verify_incremental(session_id=session_id, provider=provider, path=path)
+            # The budget of the idle comparison of a resident engine: a job that cannot finish in it gives up.
+            result = engine.verify_incremental(session_id=session_id, provider=provider, path=path,
+                                               _deadline=time.monotonic() + engine.settings.request_timeout_sec)
         finally:
             engine.close()
     if result.get("mismatch"):

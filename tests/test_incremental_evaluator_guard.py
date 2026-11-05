@@ -19,7 +19,7 @@ from self_directing_mcp import agy
 from self_directing_mcp.audit import anchors, applicability, hostblocks, patterns, runner, shellstatus, shellview
 from self_directing_mcp.retrieve import checks
 
-DIGEST = "4819c55dd6751d9b"
+DIGEST = "e7aae6e9eafd987b"
 
 MIRRORED = [
     runner.audit_contract, runner._Presence, runner._tool_matches, runner._eligible, runner._worse, runner.evidence, runner._key,
