@@ -8,6 +8,7 @@ contract is still compared in the request.
 from __future__ import annotations
 
 import fcntl
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -175,7 +176,8 @@ def test_the_hook_starts_the_verifier_detached_after_it_has_answered(env, monkey
     assert "decision" not in response                                  # the answer did not wait for any comparison
     assert len(started) == 1
     argv, kwargs = started[0]
-    assert argv[1:5] == ["-I", "-m", "self_directing_mcp.verify_job", "--provider"] and "claude" in argv and SID in argv
+    assert argv[1:3] == ["-I", "-c"] and "self_directing_mcp.verify_job" in argv[3] and "claude" in argv and SID in argv
+    assert Path(argv[4]).name == "src" or (Path(argv[4]) / "self_directing_mcp").is_dir()     # where the package was found
     assert argv[argv.index("--index-dir") + 1] == str(engine.settings.index_dir)
     assert kwargs["start_new_session"] is True and kwargs["stdout"] is subprocess.DEVNULL
     assert engine.deferred_comparisons == {}
@@ -351,3 +353,36 @@ def test_a_memoized_gating_comparison_does_not_make_the_deferred_late_comparison
     second = _audit(engine, path)                                     # same state: the gating comparison is memoized now
     assert second["incremental"].get("shadow_skipped") == incremental.VERIFIER_SKIP        # not "verified_before"
     assert engine.deferred_comparisons == {("claude", SID): str(path)}
+
+
+def test_the_detached_verifier_really_starts_runs_and_records_its_outcome(env):
+    """No stubs: the hook starts the child process, which imports the package where the hook found it, compares the
+    session and writes how it ended."""
+    import time
+    from self_directing_mcp.claude_hook_state import ClaudeHookState
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    _audit(engine, path)
+    _hook(engine)
+    write(path, assistant(use("c8", "Bash", command="echo again")), tool_result("c8", "ok"), mode="a")
+    stop(engine, path)
+    state = ClaudeHookState(engine.settings.index_dir)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and state.verifier_ready(f"claude:{SID}", 1e9, 1e9) and not any(
+            row for row in _verifier_rows(engine.settings.index_dir)):
+        time.sleep(0.2)
+    rows = _verifier_rows(engine.settings.index_dir)
+    assert rows and rows[0][0] == f"claude:{SID}", rows                 # the child ran and recorded an outcome
+    while time.monotonic() < deadline and verify_job.running(engine.settings.index_dir):
+        time.sleep(0.2)
+
+
+def _verifier_rows(index):
+    import sqlite3
+    from self_directing_mcp.claude_hook_state import STATE_FILE
+    try:
+        with sqlite3.connect(Path(index) / STATE_FILE) as conn:
+            return conn.execute("SELECT session_key, streak FROM verifier_state").fetchall()
+    except sqlite3.Error:
+        return []

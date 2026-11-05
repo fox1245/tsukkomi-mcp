@@ -371,6 +371,10 @@ def _new_engine():
     return engine
 
 
+_VERIFIER_ENTRY = ("import sys; sys.path.insert(0, sys.argv.pop(1)); "
+                   "from self_directing_mcp.verify_job import main; sys.exit(main())")
+
+
 def spawn_verifier(engine: SelfDirectEngine) -> None:
     """Start the detached verifier (``verify_job``) for the sessions whose planned shadow comparison this hook left to it.
 
@@ -387,8 +391,10 @@ def spawn_verifier(engine: SelfDirectEngine) -> None:
         # as the resident worker's backoff does, so a session that cannot be compared never costs a run after every hook.
         if not state.verifier_ready(f"{provider}:{session_id}", shadow_worker.BACKOFF_SEC, shadow_worker.BACKOFF_MAX_SEC):
             continue
-        argv = [sys.executable, "-I", "-m", "self_directing_mcp.verify_job", "--provider", provider,
-                "--session-id", session_id, "--index-dir", str(engine.settings.index_dir)]
+        # Isolated (the user's project directory is not on the path), and told where this process found the package, so
+        # the child can import it however it was installed (a wheel, an editable install, a checkout on sys.path).
+        argv = [sys.executable, "-I", "-c", _VERIFIER_ENTRY, str(Path(verify_job.__file__).resolve().parents[1]),
+                "--provider", provider, "--session-id", session_id, "--index-dir", str(engine.settings.index_dir)]
         if path:
             argv += ["--path", path]
         try:
