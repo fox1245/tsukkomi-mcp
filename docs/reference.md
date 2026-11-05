@@ -1166,7 +1166,7 @@ The authentication boundary is **the operating-system user**, and nothing finer.
 
 ### Failure behaviour: never an in-process fallback
 
-With the flag on, a hook's whole answer comes from the daemon or from a visible fail-open. If the daemon cannot be reached or started the client **never imports the engine and never judges itself**; it answers through `claude_hook_state.fail_open` / `agy_hook_state.fail_open`: no deny, a visible warning with the reason, the failure recorded in `hook_health`, and **`ask` when a contract marked `risk: high` matches the proposed action** (the same policy as every other unavailability).
+With the flag on, a hook's whole answer comes from the daemon or from a visible fail-open. If the daemon cannot be reached or started the client **never imports the engine and never judges itself**; it answers through `claude_hook_state.fail_open` / `agy_hook_state.fail_open`: no deny in general, a visible warning with the reason, the failure recorded in `hook_health`, and **a refusal (Claude Code) or an `ask` (AGY) when a contract marked `risk: high` matches the proposed action** (the same policy as every other unavailability).
 
 | Situation | Reason in the warning |
 |---|---|
