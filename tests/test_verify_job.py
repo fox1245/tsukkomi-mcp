@@ -1,0 +1,147 @@
+"""A hook process leaves its planned shadow comparisons to a detached verifier; answers that need one still get it.
+
+Synthetic data only. The comparison of an incremental audit with a full evaluation is a quality check of the answer
+that is already in hand. In a hook (one event, then exit) it used to run in the request and cost seconds on a long
+transcript; it now runs in ``verify_job`` after the hook has answered, while a violation, a flip or a high-risk
+contract is still compared in the request.
+"""
+from __future__ import annotations
+
+import fcntl
+import subprocess
+
+import pytest
+
+from self_directing_mcp import claude_hooks, verify_job
+from self_directing_mcp.audit import incremental
+
+from test_claude_hooks import SID, assistant, env, human, main_file, run, stop, tool_result, use, write  # noqa: F401
+
+RULE = {"id": "no-deploy", "type": "must_not", "provider": "claude", "scope": "tool_call", "regex": "deploy --prod"}
+
+
+def _grow(engine, path, count=4):
+    engine.settings.audit_incremental_min_events = 1                # monitors are kept for a session this small
+    for n in range(count):
+        write(path, assistant(use(f"c{n}", "Bash", command=f"echo step {n}")), tool_result(f"c{n}", "ok"), mode="a")
+
+
+def _audit(engine, path):
+    return engine.audit_session(SID, provider="claude", path=str(path))
+
+
+def test_without_the_flag_a_planned_comparison_runs_in_the_request(env):
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    report = _audit(engine, path)["incremental"]
+    assert report.get("shadow_compared") is True and "shadow_skipped" not in report
+    assert engine.deferred_comparisons == {}
+
+
+def test_a_hook_engine_leaves_the_planned_comparison_to_the_verifier_and_reads_no_reference(env):
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    _audit(engine, path)                                              # states exist now: the next audits are deltas
+    write(path, assistant(use("c9", "Bash", command="echo more")), tool_result("c9", "ok"), mode="a")
+    engine.defer_comparisons = True
+    reads = []
+    original = engine.store.capture_audit_events
+    engine.store.capture_audit_events = lambda *a, **k: (reads.append(1), original(*a, **k))[1]
+    report = _audit(engine, path)["incremental"]
+    assert report["shadow_skipped"] == incremental.VERIFIER_SKIP and not report.get("shadow_compared")
+    assert reads == []                                                # the whole session was not read for a comparison
+    assert engine.deferred_comparisons == {("claude", SID): str(path)}
+
+
+def test_a_violation_is_still_compared_in_the_request(env):
+    engine, path = env
+    engine.settings.audit_shadow_every = "adaptive"                  # the production schedule (the suite compares every audit)
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    _audit(engine, path)
+    write(path, assistant(use("bad", "Bash", command="deploy --prod now")), tool_result("bad", "ok"), mode="a")
+    engine.defer_comparisons = True
+    result = _audit(engine, path)
+    assert result["verdict"] == "violation"
+    assert result["incremental"].get("shadow_compared") is True       # the answer called for a comparison
+
+
+def test_a_high_risk_contract_that_applies_to_the_action_is_still_compared_in_the_request(env):
+    engine, path = env
+    engine.settings.audit_shadow_every = "adaptive"
+    engine.upsert_contracts([dict(RULE, id="gate", type="must", scope="tool_call", before_regex="deploy --prod",
+                                  regex="echo step 0", risk="high")])
+    _grow(engine, path)
+    engine.defer_comparisons = True
+    action = {"tool_name": "Bash", "arguments": {"command": "deploy --prod"}}
+    result = engine.check_action(SID, action, provider="claude", path=str(path))
+    assert result["incremental"].get("shadow_compared") is True
+
+
+def test_the_hook_starts_the_verifier_detached_after_it_has_answered(env, monkeypatch):
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    _audit(engine, path)
+    engine.defer_comparisons = True
+    started = []
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kwargs: started.append((argv, kwargs)))
+    write(path, assistant(use("c8", "Bash", command="echo again")), tool_result("c8", "ok"), mode="a")
+    response = stop(engine, path)
+    assert "decision" not in response                                  # the answer did not wait for any comparison
+    assert len(started) == 1
+    argv, kwargs = started[0]
+    assert argv[1:4] == ["-m", "self_directing_mcp.verify_job", "--provider"] and "claude" in argv and SID in argv
+    assert argv[argv.index("--index-dir") + 1] == str(engine.settings.index_dir)
+    assert kwargs["start_new_session"] is True and kwargs["stdout"] is subprocess.DEVNULL
+    assert engine.deferred_comparisons == {}
+
+
+def test_a_failure_to_start_the_verifier_does_not_fail_the_hook(env, monkeypatch):
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    _audit(engine, path)
+    engine.defer_comparisons = True
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(OSError("no fork")))
+    write(path, assistant(use("c7", "Bash", command="echo again")), tool_result("c7", "ok"), mode="a")
+    assert "FAILED" not in str(stop(engine, path))
+
+
+def test_the_verifier_compares_the_session_and_records_a_match(env):
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    _audit(engine, path)
+    engine.defer_comparisons = True
+    write(path, assistant(use("c6", "Bash", command="echo again")), tool_result("c6", "ok"), mode="a")
+    _audit(engine, path)
+    assert engine.deferred_comparisons
+    assert verify_job.run("claude", SID, str(path), engine.settings.index_dir) == "compared"
+
+
+def test_only_one_verifier_runs_per_index(env, monkeypatch):
+    engine, path = env
+    index = engine.settings.index_dir
+    index.mkdir(parents=True, exist_ok=True)
+    with open(verify_job.lock_path(index), "a+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        def never(*args, **kwargs):
+            raise AssertionError("a second verifier must not start an engine")
+        monkeypatch.setattr("self_directing_mcp.engine.SelfDirectEngine", never)
+        assert verify_job.run("claude", SID, str(path), index) == "busy"
+        assert verify_job.main(["--provider", "claude", "--session-id", SID, "--index-dir", str(index)]) == 0
+
+
+def test_the_verifier_entry_point_reports_only_the_error_class(env, monkeypatch, capsys):
+    engine, path = env
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("SENTINEL-secret-path")
+    monkeypatch.setattr(verify_job, "run", broken)
+    assert verify_job.main(["--provider", "claude", "--session-id", SID, "--index-dir", str(engine.settings.index_dir)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "RuntimeError" and "SENTINEL" not in captured.out + captured.err

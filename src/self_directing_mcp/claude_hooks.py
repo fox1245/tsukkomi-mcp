@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any, TYPE_CHECKING
 
@@ -353,12 +354,35 @@ def _new_settings():
 
 
 def _new_engine():
+    from self_directing_mcp import verify_job
     from self_directing_mcp.engine import SelfDirectEngine
     from self_directing_mcp.settings_core import load_hook_settings
     try:
-        return SelfDirectEngine(load_hook_settings())
+        engine = SelfDirectEngine(load_hook_settings())
     except Exception as exc:
         raise HookRuntimeError("settings or engine unavailable") from exc
+    # This process answers one event and exits: the shadow comparisons its audits plan are left to a detached verifier.
+    engine.defer_comparisons = verify_job.supported()
+    return engine
+
+
+def spawn_verifier(engine: SelfDirectEngine) -> None:
+    """Start the detached verifier (``verify_job``) for the sessions whose planned shadow comparison this hook left to it.
+
+    Nothing waits for it: its standard streams are closed and it is its own session, so the host sees this hook finish
+    as soon as it has answered. A failure to start it is not a failure of the hook (the next planned comparison covers the
+    session)."""
+    pending, engine.deferred_comparisons = dict(engine.deferred_comparisons), {}
+    for (provider, session_id), path in pending.items():
+        argv = [sys.executable, "-m", "self_directing_mcp.verify_job", "--provider", provider,
+                "--session-id", session_id, "--index-dir", str(engine.settings.index_dir)]
+        if path:
+            argv += ["--path", path]
+        try:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True)
+        except OSError:
+            pass
 
 
 def _dispatch(payload: Any, event: str | None, engine: SelfDirectEngine | None, context: dict[str, Any]) -> dict[str, Any]:
@@ -382,16 +406,20 @@ def _dispatch(payload: Any, event: str | None, engine: SelfDirectEngine | None, 
             return handle_session_start(engine, call)
         path = _validated_path(engine, call.session_id, call.transcript_path)
         if event == "PreToolUse":
-            return handle_pre_tool_use(engine, call, path)
-        if event == "Stop":
-            return handle_stop(engine, call, path)
-        target = _subagent_target(engine, call)
-        if target is None:
-            if not ClaudeHookState(engine.settings.index_dir).claim_notice(
-                    call.session_id, NOTICE_SUBAGENT_UNKNOWN, SUBAGENT_UNKNOWN):
-                return {"decision": "allow"}
-            return {"decision": "allow", "reason": SUBAGENT_UNKNOWN}
-        return handle_stop(engine, call, target[1], session_id=target[0])
+            reply = handle_pre_tool_use(engine, call, path)
+        elif event == "Stop":
+            reply = handle_stop(engine, call, path)
+        else:
+            target = _subagent_target(engine, call)
+            if target is None:
+                if not ClaudeHookState(engine.settings.index_dir).claim_notice(
+                        call.session_id, NOTICE_SUBAGENT_UNKNOWN, SUBAGENT_UNKNOWN):
+                    return {"decision": "allow"}
+                return {"decision": "allow", "reason": SUBAGENT_UNKNOWN}
+            reply = handle_stop(engine, call, target[1], session_id=target[0])
+        if engine.defer_comparisons and engine.deferred_comparisons:
+            spawn_verifier(engine)
+        return reply
     finally:
         if owned:
             engine.close()

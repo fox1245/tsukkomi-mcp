@@ -59,6 +59,7 @@ from self_directing_mcp.security.mask import mask_secrets
 # tools in ``tools``) is matched against the command view of a shell call, ``audit.shellview``.)
 EVALUATOR_VERSION = 13
 STATE_VERSION = 1
+VERIFIER_SKIP = "verifier"      # ``report["shadow_skipped"]`` of a planned comparison that a hook left to the detached verifier
 
 # The full evaluator costs about this many seconds per stored event (measured on a 225k-event session). A shadow run
 # is skipped when the request's remaining budget cannot cover it with margin; it must never turn a request that
@@ -1056,7 +1057,7 @@ class AuditPlan:
     @classmethod
     def prepare(cls, store, *, session_id, provider, active, planned, needs, link_calls, shadow_every,
                 force_full=frozenset(), report=None, premise_rules=None, force=None, idle=False, cost_key=None,
-                defer=False, foreign=None):
+                defer=False, foreign=None, hook=False):
         """Decide how to evaluate and read the events needed; ``None`` means evaluate everything the old way.
 
         ``shadow_every``: ``None`` for the adaptive schedule, else the fixed legacy rate (``audit.shadow``).
@@ -1066,6 +1067,10 @@ class AuditPlan:
         ``idle``: the idle comparison of a resident engine, which compares everything. ``cost_key``: the key of this
         contract set in ``eval_cost.COSTS`` (what a comparison is expected to cost, once this process has measured the set);
         ``defer``: a resident engine can verify a skipped comparison later, and the report then says ``deferred``.
+        ``hook``: a hook process that hands its planned comparisons (warm-up, rebuild, sampled) to a detached verifier
+        (``verify_job``) instead of making the request wait for them; comparisons that an answer calls for or that a
+        high-risk contract needs (``force``, ``high_risk``) still run in the request. The report then says
+        ``shadow_skipped: "verifier"``.
         ``foreign``: the anchors of other sessions that the global contracts take their source and activation event from
         (``audit.anchors.resolve``, made once for this build inside the same read boundary); they are part of each state's key
         and the events carry their timestamps when one of them starts a window in time."""
@@ -1200,7 +1205,10 @@ class AuditPlan:
                 comparison.add(reason, force.scope)
         shadow = comparison.active
         total = store.session_metrics(session_id, provider)[0]
-        if shadow and not _shadow_affordable(total):
+        if shadow and hook and not idle and force is None and "high_risk" not in comparison.reasons:
+            shadow, comparison = False, shadow_module.Comparison()       # nothing is compared in this request (yet)
+            report["shadow_skipped"] = VERIFIER_SKIP
+        elif shadow and not _shadow_affordable(total):
             shadow = False
             report["shadow_skipped"] = "deferred" if defer else "deadline"
         elif shadow and not idle and force is None and COSTS.observed(cost_key):

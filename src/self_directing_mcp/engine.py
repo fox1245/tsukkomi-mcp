@@ -254,6 +254,11 @@ class SelfDirectEngine:
         self._last_activity = time.monotonic()
         self._integrity_worker = None  # set only by a resident server (see integrity_worker)
         self._shadow_worker = None     # likewise: the idle comparison of incremental audits (see shadow_worker)
+        # A hook process (one event, then exit) sets ``defer_comparisons``: its planned shadow comparisons are left to a
+        # detached verifier (``verify_job``) instead of delaying the answer; ``deferred_comparisons`` collects what the
+        # verifier is to compare: ``{(provider, session id): transcript path}``.
+        self.defer_comparisons = False
+        self.deferred_comparisons: dict[tuple[str, str], str | None] = {}
         self.integrity_policy: IntegrityPolicy | None = None  # tests may inject a clock / randomness
         self.slice_policy: SlicePolicy | None = None  # tests may inject forced stops / a clock (default: the settings)
         if settings is None:
@@ -1718,7 +1723,7 @@ class SelfDirectEngine:
                                     needs=needs, link_calls=link_calls, shadow_every=every, force_full=force_full,
                                     report=report, premise_rules=premise_rules, force=force, idle=idle,
                                     cost_key=cost_key, defer=self._shadow_worker is not None and not idle,
-                                    foreign=foreign_anchors)
+                                    foreign=foreign_anchors, hook=self.defer_comparisons)
                             except (RequestStopped, IndexBusy):
                                 raise
                             except Exception as exc:  # the cache could not even be read: evaluate everything in full
@@ -1971,6 +1976,8 @@ class SelfDirectEngine:
             payload["sync"] = sync       # how far the index got and what sized the slice; a finished sync adds nothing to coverage
         if report:
             payload["incremental"] = report
+            if self.defer_comparisons and report.get("shadow_skipped") == incremental.VERIFIER_SKIP:
+                self.deferred_comparisons[(provider, sid)] = coverage.get("path")
         payload["nudge"] = (
             "Detect only. violation/suspicious: STOP and report; unknown: resolve missing evidence. "
             "clean is limited to the reported contracts and history snapshot, not execution authorization.")
