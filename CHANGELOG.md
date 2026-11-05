@@ -2,6 +2,19 @@
 
 Notable changes to tsukkomi-mcp (Python package `self_directing_mcp`). Versions follow `pyproject.toml`. Releases before 0.6.0 are not itemized here; see the git history.
 
+## Unreleased
+
+### Changed
+
+- **Hook notices are said once.** An unverified-contract or advisory notice on an allowed call, the Stop notes about an unchanged gap in the evidence and the subagent-unavailable note are shown when they first apply in a session and again only when their text changes (`notice_state` in the hook state database). Denials, asks and violation findings are verdicts and stay on every call.
+- **A failing Claude Code hook refuses what a high-risk contract gates.** When the PreToolUse audit cannot run, an action that matches the trigger of an enabled `risk: high` contract (its `tools` filter and `target` honoured) is denied with the error class named, instead of asked or allowed with a warning; unrelated actions pass. The degraded notice is said once per session and event. AGY still asks.
+- **Contracts about commands are matched against the command view of a shell call** (`target`, `audit/shellview.py`, `resources/shell_semantics.json`): here-document bodies, quoted arguments and comments no longer match a contract, scripts and code handed to a shell or interpreter still do. Evaluator version 13: saved monitor states are rebuilt once.
+- **Command hooks leave their planned shadow comparisons to a detached verifier** (`python -m self_directing_mcp.verify_job`): a Stop no longer waits for a full evaluation of the session after a rebuild or when the adaptive schedule samples it. Comparisons that an answer or a high-risk contract calls for still run in the request.
+
+### Added
+
+- `target` on a contract (`command` or `text`), see above. Tests: `tests/test_hook_notices.py`, `tests/test_hook_degraded.py`, `tests/test_shell_command_view.py`, `tests/test_shell_command_view_engine.py`, `tests/test_verify_job.py`.
+
 ## 0.11.0 - 2026-10-30
 
 **Highlights.** Four things since 0.10.0. (1) **Contracts can say where they apply**: a contract can be `inject_only` (a reminder that is injected and never judged) or carry a `tools` filter (it applies to the calls of those tools only), `check_action` reports the verdict of the action next to the verdict of the session, and a global contract anchored to a user message of another session is judged instead of ending `unknown`. (2) **A contract can be tested and an approval can be recorded without switching a contract off**: `test_contract` and the `cases` of a contract run positive and negative examples (and a comparison with the stored version) before a contract is saved, and `grant_once` lets one user-approved call pass a `must_not` contract once. (3) **Less leaves the machine, and the extraction model is a setting**: `SELF_DIRECT_MASK_PII` masks e-mail addresses and phone numbers in the three requests that leave the machine, `OPENROUTER_API_KEY` is no longer sent to an embedding endpoint that is not OpenRouter, and the GraphRAG model, output budget and reasoning effort are settings whose input budget follows the model. (4) **Hosts**: Claude Code 2.1.30x metadata records and subagent families (`sync_session`, `search_history`, `get_graph_context`), AGY results that a host receipt links, and a `sync_session` that runs in the background (`async_mode`, `job_status`).
