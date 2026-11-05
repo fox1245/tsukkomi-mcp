@@ -500,7 +500,7 @@ class _Plan:
                 is_shell = program in shells
                 script = self._script_word(
                     texts, cmd, index, is_shell, ["-c"] if is_shell else interpreters[program],
-                    option_arguments if is_shell else tuple(interpreter_options.get(program, ())))
+                    option_arguments if is_shell else tuple(interpreter_options.get(program, ())), src)
                 if script is not None:
                     (self.shell_words if is_shell else self.code_words).add(script)
                 elif self._reads_stdin(texts, cmd, index, is_shell):
@@ -524,18 +524,18 @@ class _Plan:
         return is_shell and any(o[1:2] != "-" and "s" in o[1:] for o in options)
 
     @staticmethod
-    def _script_word(texts, cmd, index, is_shell, flags, option_arguments=("-o", "+o")):
+    def _script_word(texts, cmd, index, is_shell, flags, option_arguments=("-o", "+o"), src=""):
         """Index of the word that holds the inline script or code of a shell or interpreter, or None."""
         position = index + 1
         letters = {flag[1] for flag in flags if len(flag) == 2 and flag.startswith("-")}
         while position < len(texts):
             option = texts[position]
-            attached = _quoted(cmd.words[position])
-            # The part of the word before its first quote is the option; a quote after it is the script (``-c'code'``).
-            head = option
-            if attached:
-                first = next(part for part in cmd.words[position].parts if part.kind != "lit")
-                head = texts[position][:max(0, first.start - cmd.words[position].start)]
+            # The part of the word before its first quote that is not a plain word is the option; such a quote after it
+            # is the script (``-c'code'``). A quoted plain word (``"-c"``) is read like an unquoted one.
+            first = next((part for part in cmd.words[position].parts
+                          if part.kind in ("single", "double", "ansi") and not _plain(src[part.inner_start:part.inner_end])), None)
+            attached = first is not None
+            head = option if first is None else texts[position][:max(0, first.start - cmd.words[position].start)]
             if is_shell:
                 if option == "--" or not option.startswith(("-", "+")):
                     return None                  # a script file or another operand: nothing inline
@@ -552,6 +552,8 @@ class _Plan:
                 if equals and name.startswith("--") and name in flags:
                     return position                  # ``--eval="code"``: the code is part of this word
                 if len(option) > 2 and option[0] == "-" and option[1] != "-" and letters & set(head[1:]):
+                    if attached and head[-1:] in letters:
+                        return position                  # ``perl -lne'code'``: the code is the quoted part of this word
                     return position + 1 if position + 1 < len(texts) else None      # ``python -uc "code"``
                 if option in option_arguments:
                     position += 2                    # ``python -W ignore -c ...``: the next word belongs to the option
@@ -663,7 +665,10 @@ def targets_command(rule: Any) -> bool:
     if get("path_guard") is not None:
         return False                      # a typed path contract reads paths wherever they are written, quoted or not
     tools = get("tools")
-    shell = {name.lower() for name in shell_tools()}
+    try:
+        shell = {name.lower() for name in shell_tools()}
+    except (OSError, KeyError, ValueError, TypeError):
+        return False                      # a semantics file that cannot be read: the whole text, as before
     return bool(tools) and all(str(tool).lower() in shell for tool in tools)
 
 

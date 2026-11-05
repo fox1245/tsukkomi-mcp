@@ -1849,6 +1849,7 @@ class SelfDirectEngine:
                     # turned clean (a missed one), a high-risk contract whose summary changed.
                     late = plan.late_reasons(result, request_key, applies)
                     wanted = {reason: ids for reason, ids in late.items() if ids and not plan.comparison.covers(ids)}
+                    gating, deferred_late = frozenset(), False
                     if wanted and self.defer_comparisons and planned is None and not idle and every != 1:
                         # A hook's audit of the history gates nothing but a completion obligation that may resume the
                         # agent (``auto_continue``); for every other contract the answer is a note, so its comparison
@@ -1856,12 +1857,18 @@ class SelfDirectEngine:
                         gating = {rule.id for rule in active if rule.auto_continue and rule.type == "must"}
                         if set().union(*wanted.values()) - gating:
                             report["shadow_skipped"] = incremental.VERIFIER_SKIP
+                            deferred_late = True
                         wanted = {reason: ids & gating for reason, ids in wanted.items() if ids & gating}
                     if wanted and plan.schedule is not None and not idle:
                         wanted_ids = set().union(*wanted.values())
                         if shadow_policy.memo_covers(plan.schedule, plan.state_key(), request_key, result, wanted_ids):
-                            report["shadow_skipped"] = "verified_before"
-                            late = {}
+                            if deferred_late:
+                                # What was compared before covers the gating contracts only; the late reasons of the others
+                                # (a flip, a violation) were left to the verifier and stay remembered for it.
+                                late = {reason: ids - gating for reason, ids in late.items() if ids - gating}
+                            else:
+                                report["shadow_skipped"] = "verified_before"
+                                late = {}
                         elif (attempt < 3 and report.get("shadow_skipped") not in ("deadline", "deferred")
                               and incremental._shadow_affordable(plan.count)):
                             # (A planned comparison that this pass just declined for lack of room is not asked for again:

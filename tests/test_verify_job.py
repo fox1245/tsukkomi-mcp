@@ -316,3 +316,38 @@ def test_the_verifier_records_whether_it_could_compare(env, monkeypatch):
     monkeypatch.setattr(SelfDirectEngine, "verify_incremental", lambda self, **kwargs: {"compared": True, "mismatch": []})
     assert verify_job.run("claude", SID, str(path), index) == "compared"
     assert state.verifier_ready(f"claude:{SID}", 1e9, 1e9)
+
+
+def test_a_forced_comparison_alone_does_not_start_a_verifier(env, monkeypatch):
+    from self_directing_mcp.audit import shadow
+    monkeypatch.setattr(shadow, "WARMUP_REQUESTS", 0)
+    engine, path = env
+    engine.upsert_contracts([dict(RULE, id="gate", type="must", before_regex="deploy --prod", regex="tests passed")])
+    _grow(engine, path)
+    engine.settings.audit_shadow_every = 1_000_003                    # a schedule that plans nothing once the state exists
+    engine.defer_comparisons = True
+    action = {"tool_name": "Bash", "arguments": {"command": "deploy --prod"}}
+    engine.check_action(SID, action, provider="claude", path=str(path))                # builds the state
+    write(path, assistant(use("c8", "Bash", command="echo again")), tool_result("c8", "ok"), mode="a")
+    engine.deferred_comparisons.clear()
+    result = engine.check_action(SID, action, provider="claude", path=str(path))
+    assert result["verdict"] == "violation" and result["incremental"].get("shadow_compared") is True
+    assert result["incremental"].get("shadow_skipped") != incremental.VERIFIER_SKIP
+    assert engine.deferred_comparisons == {}                           # nothing was left over for a verifier
+
+
+def test_a_memoized_gating_comparison_does_not_make_the_deferred_late_comparisons_forgotten(env):
+    engine, path = env
+    engine.upsert_contracts([
+        {"id": "ack", "type": "must", "scope": "message", "provider": "claude", "regex": "VERIFIED", "auto_continue": True,
+         "description": "state VERIFIED when done"},
+        RULE])
+    _grow(engine, path)
+    write(path, assistant(use("bad", "Bash", command="deploy --prod now")), tool_result("bad", "ok"),
+          assistant({"type": "text", "text": "done, nothing stated"}), mode="a")
+    engine.settings.audit_shadow_every = "adaptive"
+    _audit(engine, path)                                              # builds the states and compares: the schedule memoizes it
+    engine.defer_comparisons = True
+    second = _audit(engine, path)                                     # same state: the gating comparison is memoized now
+    assert second["incremental"].get("shadow_skipped") == incremental.VERIFIER_SKIP        # not "verified_before"
+    assert engine.deferred_comparisons == {("claude", SID): str(path)}

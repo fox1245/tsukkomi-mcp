@@ -1202,12 +1202,13 @@ class AuditPlan:
                              if planned is not None and risky else set())
         if high_risk_applies and not comparison.full:
             comparison.add("high_risk", high_risk_applies)
+        planned_active = comparison.active              # what the schedule asked for, before an answer's own request
         if force is not None:
             for reason in force.reasons:
                 comparison.add(reason, force.scope)
         shadow = comparison.active
         total = store.session_metrics(session_id, provider)[0]
-        if shadow and hook and shadow_every != 1 and not idle and not high_risk_applies:
+        if shadow and planned_active and hook and shadow_every != 1 and not idle and not high_risk_applies:
             # The comparisons that were only planned are left to the verifier; one that an answer called for (``force``)
             # still runs, and so does every comparison while a high-risk contract applies to the proposed action.
             comparison = shadow_module.Comparison()

@@ -248,7 +248,7 @@ class HookState:
             return True
         if row is None or row[0] <= 0:
             return True
-        wait = min(base * (2 ** (row[0] - 1)), cap)
+        wait = min(base * (2 ** min(row[0] - 1, 30)), cap)
         return (time.time() if now is None else now) - row[1] >= wait
 
     def verifier_done(self, session_key: str, compared: bool, now: float | None = None) -> bool:
@@ -350,7 +350,8 @@ def high_risk_hit(contracts_path, session_id, tool_call, provider: str = "agy") 
         text = tool_call_text(provider, name, args)   # the text the audit matches: prose fields excluded
         # The name the contract's ``tools`` filter is compared with: the host's own, and the one the text carries (Grok's
         # calls are rendered with Claude Code's tool names), as the audit's ``_tool_matches`` does.
-        names = {str(name).lower(), text[text.index(":") + 1:text.index("]")].lower()} if text.startswith("[") else {str(name).lower()}
+        carried = text[1:].partition("]")[0].partition(":")[2].lower() if text.startswith("[") else ""
+        names = {str(name).lower()} | ({carried} if carried else set())
         sid = session_id.lower() if isinstance(session_id, str) else None
         for rule in document.get("contracts", []):
             if (not isinstance(rule, dict) or rule.get("enabled", True) is not True or rule.get("risk") != "high"
