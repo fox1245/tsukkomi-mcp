@@ -107,7 +107,7 @@ def fail_open(event, payload, error_class: str, kind: str = CHECK_FAILED, *, mod
             hit = None
         if hit and hit[1] == "must_not":
             refuse = (f"Refused: high-risk contract [{hit[0]}] forbids what this action matches and could not be verified. "
-                      "Fix the audit (see the error class above) or confirm the action with the owner and retry.")
+                      "Fix the audit (see the error class above) or confirm the action with the user and retry.")
         elif hit:
             ask = (f"High-risk contract [{hit[0]}] asks for a prerequisite of this action that could not be checked; "
                    "confirm manually.")
