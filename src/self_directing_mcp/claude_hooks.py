@@ -46,6 +46,9 @@ if TYPE_CHECKING:
 
 PATH_EVENTS = ("PreToolUse", "Stop", "SubagentStop")        # events that read the transcript
 LIGHT_EVENTS = ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure")   # bookkeeping only; no engine
+NOTICE_ALLOW = "pre_tool_use_allow"       # kinds of repeatable notices (``HookState.claim_notice``)
+NOTICE_STOP = "stop_notes"
+NOTICE_SUBAGENT_UNKNOWN = "subagent_unknown"
 BUDGET_NOTE = hook_policy.budget_note("session")
 SUBAGENT_UNKNOWN = ("The subagent's transcript is unavailable; its completion cannot be verified "
                     "(does not block stopping).")
@@ -183,16 +186,31 @@ def handle_pre_tool_use(engine: SelfDirectEngine, call: HookCall, path: str | No
                                       _mode(engine), adjust=adjust)
     if judged is None or judged.silent:
         return {"decision": "allow"}
-    if judged.warn:
-        # The model never sees an allow's reason; the next PostToolUse / UserPromptSubmit shows it.
-        ClaudeHookState(engine.settings.index_dir).queue_warning(
-            call.session_id, "Unverified tool call allowed: " + judged.reason)
+    if judged.decision == "allow":
+        # An allow that only carries a notice (unverified contracts, advisory text): the same notice on every call is
+        # noise, so it is shown when it first applies in this session and again only when its text changes.
+        state = ClaudeHookState(engine.settings.index_dir)
+        if not state.claim_notice(call.session_id, NOTICE_ALLOW, judged.reason):
+            return {"decision": "allow"}
+        if judged.warn:
+            # The model never sees an allow's reason; the next PostToolUse / UserPromptSubmit shows it.
+            state.queue_warning(call.session_id, "Unverified tool call allowed: " + judged.reason)
     return {"decision": judged.decision, "reason": judged.reason}
 
 
 def _claim(engine: SelfDirectEngine, call: HookCall, key: str) -> bool:
     # One budget for the whole Claude Code session (subagent stops never draw on it).
     return ClaudeHookState(engine.settings.index_dir).claim_continue(call.session_id, key)
+
+
+def _fresh_notes(engine: SelfDirectEngine, call: HookCall, notes: list) -> list:
+    """The notes worth saying now: verdicts always, the rest only when they differ from the last Stop note of this
+    session (a subagent's stop counts against its parent's session, not its own)."""
+    quiet = [note for note in notes if not isinstance(note, hook_policy.VerdictNote)]
+    if quiet and not ClaudeHookState(engine.settings.index_dir).claim_notice(call.session_id, NOTICE_STOP,
+                                                                              "\n".join(quiet)):
+        return [note for note in notes if isinstance(note, hook_policy.VerdictNote)]
+    return notes
 
 
 def handle_stop(engine: SelfDirectEngine, call: HookCall, path: str, *, session_id: str | None = None) -> dict[str, Any]:
@@ -228,6 +246,7 @@ def handle_stop(engine: SelfDirectEngine, call: HookCall, path: str, *, session_
         misses = [(rule, f) for rule, f in misses if rule.scope not in _FINAL_MESSAGE_SCOPES]
         notes.append(TRANSCRIPT_LAGS)
     if mode == "advisory":
+        notes = _fresh_notes(engine, call, notes)
         return {"decision": "allow", "reason": hook_policy.with_notes(notes, "ADVISORY (not compliance): ")} if notes else {"decision": "allow"}
     if misses and subagent:
         notes.append(SUBAGENT_NEVER_BLOCKS)
@@ -238,6 +257,7 @@ def handle_stop(engine: SelfDirectEngine, call: HookCall, path: str, *, session_
                     "A user-specified completion obligation is confirmed unmet: " + hook_policy.miss_summary(misses)
                     + ". This is the only automatic continuation for this session."}
         notes.append(BUDGET_NOTE)
+    notes = _fresh_notes(engine, call, notes)
     if notes:
         return {"decision": "allow", "reason": hook_policy.with_notes(notes, "Not verified (does not block stopping): ")}
     return {"decision": "allow"}
@@ -367,6 +387,9 @@ def _dispatch(payload: Any, event: str | None, engine: SelfDirectEngine | None, 
             return handle_stop(engine, call, path)
         target = _subagent_target(engine, call)
         if target is None:
+            if not ClaudeHookState(engine.settings.index_dir).claim_notice(
+                    call.session_id, NOTICE_SUBAGENT_UNKNOWN, SUBAGENT_UNKNOWN):
+                return {"decision": "allow"}
             return {"decision": "allow", "reason": SUBAGENT_UNKNOWN}
         return handle_stop(engine, call, target[1], session_id=target[0])
     finally:

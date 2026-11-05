@@ -20,6 +20,7 @@ A hook must never fail because bookkeeping did, and an unreadable budget means "
 from __future__ import annotations
 
 from contextlib import closing
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -121,7 +122,10 @@ class HookState:
                     last_success_at REAL, PRIMARY KEY (kind, event));
                 CREATE TABLE IF NOT EXISTS pending_warnings (
                     conversation_id TEXT NOT NULL, text TEXT NOT NULL, created_at REAL NOT NULL,
-                    PRIMARY KEY (conversation_id, text));""")
+                    PRIMARY KEY (conversation_id, text));
+                CREATE TABLE IF NOT EXISTS notice_state (
+                    conversation_id TEXT NOT NULL, kind TEXT NOT NULL, notice_key TEXT NOT NULL, shown_at REAL NOT NULL,
+                    PRIMARY KEY (conversation_id, kind));""")
         except BaseException:
             conn.close()
             raise
@@ -224,6 +228,34 @@ class HookState:
                 f"consecutive times (last error: {last['last_error_class']}, {_stamp(last['last_at'])}). "
                 "Those checks are not being applied; do not claim compliance for them.")
         return "\n".join(lines) or None
+
+    # Notices that carry no new information when repeated.
+    def claim_notice(self, conversation_id: str, kind: str, notice: str) -> bool:
+        """True when ``notice`` differs from the last one of this ``kind`` shown in this conversation (and records it).
+
+        A notice about an unchanged situation (the same unverifiable contracts, the same incomplete history) costs
+        the model tokens on every call and says nothing new after the first time. It is shown again only when its
+        text changes. Anything but a clean, recorded comparison answers True: when the state cannot be read the
+        notice is shown, never silently dropped. Verdicts (a denial, a violation) never go through this."""
+        key = hashlib.sha256(notice.encode("utf-8", "replace")).hexdigest()
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute("SELECT notice_key FROM notice_state WHERE conversation_id=? AND kind=?",
+                                       (conversation_id, kind)).fetchone()
+                    if row is not None and row[0] == key:
+                        conn.execute("ROLLBACK")
+                        return False
+                    conn.execute("INSERT OR REPLACE INTO notice_state VALUES (?,?,?,?)",
+                                 (conversation_id, kind, key, time.time()))
+                    conn.execute("COMMIT")
+                    return True
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+        except Exception:
+            return True
 
     # Warnings for the next PreInvocation (the host-supported injection channel).
     def queue_warning(self, conversation_id: str, text: str) -> bool:

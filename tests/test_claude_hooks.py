@@ -277,7 +277,9 @@ def test_unknown_warning_is_delivered_at_user_prompt_submit_and_session_start_wh
     assert submit["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert "Unverified tool call allowed" in submit["hookSpecificOutput"]["additionalContext"]
     assert run(engine, path, "UserPromptSubmit") == {}
-    run(engine, path, "PreToolUse", tool_input={"command": "echo again"})
+    engine.upsert_contracts([{"id": "d", "type": "must_not", "provider": "claude", "regex": "echo",
+                              "applies_from_event_id": "not-in-this-session", "description": "another unverified rule"}])
+    run(engine, path, "PreToolUse", tool_input={"command": "echo again"})      # the set of notices changed
     start = run(engine, path, "SessionStart")
     assert "Unverified tool call allowed" in start["hookSpecificOutput"]["additionalContext"]
 
@@ -437,10 +439,13 @@ def test_stop_blocks_once_per_session_for_a_confirmed_auto_continue_obligation(e
     engine.upsert_contracts([ACK])
     first = stop(engine, path)
     assert first["decision"] == "block" and "ack" in first["reason"] and "hookSpecificOutput" not in first
+    again = stop(engine, path)
+    assert "decision" not in again                            # another turn: the budget is not reset
+    assert "budget" in again["systemMessage"].lower()         # said once: the situation does not change after that
     for _ in range(2):
-        again = stop(engine, path)
-        assert "decision" not in again                        # another turn: the budget is not reset
-    assert "budget" in stop(engine, path)["systemMessage"].lower()
+        later = stop(engine, path)
+        assert "decision" not in later
+        assert "budget" not in later["systemMessage"].lower() and "violation" in later["systemMessage"]   # a verdict stays
 
 
 def test_budget_survives_a_process_restart_and_is_per_session(env, tmp_path):
@@ -698,9 +703,11 @@ def test_contracts_scoped_to_the_parent_session_do_not_apply_to_a_subagent_trans
 def test_subagent_stop_without_a_locatable_transcript_allows_with_a_note(env):
     engine, path = env
     engine.upsert_contracts([ACK])
-    for extra in ({}, {"agent_id": AGENT_ID}):        # no ids at all / id of a transcript that does not exist
-        response = subagent_stop(engine, **extra)
-        assert "decision" not in response and "unavailable" in response["systemMessage"]
+    first, *rest = ({}, {"agent_id": AGENT_ID})       # no ids at all / id of a transcript that does not exist
+    response = subagent_stop(engine, **first)
+    assert "decision" not in response and "unavailable" in response["systemMessage"]
+    for extra in rest:                                # the same note is not repeated for the same session
+        assert subagent_stop(engine, **extra) == {}
     assert health(engine).health() == []               # not an error: older hosts send no subagent identifiers
 
 
