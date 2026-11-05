@@ -58,19 +58,18 @@ from self_directing_mcp.index.ingest import (
     _provider_parser, capture_for_cursor, coverage_from_capture, get_session_progress, ingest_session,
 )
 from self_directing_mcp.audit.contract_testing import evaluate_contract_cases, merge_contract_cases
-from self_directing_mcp.audit.grants import (
-    apply_grants_to_finding,
-    create_grant_record,
-    extract_canonical_english_candidates,
-    grants_lock,
-    load_grants_doc,
-    parse_expires_in,
-    save_grants_doc,
-    session_grant_contract_ids,
-    validate_grant_action_tokens_and_rule,
-    verify_raw_anchor_approves_grant,
-    verify_user_anchor_approves_grant,
-)
+
+
+class _LazyGrants:
+    """The grant machinery (``audit.grants``: about 100 compiled patterns, 30 ms to import) is needed only when a
+    grants file exists or ``grant_once`` runs; a hook process that has no grants never imports it."""
+
+    def __getattr__(self, name):
+        from self_directing_mcp.audit import grants
+        return getattr(grants, name)
+
+
+_grants = _LazyGrants()
 from self_directing_mcp.audit.runner import rejections
 from self_directing_mcp.request_stats import note_degraded
 from self_directing_mcp.index.sparse import (
@@ -1917,9 +1916,9 @@ class SelfDirectEngine:
                     with self._publication_guard(), self.store._read_boundary():
                         full_chunks = self.store.capture_evidence(sid, provider).list_chunks(sid, provider)
                     rejected_map = rejections(provider, active, full_chunks, None) if planned is None else None
-                    with grants_lock(grants_path):
-                        grants_doc = load_grants_doc(grants_path)
-                        granted_cids = session_grant_contract_ids(grants_doc, sid)
+                    with _grants.grants_lock(grants_path):
+                        grants_doc = _grants.load_grants_doc(grants_path)
+                        granted_cids = _grants.session_grant_contract_ids(grants_doc, sid)
                         if granted_cids:
                             rules_by_id = {r.id: r for r in active}
                             grants_dirty = False
@@ -1927,7 +1926,7 @@ class SelfDirectEngine:
                             for f in result.findings:
                                 rule_obj = rules_by_id.get(f.contract_id)
                                 if rule_obj is not None and f.contract_id in granted_cids and f.verdict in ("violation", "suspicious"):
-                                    updated_f, dirty = apply_grants_to_finding(
+                                    updated_f, dirty = _grants.apply_grants_to_finding(
                                         rule=rule_obj,
                                         finding=f,
                                         doc=grants_doc,
@@ -1943,7 +1942,7 @@ class SelfDirectEngine:
                                 else:
                                     new_findings.append(f)
                             if grants_dirty:
-                                save_grants_doc(grants_path, grants_doc)
+                                _grants.save_grants_doc(grants_path, grants_doc)
                             result.findings = new_findings
                             if any(f.grants_applied for f in new_findings):
                                 if any(f.verdict == "violation" for f in result.findings):
@@ -2459,7 +2458,7 @@ class SelfDirectEngine:
             }
         if isinstance(max_uses, bool) or not isinstance(max_uses, int) or max_uses != 1:
             raise ValueError("grant_once only supports max_uses=1")
-        parse_expires_in(expires_in)
+        _grants.parse_expires_in(expires_in)
 
         resolved_provider = self._resolve_provider(provider, path=path)
         sid = session_id.lower() if resolved_provider in ("codex", "agy") else session_id
@@ -2489,7 +2488,7 @@ class SelfDirectEngine:
                     "contract_id": contract_id,
                     "message": f"Contract {contract_id!r} uses path_guard or lacks a regex and does not support grant_once.",
                 }
-            validate_grant_action_tokens_and_rule(action_regex, rule_pre)
+            _grants.validate_grant_action_tokens_and_rule(action_regex, rule_pre)
             with self.store._read_boundary():
                 committed_rec = self.store.cursor_record(sid, resolved_provider)
 
@@ -2571,7 +2570,7 @@ class SelfDirectEngine:
                     "contract_id": contract_id,
                     "message": f"Contract {contract_id!r} uses path_guard or lacks a regex and does not support grant_once.",
                 }
-            validate_grant_action_tokens_and_rule(action_regex, rule)
+            _grants.validate_grant_action_tokens_and_rule(action_regex, rule)
             with self.store._read_boundary():
                 recheck_rec = self.store.cursor_record(sid, resolved_provider)
                 anchor = self.store.get_chunk(source_event_id)
@@ -2646,7 +2645,7 @@ class SelfDirectEngine:
                     "source_event_id": source_event_id,
                     "message": f"source_event_id is stale (must be within the latest {max_turns} user turns and last {max_events} events); grant_once requires a fresh user approval message.",
                 }
-            raw_approved, raw_approval_detail = verify_raw_anchor_approves_grant(
+            raw_approved, raw_approval_detail = _grants.verify_raw_anchor_approves_grant(
                 anchor_text=anchor.text,
                 action_regex=action_regex,
                 rule=rule,
@@ -2671,7 +2670,7 @@ class SelfDirectEngine:
                         "message": "canonical_english_quote does not match the indexed canonical_english metadata on the user turn",
                     }
                 effective_canon = s_clean
-            approved, approval_detail = verify_user_anchor_approves_grant(
+            approved, approval_detail = _grants.verify_user_anchor_approves_grant(
                 anchor_text=anchor.text,
                 action_regex=action_regex,
                 rule=rule,
@@ -2684,8 +2683,8 @@ class SelfDirectEngine:
                     "source_event_id": source_event_id,
                     "message": approval_detail,
                 }
-            with grants_lock(grants_path):
-                grants_doc = load_grants_doc(grants_path)
+            with _grants.grants_lock(grants_path):
+                grants_doc = _grants.load_grants_doc(grants_path)
                 if any(
                     g.session_id == sid
                     and g.contract_id == rule.id
@@ -2699,7 +2698,7 @@ class SelfDirectEngine:
                         "message": f"source_event_id {source_event_id!r} has already been used to authorize a grant for contract {rule.id!r}.",
                     }
                 issued_after_id = session_chunks[-1].chunk_id if session_chunks else source_event_id
-                record = create_grant_record(
+                record = _grants.create_grant_record(
                     session_id=sid,
                     rule=rule,
                     action_regex=action_regex,
@@ -2810,7 +2809,7 @@ class SelfDirectEngine:
                             continue
                         eff_eng_text = s_clean
                     turn_candidates.extend(
-                        extract_canonical_english_candidates(
+                        _grants.extract_canonical_english_candidates(
                             source_event_id=chunk.chunk_id,
                             raw_quote=chunk.text,
                             canonical_english=eff_eng_text,
