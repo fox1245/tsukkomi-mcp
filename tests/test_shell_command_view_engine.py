@@ -43,9 +43,24 @@ def test_a_contract_without_tools_is_matched_against_the_whole_text_as_before(en
     engine.upsert_contracts([{"id": "any-tool", "type": "must_not", "provider": "claude", "scope": "tool_call",
                               "regex": GATED}])
     assert _proposed(engine, path, HEREDOC) == "violation"
+
+
+def test_a_contract_without_tools_that_asks_for_the_command_view_gets_it(env):
+    engine, path = env
     engine.upsert_contracts([{"id": "any-tool", "type": "must_not", "provider": "claude", "scope": "tool_call",
                               "regex": GATED, "target": "command"}])
     assert _proposed(engine, path, HEREDOC) == "clean"
+    assert _proposed(engine, path, f"bash -c '{GATED}'") == "violation"
+
+
+def test_switching_a_stored_contract_to_the_command_view_needs_a_user_anchor(env):
+    engine, path = env
+    engine.upsert_contracts([{"id": "any-tool", "type": "must_not", "provider": "claude", "scope": "tool_call",
+                              "regex": GATED}])
+    answer = engine.upsert_contracts([{"id": "any-tool", "type": "must_not", "provider": "claude", "scope": "tool_call",
+                                       "regex": GATED, "target": "command"}])
+    assert "NOT APPLIED" in str(answer)
+    assert _proposed(engine, path, HEREDOC) == "violation"                 # the stored revision is still the one enforced
 
 
 def test_the_audit_of_the_history_judges_the_same_way_in_the_full_and_the_incremental_evaluator(env):
@@ -68,3 +83,19 @@ def test_a_failing_hook_refuses_a_command_and_not_a_text_that_names_it(env, monk
     monkeypatch.setattr(claude_hooks, "handle_pre_tool_use", _raising)
     assert permission(run(engine, path, "PreToolUse", tool_input={"command": f"bash -c '{GATED}'"})) == "deny"
     assert permission(run(engine, path, "PreToolUse", tool_input={"command": HEREDOC})) == "none"
+
+
+def test_matching_less_text_is_a_weakening_and_matching_more_is_not():
+    from self_directing_mcp.audit.contracts import loosening_reasons
+    from self_directing_mcp.schemas import ContractRule
+    text_contract = ContractRule(id="c", type="must_not", scope="tool_call", regex=GATED)
+    command_contract = ContractRule(id="c", type="must_not", scope="tool_call", regex=GATED, target="command")
+    reason = "matched against the command view of shell calls instead of the whole text (target)"
+    assert reason in loosening_reasons(text_contract, command_contract)                  # whole text -> command view
+    assert loosening_reasons(command_contract, text_contract) == []                      # command view -> whole text
+    bash = ContractRule(id="c", type="must_not", scope="tool_call", regex=GATED, tools=["Bash"])
+    both = ContractRule(id="c", type="must_not", scope="tool_call", regex=GATED, tools=["Bash", "Write"])
+    assert reason in loosening_reasons(both, bash)                                       # derived target changes
+    assert loosening_reasons(bash, ContractRule(**{**bash.model_dump(), "target": "text"})) == []
+    pinned_text = ContractRule(**{**bash.model_dump(), "target": "text"})
+    assert reason in loosening_reasons(pinned_text, bash)                                # unset -> derived command view

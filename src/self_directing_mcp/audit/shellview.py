@@ -146,6 +146,8 @@ def _close_paren(src: str, i: int) -> int:
             continue
         if c == "\n" and pending:
             j = _read_heredoc_bodies(src, j + 1, pending)
+            if j < 0:
+                return -1
             pending = []
             continue
         if c == "(":
@@ -187,12 +189,16 @@ def _close_brace(src: str, i: int) -> int:
 
 
 def _read_heredoc_bodies(src: str, pos: int, pending: list[_Heredoc]) -> int:
-    """Consume the bodies of the here-documents opened on the line that just ended; return the new position."""
+    """Consume the bodies of the here-documents opened on the line that just ended; return the new position, or -1 when a
+    body has text but never ends (a mistyped delimiter, a CRLF terminator, an arithmetic ``<<``): what the shell would do
+    with the rest is not known, so the caller treats the whole command as unparsed."""
     for doc in pending:
         doc.body_start = pos
         while True:
             if pos >= len(src):
-                doc.body_end = doc.terminator_end = len(src)         # never terminated: the rest is the body
+                doc.body_end = doc.terminator_end = len(src)
+                if doc.body_start < len(src):
+                    return -1
                 break
             end = src.find("\n", pos)
             line_end = len(src) if end < 0 else end
@@ -324,6 +330,8 @@ def _parse(src: str) -> tuple[list[_Command], list[tuple[int, int]]] | None:
             i += 1
             if pending:
                 i = _read_heredoc_bodies(src, i, pending)
+                if i < 0:
+                    return None
                 pending = []
         elif c == "#" and word is None:
             start = i
@@ -359,8 +367,8 @@ def _parse(src: str) -> tuple[list[_Command], list[tuple[int, int]]] | None:
             add(_Part("lit", i, i + 1))
             i += 1
     end_command(None, n)
-    if pending:
-        _read_heredoc_bodies(src, n, pending)        # a here-document opened on the last line has no body
+    if pending and _read_heredoc_bodies(src, n, pending) < 0:
+        return None
     return cmds, comments
 
 
@@ -453,13 +461,25 @@ class _Plan:
                 script = self._script_word(texts, index, is_shell, ["-c"] if is_shell else interpreters[program])
                 if script is not None:
                     (self.shell_words if is_shell else self.code_words).add(script)
-                elif not any(not t.startswith("-") and not cmd.words[index + 1 + k].herestring
-                             and not (index + k >= 0 and cmd.words[index + k].herestring)
-                             for k, t in enumerate(texts[index + 1:])):
+                elif self._reads_stdin(texts, cmd, index, is_shell):
                     self.stdin_kind = self.stdin_kind or ("shell" if is_shell else "code")
         for number, word in enumerate(cmd.words[:-1]):
             if word.herestring and self.stdin_kind is not None:        # a here-string is the script of a shell
                 (self.shell_words if self.stdin_kind == "shell" else self.code_words).add(number + 1)
+
+    @staticmethod
+    def _reads_stdin(texts, cmd, index, is_shell) -> bool:
+        """Whether a shell or interpreter with no inline script takes its script from standard input: it has no operand,
+        its first operand is ``-`` or ``/dev/stdin``, or (a shell) it was given ``-s``, whatever operands follow."""
+        options, operands = [], []
+        for number in range(index + 1, len(texts)):
+            if cmd.words[number].herestring or (number > 0 and cmd.words[number - 1].herestring):
+                continue                                        # a here-string is the input, not an operand
+            text = texts[number]
+            (options if text.startswith("-") and text != "-" else operands).append(text)
+        if not operands or operands[0] in ("-", "/dev/stdin"):
+            return True
+        return is_shell and any(o[1:2] != "-" and "s" in o[1:] for o in options)
 
     @staticmethod
     def _script_word(texts, index, is_shell, flags):

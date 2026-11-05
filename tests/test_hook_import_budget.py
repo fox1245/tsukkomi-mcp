@@ -35,7 +35,8 @@ FORBIDDEN = {
     "starlette": "an MCP dependency",
 }
 FORBIDDEN_OURS = ("self_directing_mcp.server", "self_directing_mcp.config",
-                  "self_directing_mcp.contract_bundles")      # candidate files are read by the explicit tools, never by a hook
+                  "self_directing_mcp.contract_bundles",      # candidate files are read by the explicit tools, never by a hook
+                  "self_directing_mcp.audit.grants")          # about 100 patterns (30 ms): needed only when a grants file exists
 # Documented exceptions: third-party packages the hook path does load, with the reason and the measured cost
 # (python -X importtime, this machine; see README "Hook import budget").
 ALLOWED_THIRD_PARTY = {

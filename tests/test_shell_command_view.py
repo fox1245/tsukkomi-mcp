@@ -63,6 +63,11 @@ RUN = {
     "heredoc inside a substitution run by a shell": f"x=\"$(bash <<'EOF'\n{GATED}\nEOF\n)\"",
     "nested substitution": f"echo $(echo $({GATED}))",
     "after a comment line": f"# note\n{GATED}",
+    "python script on stdin with an argument": f"python3 - \"$x\" <<'EOF'\nimport os\nos.system('{GATED}')\nEOF",
+    "bash -s with an argument": f"bash -s arg <<'EOF'\n{GATED}\nEOF",
+    "sh reading a dash": f"sh - <<'EOF'\n{GATED}\nEOF",
+    "bash reading /dev/stdin": f"bash /dev/stdin <<'EOF'\n{GATED}\nEOF",
+    "bash with a long option and stdin": f"bash --noprofile <<'EOF'\n{GATED}\nEOF",
     "while loop body": f"while true; do {GATED}; done",
 }
 
@@ -91,6 +96,23 @@ def test_a_command_that_does_not_parse_or_is_too_large_is_returned_unchanged():
     assert GATED in command_view(deep)
     huge = f"echo '{GATED}' " + "x" * shellview.MAX_CHARS
     assert command_view(huge) == huge
+
+
+UNPARSED = {
+    "arithmetic shift then a command": f"(( x = 1 << 4 ))\n{GATED}",
+    "mistyped delimiter": f"cat <<EOF > f\nbody\nEOT\n{GATED}",
+    "carriage return in the terminator": f"cat <<'EOF' > f\nbody\r\nEOF\r\n{GATED}",
+    "never terminated": f"cat <<'EOF' > f\nbody {GATED}",
+}
+
+
+@pytest.mark.parametrize("name", sorted(UNPARSED))
+def test_a_here_document_that_never_ends_is_not_guessed_at_the_command_is_returned_unchanged(name):
+    assert command_view(UNPARSED[name]) == UNPARSED[name], name
+
+
+def test_a_here_document_opened_on_the_last_line_has_no_body_and_is_fine():
+    assert command_view("cat <<EOF") == "cat <<EOF"
 
 
 def test_nesting_deeper_than_the_interpreter_allows_is_returned_unchanged_not_raised():
