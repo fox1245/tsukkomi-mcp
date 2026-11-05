@@ -128,6 +128,8 @@ class HookState:
                 CREATE TABLE IF NOT EXISTS pending_warnings (
                     conversation_id TEXT NOT NULL, text TEXT NOT NULL, created_at REAL NOT NULL,
                     PRIMARY KEY (conversation_id, text));
+                CREATE TABLE IF NOT EXISTS verifier_state (
+                    session_key TEXT PRIMARY KEY, streak INTEGER NOT NULL, last_at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS notice_state (
                     conversation_id TEXT NOT NULL, kind TEXT NOT NULL, notice_key TEXT NOT NULL, shown_at REAL NOT NULL,
                     PRIMARY KEY (conversation_id, kind));""")
@@ -233,6 +235,36 @@ class HookState:
                 f"consecutive times (last error: {last['last_error_class']}, {_stamp(last['last_at'])}). "
                 "Those checks are not being applied; do not claim compliance for them.")
         return "\n".join(lines) or None
+
+    # The detached verifier (``verify_job``): when a hook may start the next one for a session.
+    def verifier_ready(self, session_key: str, base: float, cap: float, now: float | None = None) -> bool:
+        """True when a verifier for ``session_key`` may be started: its last run compared the session, or it did not and
+        ``base`` seconds, doubled for every run in a row that could not compare, up to ``cap``, have passed since. An
+        unreadable state allows it (a hook is never held back by its bookkeeping)."""
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute("SELECT streak, last_at FROM verifier_state WHERE session_key=?", (session_key,)).fetchone()
+        except Exception:
+            return True
+        if row is None or row[0] <= 0:
+            return True
+        wait = min(base * (2 ** (row[0] - 1)), cap)
+        return (time.time() if now is None else now) - row[1] >= wait
+
+    def verifier_done(self, session_key: str, compared: bool, now: float | None = None) -> bool:
+        """Record how a verifier run for ``session_key`` ended: a comparison that ran clears the streak, anything else
+        (nothing to compare, out of time, an error) lengthens the wait before the next one."""
+        stamp = time.time() if now is None else now
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("INSERT INTO verifier_state VALUES (?,?,?) ON CONFLICT(session_key) DO UPDATE SET "
+                             "streak=CASE WHEN ? THEN 0 ELSE streak+1 END, last_at=excluded.last_at",
+                             (session_key, 0 if compared else 1, stamp, 1 if compared else 0))
+                conn.execute("COMMIT")
+            return True
+        except Exception:
+            return False
 
     # Notices that carry no new information when repeated.
     def claim_notice(self, conversation_id: str, kind: str, notice: str) -> bool:

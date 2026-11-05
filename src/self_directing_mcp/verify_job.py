@@ -77,9 +77,11 @@ def run(provider: str, session_id: str, path: str | None, index_dir) -> str:
                                                _deadline=time.monotonic() + engine.settings.request_timeout_sec)
         finally:
             engine.close()
-    if result.get("mismatch"):
-        return "mismatch"
-    return "compared" if result.get("compared") else "not_compared"
+    outcome = "mismatch" if result.get("mismatch") else "compared" if result.get("compared") else "not_compared"
+    if provider == "claude":
+        from self_directing_mcp.claude_hook_state import ClaudeHookState
+        ClaudeHookState(index_dir).verifier_done(f"{provider}:{session_id}", outcome != "not_compared")
+    return outcome
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -92,6 +94,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         run(args.provider, args.session_id, args.path, args.index_dir)
     except Exception as exc:                # nothing waits for this process and nothing is printed: the class goes to stderr
+        if args.provider == "claude":
+            from self_directing_mcp.claude_hook_state import ClaudeHookState
+            ClaudeHookState(args.index_dir).verifier_done(f"{args.provider}:{args.session_id}", False)
         print(type(exc).__name__, file=sys.stderr)
         return 1
     return 0

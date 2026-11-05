@@ -260,3 +260,59 @@ def test_a_hook_waits_for_the_index_as_long_as_its_audit_budget_instead_of_answe
         raise AssertionError("the hook answered index busy instead of waiting for the lease")
     finally:
         hook.close()
+
+
+def test_the_wait_before_the_next_verifier_grows_while_a_session_cannot_be_compared(tmp_path):
+    from self_directing_mcp.claude_hook_state import ClaudeHookState
+    store = ClaudeHookState(tmp_path)
+    key = f"claude:{SID}"
+    assert store.verifier_ready(key, 30.0, 900.0, now=1000.0)                       # never run
+    store.verifier_done(key, False, now=1000.0)
+    assert not store.verifier_ready(key, 30.0, 900.0, now=1029.0)
+    assert store.verifier_ready(key, 30.0, 900.0, now=1030.0)
+    store.verifier_done(key, False, now=1030.0)                                     # twice in a row: 60 s
+    assert not store.verifier_ready(key, 30.0, 900.0, now=1089.0) and store.verifier_ready(key, 30.0, 900.0, now=1090.0)
+    for _ in range(10):
+        store.verifier_done(key, False, now=2000.0)
+    assert not store.verifier_ready(key, 30.0, 900.0, now=2899.0) and store.verifier_ready(key, 30.0, 900.0, now=2900.0)
+    store.verifier_done(key, True, now=3000.0)                                      # a comparison that ran clears it
+    assert store.verifier_ready(key, 30.0, 900.0, now=3000.0)
+    assert store.verifier_ready("claude:another-session", 30.0, 900.0, now=2000.0)
+
+
+def test_a_hook_does_not_start_a_verifier_for_a_session_that_cannot_be_compared_until_its_wait_is_over(env, monkeypatch):
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    _audit(engine, path)
+    _hook(engine)
+    started = []
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kwargs: started.append(argv))
+    from self_directing_mcp.claude_hook_state import ClaudeHookState
+    state = ClaudeHookState(engine.settings.index_dir)
+    state.verifier_done(f"claude:{SID}", False)                                     # the last one could not compare
+    write(path, assistant(use("c8", "Bash", command="echo again")), tool_result("c8", "ok"), mode="a")
+    stop(engine, path)
+    assert started == []
+    state.verifier_done(f"claude:{SID}", True)
+    write(path, assistant(use("c9", "Bash", command="echo more")), tool_result("c9", "ok"), mode="a")
+    stop(engine, path)
+    assert len(started) == 1
+
+
+def test_the_verifier_records_whether_it_could_compare(env, monkeypatch):
+    from self_directing_mcp.claude_hook_state import ClaudeHookState
+    engine, path = env
+    engine.upsert_contracts([RULE])
+    _grow(engine, path)
+    _audit(engine, path)
+    index = engine.settings.index_dir
+    state = ClaudeHookState(index)
+    assert verify_job.run("claude", SID, str(path), index) in ("compared", "not_compared")
+    from self_directing_mcp.engine import SelfDirectEngine
+    monkeypatch.setattr(SelfDirectEngine, "verify_incremental", lambda self, **kwargs: {"compared": False, "mismatch": []})
+    assert verify_job.run("claude", SID, str(path), index) == "not_compared"
+    assert not state.verifier_ready(f"claude:{SID}", 1e9, 1e9)                      # a run that could not compare waits
+    monkeypatch.setattr(SelfDirectEngine, "verify_incremental", lambda self, **kwargs: {"compared": True, "mismatch": []})
+    assert verify_job.run("claude", SID, str(path), index) == "compared"
+    assert state.verifier_ready(f"claude:{SID}", 1e9, 1e9)

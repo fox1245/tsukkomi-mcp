@@ -377,11 +377,16 @@ def spawn_verifier(engine: SelfDirectEngine) -> None:
     Nothing waits for it: its standard streams are closed and it is its own session, so the host sees this hook finish
     as soon as it has answered. A failure to start it is not a failure of the hook (the next planned comparison covers the
     session)."""
-    from self_directing_mcp import verify_job
+    from self_directing_mcp import shadow_worker, verify_job
     pending, engine.deferred_comparisons = dict(engine.deferred_comparisons), {}
     if pending and verify_job.running(engine.settings.index_dir):
         return                 # one verifier at a time per index; the next hook starts another when this one is done
+    state = ClaudeHookState(engine.settings.index_dir)
     for (provider, session_id), path in pending.items():
+        # A session whose verifier could not compare it (nothing to compare, out of time, an error) waits longer and longer,
+        # as the resident worker's backoff does, so a session that cannot be compared never costs a run after every hook.
+        if not state.verifier_ready(f"{provider}:{session_id}", shadow_worker.BACKOFF_SEC, shadow_worker.BACKOFF_MAX_SEC):
+            continue
         argv = [sys.executable, "-I", "-m", "self_directing_mcp.verify_job", "--provider", provider,
                 "--session-id", session_id, "--index-dir", str(engine.settings.index_dir)]
         if path:
