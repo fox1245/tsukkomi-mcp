@@ -31,6 +31,10 @@ OTHER = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
 AGENT_ID = "a1b2c3d4e5f60718"
 STEM = f"agent-{AGENT_ID}"
 CHILD = f"{SID}_{STEM}"
+RUN = "wf_71f7716b-e03"
+WORKFLOW_AGENT_ID = "a257abc963f7526f8"
+WORKFLOW_STEM = f"agent-{WORKFLOW_AGENT_ID}"
+WORKFLOW_CHILD = f"{SID}_{WORKFLOW_STEM}"
 PROJECT = "-synthetic-project"
 MODES = ("advisory", "confirmed_only", "enforced")
 SENTINEL = "SENTINEL-payload-text-4f9c"
@@ -59,9 +63,9 @@ def human(text, *, sub=False, **extra):
                       origin={"kind": "human"}, promptId="prompt-1", **extra)
 
 
-def prompt_of_parent(text):
+def prompt_of_parent(text, **extra):
     """A subagent's task prompt: runtime evidence, never user authority."""
-    return env_record("user", sub=True, message={"role": "user", "content": text})
+    return env_record("user", sub=True, message={"role": "user", "content": text}, **extra)
 
 
 def assistant(*blocks, sub=False, **extra):
@@ -98,6 +102,10 @@ def main_file(root, sid=SID):
 
 def sub_file(root, sid=SID, stem=STEM):
     return root / PROJECT / sid / "subagents" / f"{stem}.jsonl"
+
+
+def workflow_file(root, sid=SID, run=RUN, stem=WORKFLOW_STEM):
+    return root / PROJECT / sid / "subagents" / "workflows" / run / f"{stem}.jsonl"
 
 
 # --- fixtures ---------------------------------------------------------------------------------------------
@@ -727,6 +735,93 @@ def test_subagent_paths_are_validated(env, bad):
     engine.upsert_contracts([ACK])
     response = subagent_stop(engine, agent_transcript_path=bad)
     assert "decision" not in response and "systemMessage" in response
+
+
+def test_subagent_stop_judges_a_workflow_agent_transcript_like_an_ordinary_subagent(env):
+    engine, path = env
+    engine.upsert_contracts([dict(ACK, session_id=None)])
+    write(path, human("hi"), assistant(text("VERIFIED")))
+    root = engine.settings.resolve_claude_projects_dir()
+    wf = write(workflow_file(root), prompt_of_parent("do workflow task", agentId=WORKFLOW_AGENT_ID),
+               assistant(text("workflow step done"), sub=True, agentId=WORKFLOW_AGENT_ID))
+    response = subagent_stop(engine, agent_transcript_path=str(wf), agent_id=WORKFLOW_AGENT_ID)
+    assert "decision" not in response
+    assert "ack" in response["systemMessage"] and "never blocked" in response["systemMessage"]
+    assert "FAILED" not in response["systemMessage"]
+    assert engine.store.get_cursor(WORKFLOW_CHILD, provider="claude")[1] == str(wf)
+    assert health(engine).health() == []
+    assert health(engine).continue_claims(SID) == 0
+    assert health(engine).continue_claims(WORKFLOW_CHILD) == 0
+
+
+def test_subagent_stop_resolves_an_exact_workflow_path_even_when_the_stem_is_duplicated(env):
+    engine, _path = env
+    engine.upsert_contracts([ACK])
+    root = engine.settings.resolve_claude_projects_dir()
+    ordinary_copy = write(sub_file(root, stem=WORKFLOW_STEM),
+                          prompt_of_parent("ordinary copy", agentId=WORKFLOW_AGENT_ID),
+                          assistant(text("VERIFIED"), sub=True, agentId=WORKFLOW_AGENT_ID))
+    wf = write(workflow_file(root, stem=WORKFLOW_STEM), prompt_of_parent("workflow copy", agentId=WORKFLOW_AGENT_ID),
+               assistant(text("missing keyword"), sub=True, agentId=WORKFLOW_AGENT_ID))
+    response = subagent_stop(engine, agent_transcript_path=str(wf))
+    assert "decision" not in response
+    assert "ack" in response["systemMessage"] and "never blocked" in response["systemMessage"]
+    assert engine.store.get_cursor(WORKFLOW_CHILD, provider="claude")[1] == str(wf)
+    # Stopping the other copy with the same session id does not overwrite the indexed session.
+    second = subagent_stop(engine, agent_transcript_path=str(ordinary_copy))
+    assert "decision" not in second and "Not verified" in second["systemMessage"]
+    assert engine.store.get_cursor(WORKFLOW_CHILD, provider="claude")[1] == str(wf)
+    # Swapping which duplicate copy satisfies the contract produces a clean {} response on the satisfied workflow copy.
+    second_agent = "b368bcd0740863709"
+    second_stem = f"agent-{second_agent}"
+    write(sub_file(root, stem=second_stem), prompt_of_parent("ordinary missing", agentId=second_agent),
+          assistant(text("missing keyword"), sub=True, agentId=second_agent))
+    wf_ok = write(workflow_file(root, stem=second_stem), prompt_of_parent("workflow ok", agentId=second_agent),
+                  assistant(text("VERIFIED"), sub=True, agentId=second_agent))
+    assert subagent_stop(engine, agent_transcript_path=str(wf_ok)) == {}
+    assert engine.store.get_cursor(f"{SID}_{second_stem}", provider="claude")[1] == str(wf_ok)
+    assert health(engine).health() == []
+
+
+def test_subagent_stop_refuses_symlinked_workflows_or_run_directory(env, tmp_path):
+    engine, _path = env
+    engine.upsert_contracts([ACK])
+    root = engine.settings.resolve_claude_projects_dir()
+    external = tmp_path / "external"
+    write(external / f"{WORKFLOW_STEM}.jsonl", prompt_of_parent("task", agentId=WORKFLOW_AGENT_ID),
+          assistant(text("done"), sub=True, agentId=WORKFLOW_AGENT_ID))
+    linked_run = root / PROJECT / SID / "subagents" / "workflows" / RUN
+    linked_run.parent.mkdir(parents=True, exist_ok=True)
+    linked_run.symlink_to(external, target_is_directory=True)
+    res_run = subagent_stop(engine, agent_transcript_path=str(linked_run / f"{WORKFLOW_STEM}.jsonl"))
+    assert "decision" not in res_run and "FAILED" in res_run["systemMessage"]
+    rows = health(engine).health()
+    assert len(rows) == 1 and (
+        rows[0]["kind"], rows[0]["event"], rows[0]["last_error_class"], rows[0]["total"], rows[0]["consecutive"]
+    ) == ("check_failed", "SubagentStop", "PathTraversalError", 1, 1)
+    linked_workflows = root / PROJECT / OTHER / "subagents" / "workflows"
+    linked_workflows.parent.mkdir(parents=True, exist_ok=True)
+    linked_workflows.symlink_to(linked_run.parent, target_is_directory=True)
+    res_wf = run(engine, write(main_file(root, OTHER), human("hi", sid=OTHER)), "SubagentStop", sid=OTHER,
+                 agent_transcript_path=str(linked_workflows / RUN / f"{WORKFLOW_STEM}.jsonl"))
+    assert "decision" not in res_wf and "FAILED" in res_wf["systemMessage"]
+    rows = health(engine).health()
+    assert len(rows) == 1 and (
+        rows[0]["kind"], rows[0]["event"], rows[0]["last_error_class"], rows[0]["total"], rows[0]["consecutive"]
+    ) == ("check_failed", "SubagentStop", "PathTraversalError", 2, 2)
+
+
+def test_subagent_stop_with_deeper_or_unrecognised_layout_gives_unknown_notice_not_check_failed(env):
+    engine, _path = env
+    engine.upsert_contracts([ACK])
+    root = engine.settings.resolve_claude_projects_dir()
+    deeper = write(root / PROJECT / SID / "subagents" / "workflows" / RUN / "deeper" / f"{WORKFLOW_STEM}.jsonl",
+                   prompt_of_parent("task", agentId=WORKFLOW_AGENT_ID),
+                   assistant(text("done"), sub=True, agentId=WORKFLOW_AGENT_ID))
+    response = subagent_stop(engine, agent_transcript_path=str(deeper))
+    assert "decision" not in response
+    assert response["systemMessage"] == claude_hooks.SUBAGENT_UNKNOWN
+    assert health(engine).health() == []
 
 
 # --- path and payload validation --------------------------------------------------------------------------

@@ -6,16 +6,19 @@ grammar here lets the bookkeeping events (``UserPromptSubmit``, ``PostToolUse``)
 
 Session ids come from the transcript's location, never from record contents:
 
-    <project>/<uuid>.jsonl                          -> "<uuid>"
-    <project>/<uuid>/subagents/<stem>.jsonl         -> "<uuid>_<stem>"   (child of session <uuid>)
+    <project>/<uuid>.jsonl                                      -> "<uuid>"
+    <project>/<uuid>/subagents/<stem>.jsonl                     -> "<uuid>_<stem>"   (child of session <uuid>)
+    <project>/<uuid>/subagents/workflows/<run>/<stem>.jsonl     -> "<uuid>_<stem>"   (workflow child of session <uuid>)
 """
 from __future__ import annotations
 
 import re
 
 SUBAGENTS = "subagents"
+WORKFLOWS = "workflows"
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 STEM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 
 
 def session_parts(session_id) -> tuple[str, str | None] | None:

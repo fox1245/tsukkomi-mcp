@@ -20,7 +20,9 @@ import json
 import re
 from pathlib import Path
 
-from self_directing_mcp.claude_ids import SUBAGENTS, STEM as _STEM, UUID as _UUID, session_parts, valid_id  # noqa: F401
+from self_directing_mcp.claude_ids import (  # noqa: F401
+    RUN as _RUN, STEM as _STEM, SUBAGENTS, UUID as _UUID, WORKFLOWS, session_parts, valid_id,
+)
 from self_directing_mcp.codex import discover as _codex_discover
 from self_directing_mcp.session_events import has_invalid_utf8, iter_raw_lines, make_chunk, parse_error, result_success
 from self_directing_mcp.tool_payload import tool_call_parts
@@ -46,8 +48,9 @@ class PathTraversalError(ValueError):
 # ----------------------------------------------------------------------------- identity and discovery
 #
 # Session ids come from the transcript's location, never from record contents:
-#   <project>/<uuid>.jsonl                          -> "<uuid>"
-#   <project>/<uuid>/subagents/<stem>.jsonl         -> "<uuid>_<stem>"   (child of session <uuid>)
+#   <project>/<uuid>.jsonl                                      -> "<uuid>"
+#   <project>/<uuid>/subagents/<stem>.jsonl                     -> "<uuid>_<stem>"   (child of session <uuid>)
+#   <project>/<uuid>/subagents/workflows/<run>/<stem>.jsonl     -> "<uuid>_<stem>"   (workflow child of session <uuid>)
 # Every record of a subagent file carries the PARENT's ``sessionId`` and ``agentId``, so neither is unique per
 # file; the composite id keeps parent and child in separate (provider, session) index partitions, keeps
 # duplicate agent ids under different parents apart, and still matches the workflow id alphabet.
@@ -59,6 +62,13 @@ def _id_from_parts(parts) -> str | None:
     stem = parts[-1][:-len(".jsonl")]
     if len(parts) >= 3 and parts[-2] == SUBAGENTS and _UUID.fullmatch(parts[-3]) and _STEM.fullmatch(stem):
         return f"{parts[-3]}_{stem}"
+    if (len(parts) >= 5 and parts[-3] == WORKFLOWS and parts[-4] == SUBAGENTS
+            and _UUID.fullmatch(parts[-5]) and _RUN.fullmatch(parts[-2]) and _STEM.fullmatch(stem)):
+        return f"{parts[-5]}_{stem}"
+    for i in range(len(parts) - 1):
+        if parts[i] == SUBAGENTS and ((i > 0 and _UUID.fullmatch(parts[i - 1]))
+                                      or (i + 1 < len(parts) - 1 and parts[i + 1] == WORKFLOWS)):
+            return None
     return stem if _UUID.fullmatch(stem) else None
 
 
@@ -67,10 +77,12 @@ def peek_session_id(path: Path) -> str | None:
 
 
 def _layout_id(relative_parts) -> str | None:
-    """Session id for a path relative to the projects root; only the two official layouts qualify."""
+    """Session id for a path relative to the projects root; only the three official layouts qualify."""
     if len(relative_parts) == 2:
-        return _id_from_parts(relative_parts) if _UUID.fullmatch(relative_parts[1][:-len(".jsonl")]) else None
+        return _id_from_parts(relative_parts[1:]) if _UUID.fullmatch(relative_parts[1][:-len(".jsonl")]) else None
     if len(relative_parts) == 4 and relative_parts[2] == SUBAGENTS:
+        return _id_from_parts(relative_parts[1:])
+    if len(relative_parts) == 6 and relative_parts[2] == SUBAGENTS and relative_parts[3] == WORKFLOWS:
         return _id_from_parts(relative_parts[1:])
     return None
 
@@ -107,6 +119,51 @@ def _linked_project_target(link: Path, *roots: Path) -> Path:
     return roots[0] / target.name
 
 
+def _entries(directory):
+    try:
+        with os.scandir(directory) as scan:
+            return sorted(scan, key=lambda entry: entry.name)
+    except OSError:
+        return []
+
+
+def _plain_entry(entry, *, directory: bool) -> bool:
+    try:
+        return (entry.is_dir(follow_symlinks=False) if directory else entry.is_file(follow_symlinks=False)) \
+            and not os.path.isjunction(entry.path)
+    except OSError:
+        return False
+
+
+def _subagent_candidates(sub_dir: Path, *, allow_ambiguous: bool = False) -> list[tuple[str, Path]]:
+    """``(stem, path)`` for subagent transcripts under ``sub_dir`` (ordinary and ``workflows/<run>/``).
+
+    When ``allow_ambiguous`` is False, a stem that appears in more than one place under ``sub_dir`` is omitted
+    completely so discovery never picks one copy arbitrarily.
+    """
+    raw: list[tuple[str, Path]] = []
+    counts: dict[str, int] = {}
+    for entry in _entries(sub_dir):
+        if _plain_entry(entry, directory=False) and entry.name.endswith(".jsonl"):
+            stem = entry.name[:-len(".jsonl")]
+            if _STEM.fullmatch(stem):
+                raw.append((stem, Path(entry.path)))
+                counts[stem] = counts.get(stem, 0) + 1
+        elif entry.name == WORKFLOWS and _plain_entry(entry, directory=True):
+            for run in _entries(entry.path):
+                if not (_plain_entry(run, directory=True) and _RUN.fullmatch(run.name)):
+                    continue
+                for child in _entries(run.path):
+                    if _plain_entry(child, directory=False) and child.name.endswith(".jsonl"):
+                        stem = child.name[:-len(".jsonl")]
+                        if _STEM.fullmatch(stem):
+                            raw.append((stem, Path(child.path)))
+                            counts[stem] = counts.get(stem, 0) + 1
+    if allow_ambiguous:
+        return raw
+    return [(stem, path) for stem, path in raw if counts[stem] == 1]
+
+
 def _find_by_id(root: Path, session_id: str) -> list[Path]:
     parent, stem = session_parts(session_id)
     found: list[Path] = []
@@ -115,13 +172,22 @@ def _find_by_id(root: Path, session_id: str) -> list[Path]:
     except OSError:
         return found
     for project in projects:
-        candidate = project / (f"{session_id}.jsonl" if stem is None else f"{parent}/{SUBAGENTS}/{stem}.jsonl")
-        if _linked(candidate) or not candidate.is_file():
-            continue
-        try:
-            found.append(resolve_session_path(root, session_id=session_id, path=str(candidate)))
-        except (ValueError, OSError):
-            continue
+        if stem is None:
+            candidates = [project / f"{session_id}.jsonl"]
+        else:
+            parent_dir = project / parent
+            sub_dir = parent_dir / SUBAGENTS
+            if _linked(parent_dir) or _linked(sub_dir) or not sub_dir.is_dir():
+                continue
+            candidates = [path for candidate_stem, path in _subagent_candidates(sub_dir, allow_ambiguous=True)
+                          if candidate_stem == stem]
+        for candidate in candidates:
+            if _linked(candidate) or not candidate.is_file():
+                continue
+            try:
+                found.append(resolve_session_path(root, session_id=session_id, path=str(candidate)))
+            except (ValueError, OSError):
+                continue
     return list(dict.fromkeys(found))
 
 
@@ -190,35 +256,19 @@ def resolve_session_path(root: Path, *, session_id: str | None = None, path: str
 def discover_session_files(root: Path, *, include_subagents: bool = True) -> list[Path]:
     """Transcripts in official layouts below ``root``. Symlinked files and directories are never followed."""
     root = Path(root).expanduser().resolve()
-
-    def entries(directory):
-        try:
-            with os.scandir(directory) as scan:
-                return sorted(scan, key=lambda entry: entry.name)
-        except OSError:
-            return []
-
-    def plain(entry, *, directory):
-        try:
-            return (entry.is_dir(follow_symlinks=False) if directory else entry.is_file(follow_symlinks=False)) \
-                and not os.path.isjunction(entry.path)
-        except OSError:
-            return False
-
     found: list[Path] = []
-    for project in entries(root):
-        if not plain(project, directory=True):
+    for project in _entries(root):
+        if not _plain_entry(project, directory=True):
             continue
-        for entry in entries(project.path):
-            if plain(entry, directory=False) and entry.name.endswith(".jsonl") \
+        for entry in _entries(project.path):
+            if _plain_entry(entry, directory=False) and entry.name.endswith(".jsonl") \
                     and _UUID.fullmatch(entry.name[:-len(".jsonl")]):
                 found.append(Path(entry.path))
-            elif include_subagents and plain(entry, directory=True) and _UUID.fullmatch(entry.name):
-                nested = next((e for e in entries(entry.path) if e.name == SUBAGENTS and plain(e, directory=True)), None)
-                for child in entries(nested.path) if nested is not None else ():
-                    if plain(child, directory=False) and child.name.endswith(".jsonl") \
-                            and _STEM.fullmatch(child.name[:-len(".jsonl")]):
-                        found.append(Path(child.path))
+            elif include_subagents and _plain_entry(entry, directory=True) and _UUID.fullmatch(entry.name):
+                nested = next((e for e in _entries(entry.path) if e.name == SUBAGENTS and _plain_entry(e, directory=True)),
+                              None)
+                if nested is not None:
+                    found.extend(path for _stem, path in _subagent_candidates(Path(nested.path)))
     return sorted(found)
 
 
@@ -235,8 +285,8 @@ def discover_subagent_files(root: Path, session_id: str, *, path: Path | None = 
             resolved_main = resolve_session_path(root, path=str(path))
             main_parts = session_parts(peek_session_id(resolved_main))
             if main_parts is not None and main_parts[0] == parent:
-                sub_dir = resolved_main.parent if main_parts[1] is not None else (resolved_main.parent / parent / SUBAGENTS)
-                candidate_dirs.append(sub_dir)
+                project_dir = root / resolved_main.relative_to(root).parts[0]
+                candidate_dirs.append(project_dir / parent / SUBAGENTS)
         except (ValueError, OSError):
             pass
     if not candidate_dirs:
@@ -249,21 +299,12 @@ def discover_subagent_files(root: Path, session_id: str, *, path: Path | None = 
             sub_dir = parent_dir / SUBAGENTS
             if not _linked(parent_dir) and not _linked(sub_dir) and sub_dir.is_dir():
                 candidate_dirs.append(sub_dir)
-    found: list[tuple[str, Path]] = []
     seen: set[str] = set()
+    found: list[tuple[str, Path]] = []
     for sub_dir in candidate_dirs:
-        if _linked(sub_dir) or not sub_dir.is_dir():
+        if _linked(sub_dir.parent) or _linked(sub_dir) or not sub_dir.is_dir():
             continue
-        try:
-            entries = sorted(sub_dir.iterdir(), key=lambda e: e.name)
-        except OSError:
-            continue
-        for entry in entries:
-            if _linked(entry) or not entry.is_file() or not entry.name.endswith(".jsonl"):
-                continue
-            stem = entry.name[:-len(".jsonl")]
-            if not _STEM.fullmatch(stem):
-                continue
+        for stem, entry in _subagent_candidates(sub_dir):
             sub_sid = f"{parent}_{stem}"
             if sub_sid in seen:
                 continue

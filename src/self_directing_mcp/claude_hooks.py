@@ -128,7 +128,9 @@ def _subagent_target(engine: SelfDirectEngine, call: HookCall) -> tuple[str, str
     """``(subagent session id, transcript path)`` of the stopping subagent, or None when it cannot be located.
 
     A subagent file is its own session (``<parent uuid>_<stem>``): it never shares evidence with the parent, and
-    contracts scoped to the parent session do not apply to it. A path that belongs to another session raises.
+    contracts scoped to the parent session do not apply to it. An unrecognised layout under the projects root is
+    treated as an unlocatable transcript (None); a path that belongs to another session or fails path validation
+    raises.
     """
     from self_directing_mcp import claude
     candidate = call.agent_transcript_path
@@ -139,7 +141,9 @@ def _subagent_target(engine: SelfDirectEngine, call: HookCall) -> tuple[str, str
         return None
     try:
         resolved = claude.resolve_session_path(engine.settings.resolve_claude_projects_dir(), path=candidate)
-    except FileNotFoundError:
+    except claude.PathTraversalError:
+        raise
+    except (FileNotFoundError, ValueError):
         return None
     agent_sid = claude.peek_session_id(resolved)
     parts = claude.session_parts(agent_sid)
