@@ -21,6 +21,10 @@ OTHER = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
 AGENT_ID = "a1b2c3d4e5f60718"
 STEM = f"agent-{AGENT_ID}"
 CHILD = f"{SID}_{STEM}"
+RUN = "wf_71f7716b-e03"
+WORKFLOW_AGENT_ID = "a257abc963f7526f8"
+WORKFLOW_STEM = f"agent-{WORKFLOW_AGENT_ID}"
+WORKFLOW_CHILD = f"{SID}_{WORKFLOW_STEM}"
 PROJECT = "-synthetic-project"
 PHRASE = "FORBIDDEN-PHRASE"
 
@@ -88,6 +92,10 @@ def main_file(root, sid=SID, project=PROJECT):
 
 def sub_file(root, sid=SID, stem=STEM, project=PROJECT):
     return root / project / sid / "subagents" / f"{stem}.jsonl"
+
+
+def workflow_file(root, sid=SID, run=RUN, stem=WORKFLOW_STEM, project=PROJECT):
+    return root / project / sid / "subagents" / "workflows" / run / f"{stem}.jsonl"
 
 
 def parse(path, **kwargs):
@@ -832,15 +840,25 @@ def test_unreadable_lines_degrade_coverage(engine, root):
 
 def test_session_id_comes_from_layout_and_subagent_ids_embed_the_parent(root):
     assert claude.peek_session_id(main_file(root)) == SID
+    assert claude.peek_session_id(main_file(root, project="subagents")) == SID
     assert claude.peek_session_id(sub_file(root)) == CHILD
+    assert claude.peek_session_id(workflow_file(root)) == WORKFLOW_CHILD
     assert claude.session_parts(CHILD) == (SID, STEM)
+    assert claude.session_parts(WORKFLOW_CHILD) == (SID, WORKFLOW_STEM)
     assert claude.session_parts(SID) == (SID, None)
     for bad in (root / PROJECT / "notes.jsonl", root / PROJECT / SID.upper() / "subagents" / "x.jsonl",
-                root / PROJECT / SID / "subagents" / "deeper" / "x.jsonl", root / PROJECT / SID / "x.jsonl",
+                root / PROJECT / SID / "subagents" / "deeper" / "x.jsonl",
+                root / PROJECT / SID / "subagents" / "deeper" / f"{OTHER}.jsonl",
+                root / PROJECT / SID / "x.jsonl",
+                root / PROJECT / SID / "subagents" / "workflows" / RUN / "deeper" / f"{WORKFLOW_STEM}.jsonl",
+                root / PROJECT / SID / "subagents" / "workflows" / RUN / "extra" / f"{OTHER}.jsonl",
+                root / PROJECT / SID / "subagents" / "workflows" / "bad run" / f"{WORKFLOW_STEM}.jsonl",
+                root / PROJECT / SID / "subagents" / "workflows" / "bad run" / f"{OTHER}.jsonl",
+                root / PROJECT / SID / "subagents" / "workflows" / ".hidden" / f"{WORKFLOW_STEM}.jsonl",
                 root / PROJECT / f"{SID.upper()}.jsonl", root / PROJECT / SID / "subagents" / ".hidden.jsonl",
                 root / PROJECT / SID / "subagents" / "bad name.jsonl", root / PROJECT / f"{SID}.json"):
         assert claude.peek_session_id(bad) is None, bad
-    assert len(CHILD) <= 128 and claude.valid_id(CHILD) and claude.valid_id(SID)
+    assert len(CHILD) <= 128 and claude.valid_id(CHILD) and claude.valid_id(WORKFLOW_CHILD) and claude.valid_id(SID)
     assert not claude.valid_id("../x") and not claude.valid_id(SID.upper()) and not claude.valid_id(f"{SID}_")
 
 
@@ -1042,9 +1060,16 @@ def test_check_action_uses_linked_success_for_temporal_requirements(engine, root
 def test_resolve_by_session_id_for_main_and_subagent_sessions(root):
     write(main_file(root), human("main"))
     write(sub_file(root), user("task", sub=True))
+    write(workflow_file(root), user("workflow task", sub=True, agentId=WORKFLOW_AGENT_ID))
+    in_subagents_project = write(main_file(root, OTHER, project="subagents"), human("main in subagents project", sid=OTHER))
     assert claude.resolve_session_path(root, session_id=SID) == main_file(root)
+    assert claude.resolve_session_path(root, session_id=OTHER) == in_subagents_project
+    assert claude.resolve_session_path(root, path=str(in_subagents_project)) == in_subagents_project
     assert claude.resolve_session_path(root, session_id=CHILD) == sub_file(root)
+    assert claude.resolve_session_path(root, session_id=WORKFLOW_CHILD) == workflow_file(root)
     assert claude.resolve_session_path(root, path=str(sub_file(root))) == sub_file(root)
+    assert claude.resolve_session_path(root, path=str(workflow_file(root))) == workflow_file(root)
+    assert claude.resolve_session_path(root, session_id=WORKFLOW_CHILD, path=str(workflow_file(root))) == workflow_file(root)
     assert claude.resolve_session_path(root, session_id=SID, path=str(main_file(root))) == main_file(root)
 
 
@@ -1290,6 +1315,86 @@ def test_discovery_lists_only_valid_unlinked_transcripts(root, tmp_path):
     assert claude.discover_session_files(root, include_subagents=False) == sorted(
         [main_file(root), main_file(root, OTHER, "-second")])
     assert claude.discover_session_files(tmp_path / "missing") == []
+
+
+def test_workflow_subagent_discovery_lists_workflow_agents_next_to_ordinary_subagents(engine, root):
+    main = write(main_file(root), human("main"))
+    ordinary = write(sub_file(root), user("ordinary task", sub=True), assistant(text("ordinary done"), sub=True))
+    wf = write(workflow_file(root), user("workflow task", sub=True, agentId=WORKFLOW_AGENT_ID),
+               assistant(text("workflow done"), sub=True, agentId=WORKFLOW_AGENT_ID))
+    assert claude.discover_session_files(root) == sorted([main, ordinary, wf])
+    assert claude.discover_session_files(root, include_subagents=False) == [main]
+    expected_pairs = [(CHILD, ordinary), (WORKFLOW_CHILD, wf)]
+    assert claude.discover_subagent_files(root, SID) == expected_pairs
+    assert claude.discover_subagent_files(root, SID, path=main) == expected_pairs
+    assert claude.discover_subagent_files(root, SID, path=ordinary) == expected_pairs
+    assert claude.discover_subagent_files(root, SID, path=wf) == expected_pairs
+    res = engine.sync_session(session_id=SID, provider="claude", path=str(main), embed=False, include_subagents=True)
+    assert res["ok"] is True and res["subagent_count"] == 2
+    assert [item["session_id"] for item in res["subagents"]] == [CHILD, WORKFLOW_CHILD]
+
+
+def test_duplicate_subagent_stem_in_two_places_is_skipped_by_discovery_and_resolves_by_exact_path(root):
+    main = write(main_file(root), human("main"))
+    ordinary_dup = write(sub_file(root), user("ordinary copy", sub=True))
+    workflow_dup = write(workflow_file(root, stem=STEM), user("workflow copy", sub=True))
+    unique_wf = write(workflow_file(root, stem=WORKFLOW_STEM),
+                      user("unique workflow", sub=True, agentId=WORKFLOW_AGENT_ID))
+    assert claude.discover_session_files(root) == sorted([main, unique_wf])
+    assert claude.discover_subagent_files(root, SID) == [(WORKFLOW_CHILD, unique_wf)]
+    with pytest.raises(FileNotFoundError, match="ambiguous"):
+        claude.resolve_session_path(root, session_id=CHILD)
+    assert claude.resolve_session_path(root, path=str(ordinary_dup)) == ordinary_dup
+    assert claude.resolve_session_path(root, session_id=CHILD, path=str(ordinary_dup)) == ordinary_dup
+    assert claude.resolve_session_path(root, path=str(workflow_dup)) == workflow_dup
+    assert claude.resolve_session_path(root, session_id=CHILD, path=str(workflow_dup)) == workflow_dup
+    # Same stem in two workflow runs is also skipped on both copies while keeping the unique ordinary subagent.
+    workflow_dup.unlink()
+    wf_run2 = write(workflow_file(root, run="wf_second-run", stem=WORKFLOW_STEM),
+                    user("second run copy", sub=True, agentId=WORKFLOW_AGENT_ID))
+    assert claude.discover_session_files(root) == sorted([main, ordinary_dup])
+    assert claude.discover_subagent_files(root, SID) == [(CHILD, ordinary_dup)]
+    with pytest.raises(FileNotFoundError, match="ambiguous"):
+        claude.resolve_session_path(root, session_id=WORKFLOW_CHILD)
+    assert claude.resolve_session_path(root, session_id=WORKFLOW_CHILD, path=str(unique_wf)) == unique_wf
+    assert claude.resolve_session_path(root, session_id=WORKFLOW_CHILD, path=str(wf_run2)) == wf_run2
+    # Across two distinct project directories, discover_subagent_files keeps the first project's copy.
+    other_proj_sub = write(sub_file(root, project="-zz-second-project"), user("other project copy", sub=True))
+    assert claude.discover_subagent_files(root, SID) == [(CHILD, ordinary_dup)]
+    assert claude.discover_session_files(root) == sorted([main, ordinary_dup, other_proj_sub])
+
+
+def test_workflow_subagent_rejects_symlinked_workflows_or_run_directory_and_invalid_run_names(root, tmp_path):
+    write(main_file(root), human("main"))
+    real_wf = write(workflow_file(root), user("workflow task", sub=True, agentId=WORKFLOW_AGENT_ID))
+    # Invalid run directory names are refused by layout resolution and ignored by discovery.
+    for bad_run in (".hidden", "bad run", "-leading", "run.dot", "r" * 65):
+        bad_path = write(workflow_file(root, run=bad_run, stem="agent-badrun"), user("task", sub=True))
+        assert claude.peek_session_id(bad_path) is None
+        with pytest.raises(ValueError, match="not an official"):
+            claude.resolve_session_path(root, path=str(bad_path))
+    # A symlinked run directory under workflows is refused.
+    target_run = tmp_path / "external-run"
+    write(target_run / "agent-linkedrun.jsonl", user("task", sub=True))
+    linked_run = root / PROJECT / SID / "subagents" / "workflows" / "wf_linked"
+    linked_run.symlink_to(target_run, target_is_directory=True)
+    with pytest.raises(claude.PathTraversalError):
+        claude.resolve_session_path(root, path=str(linked_run / "agent-linkedrun.jsonl"))
+    assert claude.discover_session_files(root) == sorted([main_file(root), real_wf])
+    assert claude.discover_subagent_files(root, SID) == [(WORKFLOW_CHILD, real_wf)]
+    # A symlinked workflows directory under subagents is also refused.
+    other_workflows = root / PROJECT / OTHER / "subagents" / "workflows"
+    other_workflows.parent.mkdir(parents=True, exist_ok=True)
+    other_workflows.symlink_to(real_wf.parent.parent, target_is_directory=True)
+    with pytest.raises(claude.PathTraversalError):
+        claude.resolve_session_path(root, path=str(other_workflows / RUN / real_wf.name))
+    assert claude.discover_subagent_files(root, OTHER) == []
+    # A path hint in a project whose subagents directory is a symlink does not fall back to another project.
+    hinted_main = write(main_file(root, SID, project="-aa-linked-subagents"), human("hinted main"))
+    linked_sub = root / "-aa-linked-subagents" / SID / "subagents"
+    linked_sub.parent.mkdir(parents=True, exist_ok=True)
+    linked_sub.symlink_to(real_wf.parent.parent.parent, target_is_directory=True)
+    assert claude.discover_subagent_files(root, SID, path=hinted_main) == []
 
 
 def test_provider_is_auto_detected_from_a_path_under_the_claude_root(engine, root, tmp_path):
