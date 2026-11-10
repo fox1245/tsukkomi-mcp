@@ -94,7 +94,11 @@ def classify(audit: dict, mode: str, high_risk: frozenset | set = frozenset()) -
         return "force_ask", reason, False
     if mode == "enforced":
         return "deny", reason, False
-    risky = sorted(set(high_risk) & set(audit.get("action_contracts", [])))
+    # A high-risk contract asks for confirmation while its own finding is not clean (or is missing, as after a failed
+    # audit). Another contract's unknown, such as a description-only rule that applies to every action and can never
+    # be machine-verified, does not make a verified high-risk action ask; it stays a warning.
+    verified = {f.get("contract_id") for f in findings if f.get("verdict") == "clean"} if ok else set()
+    risky = sorted((set(high_risk) & set(audit.get("action_contracts", []))) - verified)
     if risky:
         return "ask", f"High-risk contract [{', '.join(risky)}] could not be verified: " + reason, False
     return "allow", "WARNING - unverified, not a compliance verdict: " + reason, True
