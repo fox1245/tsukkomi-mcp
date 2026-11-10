@@ -580,3 +580,15 @@ def test_pretooluse_verdict_in_agent_review_mode(env, clock, scenario):
         assert AGENT_REVIEW_EXPECTED[scenario] == EXPECTED[scenario]["confirmed_only"]
     else:
         assert reason_of(response).startswith("Agent review needed.")
+
+
+def test_the_review_call_pass_never_lifts_a_violation_of_the_review_call_itself(review_env):
+    """The pass sits behind ``classify``: a review call that a prohibition matches is denied like any other call."""
+    engine, path = review_env
+    engine.upsert_contracts([{"id": "no-secrets-word", "type": "must_not", "scope": "tool_call", "provider": "claude",
+                              "regex": "forbidden-word"}])
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal, reason="checked before the deploy; forbidden-word is not involved")
+    response = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=args)
+    assert permission(response) == "deny" and "no-secrets-word" in reason_of(response)
+    assert latest_refusal(engine)["review_call_passes"] == 0
