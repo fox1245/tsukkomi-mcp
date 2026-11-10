@@ -233,8 +233,16 @@ and report coverage.judged_through_byte, unread_bytes, judged_prefix=true and co
 plus a note. clean then means clean as of that offset; the next audit judges the appended
 records. A must obligation that fails only for absent or failed evidence is unknown while bytes
 are unread. check_action also keeps a proposed action's requires_success prerequisite unknown
-while required history is unread, because a newer failed run may be in the unread part. A
-rewrite, truncation, replacement or deletion is never growth and stays unknown. requires_attention
+while required history is unread, because a newer failed run may be in the unread part. Hosts append
+records about the proposed call while its PreToolUse hook runs, so check_action settles first: when
+pure growth during an evaluation leaves an action finding that reads history unknown, it reads the
+appended bytes and evaluates again; no pass starts later than SELF_DIRECT_ACTION_SETTLE_SEC (default
+5, 0 = once) after the first ended, and every pass runs under the first one's limits (a deadline of
+its own would cut a hook's in-request comparisons). It answers with the last evaluation (result
+field settle). Clean only
+comes from an evaluation that saw no growth; never merge findings across evaluations, never skip a
+record by kind or contract id. A violation or suspicious finding is answered without another pass.
+A rewrite, truncation, replacement or deletion is never growth and stays unknown. requires_attention
 is true for every non-clean verdict. Checklist items stay pending_verification while coverage is
 incomplete.
 

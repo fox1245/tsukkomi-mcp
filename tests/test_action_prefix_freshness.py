@@ -17,7 +17,12 @@ from test_reliability import SID, call, result, write, session as reliability_se
 ACTION = {"tool_name": "shell", "arguments": {"command": "deploy now"}}
 
 
-def _gate(engine, path, *, requires_success=True):
+def _gate(engine, path, *, requires_success=True, settle=False):
+    # These tests are about bytes that were never read, so the check judges once (``SELF_DIRECT_ACTION_SETTLE_SEC=0``):
+    # with a budget it reads the appended records and judges again (``test_current_gate_reads_late_tests_...`` below and
+    # tests/test_action_settles_on_growth.py).
+    if not settle:
+        engine.settings.action_settle_sec = 0.0
     engine.upsert_contracts([{
         "id": "tests-first", "type": "must", "scope": "tool_call",
         "regex": "pytest", "before_regex": "deploy", "requires_success": requires_success,
@@ -85,6 +90,27 @@ def test_current_gate_does_not_certify_old_success_with_unread_tests(session, mo
 
 @pytest.mark.parametrize("timing", ["before_evaluation", "during_evaluation"])
 @pytest.mark.parametrize("status", ["failed", "pending"])
+def test_current_gate_reads_late_tests_when_it_settles(session, monkeypatch, timing, status):
+    """The same late records with a settle budget: the check reads them and judges again. The answer covers the whole
+    source, and the newer run decides: a failed one is a violation, one without a result stays unknown."""
+    engine, path = session
+    _gate(engine, path, settle=True)
+    size, value = _with_growth(lambda: engine.check_action(SID, ACTION), path, monkeypatch, timing, _late(status))
+    assert value["coverage"]["complete"] is True, value
+    assert value["coverage"]["byte_offset"] == path.stat().st_size > size
+    assert value["settle"]["passes"] == 2 and value["settle"]["stopped_by"] == "no_growth"
+    finding = next(f for f in value["findings"] if f["contract_id"] == "tests-first")
+    assert finding["verdict"] == ("violation" if status == "failed" else "unknown"), finding
+    assert value["verdict"] == finding["verdict"] and value["requires_attention"] is True
+    assert _verdict_response(value, "enforced")["decision"] == "deny"
+    if status == "failed":
+        assert _verdict_response(value)["decision"] == "deny"
+    else:
+        assert _verdict_response(value, high_risk={"tests-first"})["decision"] == "ask"
+
+
+@pytest.mark.parametrize("timing", ["before_evaluation", "during_evaluation"])
+@pytest.mark.parametrize("status", ["failed", "pending"])
 def test_retrospective_audit_can_still_judge_successful_historical_prefix(session, monkeypatch, timing, status):
     engine, path = session
     _gate(engine, path)
@@ -146,6 +172,18 @@ def test_codex_warns_when_native_current_gate_has_unread_history(session, monkey
     )
     assert "unknown" in json.dumps(value), value
     # Codex stays advisory: a warning is not an execution or permission decision.
+    assert "decision" not in value
+
+
+def test_codex_hook_settles_on_the_same_engine_path(session, monkeypatch):
+    """The Codex hook checks a proposed action through the same ``check_action``: it reads the late failed run too."""
+    engine, path = session
+    _gate(engine, path, settle=True)
+    _, value = _with_growth(
+        lambda: handle_hook(engine, "PreToolUse", SID, str(path), "shell", ACTION["arguments"]),
+        path, monkeypatch, "during_evaluation", _late("failed"),
+    )
+    assert "violation" in json.dumps(value), value
     assert "decision" not in value
 
 

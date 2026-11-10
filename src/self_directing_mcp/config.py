@@ -105,6 +105,12 @@ class Settings(SettingsAccessors, BaseSettings):
     audit_timeout_sec: float = Field(default=settings_core.DEFAULT_AUDIT_TIMEOUT_SEC, gt=0)
     audit_fold_budget_sec: float = Field(default=settings_core.DEFAULT_AUDIT_FOLD_BUDGET_SEC, gt=0, allow_inf_nan=False)
     request_timeout_sec: float = Field(default=settings_core.DEFAULT_REQUEST_TIMEOUT_SEC, gt=0)
+    action_settle_sec: float = Field(
+        default=settings_core.DEFAULT_ACTION_SETTLE_SEC, ge=0, allow_inf_nan=False,
+        description="A check of a proposed action whose session grew while it was judged reads the appended records and "
+                    "judges again; no evaluation starts later than this after the first one ended (0: judge once). "
+                    "SELF_DIRECT_ACTION_SETTLE_SEC.",
+    )
     graph_update_timeout_sec: float = Field(default=settings_core.DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC, gt=0,
                                             allow_inf_nan=False)
     graph_extractor: Literal["openrouter", "host"] = Field(
