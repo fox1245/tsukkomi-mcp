@@ -2848,6 +2848,98 @@ class SelfDirectEngine:
             "contract_id": rule.id,
         }
 
+    # ------------------------------------------------------------------------------------------------ agent reviews
+    # ``SELF_DIRECT_CLAUDE_ENFORCEMENT=agent_review`` (``action_reviews``): the Claude Code hook refuses a call whose
+    # high-risk contract it cannot verify once, the agent records its judgement with ``review_action``, and the hook lets
+    # the identical retried call run once on a ``proceed`` review (an ``escalate`` review asks the user). This tool checks
+    # what a review says against the refusal it names; the hook, at the retry, checks where the review came from (a
+    # review_action call of the refused agent's own turn in this session's transcript), because this call's own record
+    # may not be in the transcript yet while it runs.
+
+    @detached_operation
+    def review_action(self, session_id: str, refusal_id: str, action_digest: str, contract_ids: list[str],
+                      decision: str, reason: str, *, evidence_event_ids: list[str] | None = None) -> dict[str, Any]:
+        from self_directing_mcp import action_reviews as reviews
+
+        def refused(error: str, message: str, **extra) -> dict[str, Any]:
+            return {"ok": False, "error": error, "message": message, **extra}
+
+        if decision not in reviews.DECISIONS:
+            return refused("invalid_decision", "decision must be 'proceed' or 'escalate'.")
+        if not isinstance(reason, str) or not reason.strip():
+            return refused("reason_required", "reason must say what you checked and why you decided so.")
+        if len(reason) > reviews.REASON_MAX_CHARS:
+            return refused("reason_too_long", f"reason is limited to {reviews.REASON_MAX_CHARS} characters.")
+        for name, values in (("contract_ids", contract_ids), ("evidence_event_ids", evidence_event_ids or [])):
+            if (not isinstance(values, list) or len(values) > reviews.MAX_IDS
+                    or any(not isinstance(item, str) or not item for item in values)):
+                return refused("invalid_ids", f"{name} must be a list of at most {reviews.MAX_IDS} non-empty strings.")
+        store = reviews.ReviewStore(self.settings.index_dir)
+        refusal = store.refusal(refusal_id) if isinstance(refusal_id, str) and refusal_id else None
+        if refusal is None:
+            return refused("refusal_not_found", "A review must name a refusal that this server's hook issued (its "
+                                                "refusal_id); a call that was never refused cannot be reviewed.")
+        if refusal["session_id"] != session_id:
+            return refused("session_mismatch", "The refusal belongs to another session.")
+        if refusal["action_digest"] != action_digest:
+            return refused("action_mismatch", "action_digest is not the digest of the refused call; copy both values "
+                                              "from the refusal.")
+        refused_ids = sorted(cid for cid, _rev in refusal["contracts"])
+        if sorted(set(contract_ids)) != refused_ids:
+            return refused("contracts_mismatch", "contract_ids must be exactly the contracts the refusal named.",
+                           contract_ids=refused_ids)
+        if refusal["review_id"]:
+            return refused("refusal_already_reviewed", "This refusal already has a review; a refusal is reviewed once.")
+        if refusal["expires_at"] <= reviews.now():
+            return refused("refusal_expired", "The refusal expired; propose the call again to be judged anew.")
+        with self._publication_guard():
+            raw, _token = self.contracts.capture()
+        rules = {rule.id: rule for rule in visible_contracts(parse_contracts(raw).contracts, session_id)}
+        stale = [cid for cid, rev in refusal["contracts"]
+                 if (rule := rules.get(cid)) is None or not rule.enabled or rule.revision != rev or rule.risk != "high"
+                 or rule.on_unverified != "agent"]
+        if stale:
+            return refused("refusal_stale", f"Contract [{', '.join(stale)}] changed since the refusal (revision, risk or "
+                                            "on_unverified); propose the call again to be judged anew.")
+        for event_id in evidence_event_ids or []:
+            with self._publication_guard(), self.store._read_boundary():
+                chunk = self.store.get_chunk(event_id)
+            if (chunk is None or chunk.provider != refusal["host"]
+                    or not (chunk.session_id == session_id or chunk.session_id.startswith(session_id + "_"))):
+                return refused("evidence_not_found", f"Evidence event {event_id!r} is not an indexed event of this "
+                                                     "session; cite event ids from its history.")
+        record = store.record_review(refusal_id=refusal_id, decision=decision,
+                                     reason_shown=mask_secrets(reason.strip())[:reviews.SHOWN_REASON_CHARS],
+                                     reason_sha=reviews.reason_digest(reason), evidence=list(evidence_event_ids or []))
+        if isinstance(record, str):
+            return refused(record, "The refusal can no longer be reviewed; propose the call again to be judged anew.")
+        nxt = ("Retry the identical call now: it runs once on this review." if decision == "proceed" else
+               "Retry the identical call now: the user is asked to decide it.")
+        return {"ok": True, "review_id": record["review_id"], "refusal_id": refusal_id, "decision": decision,
+                "contract_ids": refused_ids, "expires_at": reviews._iso(record["expires_at"]), "next": nxt,
+                "note": "The hook accepts this review only when it finds this review_action call in your own turn of "
+                        "this session. The finding stays unverified: the review records your decision, not compliance."}
+
+    @detached_operation
+    def review_call_events(self, session_id: str, provider: str, refusal_id: str, from_byte: int = 0) -> list:
+        """The indexed events of a session at or after ``from_byte`` that mention ``refusal_id`` (the hook's lookup of a
+        review call; the caller checks what each event is)."""
+        with self._publication_guard(), self.store._read_boundary():
+            return self.store.events_mentioning(session_id, provider, refusal_id, from_byte)
+
+    @request_operation
+    def list_action_reviews(self, session_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        """The audit trail of agent reviews: every refusal-for-review, its review and whether the hook consumed it."""
+        from self_directing_mcp import action_reviews as reviews
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValueError("limit must be an integer from 1 to 500")
+        store = reviews.ReviewStore(self.settings.index_dir)
+        listing = store.listing(session_id=session_id, limit=limit)
+        return mask_value({"ok": True, "claude_enforcement": getattr(self.settings, "claude_enforcement", None),
+                           "store": str(store.path), **listing,
+                           "note": "A consumed proceed review is a call that ran on the agent's own decision although "
+                                   "a high-risk contract stayed unverified; it is not a compliance verdict."})
+
     # ------------------------------------------------------------------------------------------------ portable contracts
     # Bundles are files that carry contracts between devices (``contract_bundles``). Finding one enforces nothing:
     # ``adopt_contracts`` stores contracts from it, and only with a user message of THIS device as its anchor.

@@ -69,6 +69,16 @@ def budget_note(unit: str) -> str:
             "(budget spent, repeated reason, or counter unreadable); not continuing.")
 
 
+def unverified_high_risk(audit: dict, high_risk: frozenset | set) -> list[str]:
+    """The high-risk contracts of the action whose own finding is not clean (or is missing, as after a failed audit).
+
+    Another contract's unknown, such as a description-only rule that applies to every action and can never be
+    machine-verified, does not make a verified high-risk action ask; it stays a warning."""
+    ok = audit.get("ok") is True
+    verified = {f.get("contract_id") for f in audit.get("findings", []) if f.get("verdict") == "clean"} if ok else set()
+    return sorted((set(high_risk) & set(audit.get("action_contracts", []))) - verified)
+
+
 def classify(audit: dict, mode: str, high_risk: frozenset | set = frozenset()) -> tuple[str, str | None, bool]:
     """``(decision, reason, warn)``; ``warn`` marks an allow that rests on unverified evidence."""
     ok = audit.get("ok") is True
@@ -94,11 +104,7 @@ def classify(audit: dict, mode: str, high_risk: frozenset | set = frozenset()) -
         return "force_ask", reason, False
     if mode == "enforced":
         return "deny", reason, False
-    # A high-risk contract asks for confirmation while its own finding is not clean (or is missing, as after a failed
-    # audit). Another contract's unknown, such as a description-only rule that applies to every action and can never
-    # be machine-verified, does not make a verified high-risk action ask; it stays a warning.
-    verified = {f.get("contract_id") for f in findings if f.get("verdict") == "clean"} if ok else set()
-    risky = sorted((set(high_risk) & set(audit.get("action_contracts", []))) - verified)
+    risky = unverified_high_risk(audit, high_risk)
     if risky:
         return "ask", f"High-risk contract [{', '.join(risky)}] could not be verified: " + reason, False
     return "allow", "WARNING - unverified, not a compliance verdict: " + reason, True
@@ -145,6 +151,9 @@ class Judgement:
     reason: str | None
     warn: bool
     audit: dict
+    # For an ``ask`` that an unverified high-risk contract caused: ``(contract id, revision, on_unverified)`` of each such
+    # contract, as the obligations read them. The Claude Code adapter's ``agent_review`` mode reads it; nothing else does.
+    unverified: tuple[tuple[str, int, str], ...] = ()
 
     @property
     def silent(self) -> bool:
@@ -185,7 +194,12 @@ def judge_action(engine: SelfDirectEngine, provider: str, session_id: str, path:
         audit = adjust(audit, obligations)
     high_risk = frozenset(rule.id for rule in obligations["contracts"] if rule.risk == "high")
     decision, reason, warn = classify(audit, mode, high_risk)
-    return Judgement(decision, reason, warn, audit)
+    unverified: tuple = ()
+    if decision == "ask":
+        rules = {rule.id: rule for rule in obligations["contracts"]}
+        unverified = tuple((cid, rules[cid].revision, getattr(rules[cid], "on_unverified", "agent"))
+                           for cid in unverified_high_risk(audit, high_risk))
+    return Judgement(decision, reason, warn, audit, unverified)
 
 
 def reason_key(items: list[str]) -> str:

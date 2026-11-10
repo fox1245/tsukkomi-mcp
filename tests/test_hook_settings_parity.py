@@ -99,7 +99,7 @@ def test_the_shadow_every_values_both_readers_reject(world, text):
 
 def test_literal_choices_match_the_model():
     for name, choices in (("agy_enforcement", settings_core.ENFORCEMENT_MODES),
-                          ("claude_enforcement", settings_core.ENFORCEMENT_MODES),
+                          ("claude_enforcement", settings_core.CLAUDE_ENFORCEMENT_MODES),
                           ("grok_enforcement", settings_core.ENFORCEMENT_MODES),
                           ("session_provider", settings_core.SESSION_PROVIDERS),
                           ("dense_backend", settings_core.DENSE_BACKENDS),
@@ -200,7 +200,8 @@ LISTS = ['["/a", "/b"]', "[]", '"/a"', '{"a": 1}', "not json", '["/a", 5]', "[1]
 STR_OR_LISTS = ["/a;/b", '["/a"]', '"quoted"', "[1]", "5", "true", "null", '{"a": 1}', "", "[]", "/a:/b", "C:\\g",
                 '["/a", "/b"]', "  ", '["a", 1]', "1.5", "false"]
 CHOICES = {"agy_enforcement": ["confirmed_only", "advisory", "enforced", "Advisory", "", " advisory", "bogus", "ENFORCED"],
-           "claude_enforcement": ["confirmed_only", "advisory", "enforced", "Enforced", "", "advisory ", "bogus"],
+           "claude_enforcement": ["confirmed_only", "advisory", "enforced", "agent_review", "Enforced", "", "advisory ",
+                                  "bogus", "Agent_review", "agent-review", "agent_review "],
            "grok_enforcement": ["confirmed_only", "advisory", "enforced", "ENFORCED", "", " enforced", "bogus"],
            "session_provider": ["codex", "grokbot", "omp", "agy", "claude", "grok", "Codex", "", "cursor", "claude ",
                                 "Grok", "grok "],
@@ -245,6 +246,7 @@ FIELD_KINDS = {
     "session_start_max_contracts": "int",
     "embedding_api_key_file": "path",
     "graph_max_output_tokens": "int",
+    "agent_review_ttl_sec": "float", "agent_review_reserved_file": "path",
 }
 # SELF_DIRECT_PGVECTOR_SCHEMA: ASCII letters, digits, underscore; at most 63; no leading digit; not pg_* or information_schema.
 PGVECTOR_SCHEMAS = ["tsukkomi", "a_b1", "Tsukkomi", "_x", "x", "public", "x" * 63, "x" * 64, "1abc", "", " tsukkomi", "tsukkomi ",

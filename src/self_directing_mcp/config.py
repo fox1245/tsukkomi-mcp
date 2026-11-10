@@ -45,7 +45,12 @@ class Settings(SettingsAccessors, BaseSettings):
     grok_sessions_dir: Path = Field(default_factory=_default_grok_sessions_dir)
     agy_app_data_dirs: list[Path] = Field(default_factory=settings_core.default_agy_app_data_dirs)
     agy_enforcement: Literal["confirmed_only", "advisory", "enforced"] = settings_core.DEFAULT_ENFORCEMENT
-    claude_enforcement: Literal["confirmed_only", "advisory", "enforced"] = settings_core.DEFAULT_ENFORCEMENT
+    claude_enforcement: Literal["confirmed_only", "advisory", "enforced", "agent_review"] = Field(
+        default=settings_core.DEFAULT_ENFORCEMENT,
+        description="Claude Code hook policy. 'agent_review' is 'confirmed_only' except that a call whose risk: high "
+                    "contract cannot be verified is refused once for the agent to review (review_action) instead of "
+                    "asking the user; see docs/claude-installation.md. SELF_DIRECT_CLAUDE_ENFORCEMENT.",
+    )
     grok_enforcement: Literal["confirmed_only", "advisory", "enforced"] = settings_core.DEFAULT_ENFORCEMENT
     session_provider: Literal["codex", "grokbot", "omp", "agy", "claude", "grok"] = settings_core.DEFAULT_SESSION_PROVIDER
     index_dir: Path = Field(default_factory=_default_index_dir)
@@ -281,6 +286,19 @@ class Settings(SettingsAccessors, BaseSettings):
         ge=1,
         description="Maximum number of active contracts injected at SessionStart / PreInvocation, ordered by risk and "
                     "severity. SELF_DIRECT_SESSION_START_MAX_CONTRACTS.",
+    )
+
+    agent_review_ttl_sec: float = Field(
+        default=settings_core.DEFAULT_AGENT_REVIEW_TTL_SEC, gt=0, allow_inf_nan=False,
+        description="agent_review mode: a review must be recorded within this many seconds of the hook's refusal and is "
+                    "usable for this many seconds after it was recorded (the hook's value is stamped on the refusal). "
+                    "SELF_DIRECT_AGENT_REVIEW_TTL_SEC.",
+    )
+    agent_review_reserved_file: Path | None = Field(
+        default=None,
+        description="agent_review mode: a text file listing the actions the user reserved for themselves (one per line, "
+                    "# comments), shown to the agent as the cases for an escalation; never matched against a call. Unset: "
+                    "the packaged default (resources/agent_review_reserved.txt). SELF_DIRECT_AGENT_REVIEW_RESERVED_FILE.",
     )
 
     @field_validator("contract_bundle_paths", mode="before")

@@ -790,6 +790,40 @@ async def grant_once(
 
 
 @mcp.tool()
+async def review_action(
+    session_id: str,
+    refusal_id: str,
+    action_digest: str,
+    contract_ids: list[str],
+    decision: Literal["proceed", "escalate"],
+    reason: str,
+    evidence_event_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Record your own judgement of a call the Claude Code hook refused for agent review (agent_review mode).
+
+    The hook refuses a call once when a risk: high contract of it cannot be verified, and names session_id, refusal_id,
+    action_digest and contract_ids: pass them exactly as shown. You decide and you are accountable: check the evidence
+    yourself, then decision="proceed" with what you checked and why the call is safe in reason, and retry the identical
+    call (it runs once; the review is single-use and expires). decision="escalate" only for the actions the user reserved
+    for themselves (listed in the refusal); the retried call then asks the user. Describe the call in reason without
+    quoting it (contracts read this call too). evidence_event_ids: history event ids you relied on (optional).
+    A review never makes a finding clean, never lifts a violation or a suspicious finding, and is accepted by the hook
+    only when this call is in your own turn of the session. list_action_reviews shows every review afterwards.
+    """
+    return await _dispatch(_engine.review_action, session_id, refusal_id, action_digest, contract_ids, decision, reason,
+                           evidence_event_ids=evidence_event_ids, heavy=False)
+
+
+@mcp.tool()
+async def list_action_reviews(session_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+    """The audit trail of agent reviews (agent_review mode): every refusal-for-review the hook issued, the review the
+    agent recorded for it (decision, reason, evidence), and whether the hook consumed it; with counts of proceed and
+    escalate reviews. A consumed proceed review is a call that ran on the agent's decision although a high-risk contract
+    stayed unverified. Read-only."""
+    return await _dispatch(_engine.list_action_reviews, heavy=False, session_id=session_id, limit=limit)
+
+
+@mcp.tool()
 async def audit_status(session_id: str | None = None, provider: str | None = None,
                        timeout_ms: int | None = None) -> dict[str, Any]:
     """Index health: cursor, chunk counts, degraded flags (numpy/fake embedder).

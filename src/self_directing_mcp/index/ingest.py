@@ -1548,6 +1548,16 @@ class SessionStore:
         self.audit_rows_fetched += sum(len(v) for v in found.values())
         return found
 
+    def events_mentioning(self, session_id, provider, needle, from_byte=0):
+        """Stored events of this session at or after ``from_byte`` whose stored form contains ``needle``, in session
+        order, as full chunks. For an exact random identifier (an agent review's ``refusal_id``): the caller decides
+        from each event's kind and metadata what it is; the containment is only the lookup."""
+        check_request()
+        rows = self._conn.execute(
+            "SELECT data FROM session_events WHERE provider=? AND session_id=? AND byte_start>=? AND instr(data, ?) > 0"
+            " ORDER BY byte_start, sub_index", (provider, session_id, int(from_byte), needle)).fetchall()
+        return [Chunk.model_validate_json(row["data"]) for row in rows]
+
     PROPOSAL_LOOKBACK = 4096  # events scanned back from the first appended one
     PROPOSAL_ROWS = 128       # proposals of one tool kept from that window
 

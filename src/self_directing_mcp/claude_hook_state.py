@@ -28,6 +28,9 @@ from self_directing_mcp.agy_hook_state import (  # noqa: F401  (re-exported for 
 
 STATE_FILE = "claude-hook-state.sqlite"
 ENV_MODE = "SELF_DIRECT_CLAUDE_ENFORCEMENT"
+# Claude Code also has ``agent_review`` (``settings_core.CLAUDE_ENFORCEMENT_MODES``). After an import failure no review
+# can be checked, so the fallback treats it as ``confirmed_only``: it refuses or asks for a high-risk contract's trigger.
+CLAUDE_MODES = MODES + ("agent_review",)
 EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure",
           "Stop", "SubagentStop")
 CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")
@@ -36,7 +39,7 @@ STOP_EVENTS = ("Stop", "SubagentStop")
 
 def resolve_mode(environ=None) -> str:
     value = (environ if environ is not None else os.environ).get(ENV_MODE)
-    return value if value in MODES else DEFAULT_MODE
+    return value if value in CLAUDE_MODES else DEFAULT_MODE
 
 
 class ClaudeHookState(HookState):
@@ -79,7 +82,7 @@ def fail_open(event, payload, error_class: str, kind: str = CHECK_FAILED, *, mod
     judged it did not run, and a safety hook must not wave through what its contract is about to gate); every other
     action passes with a notice. The notice is said once per session and failure kind, because the same degraded
     state repeated on every tool call tells nothing new; the health banner and ``hook_health`` keep counting."""
-    mode = mode if mode in MODES else resolve_mode()
+    mode = mode if mode in CLAUDE_MODES else resolve_mode()
     reason = warning_text(event, error_class, kind)
     recorded, banner, quiet = False, None, False
     session = payload.get("session_id") if isinstance(payload, dict) else None

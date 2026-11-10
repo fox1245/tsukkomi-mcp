@@ -26,7 +26,7 @@ import tempfile
 
 SCRIPT_NAME = "claude_hook.py"
 ENV_KEY = "SELF_DIRECT_CLAUDE_ENFORCEMENT"
-MODES = ("confirmed_only", "advisory", "enforced")
+MODES = ("confirmed_only", "advisory", "enforced", "agent_review")
 # event -> (matcher or None, timeout seconds). Tool events keep "*": reads can be restricted and tool names
 # do not prove the absence of side effects.
 EVENT_SPECS = {

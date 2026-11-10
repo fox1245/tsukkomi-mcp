@@ -40,6 +40,9 @@ ENV_PREFIX = "SELF_DIRECT_"
 API_KEY_ENV = "OPENROUTER_API_KEY"
 
 ENFORCEMENT_MODES = ("confirmed_only", "advisory", "enforced")
+# Claude Code only: ``agent_review`` is ``confirmed_only`` except that an unverified ``risk: high`` contract refuses the call
+# once for the agent to review instead of asking the user (``action_reviews``). AGY and Grok do not implement the review.
+CLAUDE_ENFORCEMENT_MODES = ENFORCEMENT_MODES + ("agent_review",)
 SESSION_PROVIDERS = ("codex", "grokbot", "omp", "agy", "claude", "grok")
 DENSE_BACKENDS = ("sqlite-vector", "numpy", "pgvector")
 REMOTE_DENSE_BACKENDS = ("pgvector",)        # a database server: never on the hook path (hook_policy.wants_derived_work)
@@ -105,12 +108,15 @@ DEFAULT_GRANT_ANCHOR_MAX_EVENTS = 20
 DEFAULT_GRANT_ANCHOR_MAX_USER_TURNS = 2
 DEFAULT_MAX_TRANSLATED_TURNS = 100
 DEFAULT_CONTRACT_CASE_MAX_MS = 250.0
+# An agent review (``agent_review`` mode) must be recorded within this many seconds of the refusal, and is usable for this
+# many seconds after it was recorded; the hook's value is stamped on the refusal.
+DEFAULT_AGENT_REVIEW_TTL_SEC = 900.0
 AGY_APP_DATA_NAMES = ("antigravity", "antigravity-cli", "antigravity-ide")
 
 PATH_FIELDS = frozenset({
     "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
     "grok_sessions_dir", "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file",
-    "embedding_api_key_file", "pgvector_dsn_file", "contract_bundle_paths",
+    "embedding_api_key_file", "pgvector_dsn_file", "contract_bundle_paths", "agent_review_reserved_file",
 })
 
 GRAPH_TOML_KEYS = {
@@ -604,7 +610,7 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("grok_sessions_dir", _path, default_grok_sessions_dir),
     FieldSpec("agy_app_data_dirs", _path_list, default_agy_app_data_dirs),
     FieldSpec("agy_enforcement", _literal(ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
-    FieldSpec("claude_enforcement", _literal(ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
+    FieldSpec("claude_enforcement", _literal(CLAUDE_ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
     FieldSpec("grok_enforcement", _literal(ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
     FieldSpec("session_provider", _literal(SESSION_PROVIDERS), _static(DEFAULT_SESSION_PROVIDER)),
     FieldSpec("index_dir", _path, default_index_dir),
@@ -674,6 +680,9 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("contract_bundle_paths", parse_bundle_paths, lambda: []),
     FieldSpec("session_start_max_contracts", lambda name, text: _to_int(name, text, 1),
               _static(DEFAULT_SESSION_START_MAX_CONTRACTS)),
+    FieldSpec("agent_review_ttl_sec", lambda name, text: _to_float(name, text, positive=True, finite=True),
+              _static(DEFAULT_AGENT_REVIEW_TTL_SEC)),
+    FieldSpec("agent_review_reserved_file", _path, _static(None)),
 )
 FIELD_NAMES = tuple(spec.name for spec in FIELDS)
 

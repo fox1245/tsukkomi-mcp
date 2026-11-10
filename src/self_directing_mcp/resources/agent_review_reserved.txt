@@ -1,0 +1,9 @@
+# Actions the user reserved for themselves. In SELF_DIRECT_CLAUDE_ENFORCEMENT=agent_review the hook shows this list to
+# the agent as the cases for decision "escalate"; everything else that reaches an agent review is the agent's to judge.
+# It is guidance shown to the agent, never matched against a call. One entry per line; lines starting with # are skipped.
+# Point SELF_DIRECT_AGENT_REVIEW_RESERVED_FILE (or [paths] agent_review_reserved_file in the user TOML) at your own copy.
+a release, a tag or a version bump
+publishing to a public surface that was not already delegated
+making a repository public
+deleting data that cannot be restored
+dropping or weakening one of the user's rules
