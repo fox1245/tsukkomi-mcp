@@ -34,7 +34,14 @@ from self_directing_mcp.tool_payload import tool_call_parts
 #     ``meta.tool_prose``; contracts match the payload only.
 # v4: Claude Code 2.1.30x runtime metadata records (``api-request``, ``api-request-blob``, ``api-request-shape``,
 #     ``fork-context-ref``).
-PARSER_VERSION = 4
+# v5: Claude Code 2.1.31x shapes: the ``session-owner`` and ``tools-used`` records, the list form of an api-request's
+#     ``cacheControl``, the newer peer origin fields, ``queued_command`` image paste ids and tool deltas, the
+#     ``file`` attachment's ``savedCopyFraming``, the ``ultra_effort_enter``/``ultra_effort_exit``, ``advisor_tool``,
+#     ``command_permissions``, ``invoked_skills``, ``hook_cancelled``, ``plan_mode_exit``, ``thinking_stripped`` and
+#     ``advisor_stripped`` attachments, the ``agents_killed`` system record, the ``popAll`` queue operation, the
+#     ``auto-continuation`` origin, PDF documents in tool results, and the hosted ``server_tool_use`` call with its
+#     encrypted or failed ``advisor_tool_result``.
+PARSER_VERSION = 5
 
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
 _HOOK_NAME = re.compile(r"[A-Za-z0-9_.:*/@+-]{1,200}\Z")
@@ -418,9 +425,23 @@ def _envelope(record, state):
 
 # ----------------------------------------------------------------------------- origin and authority
 
-_NON_HUMAN = {"task-notification": "task_notification", "peer": "peer_message", "coordinator": "coordinator"}
-_ORIGIN_KEYS = {"human": set(), "coordinator": set(), "peer": {"body", "from", "handback", "name", "senderTaskId"},
-                "task-notification": {"producer", "runId"}}
+_NON_HUMAN = {"task-notification": "task_notification", "peer": "peer_message", "coordinator": "coordinator",
+              "auto-continuation": "auto_continuation"}
+# The fields an origin of each kind may carry: ``key -> (declared type, meta name)``; a meta name of None means the field
+# is validated and never kept. A peer origin also names the peer's message id, the mode the sender runs in, the sender
+# process the host verified, the chain of sessions that relayed it and the text of a handed-back report; none of them
+# makes a peer the user. ``auto-continuation`` is a turn the host continued by itself.
+_ORIGIN_FIELDS = {
+    "human": {},
+    "coordinator": {},
+    "auto-continuation": {},
+    "peer": {"body": (str, None), "from": (str, "peer_from"), "handback": ((bool, str, dict), None),
+             "handbackReportText": (str, None), "name": (str, "peer_name"), "senderTaskId": (str, "peer_task_id"),
+             "msg_id": (str, "peer_msg_id"), "fromMode": (str, "peer_from_mode"),
+             "verifiedPeerPid": (int, "peer_verified_pid"), "verifiedPeerProcStart": (str, None),
+             "hopChain": (list, None)},
+    "task-notification": {"producer": (str, "producer"), "runId": (str, "run_id")},
+}
 
 
 def _origin(value):
@@ -428,19 +449,15 @@ def _origin(value):
     if value is None:
         return "none", None, {}
     kind = value.get("kind") if isinstance(value, dict) else None
-    if not isinstance(kind, str) or kind not in _ORIGIN_KEYS or not set(value) <= {"kind"} | _ORIGIN_KEYS[kind]:
+    fields = _ORIGIN_FIELDS.get(kind) if isinstance(kind, str) else None
+    if fields is None or not set(value) <= {"kind"} | set(fields) \
+            or not _typed(value, **{key: declared for key, (declared, _name) in fields.items()}):
         return "bad", None, {}
-    extra = {}
-    for key in _ORIGIN_KEYS[kind] - {"body", "handback"}:
-        if key in value:
-            if not isinstance(value[key], str):
-                return "bad", None, {}
-            extra[{"from": "peer_from", "name": "peer_name", "senderTaskId": "peer_task_id",
-                   "producer": "producer", "runId": "run_id"}[key]] = value[key]
-    if "body" in value and not isinstance(value["body"], str):
+    if "hopChain" in value and _labels(value["hopChain"]) is None:
         return "bad", None, {}
-    if "handback" in value and not isinstance(value["handback"], (bool, str, dict)):
-        return "bad", None, {}
+    extra = {name: value[key] for key, (_declared, name) in fields.items() if name is not None and key in value}
+    if "hopChain" in value:
+        extra["peer_hop_count"] = len(value["hopChain"])
     return "ok", kind, extra
 
 
@@ -490,6 +507,23 @@ def _image_placeholder(block) -> str | None:
     return None
 
 
+# Media types of a base64 ``document`` block in a tool result (a Read of a PDF returns one).
+_DOCUMENT_MEDIA_TYPES = {"application/pdf"}
+
+
+def _document_placeholder(block) -> str | None:
+    """Placeholder for a strictly valid base64 document block in a tool result; the payload is never indexed."""
+    if not (isinstance(block, dict) and block.get("type") == "document" and set(block) <= {"type", "source", "cache_control"}
+            and isinstance(block.get("source"), dict)):
+        return None
+    source = block["source"]
+    if source.get("type") == "base64" and set(source) == {"type", "media_type", "data"} \
+            and isinstance(source["data"], str) and isinstance(source["media_type"], str) \
+            and source["media_type"] in _DOCUMENT_MEDIA_TYPES:
+        return f"[document:{source['media_type']}]"
+    return None
+
+
 def _unsupported_block(base, kind, block, **extra):
     name = _label(kind) or "?"
     return _unsupported(base, f"[unsupported_content:{name}] {_keys(block)}", **extra)
@@ -522,7 +556,7 @@ def _tool_result(base, block, record):
         if _text_block_ok(item):
             parts.append(item["text"])
             text_blocks.append(item)
-        elif (placeholder := _image_placeholder(item)) is not None:
+        elif (placeholder := _image_placeholder(item)) is not None or (placeholder := _document_placeholder(item)) is not None:
             parts.append(placeholder)
         elif isinstance(item, dict) and item.get("type") == "tool_reference" and set(item) <= {
                 "type", "tool_name", "cache_control"} and isinstance(item.get("tool_name"), str):
@@ -634,8 +668,56 @@ def _assistant(base, record, state):
                 text, prose = tool_call_parts("claude", block["name"], block["input"])
                 yield _Event("tool_call", text, {**base, "role": "assistant", "tool_name": block["name"],
                                                  "call_id": block["id"], **prose})
+        elif kind == "server_tool_use" and _server_tool_use_ok(block):
+            # A tool the API runs itself (hosted), called by the model: a call, never a local execution or user text.
+            if api_error or synthetic:
+                yield _unsupported(base, "[unsupported_content:server_tool_use] keys=-")
+            else:
+                text, prose = tool_call_parts("claude", block["name"], block["input"])
+                yield _Event("tool_call", text, {**base, "role": "assistant", "tool_name": block["name"],
+                                                 "call_id": block["id"], "evidence_origin": "hosted_tool", **prose})
+        elif kind == "advisor_tool_result" and (result := _advisor_result(block)) is not None:
+            if api_error or synthetic:
+                yield _unsupported(base, "[unsupported_content:advisor_tool_result] keys=-")
+            else:
+                content_type, success, error_code = result
+                suffix = f" error_code={error_code}" if error_code else ""
+                yield _Event("tool_result", f"[tool_result] [{content_type}]{suffix}",
+                             {**base, "role": "tool", "call_id": block["tool_use_id"], "tool_name": None,
+                              "success": success, "evidence_origin": "hosted_tool",
+                              **({"error_code": error_code} if error_code else {})})
         else:
             yield _unsupported_block(base, kind, block)
+
+
+_SERVER_TOOL_USE_KEYS = {"type", "id", "name", "input"}
+# Advisor results by ``content.type``: required fields, optional fields and what the result says about success. The
+# encrypted advice cannot be read and is never indexed; a failed consultation names its error code. The plaintext form
+# (``advisor_result``) stays unsupported until a transcript shows it.
+_ADVISOR_RESULTS = {"advisor_redacted_result": ({"encrypted_content": str}, {"stop_reason": str}, True),
+                    "advisor_tool_result_error": ({"error_code": str}, {}, False)}
+_ADVISOR_LABELS = ("stop_reason", "error_code")  # fields of an advisor result that must be plain identifiers
+
+
+def _server_tool_use_ok(block) -> bool:
+    return (set(block) == _SERVER_TOOL_USE_KEYS and isinstance(block["id"], str) and bool(block["id"])
+            and _label(block["name"]) is not None and isinstance(block["input"], dict))
+
+
+def _advisor_result(block):
+    """``(content type, success, error code or None)`` of a strictly valid advisor tool result block, or None."""
+    content = block.get("content")
+    if not (set(block) == {"type", "tool_use_id", "content"} and isinstance(block["tool_use_id"], str)
+            and block["tool_use_id"] and isinstance(content, dict) and isinstance(content.get("type"), str)):
+        return None
+    known = _ADVISOR_RESULTS.get(content["type"])
+    if known is None:
+        return None
+    required, optional, success = known
+    if not _shape(content, required, optional) or any(
+            key in content and _label(content[key]) is None for key in _ADVISOR_LABELS):
+        return None
+    return content["type"], success, content.get("error_code")
 
 
 # ----------------------------------------------------------------------------- attachments
@@ -654,6 +736,15 @@ def _typed(fields, **types):
 
 def _names(value):
     return value if isinstance(value, list) and all(isinstance(item, str) for item in value) else None
+
+
+def _labels(value):
+    """A list of plain identifiers (``_LABEL``), or None."""
+    return value if isinstance(value, list) and all(_label(item) is not None for item in value) else None
+
+
+def _ints(value):
+    return value if isinstance(value, list) and all(_is_int(item) for item in value) else None
 
 
 def _shape(a, required, optional=None):
@@ -682,6 +773,17 @@ def _hook_success(a):
     return f"{text} exit={a['exitCode'] if 'exitCode' in a else '-'}", {**meta, "exit_code": a.get("exitCode")}
 
 
+def _hook_cancelled(a):
+    """A hook the host cancelled (it ran out of time): event, name and the timing are kept, the command never is."""
+    if not (_shape(a, {"command": str, "durationMs": int, "hookEvent": str, "hookName": str, "timedOut": bool,
+                       "timeoutMs": int, "toolUseID": str}) and a["toolUseID"]):
+        return None
+    text, meta = _hook_ref(a)
+    return (f"{text} timed_out={'true' if a['timedOut'] else 'false'}",
+            {**meta, "tool_use_id": a["toolUseID"], "timed_out": a["timedOut"], "duration_ms": a["durationMs"],
+             "timeout_ms": a["timeoutMs"]})
+
+
 def _hook_injection(content_type):
     """Hook-injected context/messages: runtime only. The payload may carry other tools' output; never indexed."""
     def check(a):
@@ -694,17 +796,25 @@ def _hook_injection(content_type):
 
 
 def _file_reference(with_content):
-    """A file attached to the context: its path is evidence of what was shown, its content never is."""
+    """A file attached to the context: its path is evidence of what was shown, its content never is.
+
+    ``savedCopyFraming`` (``{"enveloped": bool}``) says how the host framed the copy of the content it saved; it is kept
+    as a flag."""
     required = {"filename": str, "displayPath": str, **({"content": dict} if with_content else {})}
+    optional = {"savedCopyFraming": dict} if with_content else {}
 
     def check(a):
-        if not _shape(a, required):
+        if not _shape(a, required, optional):
             return None
         if with_content and not (set(a["content"]) == {"file", "type"} and isinstance(a["content"]["type"], str)
                                  and isinstance(a["content"]["file"], dict)):
             return None
+        framing = a.get("savedCopyFraming")
+        if framing is not None and not (set(framing) == {"enveloped"} and isinstance(framing["enveloped"], bool)):
+            return None
         return (f" display_path={_one_line(a['displayPath'])} filename={_one_line(a['filename'])}",
-                {"filename": a["filename"], "display_path": a["displayPath"]})
+                {"filename": a["filename"], "display_path": a["displayPath"],
+                 **({"saved_copy_enveloped": framing["enveloped"]} if framing is not None else {})})
     return check
 
 
@@ -735,6 +845,25 @@ def _plan_mode(a):
     return (f" reminder_type={kind or '-'} plan_exists={'true' if a['planExists'] else 'false'}",
             {"reminder_type": kind, "plan_exists": a["planExists"], "is_sub_agent": a["isSubAgent"],
              "plan_file_path": a["planFilePath"]})
+
+
+def _plan_mode_exit(a):
+    """Plan mode ended: whether a plan exists is indexed; the plan file is never read."""
+    if not _shape(a, {"planExists": bool, "planFilePath": str}):
+        return None
+    return (f" plan_exists={'true' if a['planExists'] else 'false'}",
+            {"plan_exists": a["planExists"], "plan_file_path": a["planFilePath"]})
+
+
+def _thinking_stripped(a):
+    """The host removed a thinking block from the model's context: which one (message id, index) and the scope."""
+    origin = a.get("from")
+    if not (_shape(a, {"from": dict, "scope": str}) and (scope := _label(a["scope"])) is not None
+            and set(origin) == {"messageId", "thinkingIndex"} and isinstance(origin["messageId"], str)
+            and _is_int(origin["thinkingIndex"])):
+        return None
+    return f" scope={scope}", {"scope": scope, "stripped_message_id": origin["messageId"],
+                               "thinking_index": origin["thinkingIndex"]}
 
 
 def _read_truncation_notice(a):
@@ -769,6 +898,50 @@ def _plain(**types):
     return lambda a: ("", {}) if _typed(a, **types) else None
 
 
+def _bare(a):
+    """An attachment that carries nothing but its type."""
+    return ("", {}) if _shape(a, {}) else None
+
+
+def _effort_mode(a):
+    """The host reminds the model that a higher-effort mode began: the reminder type is kept, the reminder text is not."""
+    if not _shape(a, {"reminderType": str}) or (kind := _label(a["reminderType"])) is None:
+        return None
+    return f" reminder_type={kind}", {"reminder_type": kind}
+
+
+def _advisor_tool(a):
+    """The host added or removed the advisor tool. A change of the model's tools, not something the user said."""
+    if not _shape(a, {"available": bool, "model": str, "toolChange": str}, {"byBase": bool}) \
+            or (change := _label(a["toolChange"])) is None:
+        return None
+    return (f" tool_change={change} available={'true' if a['available'] else 'false'}",
+            {"tool_change": change, "available": a["available"], "advisor_model": _label(a["model"]),
+             "by_base": a.get("byBase")})
+
+
+def _command_permissions(a):
+    """Tools a command the user invoked may use. A host permission grant, never a user instruction: the text carries the
+    count, and only rules that are plain names are kept (in meta)."""
+    if not _shape(a, {"allowedTools": list}) or _names(a["allowedTools"]) is None:
+        return None
+    rules = a["allowedTools"]
+    return (f" allowed_tools={len(rules)}",
+            {"allowed_tool_count": len(rules), "allowed_tool_names": [rule for rule in rules if _label(rule)]})
+
+
+def _invoked_skills(a):
+    """Skills invoked earlier, re-injected by the host. Their content is injected instruction text, not something the
+    user said: validated and never indexed. Skill names that are plain identifiers are kept."""
+    skills = a.get("skills")
+    if not _shape(a, {"skills": list}) or not all(
+            isinstance(skill, dict) and set(skill) == {"content", "name", "path"}
+            and all(isinstance(value, str) for value in skill.values()) for skill in skills):
+        return None
+    names = [skill["name"] for skill in skills if _label(skill["name"])]
+    return f" count={len(skills)} names={','.join(names)}", {"skill_count": len(skills), "skill_names": names}
+
+
 # Known attachment types. Payloads are validated where their shape is known and never indexed.
 _ATTACHMENTS = {
     "hook_success": _hook_success,
@@ -788,14 +961,24 @@ _ATTACHMENTS = {
     "remote_session_change": _remote_session_change,
     "read_truncation_notice": _read_truncation_notice,
     "plan_mode": _plan_mode,
+    "hook_cancelled": _hook_cancelled,
+    "plan_mode_exit": _plan_mode_exit,
+    "thinking_stripped": _thinking_stripped,
+    "advisor_stripped": _bare,
+    "ultra_effort_enter": _effort_mode,
+    "ultra_effort_exit": _bare,
+    "advisor_tool": _advisor_tool,
+    "command_permissions": _command_permissions,
+    "invoked_skills": _invoked_skills,
     **{name: _plain() for name in ("prompt_snapshot", "deferred_tools_delta", "environment", "session_context",
                                     "instructions", "credential_org", "agent_listing_delta", "auto_mode",
                                     "skill_listing", "task_status")},
 }
 _QUEUED_KEYS = {"type", "commandMode", "delivery_id", "origin", "prompt", "runId", "source_uuid", "timestamp", "usage",
-                "humanTurn", "isMeta", "reminderId"}
+                "humanTurn", "isMeta", "reminderId", "imagePasteIds", "toolsUsedDelta"}
 _QUEUED_TYPES = {"delivery_id": str, "runId": str, "source_uuid": str, "timestamp": str, "isMeta": bool,
-                 "reminderId": (str, int), "humanTurn": (bool, str, int), "usage": (dict, int, float, str, type(None))}
+                 "reminderId": (str, int), "humanTurn": (bool, str, int), "usage": (dict, int, float, str, type(None)),
+                 "imagePasteIds": list, "toolsUsedDelta": list}
 
 
 def _queued_command(base, a, state):
@@ -803,7 +986,9 @@ def _queued_command(base, a, state):
     status, origin, extra = _origin(a.get("origin"))
     mode, prompt = a.get("commandMode"), a.get("prompt")
     if (status == "bad" or not set(a) <= _QUEUED_KEYS or mode not in (None, "prompt", "task-notification")
-            or not isinstance(prompt, (str, list)) or not _typed(a, **_QUEUED_TYPES)):
+            or not isinstance(prompt, (str, list)) or not _typed(a, **_QUEUED_TYPES)
+            or ("imagePasteIds" in a and _ints(a["imagePasteIds"]) is None)
+            or ("toolsUsedDelta" in a and _labels(a["toolsUsedDelta"]) is None)):
         yield _unsupported(base, "[unsupported_attachment:queued_command]", attachment_type="queued_command")
         return
     is_meta = a.get("isMeta", False)
@@ -811,6 +996,10 @@ def _queued_command(base, a, state):
     for key, name in (("delivery_id", "delivery_id"), ("runId", "run_id"), ("reminderId", "reminder_id")):
         if key in a:
             base[name] = a[key]
+    # Pasted images are blocks of the prompt (placeholders); the ids and the tools a finished task used are counts only.
+    for key, name in (("imagePasteIds", "image_paste_count"), ("toolsUsedDelta", "tools_used_delta_count")):
+        if key in a:
+            base[name] = len(a[key])
     if isinstance(a.get("humanTurn"), (bool, int)) or (isinstance(a.get("humanTurn"), str) and len(a["humanTurn"]) <= 64):
         base["human_turn"] = a["humanTurn"]
     if "isMeta" in a:
@@ -859,19 +1048,38 @@ def _attachment(base, record, state):
 # ----------------------------------------------------------------------------- runtime and metadata records
 
 _SYSTEM_SUBTYPES = {"turn_duration", "stop_hook_summary", "away_summary", "compact_boundary", "local_command",
-                    "informational", "scheduled_task_fire"}
-_QUEUE_OPERATIONS = {"enqueue", "dequeue", "remove"}
+                    "informational", "scheduled_task_fire", "agents_killed"}
+_QUEUE_OPERATIONS = {"enqueue", "dequeue", "remove", "popAll"}
 _METADATA = {"mode", "permission-mode", "ai-title", "agent-name", "pr-link", "file-history-snapshot",
              "file-history-delta", "cost-state", "atis-latch", "last-prompt", "continued-in",
-             "api-request", "api-request-blob", "api-request-shape", "fork-context-ref"}
+             "api-request", "api-request-blob", "api-request-shape", "fork-context-ref", "session-owner", "tools-used"}
 _SESSION_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _ENVELOPE_KEYS = {"type", "sessionId", "timestamp", "version", "uuid", "parentUuid", "cwd",
                   "agentId", "isSidechain", "userType", "promptId", "requestId"}
+# Keys the host stamps on most records besides the envelope (all text). ``session_id`` repeats ``sessionId``.
+_HOST_KEYS = {"entrypoint": str, "gitBranch": str, "slug": str, "session_id": str}
 _API_REQUEST_KEYS = _ENVELOPE_KEYS | {"id", "base", "tail", "keep", "params", "cacheControl",
                                       "querySource", "requestDigest", "shapeHash"}
 _API_REQUEST_BLOB_KEYS = _ENVELOPE_KEYS | {"hash", "message"}
 _API_REQUEST_SHAPE_KEYS = _ENVELOPE_KEYS | {"shape", "shapeHash"}
 _FORK_CONTEXT_REF_KEYS = _ENVELOPE_KEYS | {"contextLength", "parentLastUuid", "parentSessionId"}
+_SESSION_OWNER_KEYS = _ENVELOPE_KEYS | {"accountUuid", "organizationUuid"}
+_TOOLS_USED_KEYS = _ENVELOPE_KEYS | {"tools"}
+_AGENTS_KILLED_KEYS = _ENVELOPE_KEYS | set(_HOST_KEYS) | {"subtype", "level", "isMeta"}
+_POP_ALL_KEYS = _ENVELOPE_KEYS | set(_HOST_KEYS) | {"operation", "content"}
+_CACHE_SETTING_KEYS = {"type", "ttl", "scope"}
+
+
+def _cache_breakpoints(value) -> bool:
+    """The list form of an api-request's ``cacheControl``: where in the request each cache breakpoint sits (a path of
+    field names and indices) and its setting (labels). Nothing of it is kept."""
+    return isinstance(value, list) and all(
+        isinstance(item, dict) and set(item) == {"path", "value"}
+        and isinstance(item["path"], list) and bool(item["path"])
+        and all(_is_int(step) or _label(step) is not None for step in item["path"])
+        and isinstance(item["value"], dict) and "type" in item["value"] and set(item["value"]) <= _CACHE_SETTING_KEYS
+        and all(_label(setting) is not None for setting in item["value"].values())
+        for item in value)
 
 
 def _scheduled_task_fire(record):
@@ -896,6 +1104,12 @@ def _system(base, record, state):
     if subtype not in _SYSTEM_SUBTYPES or not isinstance(level, str) or not isinstance(record.get("isMeta", False), bool):
         yield _unsupported(base, f"[unsupported_system:{_label(subtype) or '?'}] {_keys(record)}")
         return
+    if subtype == "agents_killed" and not (
+            set(record) <= _AGENTS_KILLED_KEYS and _typed(record, **_HOST_KEYS)
+            and record.get("session_id", record.get("sessionId")) == record.get("sessionId")):
+        # The host stopped the session's background agents. The notice carries no text; any other field is unknown.
+        yield _unsupported(base, "[unsupported_system:agents_killed] " + _keys(record))
+        return
     if subtype == "scheduled_task_fire":
         found = _scheduled_task_fire(record)
         if found is None:
@@ -918,7 +1132,10 @@ def _system(base, record, state):
 
 def _queue_operation(base, record, state):
     operation = record.get("operation")
-    if operation not in _QUEUE_OPERATIONS:
+    if operation not in _QUEUE_OPERATIONS or (operation == "popAll" and not (
+            set(record) <= _POP_ALL_KEYS and _typed(record, content=str, **_HOST_KEYS))):
+        # ``popAll`` (the queue was emptied at once; its ``content`` is the queued text, never indexed) is checked
+        # strictly; the older operations keep their original check.
         yield _unsupported(base, f"[unsupported_queue_operation:{_label(operation) or '?'}] {_keys(record)}")
         return
     extra = {"operation": operation}
@@ -942,12 +1159,29 @@ def _metadata(base, record, state):
             yield _unsupported(base, f"[unsupported_claude_event:continued-in] {_keys(record)}")
             return
         extra["continued_in_session_id"] = target
+    if kind == "session-owner":
+        # The account and organization the session runs under. Identifiers only: validated, never kept in the text or
+        # in meta (they say nothing about what anyone asked for or did).
+        if not (set(record) <= _SESSION_OWNER_KEYS and all(
+                isinstance(record.get(key), str) and _UUID.fullmatch(record[key])
+                for key in ("accountUuid", "organizationUuid"))):
+            yield _unsupported(base, f"[unsupported_claude_event:session-owner] {_keys(record)}")
+            return
+    if kind == "tools-used":
+        # Bookkeeping of the tools the session has used so far; the calls themselves are the evidence. Only the count is
+        # kept, so a tool name here can never match a contract.
+        if not (set(record) <= _TOOLS_USED_KEYS and _labels(record.get("tools")) is not None):
+            yield _unsupported(base, f"[unsupported_claude_event:tools-used] {_keys(record)}")
+            return
+        extra["tool_count"] = len(record["tools"])
     if kind == "api-request":
+        cache_control = record.get("cacheControl")
         if not (set(record) <= _API_REQUEST_KEYS
                 and _typed(record, id=str, querySource=str, requestDigest=str, shapeHash=str,
                            base=(str, dict, list, int, type(None)), tail=(str, dict, list, int, type(None)),
                            keep=(int, list, dict, bool, str, type(None)), params=(dict, type(None)),
-                           cacheControl=(dict, str, bool, type(None)))):
+                           cacheControl=(dict, str, bool, list, type(None)))
+                and (not isinstance(cache_control, list) or _cache_breakpoints(cache_control))):
             yield _unsupported(base, f"[unsupported_claude_event:api-request] {_keys(record)}")
             return
         if _label(record.get("querySource")):

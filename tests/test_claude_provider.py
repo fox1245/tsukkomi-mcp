@@ -792,8 +792,11 @@ UNKNOWN_SHAPES = {
     "record_type": lambda: env("future-record", payload="UNKNOWN-SHAPE-SENTINEL"),
     "attachment_type": lambda: attachment("future_attachment", payload="UNKNOWN-SHAPE-SENTINEL"),
     "attachment_not_a_dict": lambda: env("attachment", attachment="UNKNOWN-SHAPE-SENTINEL"),
-    "assistant_block": lambda: assistant({"type": "server_tool_use", "id": "s1", "name": "web_search",
-                                          "input": {"q": "UNKNOWN-SHAPE-SENTINEL"}}),
+    # A hosted tool's call (``server_tool_use``) is known since parser v5; its other result blocks are not.
+    "assistant_block": lambda: assistant({"type": "web_search_tool_result", "tool_use_id": "s1",
+                                          "content": [{"type": "web_search_result", "url": "UNKNOWN-SHAPE-SENTINEL"}]}),
+    "server_tool_use_extra_key": lambda: assistant({"type": "server_tool_use", "id": "s1", "name": "web_search",
+                                                    "input": {"q": "UNKNOWN-SHAPE-SENTINEL"}, "mystery": 1}),
     "assistant_block_extra_key": lambda: assistant({"type": "text", "text": "x", "mystery": "UNKNOWN-SHAPE-SENTINEL"}),
     "user_block": lambda: user([{"type": "document", "source": {"data": "UNKNOWN-SHAPE-SENTINEL"}}]),
     "image_without_source": lambda: user([{"type": "image", "data": "UNKNOWN-SHAPE-SENTINEL"}]),
@@ -1571,7 +1574,7 @@ def test_claude_2_1_30x_runtime_metadata_records_are_supported_and_blobs_are_nev
 
     res_main = engine.sync_session(session_id=SID, provider="claude", path=str(path), embed=False, include_subagents=True)
     assert res_main["ok"] is True
-    assert res_main["parser_version"] == 4
+    assert res_main["parser_version"] == claude.PARSER_VERSION >= 4
     assert res_main["coverage"]["complete"] is True
     assert res_main["coverage"]["unsupported_event_count"] == 0
     assert res_main["subagent_count"] == 1
