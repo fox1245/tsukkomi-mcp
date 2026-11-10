@@ -307,6 +307,8 @@ def _refusal_text(engine: SelfDirectEngine, refusal: dict, reason: str) -> str:
     if note:
         reserved += f" ({note})"
     ids = json.dumps([cid for cid, _rev in refusal["contracts"]])
+    reason = reason.rstrip()
+    reason += "" if reason.endswith((".", "!", "?")) else "."
     return (
         f"Agent review needed. {reason} This call was refused once so that you, the agent, judge it: you decide, and you "
         "are accountable for the decision; the user can read every review afterwards (list_action_reviews). Check the "
