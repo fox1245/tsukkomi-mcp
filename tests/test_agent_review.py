@@ -530,3 +530,35 @@ def test_two_consumers_of_one_review_cannot_both_win(review_env):
     assert store(engine).consume(review_id, "event-b") is False
     with sqlite3.connect(store(engine).path) as conn:
         assert conn.execute("SELECT origin_event_id FROM reviews").fetchone()[0] == "event-a"
+
+
+def test_the_mcp_tools_record_and_list_a_review(review_env, monkeypatch):
+    import asyncio
+    from self_directing_mcp import server
+    engine, path = review_env
+    monkeypatch.setattr(server, "_engine", engine)
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal)
+    write(path, assistant(use("toolu_m1", REVIEW_TOOL, **args)), mode="a")
+    recorded = asyncio.run(server.review_action(**args))
+    assert recorded["ok"] is True and recorded["review_id"]
+    write(path, tool_result("toolu_m1", json.dumps(recorded)), mode="a")
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "none"
+    listing = asyncio.run(server.list_action_reviews(session_id=SID))
+    assert listing["counts"]["consumed"]["proceed"] == 1 and listing["items"][0]["review"]["state"] == "consumed"
+    assert {"review_action", "list_action_reviews"} <= {tool.name for tool in asyncio.run(server.mcp.list_tools())}
+
+
+def test_a_hook_error_in_agent_review_mode_refuses_a_high_risk_trigger_like_confirmed_only(env, monkeypatch):
+    engine, path = env
+    set_mode(engine, "agent_review")
+    engine.upsert_contracts([{"id": "no-force-push", "type": "must_not", "scope": "tool_call", "provider": "claude",
+                              "regex": "git push --force", "risk": "high"}])
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr(claude_hooks, "handle_pre_tool_use", broken)
+    response = run(engine, path, "PreToolUse", tool_input={"command": "git push --force origin x"})
+    assert permission(response) == "deny" and "Refused" in reason_of(response)
+    assert permission(run(engine, path, "PreToolUse", tool_input={"command": "git status"})) == "none"
