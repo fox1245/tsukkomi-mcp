@@ -117,6 +117,7 @@ Register deterministic `must` and `must_not` rules scoped to a session or global
 #### Contract fields: `risk`, `auto_continue` and `when`
 
 - `risk` (`"low"` | `"high"`): when `"high"`, an unverifiable (`unknown`) pre-tool check escalates to host confirmation (`ask`) instead of passing silently.
+- `on_unverified` (`"agent"` | `"human"`, `risk: "high"` only): in the Claude Code hook's `agent_review` mode, an unverifiable call is refused once for the agent to judge and record with `review_action` (`"agent"`, the default), or always asks the user (`"human"`). See [Agent review](docs/claude-installation.md#agent-review-agent_review).
 - `auto_continue` (`bool`): controls whether a `Stop` hook may automatically resume the agent on a violation.
 - `when`: activates a conditional obligation only after a matching trigger event is observed in the session.
 - `enforcement` (`"enforce"` | `"inject_only"`): `"inject_only"` surfaces contract reminders in prompt hooks without failing `audit_session` or `check_action`.
@@ -151,6 +152,8 @@ Build and query a session knowledge graph (`run_neograph_update`, `propose_graph
 | | `job_status` | Poll live progress (`stage`, `bytes_done`, `chunks_done`, `embedded_done`, `elapsed_ms`, `eta_ms`) for an in-flight session sync or background embedding job (`#51`). |
 | | `test_contract` | Pre-save dry-run harness for candidate contract rules: evaluates positive/negative `cases`, synthesizes canonical tool calls, checks per-case `max_ms`, and reports baseline diffs/regressions (`#57`). |
 | | `grant_once` | Create a scoped, bounded one-time grant for a `must_not` contract anchored to an indexed user approval message (`source_event_id`) and verified against Canonical English (`#56`). |
+| | `review_action` | `agent_review` mode: record the agent's own judgement (`proceed` or `escalate`) of a call the Claude Code hook refused because a high-risk contract could not be verified ([Agent review](docs/claude-installation.md#agent-review-agent_review)). |
+| | `list_action_reviews` | Read-only audit trail of agent reviews, with counts of `proceed` and `escalate`. |
 | **Checklist & Evidence** | `update_checklist` | Update requirements; enforces evidence gating for completion. |
 | | `get_checklist` | Inspect checklist status, history and linked evidence. |
 | **GraphRAG & Architecture** | `get_graph_context` | Query entity dependencies and the active knowledge graph. |

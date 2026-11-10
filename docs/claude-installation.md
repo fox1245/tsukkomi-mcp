@@ -62,7 +62,7 @@ Apply only when the user asked for the hooks. The complete `--print` output with
 | `--apply` | Merge into `--settings PATH`. Refused if the hook script file does not exist. |
 | `--uninstall` | Remove the owned handlers and the owned `env` key from `--settings PATH`. |
 | `--settings PATH` | The settings JSON file. Required with `--apply` and `--uninstall`. |
-| `--mode {confirmed_only,advisory,enforced}` | Value written to `env.SELF_DIRECT_CLAUDE_ENFORCEMENT`. Default `confirmed_only`. |
+| `--mode {confirmed_only,advisory,enforced,agent_review}` | Value written to `env.SELF_DIRECT_CLAUDE_ENFORCEMENT`. Default `confirmed_only`. |
 | `--events A,B,...` | Comma-separated subset of the seven events. Default all. |
 | `--python PATH` | Interpreter that runs the hook command. Default: the interpreter running the installer. |
 | `--script PATH` | Path of `scripts/claude_hook.py`. Default: the copy next to the installer. |
@@ -120,21 +120,36 @@ One judgement, host-specific enforcement. The verdict-to-decision table is share
 | `confirmed_only` (default) | Only confirmed findings gate: `violation` denies, `suspicious` asks. Unverifiable calls pass with a warning unless a `risk: "high"` contract applies. |
 | `advisory` | Never denies or asks. Non-clean findings appear as `ADVISORY (not compliance)` messages. |
 | `enforced` | Strict opt-in. Also denies an unverifiable PreToolUse. |
+| `agent_review` | `confirmed_only`, except that a call whose `risk: "high"` contract cannot be verified is refused once for the agent to review instead of asking the user ([Agent review](#agent-review-agent_review)). Claude Code only. |
 
 ### PreToolUse
 
 "None" means the hook gives no permission decision, so Claude Code's own permission flow decides.
 
-| Verdict for the proposed call | `advisory` | `confirmed_only` | `enforced` |
-|---|---|---|---|
-| `violation` (confirmed) | none, advisory message | `deny` | `deny` |
-| `suspicious` (concrete evidence, such as an exception that needs confirmation) | none, advisory message | `ask` | `ask` |
-| `unknown`, no high-risk contract applies | none, advisory message | none, with a visible unverified warning | `deny` |
-| `unknown`, and an applicable contract has `risk: "high"` | none, advisory message | `ask` | `deny` |
-| `clean` | none | none, silent | none, silent |
-| No applicable contract for this call | none | none, silent | none, silent |
+| Verdict for the proposed call | `advisory` | `confirmed_only` | `enforced` | `agent_review` |
+|---|---|---|---|---|
+| `violation` (confirmed) | none, advisory message | `deny` | `deny` | `deny` |
+| `suspicious` (concrete evidence, such as an exception that needs confirmation) | none, advisory message | `ask` | `ask` | `ask` |
+| `unknown`, no high-risk contract applies | none, advisory message | none, with a visible unverified warning | `deny` | none, with a visible unverified warning |
+| `unknown`, and an applicable contract has `risk: "high"` | none, advisory message | `ask` | `deny` | `deny` once with review instructions, then by the agent's review ([below](#agent-review-agent_review)) |
+| `clean` | none | none, silent | none, silent | none, silent |
+| No applicable contract for this call | none | none, silent | none, silent | none, silent |
 
 Claude Code has no equivalent of AGY's `force_ask`: `ask` is the strongest confirmation available. A `suspicious` finding that sits beside an `unknown` prerequisite stays `ask` in `confirmed_only`, because confirming an exception cannot waive another unverified prerequisite in strict mode; `enforced` turns that combination into `deny`.
+
+### Agent review (`agent_review`)
+
+In `confirmed_only` an unverifiable call under a `risk: "high"` contract asks the user, every time, and the agent waits for the answer. With `SELF_DIRECT_CLAUDE_ENFORCEMENT=agent_review` the agent judges that call itself and only what the user reserved goes to the user:
+
+1. **Refusal.** The hook denies the call once. Its reason names the unverified contract and its finding, and tells the agent what to check, that it decides and is accountable, and how to record the review: the MCP tool `review_action` with the `session_id`, `refusal_id`, `action_digest` and `contract_ids` the reason shows, a `decision` and a `reason` (what it checked and why), optionally `evidence_event_ids`. The values survive the hook's output masking. The refusal is recorded first; when the store cannot be used, the hook asks the user instead (a refusal is never issued without a record).
+2. **Review.** `review_action` checks the review against the refusal (it exists, belongs to this session, is not expired and not reviewed yet, the digest and the contract ids match, and every contract is still at the refused revision, still `risk: "high"` and not `on_unverified: "human"`) and stores it. `decision="proceed"` is the normal outcome. `decision="escalate"` is meant for the actions the user reserved for themselves: a list the hook shows in the refusal, read from `SELF_DIRECT_AGENT_REVIEW_RESERVED_FILE` (or `agent_review_reserved_file` in the user TOML `[paths]`), else from the packaged [`resources/agent_review_reserved.txt`](../src/self_directing_mcp/resources/agent_review_reserved.txt) (a release, tag or version bump; publishing to a public surface not already delegated; making a repository public; deleting data that cannot be restored; dropping one of the user's rules). The list is guidance for the agent; the hook never matches it against a call.
+3. **Retry.** The identical call is proposed again. An unused, unexpired review of it (same session, same digest, covering every contract unverified now at its current revision) is accepted only if its `review_action` call is in this session's transcript as an assistant tool call of the main agent (not a tool result, user or peer text, injected record, a subagent's record or a call in another session's transcript), with the same refusal, digest, contracts, decision and reason. It is consumed once: `proceed` passes the call with no permission decision (Claude Code's own permissions still apply) and a `systemMessage` that says the call ran on the agent's decision while the contract stayed unverified; `escalate` asks the user, with the agent's reason. A review whose call is not found is marked `rejected` and the call is refused again.
+
+What a review cannot do: lift a `violation` (still `deny`) or a `suspicious` finding (still `ask`); apply when the retry's own evaluation finds the contract clean (nothing is consumed) or finds a violation; apply to another call (the digest covers the tool name and payload; Claude Code's `description` of a `Bash` call is the model's label and not part of it), another session, another contract revision, after it expired or after it was used; be recorded for a call the hook never refused (the `refusal_id` is random). It never turns a finding clean.
+
+Expiry: `SELF_DIRECT_AGENT_REVIEW_TTL_SEC` (default 900): a refusal must be reviewed within this time, and the review is usable for this time after it is recorded; the hook's value is stamped on the refusal. The `review_action` call that records the review of an open refusal passes the review step itself (a contract that also reads that call would otherwise refuse every review). Still asking the user as in `confirmed_only`: a call under a contract with `on_unverified: "human"`, and a subagent's call (the review covers the main agent's calls only).
+
+Everything is kept in `<index_dir>/action-reviews.sqlite`, never in the transcript: refusals (time, session, contracts and revisions, finding, the call's digest and a short masked rendering, never its arguments) and reviews (decision, masked reason, evidence ids, expiry, when it was consumed and by which event, or why it was rejected). `list_action_reviews` returns them with counts of `proceed` and `escalate` reviews, consumed reviews, rejected and expired ones. The hooks and the MCP server must use the same index directory; otherwise the review tool cannot see the refusal and every retry is refused again.
 
 The optional owner-approved workflow layer adds one more rule: a direct completion action that the approved workflow maps to its own executor is denied in `confirmed_only` and `enforced`, and passes with an advisory message in `advisory`.
 
@@ -158,7 +173,7 @@ A hook that answers `permissionDecision: "allow"` approves the call without Clau
 
 ### Contracts that influence hooks
 
-The hooks read the contract fields `risk`, `auto_continue` and `when` described in the [README](../README.md#contract-fields-risk-auto_continue-and-when). In short: `risk: "high"` turns an unverifiable call into `ask`, `auto_continue` is the only way a Stop can restart the agent, and `when` limits an obligation to sessions where a matching tool call was observed. Contracts with `provider: "claude"` (or no provider) and the matching session (or no session) apply. Nothing is registered by the hooks themselves; a session without contracts yields silent, unremarkable responses, which is not a compliance claim.
+The hooks read the contract fields `risk`, `on_unverified`, `auto_continue` and `when` described in the [README](../README.md#contract-fields-risk-auto_continue-and-when). In short: `risk: "high"` turns an unverifiable call into `ask` (in `agent_review` into a refusal for the agent's review, unless `on_unverified` is `"human"`), `auto_continue` is the only way a Stop can restart the agent, and `when` limits an obligation to sessions where a matching tool call was observed. Contracts with `provider: "claude"` (or no provider) and the matching session (or no session) apply. Nothing is registered by the hooks themselves; a session without contracts yields silent, unremarkable responses, which is not a compliance claim.
 
 ---
 

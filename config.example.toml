@@ -33,3 +33,7 @@ agy_app_data_dirs = [
 # adopted on this device with adopt_contracts; also the only places besides the project directory that
 # export_contracts may write. Same as SELF_DIRECT_CONTRACT_BUNDLE_PATHS in the environment.
 # contract_bundle_paths = ["~/.config/tsukkomi-mcp/contracts.json"]
+
+# SELF_DIRECT_CLAUDE_ENFORCEMENT=agent_review: the actions you reserve for yourself (one per line), shown to the agent
+# as the cases for an escalation; never matched against a call. Default: the packaged resources/agent_review_reserved.txt.
+# agent_review_reserved_file = "~/.config/tsukkomi-mcp/agent-review-reserved.txt"
