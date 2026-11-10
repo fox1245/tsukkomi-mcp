@@ -60,7 +60,7 @@ SHORT_HASH = 12
 # are plain text kept beside them and never compared (the quote is the author's wording, the claimed event an assertion).
 CONTENT_FIELDS = ("id", "type", "scope", "severity", "description", "regex", "path_guard", "search_query", "enabled",
                   "provider", "roles", "before_regex", "requires_success", "exception_regex", "risk", "auto_continue",
-                  "when", "mode", "tools", "target")
+                  "when", "mode", "tools", "target", "on_unverified")
 PROVENANCE_FIELDS = ("source_quote", "claimed_origin_event_id")
 BUNDLE_CONTRACT_FIELDS = frozenset(CONTENT_FIELDS + PROVENANCE_FIELDS)
 DEVICE_BOUND_FIELDS = ("source_event_id", "applies_from_event_id", "session_id", "revision", "origin")
@@ -121,6 +121,8 @@ def content_of(rule: ContractRule) -> dict[str, Any]:
         content["tools"] = sorted({t for t in rule.tools})
     if rule.target is not None:
         content["target"] = rule.target
+    if rule.on_unverified != "agent":
+        content["on_unverified"] = rule.on_unverified      # absent at the default: old hashes stay as they were
     if rule.session_id is not None:
         content["session_scoped"] = True
     return content
@@ -624,6 +626,8 @@ def describe_contract(entry: Entry) -> dict[str, Any]:
         out["tools"] = list(rule.tools)
     if rule.target is not None:
         out["target"] = rule.target
+    if rule.on_unverified != "agent":
+        out["on_unverified"] = rule.on_unverified
     for name in ("requires_success", "auto_continue"):
         if getattr(rule, name):
             out[name] = True
@@ -686,6 +690,8 @@ def portable_dict(rule: ContractRule) -> dict[str, Any]:
         out["tools"] = list(rule.tools)
     if rule.target is not None:
         out["target"] = rule.target
+    if rule.on_unverified != "agent":
+        out["on_unverified"] = rule.on_unverified
     return out
 
 
