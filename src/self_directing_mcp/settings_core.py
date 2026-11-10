@@ -75,6 +75,11 @@ DEFAULT_AUDIT_TIMEOUT_SEC = 8.0
 # than 2 s per contract for; a monitor that runs out is dropped and never kept.
 DEFAULT_AUDIT_FOLD_BUDGET_SEC = 60.0
 DEFAULT_REQUEST_TIMEOUT_SEC = 45.0
+# A check of a proposed action whose session grew while it was judged reads the appended records and judges again; no
+# evaluation starts later than this many seconds after the first one ended (0 judges once). A host appends records about
+# the proposed call while its PreToolUse hook runs; a hook's timeout (60 s for Claude Code's PreToolUse) leaves room for
+# this budget and one more evaluation next to the first.
+DEFAULT_ACTION_SETTLE_SEC = 5.0
 DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC = 300.0
 DEFAULT_MAX_TOOL_TIMEOUT_SEC = 600.0
 DEFAULT_MAX_CONCURRENT_CALLS = 4
@@ -628,6 +633,7 @@ FIELDS: tuple[FieldSpec, ...] = (
               _static(DEFAULT_AUDIT_FOLD_BUDGET_SEC)),
     FieldSpec("request_timeout_sec", lambda name, text: _to_float(name, text, positive=True),
               _static(DEFAULT_REQUEST_TIMEOUT_SEC)),
+    FieldSpec("action_settle_sec", _to_nonnegative_finite, _static(DEFAULT_ACTION_SETTLE_SEC)),
     FieldSpec("graph_update_timeout_sec", lambda name, text: _to_float(name, text, positive=True, finite=True),
               _static(DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC)),
     FieldSpec("graph_extractor", _literal(GRAPH_EXTRACTORS), _static(DEFAULT_GRAPH_EXTRACTOR)),

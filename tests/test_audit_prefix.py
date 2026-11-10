@@ -81,11 +81,24 @@ def test_obligation_evidenced_in_prefix_is_clean_as_of_offset(session, monkeypat
 
 def test_gate_prerequisite_absence_for_proposed_action_is_unknown_with_growth(session, monkeypatch):
     engine, path = session
+    engine.settings.action_settle_sec = 0.0     # about bytes that were never read: the check judges once
     engine.upsert_contracts([{"id": "test-first", "type": "must", "scope": "tool_call", "regex": "npm test",
                               "before_regex": "deploy"}])
     action = {"tool_name": "shell", "arguments": {"command": "deploy now"}}
     _, value = _audit_with_late(engine, path, monkeypatch, "npm test", method="check_action", args=(action,))
     assert value["verdict"] == "unknown", value
+
+
+def test_gate_prerequisite_appended_during_the_check_is_read_when_it_settles(session, monkeypatch):
+    """With a settle budget the check reads the late record: a presence-only prerequisite that is now in the history is
+    met, by the rule for complete history (tests/test_action_settles_on_growth.py)."""
+    engine, path = session
+    engine.upsert_contracts([{"id": "test-first", "type": "must", "scope": "tool_call", "regex": "npm test",
+                              "before_regex": "deploy"}])
+    action = {"tool_name": "shell", "arguments": {"command": "deploy now"}}
+    _, value = _audit_with_late(engine, path, monkeypatch, "npm test", method="check_action", args=(action,))
+    assert value["coverage"]["complete"] is True and value["settle"]["passes"] == 2, value
+    assert value["verdict"] == "clean"
 
 
 @pytest.mark.parametrize("kind", ["overwrite", "overwrite_append", "truncate", "replace", "delete"])

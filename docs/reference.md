@@ -486,6 +486,7 @@ All settings use the `SELF_DIRECT_` prefix except the key itself. The names belo
 | `SELF_DIRECT_LOCK_WAIT_TIMEOUT_SEC` | `1` | Combined process/file writer-lease wait. |
 | `SELF_DIRECT_AUDIT_TIMEOUT_SEC` | `8` | Response budget for audits and hooks. |
 | `SELF_DIRECT_AUDIT_FOLD_BUDGET_SEC` | `60` | The most one fold of stored events into the incremental monitors may spend in contract patterns, in seconds, however many monitors it feeds (it is never less than 2 s per monitor). A monitor that is built from nothing, after a contract change or an evaluator upgrade, reads the whole history; a budget that is too small drops it every time and the audit falls back to the full evaluator on every Stop. |
+| `SELF_DIRECT_ACTION_SETTLE_SEC` | `5` | A check of a proposed action (`check_action`, every host's PreToolUse hook) whose session grew while it was judged reads the appended records and judges again; no new evaluation starts later than this many seconds after the first one ended, and one that started runs to its end under the same limits as the first (the request's own deadline, if any). `0`: judge once, as before. See [`check_action` and current prerequisites](#check_action-and-current-prerequisites). |
 | `SELF_DIRECT_REQUEST_TIMEOUT_SEC` | `45` | Response budget for ordinary calls. |
 | `SELF_DIRECT_GRAPH_UPDATE_TIMEOUT_SEC` | `300` | Budget for `run_neograph_update`. |
 | `SELF_DIRECT_GRAPH_EXTRACTOR` | `openrouter` | Who extracts for `run_neograph_update`: `openrouter` (an OpenRouter model) or `host`, which disables that tool (`extractor_disabled`; the key and the network are not touched). `graph_next_batch` and `graph_submit_batch` work with either value, also with `SELF_DIRECT_LOCAL_ONLY=true`. An unknown value is an error. See [Host-side GraphRAG extraction](#host-side-graphrag-extraction). |
@@ -732,6 +733,15 @@ A proposed action runs now, so unread records come before it, not after it. When
 - With `requires_success: true`, a `clean` finding becomes `unknown` and the overall verdict is raised to at least `unknown`, because a newer failed or pending run may be in the unread part ([#8](https://github.com/fox1245/tsukkomi-mcp/issues/8)).
 - A presence-only prerequisite (`requires_success: false`) stays `clean` while the only gap is appended bytes, because an observed earlier run is not undone by later records. For any other coverage gap it becomes `unknown`.
 - A `must_not` violation already found is not hidden by this rule.
+
+While a host's PreToolUse hook runs, the host keeps appending records about the proposed call itself (its own assistant record, the results of its other PreToolUse hooks, session bookkeeping), so the source of a hook-time check nearly always grows while it is judged. When the only coverage gap of an evaluation is bytes appended during it, and a finding of the action that reads the history (an obligation, or a `when` condition) is `unknown`, `check_action` reads the appended bytes and evaluates again, until one evaluation sees no growth during it. No evaluation starts later than `SELF_DIRECT_ACTION_SETTLE_SEC` (default 5 s) after the first one ended; one that started runs under the same limits as the first, so a hook's in-request comparison with the full evaluator (a high-risk contract's) is not cut by the settling. The answer is that last evaluation, judged by the rules above:
+
+- Appended records that hold no newer run of the prerequisite leave a satisfied prerequisite `clean`. The proposed call's own record is a run of the prerequisite only when it matches the prerequisite's pattern itself; it then has no result yet, and the prerequisite is `unknown`.
+- A newer failed run of the prerequisite in the appended records is a `violation`; a newer run without a result is `unknown`.
+- A source that is still growing when the budget ends, a tail that a second read cannot parse either (an unfinished record), or any other coverage gap (an unparseable record, a changed source) stays `unknown`, as before.
+- A `violation` or `suspicious` finding decides the action by itself and is answered without another evaluation.
+
+The result then carries `settle` (`passes`, `stopped_by`: `no_growth`, `budget`, `deadline`, `no_progress`, `coverage_gap`, `decided` or `index_busy`, `budget_sec`, `ms`). Each evaluation judges only the bytes it read; nothing of an earlier evaluation is carried into the answer. The request's own deadline (an MCP call, the daemon) still bounds every evaluation, less the time to return the answer in hand: an evaluation it cuts leaves the previous answer standing (`deadline`).
 
 ### Duplicate session sources
 

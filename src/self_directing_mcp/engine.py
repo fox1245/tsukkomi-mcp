@@ -165,6 +165,41 @@ def _mark_growth(coverage, observation) -> bool:
     return bool(unread)
 
 
+# A check of a proposed action whose source grew while it was judged reads the appended bytes and judges again; no new
+# evaluation starts later than ``action_settle_sec`` after the first one ended (``SelfDirectEngine._settle``). The budget is
+# measured on this clock (a module attribute, so that a test can fix the number of passes).
+SETTLE_CLOCK = time.monotonic
+# Private key of an action check's payload, removed before the check answers: the ids of the action's findings that read
+# the history and are unknown while the only coverage gap is bytes appended during the evaluation.
+_UNREAD_DEPENDENT = "_unread_dependent"
+
+
+def _source_end(coverage) -> int:
+    """The size of the source as the evaluation last saw it: what it judged plus what it left unread."""
+    return (coverage.get("judged_through_byte") or 0) + (coverage.get("unread_bytes") or 0)
+
+
+def _settle_stop(payload, previous_end):
+    """Why judging an action check again cannot settle its answer (a ``settle.stopped_by`` value), or None when it can.
+
+    Another evaluation can only help when the one coverage gap is bytes appended while this evaluation ran
+    (``judged_prefix``) and a finding of the action that reads the history is unknown. A violation or suspicious finding
+    decides the action by itself (and a pass that applied a one-time grant must not run twice). An evaluation whose source
+    ends where the previous one's ended has read nothing new: its unread tail (an unfinished record) is not readable yet.
+    """
+    coverage = payload.get("coverage") or {}
+    dependent = payload.pop(_UNREAD_DEPENDENT, None)
+    if not coverage.get("unread_bytes"):
+        return "no_growth"
+    if coverage.get("judged_prefix") is not True or set(coverage.get("issues") or ()) != {"unread_bytes"}:
+        return "coverage_gap"
+    if not dependent or any(item.get("verdict") in ("violation", "suspicious") for item in payload.get("findings") or ()):
+        return "decided"
+    if previous_end is not None and _source_end(coverage) <= previous_end:
+        return "no_progress"
+    return None
+
+
 VERIFY_MODES = ("full", "fast")
 
 # A deadline-bound audit or action check gives its evidence refresh this share of the time it has left and keeps the rest
@@ -2064,6 +2099,14 @@ class SelfDirectEngine:
                     action_verdict = "unknown"
                 payload["action_verdict"] = action_verdict
                 payload["session_verdict"] = payload["verdict"]
+                if payload["coverage"].get("judged_prefix"):
+                    # The action's findings that the bytes appended during this evaluation leave open: the unknown ones of
+                    # contracts that read the history (an obligation, a ``when`` condition). ``check_action`` reads those
+                    # bytes and judges again (``_settle``); the key never leaves the engine.
+                    reads = {rule.id for rule in history_rules} | {rule.id for rule in active if rule.when is not None}
+                    payload[_UNREAD_DEPENDENT] = sorted(
+                        item["contract_id"] for item in payload["findings"]
+                        if item.get("contract_id") in action_ids & reads and item["verdict"] == "unknown")
             payload["requires_attention"] = payload["verdict"] != "clean"
             payload["integrity"] = integrity
             if plan is not None and not mismatch:
@@ -2154,8 +2197,72 @@ class SelfDirectEngine:
         ``verify="fast"`` is for hook-time checks: the source is verified by comparing its tail, latest blocks and a
         random sample with the stored block digests instead of a scan of everything (see ``integrity`` in the
         result, and the README's "Source integrity"). It is never used implicitly.
+
+        A source that grew while the check was judged is read and judged again before the check answers (``_settle``).
         """
-        return self._audit(session_id, provider, proposed=action, path=path, verify=_check_verify(verify))
+        verify = _check_verify(verify)
+
+        def judge():
+            return self._audit(session_id, provider, proposed=action, path=path, verify=verify)
+
+        return self._settle(judge(), judge)
+
+    def _settle(self, payload, judge):
+        """The answer of an action check whose source grew while it was judged: read the appended bytes, judge again.
+
+        While a PreToolUse hook runs, the host appends records about the proposed call itself (its own assistant record,
+        the results of the call's other hooks, bookkeeping), so a hook-time check nearly always sees growth, and an
+        evaluation of a prefix cannot vouch for a prerequisite that a newer run in the unread part could undo. ``judge``
+        runs one whole evaluation (``_audit``: refresh, then judge); it is repeated while ``_settle_stop`` says another one
+        can settle the answer, and no evaluation starts later than ``action_settle_sec`` after the first one ended. Each
+        evaluation runs under the same limits as the first (the request's own deadline, if it has one, less the time to
+        return the answer in hand): a settle budget of its own would also cut the comparisons with the full evaluator that
+        a hook runs in the request (a high-risk contract's), and leave the settled answer unverified. The answer is the last
+        evaluation that finished, as it is: clean only when that evaluation read the source with no growth during it, and
+        nothing of an earlier pass is carried into it. An evaluation the request's deadline cuts leaves the previous answer
+        standing; a stop of the request itself is not absorbed."""
+        stop = _settle_stop(payload, None)
+        if stop == "no_growth":
+            return payload
+        budget = float(self.settings.action_settle_sec)
+        control = current_request()
+        passes, spent = 1, time.perf_counter()
+        started = SETTLE_CLOCK()
+        while stop is None:
+            if SETTLE_CLOCK() - started >= budget:
+                stop = "budget"
+                break
+            limit = None
+            if control is not None and control.deadline is not None:
+                # Keep the time to return the answer in hand, as a pass that only verifies an answer does.
+                now = time.monotonic()
+                limit = control.deadline - incremental.comparison_reserve(control.deadline - now)
+                if limit <= now:
+                    stop = "deadline"
+                    break
+            previous_end = _source_end(payload["coverage"])
+            try:
+                with request_scope(deadline=limit) if limit is not None else nullcontext():
+                    again = judge()
+            except RequestStopped:
+                if limit is None or _request_over(control):
+                    raise
+                stop = "deadline"
+                break
+            except IndexBusy:
+                stop = "index_busy"
+                break
+            passes += 1
+            payload = again
+            stop = _settle_stop(payload, previous_end)
+        payload.pop(_UNREAD_DEPENDENT, None)
+        payload["settle"] = {"passes": passes, "stopped_by": stop, "budget_sec": budget,
+                             "ms": round((time.perf_counter() - spent) * 1000, 2)}
+        unread = payload["coverage"].get("unread_bytes")
+        if unread and stop not in ("coverage_gap", "decided"):
+            payload["notes"].append(f"The source grew while this action was checked; judged {passes} time(s) ({stop}), "
+                                    f"{unread} appended byte(s) were not reviewed.")
+        return payload
 
     @background_operation
     def verify_incremental(self, session_id: str, provider: str | None = None, path: str | None = None,
