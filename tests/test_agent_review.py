@@ -562,3 +562,21 @@ def test_a_hook_error_in_agent_review_mode_refuses_a_high_risk_trigger_like_conf
     response = run(engine, path, "PreToolUse", tool_input={"command": "git push --force origin x"})
     assert permission(response) == "deny" and "Refused" in reason_of(response)
     assert permission(run(engine, path, "PreToolUse", tool_input={"command": "git status"})) == "none"
+
+
+AGENT_REVIEW_EXPECTED = {"violation": "deny", "suspicious": "ask", "unknown": "none", "unknown_high_risk": "deny",
+                         "clean": "none", "no_contract": "none"}
+
+
+@pytest.mark.parametrize("scenario", sorted(AGENT_REVIEW_EXPECTED))
+def test_pretooluse_verdict_in_agent_review_mode(env, clock, scenario):
+    """Every scenario of the confirmed_only table, with only the high-risk unknown changed (to a refusal for review)."""
+    from test_claude_hooks import EXPECTED, SCENARIOS
+    engine, path = env
+    set_mode(engine, "agent_review")
+    response = run(engine, path, "PreToolUse", tool_input=SCENARIOS[scenario](engine))
+    assert permission(response) == AGENT_REVIEW_EXPECTED[scenario], response
+    if scenario != "unknown_high_risk":
+        assert AGENT_REVIEW_EXPECTED[scenario] == EXPECTED[scenario]["confirmed_only"]
+    else:
+        assert reason_of(response).startswith("Agent review needed.")
