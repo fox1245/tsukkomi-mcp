@@ -303,8 +303,8 @@ class Settings(SettingsAccessors, BaseSettings):
     mcp_server_name: str | None = Field(
         default=None,
         description="Name under which this server is registered in Claude Code (TOML [claude] mcp_server_name). "
-                    "When set, agent_review accepts only mcp__<mcp_server_name>__review_action for the review call "
-                    "pass-through and origin check; when unset, any mcp__<server>__review_action is accepted. "
+                    "Required by agent_review: accepts only mcp__<mcp_server_name>__review_action for the review call "
+                    "pass-through and origin check, and asks the user when unset; other modes do not require it. "
                     "SELF_DIRECT_MCP_SERVER_NAME.",
     )
 

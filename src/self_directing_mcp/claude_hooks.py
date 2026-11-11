@@ -68,7 +68,10 @@ REVIEW_NOT_INDEXED = (
     "The review's review_action call is not in the indexed transcript yet; "
     "the review remains unused and the identical call can be retried before it expires."
 )
-_EOF_ISSUES = frozenset({"parse_errors", "unsupported_events"})
+SERVER_NAME_REQUIRED = (
+    "Agent review requires mcp_server_name (SELF_DIRECT_MCP_SERVER_NAME) and the setting is missing; "
+    "the user decides this call. "
+)
 
 
 @dataclass(frozen=True)
@@ -218,7 +221,7 @@ def handle_pre_tool_use(engine: SelfDirectEngine, call: HookCall, path: str | No
 
 
 def _transcript_read_to_end(audit: Any) -> bool:
-    """True when ``audit`` read the transcript to its end with no unread bytes and no growth during evaluation."""
+    """True when ``audit`` read the transcript to its end with no coverage issues, unread bytes or growth."""
     if not isinstance(audit, dict) or audit.get("ok") is not True:
         return False
     if (audit.get("integrity") or {}).get("verification") == "unavailable":
@@ -251,7 +254,7 @@ def _transcript_read_to_end(audit: Any) -> bool:
     if coverage.get("judged_prefix"):
         return False
     issues = coverage.get("issues")
-    return isinstance(issues, list) and set(issues) <= _EOF_ISSUES
+    return isinstance(issues, list) and not issues
 
 
 def _agent_review(engine: SelfDirectEngine, call: HookCall, judged: hook_policy.Judgement) -> dict[str, Any]:
@@ -259,16 +262,18 @@ def _agent_review(engine: SelfDirectEngine, call: HookCall, judged: hook_policy.
     unverified. Nothing else reaches this: a violation (deny), a suspicious finding (ask) and a clean verdict were decided
     by ``classify`` before, so a review can never lift them.
 
-    In order: a contract with ``on_unverified: "human"`` or a subagent's call asks the user as before; an unused, unexpired
-    review of this very call (same session and digest, covering every contract unverified now at its current revision)
-    whose ``review_action`` call is the main agent's own in this transcript is consumed once: ``proceed`` lets the call
-    pass (no permission decision, so Claude Code's own permissions still apply; the finding stays unverified) and
-    ``escalate`` (or any other stored decision) asks the user; a candidate review whose call is not in the indexed
-    transcript is rejected only when the audit read the transcript to its end with no unread bytes and no growth during
-    evaluation, and otherwise stays unused without a new refusal while the call is refused for retry until the review
-    expires; the ``review_action`` call that records the review of an open refusal passes this step (it would otherwise be
-    refused for a review of its own when a contract reads it too); anything else is refused once, with the instructions for
-    the review. Any failure in this step asks the user: a refusal is never issued without a record."""
+    In order: a contract with ``on_unverified: "human"`` or a subagent's call asks the user as before; when
+    ``mcp_server_name`` is not set, the step asks the user saying the setting is missing and issues no refusal, lets no
+    review call pass and spends no review; an unused, unexpired review of this very call (same session and digest, covering
+    every contract unverified now at its current revision) whose ``review_action`` call is the main agent's own in this
+    transcript is consumed once: ``proceed`` lets the call pass (no permission decision, so Claude Code's own permissions
+    still apply; the finding stays unverified) and ``escalate`` (or any other stored decision) asks the user; a candidate
+    review whose call is not in the indexed transcript is rejected only when the audit read the transcript to its end with
+    no coverage issues, unread bytes or growth during evaluation, and otherwise stays unused without a new refusal while
+    the call is refused for retry until the review expires; the ``review_action`` call that records the review of an open
+    refusal passes this step (it would otherwise be refused for a review of its own when a contract reads it too); anything
+    else is refused once, with the instructions for the review. Any failure in this step asks the user: a refusal is never
+    issued without a record."""
     human = [cid for cid, _rev, who in judged.unverified if who != "agent"]
     if human:
         return {"decision": "ask", "reason": HUMAN_ONLY.format(ids=", ".join(human)) + judged.reason}
@@ -279,7 +284,9 @@ def _agent_review(engine: SelfDirectEngine, call: HookCall, judged: hook_policy.
         from self_directing_mcp.settings_core import check_mcp_server_name
         from self_directing_mcp.tool_payload import tool_call_text
         raw_server = getattr(engine.settings, "mcp_server_name", None)
-        server_name = check_mcp_server_name(raw_server) if raw_server is not None else None
+        if raw_server is None:
+            return {"decision": "ask", "reason": SERVER_NAME_REQUIRED + judged.reason}
+        server_name = check_mcp_server_name(raw_server)
         contracts = [(cid, rev) for cid, rev, _who in judged.unverified]
         ids = ", ".join(cid for cid, _rev in contracts)
         store = reviews.ReviewStore(engine.settings.index_dir)
@@ -333,15 +340,36 @@ def _agent_review(engine: SelfDirectEngine, call: HookCall, judged: hook_policy.
 _UNSET = object()
 
 
+def _foreign_peer(peer: Any) -> bool:
+    meta = peer.meta
+    return bool(meta.get("inherited")) or meta.get("sidechain") is not False or meta.get("agent_id") is not None
+
+
+def _result_qualifies(result_chunk: Any, call_chunk: Any, review: dict, reviews: Any) -> bool:
+    res_meta = result_chunk.meta
+    call_meta = call_chunk.meta
+    return (
+        (result_chunk.byte_start, res_meta.get("sub_index", 0))
+        > (call_chunk.byte_start, call_meta.get("sub_index", 0))
+        and res_meta.get("role") == "tool"
+        and res_meta.get("evidence_origin") is None
+        and not res_meta.get("unsupported_event")
+        and res_meta.get("success") is not False
+        and not reviews.permission_rejected(res_meta.get("permission_decision"))
+        and reviews.result_matches(result_chunk.text, review)
+    )
+
+
 def _review_origin(engine: SelfDirectEngine, session_id: str, review: dict,
                    *, server_name: Any = _UNSET) -> str | None:
     """The event id of the ``review_action`` call that recorded ``review``, or None.
 
     It must be a tool call the main agent made in its own turn of this session: an assistant ``tool_call`` of the main
-    transcript (not a subagent's record, not replayed history, not a hosted or unsupported record) of the review tool
-    (``mcp__<mcp_server_name>__review_action`` when configured, else any ``mcp__<server>__review_action``), whose
-    arguments match ``review`` and whose linked ``tool_result`` is in this transcript, succeeded (not an error and not
-    rejected by a permission decision) and names ``review['review_id']``."""
+    transcript (not a subagent's record, not replayed history, not a hosted or unsupported record) of the configured
+    review tool (``mcp__<mcp_server_name>__review_action``), whose arguments match ``review``. Among the records sharing
+    its ``call_id`` (ignoring inherited, sidechain and other-agent records), it must be the only call, at least one
+    ``tool_result`` after it must qualify (role ``tool``, succeeded with ``ok: true`` and naming ``review['review_id']``),
+    and no ``tool_result`` of that id may be an error or a permission rejection."""
     from self_directing_mcp import action_reviews as reviews
     if server_name is _UNSET:
         raw_server = getattr(engine.settings, "mcp_server_name", None)
@@ -350,6 +378,8 @@ def _review_origin(engine: SelfDirectEngine, session_id: str, review: dict,
             server_name = check_mcp_server_name(raw_server)
         else:
             server_name = None
+    if server_name is None:
+        return None
     events, linked = engine.review_origin_events(session_id, "claude", review["refusal_id"], review["source_offset"])
     for chunk in reversed(events):
         meta = chunk.meta
@@ -364,21 +394,17 @@ def _review_origin(engine: SelfDirectEngine, session_id: str, review: dict,
         call_id = meta.get("call_id")
         if not isinstance(call_id, str) or not call_id:
             continue
-        peers = linked.get(call_id, ())
+        peers = [peer for peer in linked.get(call_id, ()) if not _foreign_peer(peer)]
         calls = [peer for peer in peers if peer.kind == "tool_call"]
         results = [peer for peer in peers if peer.kind == "tool_result"]
-        if len(calls) != 1 or calls[0].chunk_id != chunk.chunk_id or len(results) != 1:
+        if len(calls) != 1 or calls[0].chunk_id != chunk.chunk_id:
             continue
-        result_chunk = results[0]
-        res_meta = result_chunk.meta
-        if ((result_chunk.byte_start, res_meta.get("sub_index", 0)) <= (chunk.byte_start, meta.get("sub_index", 0))
-                or res_meta.get("role") != "tool" or res_meta.get("sidechain") is not False
-                or res_meta.get("agent_id") is not None or res_meta.get("inherited")
-                or res_meta.get("evidence_origin") is not None or res_meta.get("unsupported_event")
-                or res_meta.get("success") is False
-                or reviews.permission_rejected(res_meta.get("permission_decision"))):
+        if any(res.meta.get("success") is False
+               or reviews.permission_rejected(res.meta.get("permission_decision"))
+               or reviews.result_is_error(res.text)
+               for res in results):
             continue
-        if reviews.result_matches(result_chunk.text, review):
+        if any(_result_qualifies(res, chunk, review, reviews) for res in results):
             return chunk.chunk_id
     return None
 

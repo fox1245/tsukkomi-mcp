@@ -40,7 +40,7 @@ agy_app_data_dirs = [
 
 # [claude]
 # Name under which this server is registered in Claude Code (same as SELF_DIRECT_MCP_SERVER_NAME).
-# When set, agent_review accepts only mcp__<mcp_server_name>__review_action for the review call pass-through
-# and origin check; another server's review_action is an ordinary call. When unset, any mcp__<server>__review_action
-# is accepted.
+# Required by agent_review: accepts only mcp__<mcp_server_name>__review_action for the review call pass-through
+# and origin check (another server's review_action is an ordinary call); when unset in agent_review, the review
+# step asks the user saying the setting is missing. Other modes do not require it.
 # mcp_server_name = "tsukkomi-mcp"

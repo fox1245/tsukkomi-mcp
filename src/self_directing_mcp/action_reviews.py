@@ -86,7 +86,8 @@ def permission_rejected(decision: Any) -> bool:
 
 
 def result_matches(text: str, review: dict) -> bool:
-    """Whether a stored ``tool_result`` text is a succeeded ``review_action`` reply naming ``review['review_id']``."""
+    """Whether a stored ``tool_result`` text is a succeeded ``review_action`` reply (``ok: true``) naming
+    ``review['review_id']``."""
     prefix = "[tool_result] "
     review_id = review.get("review_id")
     if not isinstance(text, str) or not text.startswith(prefix) or not isinstance(review_id, str) or not review_id:
@@ -95,13 +96,25 @@ def result_matches(text: str, review: dict) -> bool:
         payload = json.loads(text[len(prefix):])
     except ValueError:
         return False
-    if not isinstance(payload, dict) or payload.get("ok") is False or "error" in payload:
+    if not isinstance(payload, dict) or payload.get("ok") is not True or "error" in payload:
         return False
     if payload.get("review_id") != review_id:
         return False
     if "refusal_id" in payload and payload["refusal_id"] != review.get("refusal_id"):
         return False
     return True
+
+
+def result_is_error(text: str) -> bool:
+    """Whether a stored ``tool_result`` text is a structured ``review_action`` error reply."""
+    prefix = "[tool_result] "
+    if not isinstance(text, str) or not text.startswith(prefix):
+        return False
+    try:
+        payload = json.loads(text[len(prefix):])
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and (payload.get("ok") is False or "error" in payload)
 
 
 def call_arguments(text: str, tool_name: str) -> dict | None:
@@ -266,20 +279,20 @@ class ReviewStore:
 
         The call must target the review tool (``mcp__<server_name>__review_action`` when ``server_name`` is set), carry
         only ``review_action`` parameters, and name this session, the hook's own random ``refusal_id``, the refused
-        call's ``action_digest``, the refusal's exact ``contract_ids`` and a valid ``decision`` while that refusal has
-        no review and has not expired."""
+        call's ``action_digest``, the refusal's exact ``contract_ids``, a valid ``decision`` and a non-empty ``reason``
+        while that refusal has no review and has not expired."""
         if not is_review_tool(tool_name, server_name) or not isinstance(arguments, dict):
             return None
         if not set(arguments) <= REVIEW_TOOL_PARAMS or arguments.get("session_id") != session_id:
             return None
         refusal_id, digest = arguments.get("refusal_id"), arguments.get("action_digest")
         decision, contract_ids = arguments.get("decision"), arguments.get("contract_ids")
+        reason = arguments.get("reason")
         if (not isinstance(refusal_id, str) or not refusal_id or not isinstance(digest, str) or not digest
                 or not isinstance(decision, str) or decision not in DECISIONS
+                or not isinstance(reason, str) or not reason.strip()
                 or not isinstance(contract_ids, list)
                 or any(not isinstance(item, str) or not item for item in contract_ids)):
-            return None
-        if "reason" in arguments and not isinstance(arguments["reason"], str):
             return None
         evidence = arguments.get("evidence_event_ids")
         if evidence is not None and (not isinstance(evidence, list)
