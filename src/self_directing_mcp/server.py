@@ -690,9 +690,12 @@ async def upsert_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
     without one the change is held as pending and the active revision stays. before_regex
     and requires_success apply to must tool_call rules with regex. Revisions increment
     on update. Description-only rules return unknown until a verifier exists.
-    Set risk="high", auto_continue=true or when={"tool_call_regex": ...} only when
-    the user asked for that: risk="high" marks actions the user named high-risk (a
-    host may ask instead of allowing when verification fails); auto_continue=true
+    Set risk="high", on_unverified="human", auto_continue=true or when={"tool_call_regex": ...}
+    only when the user asked for that: risk="high" marks actions the user named high-risk (a
+    host may ask instead of allowing when verification fails); on_unverified="human" (risk
+    "high" only) keeps asking the user where the Claude Code hook would otherwise let the
+    agent review the unverified call (agent_review mode); removing it enforces less;
+    auto_continue=true
     (must with regex only) lets a confirmed, fully observed miss resume a stopping
     agent once per session; when limits a must obligation to sessions where a
     matching tool call was observed (otherwise it is reported not_applicable).
@@ -787,6 +790,40 @@ async def grant_once(
         canonical_english_quote=canonical_english_quote,
         heavy=False,
     )
+
+
+@mcp.tool()
+async def review_action(
+    session_id: str,
+    refusal_id: str,
+    action_digest: str,
+    contract_ids: list[str],
+    decision: Literal["proceed", "escalate"],
+    reason: str,
+    evidence_event_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Record your own judgement of a call the Claude Code hook refused for agent review (agent_review mode).
+
+    The hook refuses a call once when a risk: high contract of it cannot be verified, and names session_id, refusal_id,
+    action_digest and contract_ids: pass them exactly as shown. You decide and you are accountable: check the evidence
+    yourself, then decision="proceed" with what you checked and why the call is safe in reason, and retry the identical
+    call (it runs once; the review is single-use and expires). decision="escalate" only for the actions the user reserved
+    for themselves (listed in the refusal); the retried call then asks the user. Describe the call in reason without
+    quoting it (contracts read this call too). evidence_event_ids: history event ids you relied on (optional).
+    A review never makes a finding clean, never lifts a violation or a suspicious finding, and is accepted by the hook
+    only when this call is in your own turn of the session. list_action_reviews shows every review afterwards.
+    """
+    return await _dispatch(_engine.review_action, session_id, refusal_id, action_digest, contract_ids, decision, reason,
+                           evidence_event_ids=evidence_event_ids, heavy=False)
+
+
+@mcp.tool()
+async def list_action_reviews(session_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+    """The audit trail of agent reviews (agent_review mode): every refusal-for-review the hook issued, the review the
+    agent recorded for it (decision, reason, evidence), and whether the hook consumed it; with counts of proceed and
+    escalate reviews. A consumed proceed review is a call that ran on the agent's decision although a high-risk contract
+    stayed unverified. Read-only."""
+    return await _dispatch(_engine.list_action_reviews, heavy=False, session_id=session_id, limit=limit)
 
 
 @mcp.tool()

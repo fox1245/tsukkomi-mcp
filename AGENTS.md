@@ -61,6 +61,14 @@ only reports, a Stop blocks at most once per session and only for a confirmed
 `hook_health` entry. Do not hide hook failures or hand-edit the settings file to work
 around them. Hooks never read a project `.env`; point them at the right index with `--index-dir`, the user TOML or the settings `env`. The AGY adapter follows the same policy (`SELF_DIRECT_AGY_ENFORCEMENT`,
 default `confirmed_only`). See docs/claude-installation.md and docs/agy-installation.md.
+`SELF_DIRECT_CLAUDE_ENFORCEMENT=agent_review` (Claude Code only; AGY and Grok reject the value) judges as `confirmed_only`
+and replaces only the ask for an unverified `risk: high` contract: the call is refused once for the agent to review
+(`action_reviews`, `review_action`, `list_action_reviews`). Rules a change must keep: `classify` is not changed for it, so a
+violation, a suspicious finding and a clean verdict never reach the review; a review is bound to a refusal the hook issued
+(random id), the session, the call's digest and the contracts at their revisions, is single-use and expires; the hook
+accepts it only when the review_action call is an assistant tool call of the main agent in this session's transcript; a
+refusal is never issued without a record (an unusable store asks); `on_unverified: "human"` and subagent calls ask; the
+finding stays `unknown`; the reserved-actions list is data shown to the agent and never matched against a call.
 
 Grok CLI hooks are opt-in and separate from both installers. `python scripts/install_grok_hooks.py --print` first,
 `--apply` only when the user asks, `--verify` and `--uninstall` after. The installer owns exactly one file,

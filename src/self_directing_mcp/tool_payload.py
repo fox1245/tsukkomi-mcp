@@ -37,6 +37,14 @@ PROSE_FIELDS: dict[str, tuple[frozenset[str], Any]] = {
     "agy": (frozenset({"toolAction", "toolSummary"}), lambda name: True),
 }
 
+# provider -> {exact tool name: field names whose string value is omitted from the action digest}.
+# Only fields confirmed as prose for that exact tool are excluded from the call identity; every other tool's
+# ``description`` (or other field) remains part of the digest.
+DIGEST_PROSE_FIELDS: dict[str, dict[str, frozenset[str]]] = {
+    "claude": {"Bash": frozenset({"description"})},
+    "agy": {"run_command": frozenset({"toolAction", "toolSummary"})},
+}
+
 # Fields that look like prose but are NOT confirmed from this repository's fixtures or code, so they stay payload.
 UNCONFIRMED = {
     "agy": ("Description", "Instruction", "Explanation"),
@@ -63,6 +71,19 @@ def split_prose(provider: str | None, tool_name: Any, arguments: Any) -> tuple[A
     if not prose:
         return arguments, {}
     return {key: value for key, value in arguments.items() if key not in prose}, prose
+
+
+def digest_payload(provider: str | None, tool_name: Any, arguments: Any) -> Any:
+    """``arguments`` without string fields declared prose in ``DIGEST_PROSE_FIELDS`` for this exact tool."""
+    if not isinstance(tool_name, str) or not isinstance(arguments, dict):
+        return arguments
+    fields = DIGEST_PROSE_FIELDS.get(provider or "", {}).get(tool_name)
+    if not fields:
+        return arguments
+    removed = {key for key, value in arguments.items() if key in fields and isinstance(value, str)}
+    if not removed:
+        return arguments
+    return {key: value for key, value in arguments.items() if key not in removed}
 
 
 def tool_call_parts(provider: str | None, tool_name: Any, arguments: Any, *, label: str = "tool_call") -> tuple[str, dict]:

@@ -1548,6 +1548,37 @@ class SessionStore:
         self.audit_rows_fetched += sum(len(v) for v in found.values())
         return found
 
+    def events_mentioning(self, session_id, provider, needle, from_byte=0):
+        """Stored events of this session at or after ``from_byte`` whose stored form contains ``needle``, in session
+        order, as full chunks. For an exact random identifier (an agent review's ``refusal_id``): the caller decides
+        from each event's kind and metadata what it is; the containment is only the lookup."""
+        check_request()
+        rows = self._conn.execute(
+            "SELECT data FROM session_events WHERE provider=? AND session_id=? AND byte_start>=? AND instr(data, ?) > 0"
+            " ORDER BY byte_start, sub_index", (provider, session_id, int(from_byte), needle)).fetchall()
+        return [Chunk.model_validate_json(row["data"]) for row in rows]
+
+    def call_chunks(self, session_id, provider, call_ids):
+        """``{call_id: [Chunk, ...]}`` for stored ``tool_call`` and ``tool_result`` events of these ids, in session
+        order."""
+        found: dict[str, list[Chunk]] = {}
+        ids = [cid for cid in dict.fromkeys(call_ids) if isinstance(cid, str) and cid]
+        for start in range(0, len(ids), 400):
+            check_request()
+            batch = ids[start:start + 400]
+            rows = self._conn.execute(
+                "SELECT data FROM session_events WHERE provider=? AND session_id=?"
+                " AND json_extract(data,'$.meta.call_id') IN (" + ",".join("?" for _ in batch) + ")"
+                " AND json_extract(data,'$.kind') IN ('tool_call','tool_result')"
+                " ORDER BY byte_start, sub_index",
+                [provider, session_id, *batch]).fetchall()
+            for row in rows:
+                chunk = Chunk.model_validate_json(row["data"])
+                cid = chunk.meta.get("call_id")
+                if isinstance(cid, str):
+                    found.setdefault(cid, []).append(chunk)
+        return found
+
     PROPOSAL_LOOKBACK = 4096  # events scanned back from the first appended one
     PROPOSAL_ROWS = 128       # proposals of one tool kept from that window
 

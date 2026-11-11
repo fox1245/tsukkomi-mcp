@@ -41,7 +41,7 @@ tsukkomi-workflow = "self_directing_mcp.workflow_cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-self_directing_mcp = ["resources/*.json", "resources/workflow/*.lean"]
+self_directing_mcp = ["resources/*.json", "resources/*.txt", "resources/workflow/*.lean"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

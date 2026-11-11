@@ -59,6 +59,19 @@ SUBAGENT_NEVER_BLOCKS = "A subagent's stop is reported, never blocked."
 _FINAL_MESSAGE_SCOPES = ("message", "any")     # what the unflushed final assistant text could still satisfy
 SUBAGENT_HISTORY = ("A subagent's own history is not consulted for this call; "
                     "history-dependent obligations stay unverified.")
+AGENT_REVIEW = "agent_review"             # SELF_DIRECT_CLAUDE_ENFORCEMENT: confirmed_only, with agent reviews (``_agent_review``)
+SUBAGENT_NOT_REVIEWED = ("Agent review covers the main agent's calls only; the user decides this subagent call. ")
+HUMAN_ONLY = "Contract [{ids}] sends an unverified call to the user (on_unverified: human). "
+REVIEW_UNAVAILABLE = "Agent review is unavailable (its store could not be used); the user decides this call. "
+NOT_THE_AGENTS_CALL = "no review_action call of the agent's own turn in this session carries this review"
+REVIEW_NOT_INDEXED = (
+    "The review's review_action call is not in the indexed transcript yet; "
+    "the review remains unused and the identical call can be retried before it expires."
+)
+SERVER_NAME_REQUIRED = (
+    "Agent review requires mcp_server_name (SELF_DIRECT_MCP_SERVER_NAME) and the setting is missing; "
+    "the user decides this call. "
+)
 
 
 @dataclass(frozen=True)
@@ -187,10 +200,14 @@ def handle_pre_tool_use(engine: SelfDirectEngine, call: HookCall, path: str | No
     adjust = None
     if call.agent_id is not None:
         adjust = lambda audit, obligations: hook_policy.demote_history_findings(audit, obligations, SUBAGENT_HISTORY)
+    mode = _mode(engine)
+    # ``agent_review`` judges exactly as ``confirmed_only``; only the ask for an unverified high-risk contract differs.
     judged = hook_policy.judge_action(engine, "claude", call.session_id, path, call.tool_name, call.tool_input,
-                                      _mode(engine), adjust=adjust)
+                                      "confirmed_only" if mode == AGENT_REVIEW else mode, adjust=adjust)
     if judged is None or judged.silent:
         return {"decision": "allow"}
+    if mode == AGENT_REVIEW and judged.decision == "ask" and judged.unverified:
+        return _agent_review(engine, call, judged)
     if judged.decision == "allow":
         # An allow that only carries a notice (unverified contracts, advisory text): the same notice on every call is
         # noise, so it is shown when it first applies in this session and again only when its text changes.
@@ -201,6 +218,226 @@ def handle_pre_tool_use(engine: SelfDirectEngine, call: HookCall, path: str | No
             # The model never sees an allow's reason; the next PostToolUse / UserPromptSubmit shows it.
             state.queue_warning(call.session_id, "Unverified tool call allowed: " + judged.reason)
     return {"decision": judged.decision, "reason": judged.reason}
+
+
+def _transcript_read_to_end(audit: Any) -> bool:
+    """True when ``audit`` read the transcript to its end with no coverage issues, unread bytes or growth."""
+    if not isinstance(audit, dict) or audit.get("ok") is not True:
+        return False
+    if (audit.get("integrity") or {}).get("verification") == "unavailable":
+        return False
+    sync = audit.get("sync")
+    if isinstance(sync, dict) and sync.get("state") != "complete":
+        return False
+    settle = audit.get("settle")
+    if isinstance(settle, dict) and settle.get("stopped_by") != "no_growth":
+        return False
+    coverage = audit.get("coverage")
+    if not isinstance(coverage, dict):
+        return False
+    unread = coverage.get("unread_bytes")
+    if type(unread) is not int or unread != 0:
+        return False
+    for key in ("pending_bytes", "backlog_bytes"):
+        value = coverage.get(key, 0)
+        if value is not None and (type(value) is not int or value != 0):
+            return False
+    offset = coverage.get("byte_offset")
+    judged = coverage.get("judged_through_byte")
+    size = coverage.get("file_size")
+    if offset is not None and type(offset) is not int:
+        return False
+    if judged is not None and (type(judged) is not int or (offset is not None and judged != offset)):
+        return False
+    if size is not None and (type(size) is not int or (offset is not None and size != offset)):
+        return False
+    if coverage.get("judged_prefix"):
+        return False
+    issues = coverage.get("issues")
+    return isinstance(issues, list) and not issues
+
+
+def _agent_review(engine: SelfDirectEngine, call: HookCall, judged: hook_policy.Judgement) -> dict[str, Any]:
+    """``agent_review``: a call that ``confirmed_only`` would ask the user about because a ``risk: high`` contract of it is
+    unverified. Nothing else reaches this: a violation (deny), a suspicious finding (ask) and a clean verdict were decided
+    by ``classify`` before, so a review can never lift them.
+
+    In order: a contract with ``on_unverified: "human"`` or a subagent's call asks the user as before; when
+    ``mcp_server_name`` is not set, the step asks the user saying the setting is missing and issues no refusal, lets no
+    review call pass and spends no review; an unused, unexpired review of this very call (same session and digest, covering
+    every contract unverified now at its current revision) whose ``review_action`` call is the main agent's own in this
+    transcript is consumed once: ``proceed`` lets the call pass (no permission decision, so Claude Code's own permissions
+    still apply; the finding stays unverified) and ``escalate`` (or any other stored decision) asks the user; a candidate
+    review whose call is not in the indexed transcript is rejected only when the audit read the transcript to its end with
+    no coverage issues, unread bytes or growth during evaluation, and otherwise stays unused without a new refusal while
+    the call is refused for retry until the review expires; the ``review_action`` call that records the review of an open
+    refusal passes this step (it would otherwise be refused for a review of its own when a contract reads it too); anything
+    else is refused once, with the instructions for the review. Any failure in this step asks the user: a refusal is never
+    issued without a record."""
+    human = [cid for cid, _rev, who in judged.unverified if who != "agent"]
+    if human:
+        return {"decision": "ask", "reason": HUMAN_ONLY.format(ids=", ".join(human)) + judged.reason}
+    if call.agent_id is not None or call.agent_transcript_path is not None:
+        return {"decision": "ask", "reason": SUBAGENT_NOT_REVIEWED + judged.reason}
+    try:
+        from self_directing_mcp import action_reviews as reviews
+        from self_directing_mcp.settings_core import check_mcp_server_name
+        from self_directing_mcp.tool_payload import tool_call_text
+        raw_server = getattr(engine.settings, "mcp_server_name", None)
+        if raw_server is None:
+            return {"decision": "ask", "reason": SERVER_NAME_REQUIRED + judged.reason}
+        server_name = check_mcp_server_name(raw_server)
+        contracts = [(cid, rev) for cid, rev, _who in judged.unverified]
+        ids = ", ".join(cid for cid, _rev in contracts)
+        store = reviews.ReviewStore(engine.settings.index_dir)
+        digest = reviews.action_digest("claude", call.tool_name, call.tool_input)
+        read_to_end = _transcript_read_to_end(judged.audit)
+        unindexed = False
+        for review in store.candidates(host="claude", session_id=call.session_id, agent_id=None, digest=digest,
+                                       contracts=contracts):
+            origin = _review_origin(engine, call.session_id, review, server_name=server_name)
+            if origin is None:
+                if read_to_end:
+                    store.reject(review["review_id"], NOT_THE_AGENTS_CALL)
+                else:
+                    unindexed = True
+                continue
+            if not store.consume(review["review_id"], origin):
+                continue                     # a parallel identical call consumed it first
+            told = hook_policy.short(review["reason"], 300)
+            if review["decision"] == "proceed":
+                return {"decision": "allow", "reason": (
+                    f"Agent review {review['review_id']}: the agent decided that this call may run although high-risk "
+                    f"contract [{ids}] is unverified; the finding stays unverified (not a compliance verdict). "
+                    f"The agent's reason: {told}")}
+            if review["decision"] == "escalate":
+                return {"decision": "ask", "reason": f"The agent escalated this call to you (review {review['review_id']}): "
+                                                     f"{told} " + judged.reason}
+            return {"decision": "ask", "reason": (
+                f"Agent review {review['review_id']} has an invalid decision; the user decides this call. "
+                + judged.reason)}
+        passed = store.open_refusal_for(host="claude", session_id=call.session_id, agent_id=None,
+                                        tool_name=call.tool_name, arguments=call.tool_input,
+                                        server_name=server_name)
+        if passed is not None:
+            return {"decision": "allow", "reason": (
+                f"This call records the agent's review of refusal {passed['refusal_id']}; it passed the agent review step "
+                f"without a review of its own (high-risk contract [{ids}] is unverified for it; not a compliance verdict).")}
+        if unindexed:
+            return {"decision": "deny", "reason": REVIEW_NOT_INDEXED}
+        coverage = judged.audit.get("coverage") or {}
+        refusal = store.refuse(
+            host="claude", session_id=call.session_id, agent_id=None, digest=digest, tool_name=call.tool_name,
+            preview=hook_policy.short(tool_call_text("claude", call.tool_name, call.tool_input), 240), contracts=contracts,
+            finding=hook_policy.short(judged.reason, 600),
+            source_offset=coverage.get("judged_through_byte") or coverage.get("byte_offset") or 0,
+            ttl_sec=engine.settings.agent_review_ttl_sec)
+        return {"decision": "deny", "reason": _refusal_text(engine, refusal, judged.reason)}
+    except Exception:
+        return {"decision": "ask", "reason": REVIEW_UNAVAILABLE + judged.reason}
+
+
+_UNSET = object()
+
+
+def _foreign_peer(peer: Any) -> bool:
+    meta = peer.meta
+    return bool(meta.get("inherited")) or meta.get("sidechain") is not False or meta.get("agent_id") is not None
+
+
+def _result_qualifies(result_chunk: Any, call_chunk: Any, review: dict, reviews: Any) -> bool:
+    res_meta = result_chunk.meta
+    call_meta = call_chunk.meta
+    return (
+        (result_chunk.byte_start, res_meta.get("sub_index", 0))
+        > (call_chunk.byte_start, call_meta.get("sub_index", 0))
+        and res_meta.get("role") == "tool"
+        and res_meta.get("evidence_origin") is None
+        and not res_meta.get("unsupported_event")
+        and res_meta.get("success") is not False
+        and not reviews.permission_rejected(res_meta.get("permission_decision"))
+        and reviews.result_matches(result_chunk.text, review)
+    )
+
+
+def _review_origin(engine: SelfDirectEngine, session_id: str, review: dict,
+                   *, server_name: Any = _UNSET) -> str | None:
+    """The event id of the ``review_action`` call that recorded ``review``, or None.
+
+    It must be a tool call the main agent made in its own turn of this session: an assistant ``tool_call`` of the main
+    transcript (not a subagent's record, not replayed history, not a hosted or unsupported record) of the configured
+    review tool (``mcp__<mcp_server_name>__review_action``), whose arguments match ``review``. Among the records sharing
+    its ``call_id`` (ignoring inherited, sidechain and other-agent records), it must be the only call, at least one
+    ``tool_result`` after it must qualify (role ``tool``, succeeded with ``ok: true`` and naming ``review['review_id']``),
+    and no ``tool_result`` of that id may be an error or a permission rejection."""
+    from self_directing_mcp import action_reviews as reviews
+    if server_name is _UNSET:
+        raw_server = getattr(engine.settings, "mcp_server_name", None)
+        if raw_server is not None:
+            from self_directing_mcp.settings_core import check_mcp_server_name
+            server_name = check_mcp_server_name(raw_server)
+        else:
+            server_name = None
+    if server_name is None:
+        return None
+    events, linked = engine.review_origin_events(session_id, "claude", review["refusal_id"], review["source_offset"])
+    for chunk in reversed(events):
+        meta = chunk.meta
+        if (chunk.kind != "tool_call" or meta.get("role") != "assistant" or meta.get("sidechain") is not False
+                or meta.get("agent_id") is not None or meta.get("inherited") or meta.get("evidence_origin") is not None
+                or meta.get("unsupported_event")):
+            continue
+        name = meta.get("tool_name")
+        arguments = reviews.call_arguments(chunk.text, name) if reviews.is_review_tool(name, server_name) else None
+        if arguments is None or not reviews.call_matches(arguments, review):
+            continue
+        call_id = meta.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        peers = [peer for peer in linked.get(call_id, ()) if not _foreign_peer(peer)]
+        calls = [peer for peer in peers if peer.kind == "tool_call"]
+        results = [peer for peer in peers if peer.kind == "tool_result"]
+        if len(calls) != 1 or calls[0].chunk_id != chunk.chunk_id:
+            continue
+        if any(res.meta.get("success") is False
+               or reviews.permission_rejected(res.meta.get("permission_decision"))
+               or reviews.result_is_error(res.text)
+               for res in results):
+            continue
+        if any(_result_qualifies(res, chunk, review, reviews) for res in results):
+            return chunk.chunk_id
+    return None
+
+
+def _duration(seconds: float) -> str:
+    return f"{int(seconds // 60)} min" if seconds >= 60 and seconds % 60 == 0 else f"{seconds:g} s"
+
+
+def _refusal_text(engine: SelfDirectEngine, refusal: dict, reason: str) -> str:
+    """What the agent reads when a call is refused for its review. The list of reserved actions is the user's data
+    (``action_reviews.reserved_classes``), shown as guidance; the hook never matches it against a call."""
+    from self_directing_mcp import action_reviews as reviews
+    entries, note = reviews.reserved_classes(getattr(engine.settings, "agent_review_reserved_file", None))
+    reserved = "; ".join(hook_policy.short(entry, 200) for entry in entries[:16]) or "nothing (the list is empty)"
+    if note:
+        reserved += f" ({note})"
+    ids = json.dumps([cid for cid, _rev in refusal["contracts"]])
+    reason = reason.rstrip()
+    reason += "" if reason.endswith((".", "!", "?")) else "."
+    return (
+        f"Agent review needed. {reason} This call was refused once so that you, the agent, judge it: you decide, and you "
+        "are accountable for the decision; the user can read every review afterwards (list_action_reviews). Check the "
+        "evidence the finding is about yourself (search_history, get_chunk, the files and commands involved). If the call "
+        "is safe, call the MCP tool review_action of the server that holds these contracts with "
+        f'session_id="{refusal["session_id"]}", refusal_id="{refusal["refusal_id"]}", '
+        f'action_digest="{refusal["action_digest"]}", contract_ids={ids}, decision="proceed", reason=<what you checked and '
+        "why the call is safe> and, optionally, evidence_event_ids=<history event ids you relied on>, then retry the "
+        "identical call: it runs once. The review is single-use and expires "
+        f"{_duration(refusal['ttl_sec'])} after it is recorded; a changed call needs a new review. Describe the call in "
+        "the reason without quoting it: contracts read the review call too. If your check shows that the call is not "
+        'safe, do not run it. decision="escalate" is the exception, for the actions the user reserved for themselves: '
+        f"{reserved}. A retried escalated call asks the user. A review never makes the finding clean: the hook's note and "
+        "the audit trail record that the call ran on your decision although the contract stayed unverified.")
 
 
 def _claim(engine: SelfDirectEngine, call: HookCall, key: str) -> bool:

@@ -108,6 +108,8 @@ def loosening_reasons(previous: ContractRule, new: ContractRule) -> list[str]:
         reasons.append("success requirement removed")
     if previous.risk == "high" and new.risk != "high":
         reasons.append("risk lowered")
+    if previous.on_unverified == "human" and new.on_unverified != "human":
+        reasons.append("on_unverified changed from human to agent")
     if previous.auto_continue and not new.auto_continue:
         reasons.append("auto_continue removed")
     if previous.mode == "enforced" and new.mode != "enforced":

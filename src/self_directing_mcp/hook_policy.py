@@ -69,6 +69,16 @@ def budget_note(unit: str) -> str:
             "(budget spent, repeated reason, or counter unreadable); not continuing.")
 
 
+def unverified_high_risk(audit: dict, high_risk: frozenset | set) -> list[str]:
+    """The high-risk contracts of the action whose own finding is not clean (or is missing, as after a failed audit).
+
+    Another contract's unknown, such as a description-only rule that applies to every action and can never be
+    machine-verified, does not make a verified high-risk action ask; it stays a warning."""
+    ok = audit.get("ok") is True
+    verified = {f.get("contract_id") for f in audit.get("findings", []) if f.get("verdict") == "clean"} if ok else set()
+    return sorted((set(high_risk) & set(audit.get("action_contracts", []))) - verified)
+
+
 def classify(audit: dict, mode: str, high_risk: frozenset | set = frozenset()) -> tuple[str, str | None, bool]:
     """``(decision, reason, warn)``; ``warn`` marks an allow that rests on unverified evidence."""
     ok = audit.get("ok") is True
@@ -94,11 +104,7 @@ def classify(audit: dict, mode: str, high_risk: frozenset | set = frozenset()) -
         return "force_ask", reason, False
     if mode == "enforced":
         return "deny", reason, False
-    # A high-risk contract asks for confirmation while its own finding is not clean (or is missing, as after a failed
-    # audit). Another contract's unknown, such as a description-only rule that applies to every action and can never
-    # be machine-verified, does not make a verified high-risk action ask; it stays a warning.
-    verified = {f.get("contract_id") for f in findings if f.get("verdict") == "clean"} if ok else set()
-    risky = sorted((set(high_risk) & set(audit.get("action_contracts", []))) - verified)
+    risky = unverified_high_risk(audit, high_risk)
     if risky:
         return "ask", f"High-risk contract [{', '.join(risky)}] could not be verified: " + reason, False
     return "allow", "WARNING - unverified, not a compliance verdict: " + reason, True
@@ -145,11 +151,55 @@ class Judgement:
     reason: str | None
     warn: bool
     audit: dict
+    # For an ``ask`` that an unverified high-risk contract caused: ``(contract id, revision, on_unverified)`` of each such
+    # contract, from the contract set the audit judged (or verified unchanged after the audit). The Claude Code adapter's
+    # ``agent_review`` mode reads it; nothing else does.
+    unverified: tuple[tuple[str, int, str], ...] = ()
 
     @property
     def silent(self) -> bool:
         """Nothing to tell the user: clean, or no contract triggered by this action (never a compliance claim)."""
         return self.reason is None or (self.audit.get("ok") is True and self.audit.get("action_scope") == "not_applicable")
+
+
+@dataclass(frozen=True)
+class _JudgedRule:
+    id: str
+    type: str
+    revision: int
+    risk: str = "normal"
+    on_unverified: str = "agent"
+
+
+def _judged_contracts(audit: dict) -> list[_JudgedRule] | None:
+    if audit.get("ok") is not True:
+        return None
+    raw = audit.get("judged_contracts")
+    if not isinstance(raw, list):
+        return None
+    rules: list[_JudgedRule] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        cid, rtype, rev = item.get("id"), item.get("type"), item.get("revision")
+        risk = item.get("risk", "normal")
+        who = item.get("on_unverified", "agent")
+        if (not isinstance(cid, str) or not cid
+                or not isinstance(rtype, str) or not rtype
+                or isinstance(rev, bool) or not isinstance(rev, int) or rev < 1
+                or risk not in ("normal", "high")
+                or who not in ("agent", "human")):
+            return None
+        rules.append(_JudgedRule(id=cid, type=rtype, revision=rev, risk=risk, on_unverified=who))
+    return rules
+
+
+def _same_high_risk(first: Any, second: Any) -> bool:
+    return (first is not None and second is not None
+            and getattr(first, "risk", "normal") == "high"
+            and getattr(second, "risk", "normal") == "high"
+            and first.revision == second.revision
+            and getattr(first, "on_unverified", "agent") == getattr(second, "on_unverified", "agent"))
 
 
 def demote_history_findings(audit: dict, obligations: dict, why: str) -> dict:
@@ -181,11 +231,53 @@ def judge_action(engine: SelfDirectEngine, provider: str, session_id: str, path:
     # the verdict would rest on anything the cheap check cannot vouch for.
     audit = engine.check_action(session_id=session_id, provider=provider, path=path,
                                 action={"tool_name": tool_name, "arguments": arguments}, verify="fast")
+    judged_rules = _judged_contracts(audit)
+    if judged_rules is not None:
+        effective = {**obligations, "contracts": judged_rules}
+        if adjust is not None:
+            audit = adjust(audit, effective)
+        high_risk = frozenset(rule.id for rule in judged_rules if rule.risk == "high")
+        decision, reason, warn = classify(audit, mode, high_risk)
+        unverified: tuple[tuple[str, int, str], ...] = ()
+        if decision == "ask":
+            rules = {rule.id: rule for rule in judged_rules}
+            unverified = tuple((cid, rules[cid].revision, rules[cid].on_unverified)
+                               for cid in unverified_high_risk(audit, high_risk) if cid in rules)
+        return Judgement(decision, reason, warn, audit, unverified)
+
+    try:
+        after_contracts: list | None = read_obligations(engine, provider, session_id, path)["contracts"]
+    except HookRuntimeError:
+        after_contracts = None
+    first_rules = {rule.id: rule for rule in obligations["contracts"]}
+    after_rules = {rule.id: rule for rule in after_contracts} if after_contracts is not None else None
+    merged_contracts = (list(first_rules.values()) if after_rules is None
+                        else list({**first_rules, **after_rules}.values()))
     if adjust is not None:
-        audit = adjust(audit, obligations)
-    high_risk = frozenset(rule.id for rule in obligations["contracts"] if rule.risk == "high")
+        audit = adjust(audit, {**obligations, "contracts": merged_contracts})
+    first_high = frozenset(rule.id for rule in obligations["contracts"] if rule.risk == "high")
+    after_high = (frozenset(rule.id for rule in after_contracts if rule.risk == "high")
+                  if after_contracts is not None else frozenset())
+    high_risk = first_high | after_high
+    action_high = sorted(set(audit.get("action_contracts") or ()) & set(high_risk))
+    changed = [cid for cid in action_high
+               if not _same_high_risk(first_rules.get(cid),
+                                      after_rules.get(cid) if after_rules is not None else None)]
     decision, reason, warn = classify(audit, mode, high_risk)
-    return Judgement(decision, reason, warn, audit)
+    if changed:
+        if mode in ("confirmed_only", "enforced") and decision in ("allow", "ask"):
+            note = f"High-risk contract [{', '.join(changed)}] changed while this action was checked."
+            if decision == "allow":
+                reason = f"{note} {reason}" if reason else note
+            elif reason and note not in reason:
+                reason = f"{note} {reason}"
+            return Judgement("ask", reason, False, audit, ())
+        return Judgement(decision, reason, warn, audit, ())
+    unverified = ()
+    if decision == "ask":
+        unverified = tuple((cid, first_rules[cid].revision, getattr(first_rules[cid], "on_unverified", "agent"))
+                           for cid in unverified_high_risk(audit, high_risk) if cid in first_rules)
+    return Judgement(decision, reason, warn, audit, unverified)
 
 
 def reason_key(items: list[str]) -> str:

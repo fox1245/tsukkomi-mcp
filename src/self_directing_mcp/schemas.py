@@ -16,6 +16,7 @@ ContractScope = Literal["tool_call", "tool_result", "message", "any"]
 Severity = Literal["critical", "high", "medium", "low"]
 ContractRisk = Literal["normal", "high"]
 ContractMode = Literal["enforced", "inject_only"]
+ContractOnUnverified = Literal["agent", "human"]
 Applicability = Literal["applicable", "not_applicable"]
 Verdict = Literal["violation", "suspicious", "clean", "unknown"]
 SearchMode = Literal["hybrid", "regex", "sparse", "dense"]
@@ -67,7 +68,8 @@ class ContractWhen(BaseModel):
 
 # Fields added after 1.0. They are omitted from serialized contracts while at their default so files written
 # by this version stay loadable by older processes (extra="forbid") and snapshots of unchanged contracts hold.
-_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None, "origin": None, "path_guard": None, "mode": "enforced", "tools": None, "target": None}
+_OPTIONAL_DEFAULTS = {"risk": "normal", "auto_continue": False, "when": None, "origin": None, "path_guard": None, "mode": "enforced", "tools": None, "target": None,
+                      "on_unverified": "agent"}
 
 
 class ContractOrigin(BaseModel):
@@ -238,6 +240,13 @@ class ContractRule(BaseModel):
         description="'high' declares that actions this contract applies to are high-risk. Hosts may ask the user "
                     "instead of silently allowing when such an action cannot be verified.",
     )
+    on_unverified: ContractOnUnverified = Field(
+        default="agent",
+        description="For risk 'high' contracts: who settles a call this contract cannot verify when the Claude Code hook "
+                    "runs in agent_review mode. 'agent' (default): the hook refuses the call once and the agent records "
+                    "its own judgement with review_action. 'human': the user is always asked, as in confirmed_only. "
+                    "In every other mode it changes nothing. Changing 'human' to 'agent' enforces less.",
+    )
     auto_continue: bool = Field(
         default=False,
         description="For must completion obligations only: a confirmed, fully observed miss may resume a stopping "
@@ -335,6 +344,8 @@ class ContractRule(BaseModel):
             raise ValueError("auto_continue requires a must completion obligation with regex and no before_regex")
         if self.when is not None and self.type != "must":
             raise ValueError("when applies only to must rules")
+        if self.on_unverified == "human" and self.risk != "high":
+            raise ValueError("on_unverified 'human' applies only to risk 'high' contracts")
         if self.tools is not None:
             if self.scope not in ("tool_call", "any"):
                 raise ValueError("tools filter requires scope 'tool_call' or 'any'")

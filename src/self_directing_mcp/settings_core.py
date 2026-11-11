@@ -7,7 +7,7 @@ pydantic-settings just to read a handful of environment variables and one TOML f
 What lives here, so that the two readers cannot drift:
 
 * the defaults (constants and default factories), the allowed values and numeric bounds of every field;
-* the user TOML ``[paths]`` source and the ``CODEX_SESSIONS_DIR`` source;
+* the user TOML ``[paths]``, ``[graph]`` and ``[claude]`` sources and the ``CODEX_SESSIONS_DIR`` source;
 * the accessor methods (``resolve_*``) that both settings objects share (``SettingsAccessors``);
 * ``FIELDS``, the declarative field table the light reader is driven by. ``config.Settings`` declares the same
   fields with pydantic types, and ``tests/test_hook_settings_parity.py`` compares the two on many environment/TOML
@@ -15,7 +15,7 @@ What lives here, so that the two readers cannot drift:
 
 Precedence, identical to ``Settings`` (highest first): environment (``SELF_DIRECT_<FIELD>``; ``OPENROUTER_API_KEY``
 for the key; names are case-insensitive), ``CODEX_SESSIONS_DIR`` (only for the Codex sessions directory), the user
-TOML ``[paths]`` (``SELF_DIRECT_CONFIG_FILE`` or ``~/.config/tsukkomi-mcp/config.toml``), then the defaults. A ``.env``
+TOML (``SELF_DIRECT_CONFIG_FILE`` or ``~/.config/tsukkomi-mcp/config.toml``), then the defaults. A ``.env``
 in the working directory is never read by the light reader, exactly as ``config.hook_settings()`` documents: hosts run
 hooks inside the project being edited, and that file is content the audited agent can write.
 
@@ -40,6 +40,9 @@ ENV_PREFIX = "SELF_DIRECT_"
 API_KEY_ENV = "OPENROUTER_API_KEY"
 
 ENFORCEMENT_MODES = ("confirmed_only", "advisory", "enforced")
+# Claude Code only: ``agent_review`` is ``confirmed_only`` except that an unverified ``risk: high`` contract refuses the call
+# once for the agent to review instead of asking the user (``action_reviews``). AGY and Grok do not implement the review.
+CLAUDE_ENFORCEMENT_MODES = ENFORCEMENT_MODES + ("agent_review",)
 SESSION_PROVIDERS = ("codex", "grokbot", "omp", "agy", "claude", "grok")
 DENSE_BACKENDS = ("sqlite-vector", "numpy", "pgvector")
 REMOTE_DENSE_BACKENDS = ("pgvector",)        # a database server: never on the hook path (hook_policy.wants_derived_work)
@@ -105,12 +108,15 @@ DEFAULT_GRANT_ANCHOR_MAX_EVENTS = 20
 DEFAULT_GRANT_ANCHOR_MAX_USER_TURNS = 2
 DEFAULT_MAX_TRANSLATED_TURNS = 100
 DEFAULT_CONTRACT_CASE_MAX_MS = 250.0
+# An agent review (``agent_review`` mode) must be recorded within this many seconds of the refusal, and is usable for this
+# many seconds after it was recorded; the hook's value is stamped on the refusal.
+DEFAULT_AGENT_REVIEW_TTL_SEC = 900.0
 AGY_APP_DATA_NAMES = ("antigravity", "antigravity-cli", "antigravity-ide")
 
 PATH_FIELDS = frozenset({
     "index_dir", "codex_sessions_dir", "omp_sessions_dir", "grokbot_transcripts_dir", "claude_projects_dir",
     "grok_sessions_dir", "agy_app_data_dirs", "contracts_path", "sqlite_vector_path", "openrouter_api_key_file",
-    "embedding_api_key_file", "pgvector_dsn_file", "contract_bundle_paths",
+    "embedding_api_key_file", "pgvector_dsn_file", "contract_bundle_paths", "agent_review_reserved_file",
 })
 
 GRAPH_TOML_KEYS = {
@@ -123,6 +129,20 @@ GRAPH_TOML_KEYS = {
     "extractor": "graph_extractor",
     "graph_extractor": "graph_extractor",
 }
+
+CLAUDE_TOML_KEYS = {
+    "mcp_server_name": "mcp_server_name",
+}
+
+
+def check_mcp_server_name(name: object) -> str:
+    """A Claude Code MCP server registration name as it appears in ``mcp__<name>__<tool>``."""
+    if not isinstance(name, str) or not name or any(ch.isspace() or not ch.isprintable() for ch in name):
+        raise ValueError("mcp_server_name must be a non-empty printable string without whitespace")
+    parts = f"mcp__{name}__review_action".split("__")
+    if len(parts) < 3 or not all(parts[1:-1]) or parts[-1] != "review_action":
+        raise ValueError("mcp_server_name must form a valid mcp__<name>__review_action tool name")
+    return name
 
 
 def is_openrouter_url(url: object) -> bool:
@@ -271,7 +291,7 @@ def toml_path(value: object, directory: Path) -> Path:
 
 
 def toml_path_settings() -> dict[str, object]:
-    """The user TOML ``[paths]`` table as resolved ``Path`` values (raises ``ValueError`` when unusable)."""
+    """The user TOML ``[paths]``, ``[graph]`` and ``[claude]`` tables (raises ``ValueError`` when unusable)."""
     source = get_config_path()
     try:
         with source.open("rb") as stream:
@@ -282,15 +302,20 @@ def toml_path_settings() -> dict[str, object]:
         return {}
     except (OSError, UnicodeError, tomllib.TOMLDecodeError):
         raise ValueError("Unable to read valid TOML path configuration") from None
-    if set(document) - {"paths", "graph"}:
-        raise ValueError("TOML path configuration only supports [paths] and [graph]")
+    if set(document) - {"paths", "graph", "claude"}:
+        raise ValueError("TOML path configuration only supports [paths], [graph] and [claude]")
     paths = document.get("paths", {})
     if not isinstance(paths, dict) or set(paths) - PATH_FIELDS:
         raise ValueError("Invalid or unknown TOML path setting")
     graph = document.get("graph", {})
     if not isinstance(graph, dict) or set(graph) - set(GRAPH_TOML_KEYS):
         raise ValueError("Invalid or unknown TOML graph setting")
+    claude = document.get("claude", {})
+    if not isinstance(claude, dict) or set(claude) - set(CLAUDE_TOML_KEYS):
+        raise ValueError("Invalid or unknown TOML claude setting")
     resolved: dict[str, object] = {}
+    for raw_key, value in claude.items():
+        resolved[CLAUDE_TOML_KEYS[raw_key]] = check_mcp_server_name(value)
     for raw_key, value in graph.items():
         target = GRAPH_TOML_KEYS[raw_key]
         if target in resolved:
@@ -524,6 +549,13 @@ def _to_schema(name: str, text: str) -> str:
         raise _bad(name, "PostgreSQL schema name") from None
 
 
+def _to_mcp_server_name(name: str, text: str) -> str:
+    try:
+        return check_mcp_server_name(text)
+    except ValueError:
+        raise _bad(name, "MCP server name") from None
+
+
 def _literal(choices: tuple[str, ...]) -> Callable[[str, str], str]:
     def convert(name: str, text: str) -> str:
         if text not in choices:
@@ -604,7 +636,7 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("grok_sessions_dir", _path, default_grok_sessions_dir),
     FieldSpec("agy_app_data_dirs", _path_list, default_agy_app_data_dirs),
     FieldSpec("agy_enforcement", _literal(ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
-    FieldSpec("claude_enforcement", _literal(ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
+    FieldSpec("claude_enforcement", _literal(CLAUDE_ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
     FieldSpec("grok_enforcement", _literal(ENFORCEMENT_MODES), _static(DEFAULT_ENFORCEMENT)),
     FieldSpec("session_provider", _literal(SESSION_PROVIDERS), _static(DEFAULT_SESSION_PROVIDER)),
     FieldSpec("index_dir", _path, default_index_dir),
@@ -674,6 +706,10 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("contract_bundle_paths", parse_bundle_paths, lambda: []),
     FieldSpec("session_start_max_contracts", lambda name, text: _to_int(name, text, 1),
               _static(DEFAULT_SESSION_START_MAX_CONTRACTS)),
+    FieldSpec("agent_review_ttl_sec", lambda name, text: _to_float(name, text, positive=True, finite=True),
+              _static(DEFAULT_AGENT_REVIEW_TTL_SEC)),
+    FieldSpec("agent_review_reserved_file", _path, _static(None)),
+    FieldSpec("mcp_server_name", _to_mcp_server_name, _static(None)),
 )
 FIELD_NAMES = tuple(spec.name for spec in FIELDS)
 
