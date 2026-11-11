@@ -1558,6 +1558,27 @@ class SessionStore:
             " ORDER BY byte_start, sub_index", (provider, session_id, int(from_byte), needle)).fetchall()
         return [Chunk.model_validate_json(row["data"]) for row in rows]
 
+    def call_chunks(self, session_id, provider, call_ids):
+        """``{call_id: [Chunk, ...]}`` for stored ``tool_call`` and ``tool_result`` events of these ids, in session
+        order."""
+        found: dict[str, list[Chunk]] = {}
+        ids = [cid for cid in dict.fromkeys(call_ids) if isinstance(cid, str) and cid]
+        for start in range(0, len(ids), 400):
+            check_request()
+            batch = ids[start:start + 400]
+            rows = self._conn.execute(
+                "SELECT data FROM session_events WHERE provider=? AND session_id=?"
+                " AND json_extract(data,'$.meta.call_id') IN (" + ",".join("?" for _ in batch) + ")"
+                " AND json_extract(data,'$.kind') IN ('tool_call','tool_result')"
+                " ORDER BY byte_start, sub_index",
+                [provider, session_id, *batch]).fetchall()
+            for row in rows:
+                chunk = Chunk.model_validate_json(row["data"])
+                cid = chunk.meta.get("call_id")
+                if isinstance(cid, str):
+                    found.setdefault(cid, []).append(chunk)
+        return found
+
     PROPOSAL_LOOKBACK = 4096  # events scanned back from the first appended one
     PROPOSAL_ROWS = 128       # proposals of one tool kept from that window
 

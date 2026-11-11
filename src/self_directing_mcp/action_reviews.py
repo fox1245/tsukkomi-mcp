@@ -5,8 +5,8 @@ the hook refuses that call once and tells the agent how to judge it; the agent r
 ``review_action``, and the retried call runs once on a ``proceed`` review (an ``escalate`` review asks the user). This
 module is the store both sides share and the few pure functions they must agree on:
 
-* ``action_digest``: the identity of a call, a SHA-256 over its tool name and its payload (``tool_payload.split_prose``:
-  the model's own label of the call, such as Bash's ``description``, is not part of the call).
+* ``action_digest``: the identity of a call, a SHA-256 over its tool name and its payload (``tool_payload.digest_payload``:
+  only fields declared prose for that exact tool, such as ``Bash``'s ``description`` in Claude Code, are left out).
 * ``refusals``: every refusal the hook issued (a random ``refusal_id``, the session, the digest, the contracts and their
   revisions, the finding, when it expires). A review can only name one of these, so a call that was never refused cannot
   be reviewed.
@@ -30,11 +30,14 @@ import sqlite3
 import time
 from typing import Any
 
-from self_directing_mcp.tool_payload import split_prose
+from self_directing_mcp.tool_payload import digest_payload
 
 STORE_FILE = "action-reviews.sqlite"
 DECISIONS = ("proceed", "escalate")
 REVIEW_TOOL = "review_action"              # this server's tool; a host names it ``mcp__<server>__review_action``
+REVIEW_TOOL_PARAMS = frozenset({
+    "session_id", "refusal_id", "action_digest", "contract_ids", "decision", "reason", "evidence_event_ids",
+})
 RESERVED_FILE = Path(__file__).resolve().parent / "resources" / "agent_review_reserved.txt"
 RESERVED_MAX_BYTES = 8192                   # the guidance is a short list shown to the agent
 REASON_MAX_CHARS = 4000
@@ -49,8 +52,8 @@ def now() -> float:
 
 
 def action_digest(provider: str, tool_name: Any, arguments: Any) -> str:
-    """The identity of a proposed call: its tool name and payload in canonical JSON (prose fields left out)."""
-    payload, _prose = split_prose(provider, tool_name, arguments)
+    """The identity of a proposed call: its tool name and payload in canonical JSON (exact-tool prose fields left out)."""
+    payload = digest_payload(provider, tool_name, arguments)
     canonical = json.dumps({"tool_name": tool_name, "arguments": payload}, sort_keys=True, ensure_ascii=False,
                            separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -60,12 +63,45 @@ def reason_digest(reason: str) -> str:
     return hashlib.sha256(reason.encode("utf-8")).hexdigest()
 
 
-def is_review_tool(tool_name: Any) -> bool:
-    """Whether a host tool name is an MCP server's ``review_action`` (``mcp__<server>__review_action``)."""
+def is_review_tool(tool_name: Any, server_name: str | None = None) -> bool:
+    """Whether a host tool name is an MCP server's ``review_action`` (``mcp__<server>__review_action``;
+    ``mcp__<server_name>__review_action`` when ``server_name`` is set)."""
     if not isinstance(tool_name, str) or not tool_name.startswith("mcp__"):
         return False
     parts = tool_name.split("__")
-    return len(parts) >= 3 and all(parts[1:-1]) and parts[-1] == REVIEW_TOOL
+    if not (len(parts) >= 3 and all(parts[1:-1]) and parts[-1] == REVIEW_TOOL):
+        return False
+    if server_name is not None:
+        return isinstance(server_name, str) and bool(server_name) and tool_name == f"mcp__{server_name}__{REVIEW_TOOL}"
+    return True
+
+
+def permission_rejected(decision: Any) -> bool:
+    """Whether a tool result's ``permission_decision`` metadata records a host or hook rejection."""
+    if isinstance(decision, str):
+        return decision in ("deny", "reject")
+    return isinstance(decision, dict) and (
+        decision.get("decision") in ("reject", "deny") or decision.get("behavior") in ("deny", "reject")
+    )
+
+
+def result_matches(text: str, review: dict) -> bool:
+    """Whether a stored ``tool_result`` text is a succeeded ``review_action`` reply naming ``review['review_id']``."""
+    prefix = "[tool_result] "
+    review_id = review.get("review_id")
+    if not isinstance(text, str) or not text.startswith(prefix) or not isinstance(review_id, str) or not review_id:
+        return False
+    try:
+        payload = json.loads(text[len(prefix):])
+    except ValueError:
+        return False
+    if not isinstance(payload, dict) or payload.get("ok") is False or "error" in payload:
+        return False
+    if payload.get("review_id") != review_id:
+        return False
+    if "refusal_id" in payload and payload["refusal_id"] != review.get("refusal_id"):
+        return False
+    return True
 
 
 def call_arguments(text: str, tool_name: str) -> dict | None:
@@ -184,14 +220,16 @@ class ReviewStore:
         """Unused, unexpired reviews of refusals of this very call (same host, session, agent and digest) that cover
         every contract unverified now, newest first."""
         with closing(self._connect()) as conn:
+            stamp = now()
             rows = conn.execute(
                 "SELECT r.*, f.contracts AS contracts, f.source_offset AS source_offset, f.session_id AS session_id,"
                 " f.action_digest AS action_digest"
                 " FROM reviews r JOIN refusals f ON f.refusal_id = r.refusal_id"
                 " WHERE f.host=? AND f.session_id=? AND f.agent_id=? AND f.action_digest=?"
+                " AND f.issued_at <= ? AND r.recorded_at <= ?"
                 " AND r.consumed_at IS NULL AND r.rejected_at IS NULL AND r.expires_at > ?"
                 " ORDER BY r.recorded_at DESC, r.rowid DESC",
-                (host, session_id, agent_id or "", digest, now())).fetchall()
+                (host, session_id, agent_id or "", digest, stamp, stamp, stamp)).fetchall()
         found = []
         for row in rows:
             item = {**dict(row), "contracts": _pairs(row["contracts"])}
@@ -200,14 +238,16 @@ class ReviewStore:
         return found
 
     def consume(self, review_id: str, origin_event_id: str) -> bool:
-        """Spend a review once. False when it was used, rejected or expired meanwhile (a parallel call won)."""
-        stamp = now()
+        """Spend a review once. False when it was used, rejected, expired or recorded in the future."""
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                stamp = now()
                 changed = conn.execute(
                     "UPDATE reviews SET consumed_at=?, origin_event_id=? WHERE review_id=? AND consumed_at IS NULL"
-                    " AND rejected_at IS NULL AND expires_at > ?", (stamp, origin_event_id, review_id, stamp)).rowcount
+                    " AND rejected_at IS NULL AND recorded_at <= ? AND expires_at > ?"
+                    " AND EXISTS (SELECT 1 FROM refusals f WHERE f.refusal_id = reviews.refusal_id AND f.issued_at <= ?)",
+                    (stamp, origin_event_id, review_id, stamp, stamp, stamp)).rowcount
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
@@ -221,33 +261,54 @@ class ReviewStore:
                          " AND rejected_at IS NULL", (now(), why[:200], review_id))
 
     def open_refusal_for(self, *, host: str, session_id: str, agent_id: str | None, tool_name: Any,
-                         arguments: Any) -> dict | None:
+                         arguments: Any, server_name: str | None = None) -> dict | None:
         """The open refusal a proposed ``review_action`` call records a review for, counted as a pass; else None.
 
-        The call names the hook's own random ``refusal_id`` and the refused call's digest, in the same session and agent,
-        while that refusal has no review and has not expired. Such a call is the review step itself, so it is not sent
-        to another review (which would refuse every review of a contract that also reads the review call)."""
-        if not is_review_tool(tool_name) or not isinstance(arguments, dict):
+        The call must target the review tool (``mcp__<server_name>__review_action`` when ``server_name`` is set), carry
+        only ``review_action`` parameters, and name this session, the hook's own random ``refusal_id``, the refused
+        call's ``action_digest``, the refusal's exact ``contract_ids`` and a valid ``decision`` while that refusal has
+        no review and has not expired."""
+        if not is_review_tool(tool_name, server_name) or not isinstance(arguments, dict):
+            return None
+        if not set(arguments) <= REVIEW_TOOL_PARAMS or arguments.get("session_id") != session_id:
             return None
         refusal_id, digest = arguments.get("refusal_id"), arguments.get("action_digest")
-        if not isinstance(refusal_id, str) or not isinstance(digest, str):
+        decision, contract_ids = arguments.get("decision"), arguments.get("contract_ids")
+        if (not isinstance(refusal_id, str) or not refusal_id or not isinstance(digest, str) or not digest
+                or not isinstance(decision, str) or decision not in DECISIONS
+                or not isinstance(contract_ids, list)
+                or any(not isinstance(item, str) or not item for item in contract_ids)):
             return None
+        if "reason" in arguments and not isinstance(arguments["reason"], str):
+            return None
+        evidence = arguments.get("evidence_event_ids")
+        if evidence is not None and (not isinstance(evidence, list)
+                                     or any(not isinstance(item, str) or not item for item in evidence)):
+            return None
+        contracts: list[tuple[str, int]] = []
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                stamp = now()
                 row = conn.execute(
                     "SELECT f.* FROM refusals f LEFT JOIN reviews r ON r.refusal_id = f.refusal_id"
                     " WHERE f.refusal_id=? AND f.host=? AND f.session_id=? AND f.agent_id=? AND f.action_digest=?"
-                    " AND f.expires_at > ? AND r.review_id IS NULL",
-                    (refusal_id, host, session_id, agent_id or "", digest, now())).fetchone()
+                    " AND f.issued_at <= ? AND f.expires_at > ? AND r.review_id IS NULL",
+                    (refusal_id, host, session_id, agent_id or "", digest, stamp, stamp)).fetchone()
                 if row is not None:
-                    conn.execute("UPDATE refusals SET review_call_passes = review_call_passes + 1 WHERE refusal_id=?",
-                                 (refusal_id,))
+                    contracts = _pairs(row["contracts"])
+                    if sorted(contract_ids) != sorted(cid for cid, _rev in contracts):
+                        row = None
+                    else:
+                        conn.execute("UPDATE refusals SET review_call_passes = review_call_passes + 1"
+                                     " WHERE refusal_id=?", (refusal_id,))
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
-        return None if row is None else {**dict(row), "contracts": _pairs(row["contracts"])}
+        if row is None:
+            return None
+        return {**dict(row), "contracts": contracts, "review_call_passes": int(row["review_call_passes"]) + 1}
 
     # --- the review tool ------------------------------------------------------------------------------------------------
 

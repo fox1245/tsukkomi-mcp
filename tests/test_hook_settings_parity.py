@@ -252,7 +252,11 @@ FIELD_KINDS = {
 PGVECTOR_SCHEMAS = ["tsukkomi", "a_b1", "Tsukkomi", "_x", "x", "public", "x" * 63, "x" * 64, "1abc", "", " tsukkomi", "tsukkomi ",
                     "x y", "a;b", 'a"b', "a-b", "a$b", "schema\u00e9", "pg_catalog", "PG_x", "pgx", "information_schema",
                     "Information_Schema", "tsukkomi\n", "a.b", "\u0661a"]
-FREE_TEXT = {"pgvector_schema": PGVECTOR_SCHEMAS, "embedding_model": ["m", "", " spaced model ", "a/b:c"], "embedding_base_url": ["http://x", "", "u r l"],
+MCP_SERVER_NAMES = ["tsukkomi-mcp", "tsukkomi", "any-server", "my_server", "org__srv", "srv.1",
+                    "", " tsukkomi", "tsukkomi ", "a b", "tsukkomi\n", "_", "__", "_srv", "srv_", "a____b",
+                    "srv\x01", "srv\x7f"]
+FREE_TEXT = {"pgvector_schema": PGVECTOR_SCHEMAS, "mcp_server_name": MCP_SERVER_NAMES,
+             "embedding_model": ["m", "", " spaced model ", "a/b:c"], "embedding_base_url": ["http://x", "", "u r l"],
              "openrouter_api_key": ["k", "", " k ", "sk-synthetic"],
              "embedding_api_key": ["k", "", " k ", "emb-synthetic"],
              "mask_pii": ["email", "email,phone", "", "all", "none"],
@@ -480,3 +484,34 @@ def test_project_contracts_off_and_unknown_values(world):
     assert hook_settings().project_contracts == load_hook_settings().project_contracts == "off"
     put(world, SELF_DIRECT_PROJECT_CONTRACTS="enforce")           # a mode that would enforce does not exist
     assert outcome(hook_settings)[0] == "error" and outcome(load_hook_settings)[0] == "error"
+
+
+@pytest.mark.parametrize("name", MCP_SERVER_NAMES)
+def test_the_mcp_server_name_rule_is_one_function(world, name):
+    put(world, SELF_DIRECT_MCP_SERVER_NAME=name)
+    try:
+        settings_core.check_mcp_server_name(name)
+        accepted = True
+    except ValueError:
+        accepted = False
+    assert (outcome(hook_settings)[0] == "ok") is accepted and (outcome(load_hook_settings)[0] == "ok") is accepted
+
+
+def test_the_claude_toml_mcp_server_name_agrees_and_the_environment_beats_it(world):
+    assert hook_settings().mcp_server_name is None and load_hook_settings().mcp_server_name is None
+    toml(world, '[claude]\nmcp_server_name = "tsukkomi-mcp"\n')
+    agree("claude toml")
+    assert hook_settings().mcp_server_name == load_hook_settings().mcp_server_name == "tsukkomi-mcp"
+    put(world, SELF_DIRECT_MCP_SERVER_NAME="override-server")
+    agree("env over claude toml")
+    assert hook_settings().mcp_server_name == load_hook_settings().mcp_server_name == "override-server"
+    world["monkeypatch"].delenv("SELF_DIRECT_MCP_SERVER_NAME")
+    for bad_toml in ('[claude]\nmcp_server_name = ""\n', '[claude]\nmcp_server_name = "bad name"\n',
+                     "[claude]\nmcp_server_name = 5\n", '[claude]\nunknown = "x"\n', 'claude = "x"\n'):
+        toml(world, bad_toml)
+        agree(bad_toml)
+        assert outcome(hook_settings)[0] == "error" and outcome(load_hook_settings)[0] == "error", bad_toml
+    with pytest.raises(ValueError):
+        settings_core.check_mcp_server_name("srv\x00")
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, mcp_server_name="srv\x00")

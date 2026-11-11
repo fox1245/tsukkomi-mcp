@@ -2,7 +2,7 @@
 # SELF_DIRECT_CONFIG_FILE. Keep the edited file private and outside agent workspaces.
 # Priority: explicit Settings > environment > TOML > cwd .env > defaults.
 # Paths expand ~; relative paths use the canonical TOML file's directory.
-# No ${ENV_VAR} interpolation. Only the [paths] keys below are supported.
+# No ${ENV_VAR} interpolation. Only the [paths], [graph] and [claude] keys are supported.
 
 [paths]
 index_dir = "~/.self_direct_index"
@@ -37,3 +37,10 @@ agy_app_data_dirs = [
 # SELF_DIRECT_CLAUDE_ENFORCEMENT=agent_review: the actions you reserve for yourself (one per line), shown to the agent
 # as the cases for an escalation; never matched against a call. Default: the packaged resources/agent_review_reserved.txt.
 # agent_review_reserved_file = "~/.config/tsukkomi-mcp/agent-review-reserved.txt"
+
+# [claude]
+# Name under which this server is registered in Claude Code (same as SELF_DIRECT_MCP_SERVER_NAME).
+# When set, agent_review accepts only mcp__<mcp_server_name>__review_action for the review call pass-through
+# and origin check; another server's review_action is an ordinary call. When unset, any mcp__<server>__review_action
+# is accepted.
+# mcp_server_name = "tsukkomi-mcp"

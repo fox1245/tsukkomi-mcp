@@ -300,6 +300,23 @@ class Settings(SettingsAccessors, BaseSettings):
                     "# comments), shown to the agent as the cases for an escalation; never matched against a call. Unset: "
                     "the packaged default (resources/agent_review_reserved.txt). SELF_DIRECT_AGENT_REVIEW_RESERVED_FILE.",
     )
+    mcp_server_name: str | None = Field(
+        default=None,
+        description="Name under which this server is registered in Claude Code (TOML [claude] mcp_server_name). "
+                    "When set, agent_review accepts only mcp__<mcp_server_name>__review_action for the review call "
+                    "pass-through and origin check; when unset, any mcp__<server>__review_action is accepted. "
+                    "SELF_DIRECT_MCP_SERVER_NAME.",
+    )
+
+    @field_validator("mcp_server_name")
+    @classmethod
+    def _mcp_server_name(cls, value):
+        if value is None:
+            return None
+        try:
+            return settings_core.check_mcp_server_name(value)
+        except ValueError:
+            raise ValueError("invalid MCP server name for mcp_server_name") from None
 
     @field_validator("contract_bundle_paths", mode="before")
     @classmethod

@@ -1679,10 +1679,12 @@ class SelfDirectEngine:
         sync_finished = time.perf_counter()
         with self._publication_guard():
             raw_contracts, contract_token = self.contracts.capture()
+        contracts_corrupt = False
         try:
             contracts = parse_contracts(raw_contracts).contracts   # shared and read-only: filtered below, never edited
         except ValueError:
             contracts = []
+            contracts_corrupt = True
             coverage["complete"] = False
             coverage["issues"].append("contracts_corrupt")
         # The verification premise is taken over the contracts of this session before the proposed-action filter below, so
@@ -2099,6 +2101,12 @@ class SelfDirectEngine:
                     action_verdict = "unknown"
                 payload["action_verdict"] = action_verdict
                 payload["session_verdict"] = payload["verdict"]
+                if not contracts_corrupt and not any(s.startswith("contracts_") for s in stale):
+                    payload["judged_contracts"] = [
+                        {"id": rule.id, "type": rule.type, "revision": rule.revision,
+                         "risk": rule.risk, "on_unverified": rule.on_unverified}
+                        for rule in premise_rules
+                    ]
                 if payload["coverage"].get("judged_prefix"):
                     # The action's findings that the bytes appended during this evaluation leave open: the unknown ones of
                     # contracts that read the history (an obligation, a ``when`` condition). ``check_action`` reads those
@@ -2927,6 +2935,20 @@ class SelfDirectEngine:
         with self._publication_guard(), self.store._read_boundary():
             return self.store.events_mentioning(session_id, provider, refusal_id, from_byte)
 
+    @detached_operation
+    def review_origin_events(self, session_id: str, provider: str, refusal_id: str,
+                             from_byte: int = 0) -> tuple[list, dict[str, list]]:
+        """Indexed events at or after ``from_byte`` mentioning ``refusal_id``, paired with all ``tool_call`` and
+        ``tool_result`` chunks in the session sharing any candidate call's ``call_id``."""
+        with self._publication_guard():
+            self.store.ensure_call_index()
+        with self._publication_guard(), self.store._read_boundary():
+            events = self.store.events_mentioning(session_id, provider, refusal_id, from_byte)
+            call_ids = [cid for chunk in events if chunk.kind == "tool_call"
+                        and isinstance(cid := chunk.meta.get("call_id"), str) and cid]
+            linked = self.store.call_chunks(session_id, provider, call_ids) if call_ids else {}
+            return events, linked
+
     @request_operation
     def list_action_reviews(self, session_id: str | None = None, limit: int = 50) -> dict[str, Any]:
         """The audit trail of agent reviews: every refusal-for-review, its review and whether the hook consumed it."""
@@ -2936,7 +2958,7 @@ class SelfDirectEngine:
         store = reviews.ReviewStore(self.settings.index_dir)
         listing = store.listing(session_id=session_id, limit=limit)
         return mask_value({"ok": True, "claude_enforcement": getattr(self.settings, "claude_enforcement", None),
-                           "store": str(store.path), **listing,
+                           **listing,
                            "note": "A consumed proceed review is a call that ran on the agent's own decision although "
                                    "a high-risk contract stayed unverified; it is not a compliance verdict."})
 

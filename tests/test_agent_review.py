@@ -9,6 +9,7 @@ Synthetic data only: transcripts follow the shapes the ``claude`` provider parse
 """
 from __future__ import annotations
 
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -505,6 +506,9 @@ def test_the_digest_and_the_review_tool_name_are_structural():
     assert action_reviews.is_review_tool("mcp__any-server__review_action")
     assert not action_reviews.is_review_tool("review_action") and not action_reviews.is_review_tool("mcp____review_action")
     assert not action_reviews.is_review_tool("mcp__server__review_action_extra")
+    assert action_reviews.is_review_tool("mcp__tsukkomi-mcp__review_action", "tsukkomi-mcp")
+    assert not action_reviews.is_review_tool("mcp__any-server__review_action", "tsukkomi-mcp")
+    assert not action_reviews.is_review_tool("mcp__tsukkomi-mcp__review_action_extra", "tsukkomi-mcp")
     a = action_reviews.action_digest("claude", "Bash", {"command": "x", "description": "one"})
     assert a == action_reviews.action_digest("claude", "Bash", {"description": "two", "command": "x"})
     assert a != action_reviews.action_digest("claude", "Bash", {"command": "x "})
@@ -592,3 +596,785 @@ def test_the_review_call_pass_never_lifts_a_violation_of_the_review_call_itself(
     response = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=args)
     assert permission(response) == "deny" and "no-secrets-word" in reason_of(response)
     assert latest_refusal(engine)["review_call_passes"] == 0
+
+
+def test_only_a_proceed_decision_lets_a_reviewed_call_pass(review_env):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    recorded = record_review(engine, path, refusal, transcript=False)
+    with closing(sqlite3.connect(store(engine).path)) as conn, conn:
+        conn.execute("UPDATE reviews SET decision = ? WHERE review_id = ?", ("allow", recorded["review_id"]))
+    call_id = f"toolu_r{next(_calls)}"
+    args = review_args(refusal, decision="allow")
+    write(path, assistant(use(call_id, REVIEW_TOOL, **args)),
+          tool_result(call_id, json.dumps({**recorded, "decision": "allow"})), mode="a")
+    retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(retry) == "ask" and "invalid decision" in reason_of(retry)
+    assert review_state(engine, refusal) == "consumed"
+    again = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(again) == "deny" and latest_refusal(engine)["refusal_id"] != refusal["refusal_id"]
+
+
+def test_any_exception_in_the_agent_review_step_asks_the_user_as_unavailable(review_env, monkeypatch):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    record_review(engine, path, refusal)
+    with closing(sqlite3.connect(store(engine).path)) as conn, conn:
+        conn.executescript("""
+            ALTER TABLE refusals RENAME TO refusals_rows;
+            CREATE TABLE refusals AS
+                SELECT refusal_id, host, session_id, agent_id, action_digest, tool_name, action_preview,
+                       7 AS contracts, finding, source_offset, ttl_sec, issued_at, expires_at, review_call_passes
+                FROM refusals_rows;
+            DROP TABLE refusals_rows;
+        """)
+    direct = claude_hooks.handle_pre_tool_use(
+        engine, claude_hooks.HookCall("PreToolUse", SID, str(path), "Bash", DEPLOY), str(path))
+    assert direct["decision"] == "ask" and direct["reason"].startswith(claude_hooks.REVIEW_UNAVAILABLE)
+    response = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(response) == "ask" and reason_of(response).startswith(claude_hooks.REVIEW_UNAVAILABLE)
+
+    def broken_text(*_args, **_kwargs):
+        raise RuntimeError("formatting failed")
+
+    monkeypatch.setattr(claude_hooks, "_refusal_text", broken_text)
+    store(engine).path.unlink()
+    tail_failure = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(tail_failure) == "ask" and reason_of(tail_failure).startswith(claude_hooks.REVIEW_UNAVAILABLE)
+
+
+def test_a_subagent_call_with_only_an_agent_transcript_path_asks_and_preserves_a_main_agent_review(review_env):
+    engine, path = review_env
+    child = sub_file(engine.settings.resolve_claude_projects_dir())
+    first = run(engine, path, "PreToolUse", tool_input=DEPLOY, agent_transcript_path=str(child))
+    assert permission(first) == "ask" and reason_of(first).startswith(claude_hooks.SUBAGENT_NOT_REVIEWED)
+    assert store(engine).listing()["counts"]["refusals"] == 0
+    _, refusal = refuse(engine, path)
+    record_review(engine, path, refusal)
+    sub_call = run(engine, path, "PreToolUse", tool_input=DEPLOY, agent_transcript_path=str(child))
+    assert permission(sub_call) == "ask" and reason_of(sub_call).startswith(claude_hooks.SUBAGENT_NOT_REVIEWED)
+    assert review_state(engine, refusal) == "unused"
+    main_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(main_retry) == "none" and review_state(engine, refusal) == "consumed"
+
+
+def test_consume_takes_its_timestamp_inside_its_transaction(review_env, clock, monkeypatch):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    recorded = record_review(engine, path, refusal)
+    reviews_store = store(engine)
+    order: list[str] = []
+    real_connect = reviews_store._connect
+    advance = 5.0
+
+    def tick() -> float:
+        order.append("clock")
+        return clock.now
+
+    def traced_connect() -> sqlite3.Connection:
+        conn = real_connect()
+
+        def on_sql(sql: str) -> None:
+            if sql == "BEGIN IMMEDIATE":
+                order.append("begin")
+                clock.now += advance
+
+        conn.set_trace_callback(on_sql)
+        return conn
+
+    monkeypatch.setattr(action_reviews, "CLOCK", tick)
+    monkeypatch.setattr(reviews_store, "_connect", traced_connect)
+    start = clock.now
+    assert reviews_store.consume(recorded["review_id"], "evt-1") is True
+    assert order == ["begin", "clock"]
+    with closing(sqlite3.connect(reviews_store.path)) as conn:
+        consumed_at = conn.execute("SELECT consumed_at FROM reviews WHERE review_id = ?",
+                                   (recorded["review_id"],)).fetchone()[0]
+    assert consumed_at == start + advance
+
+    _, second = refuse(engine, path)
+    second_review = record_review(engine, path, second)
+    order.clear()
+    advance = engine.settings.agent_review_ttl_sec + 1.0
+    assert reviews_store.consume(second_review["review_id"], "evt-2") is False
+    assert order == ["begin", "clock"]
+
+
+def test_refusals_and_reviews_recorded_in_the_future_are_skipped_when_the_clock_moves_back(review_env, clock):
+    engine, path = review_env
+    reviews_store = store(engine)
+    contracts = [(GATE, 1)]
+
+    _, future_refusal = refuse(engine, path)
+    pass_args = review_args(future_refusal, reason="checked before the deploy: safe")
+    clock.now -= 30.0
+    assert reviews_store.open_refusal_for(host="claude", session_id=SID, agent_id=None,
+                                          tool_name=REVIEW_TOOL, arguments=pass_args) is None
+    assert permission(run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=pass_args)) == "deny"
+    clock.now += 30.0
+    assert reviews_store.open_refusal_for(host="claude", session_id=SID, agent_id=None,
+                                          tool_name=REVIEW_TOOL, arguments=pass_args) is not None
+
+    _, refusal = refuse(engine, path)
+    clock.now += 60.0
+    recorded = record_review(engine, path, refusal)
+    clock.now -= 30.0
+    assert reviews_store.candidates(host="claude", session_id=SID, agent_id=None,
+                                    digest=refusal["action_digest"], contracts=contracts) == []
+    assert reviews_store.consume(recorded["review_id"], "evt-early") is False
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "deny"
+    assert review_state(engine, refusal) == "unused"
+    clock.now += 30.0
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "none"
+    assert review_state(engine, refusal) == "consumed"
+
+    clock.now += 100.0
+    _, jumped_refusal = refuse(engine, path)
+    clock.now -= 50.0
+    jumped_review = record_review(engine, path, jumped_refusal)
+    clock.now += 10.0
+    assert reviews_store.candidates(host="claude", session_id=SID, agent_id=None,
+                                    digest=jumped_refusal["action_digest"], contracts=contracts) == []
+    assert reviews_store.consume(jumped_review["review_id"], "evt-jumped") is False
+    clock.now += 40.0
+    assert len(reviews_store.candidates(host="claude", session_id=SID, agent_id=None,
+                                        digest=jumped_refusal["action_digest"], contracts=contracts)) == 1
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "none"
+    assert review_state(engine, jumped_refusal) == "consumed"
+
+
+def test_list_action_reviews_omits_the_store_file_path(review_env, monkeypatch):
+    import asyncio
+    from self_directing_mcp import server
+    engine, path = review_env
+    monkeypatch.setattr(server, "_engine", engine)
+    empty = engine.list_action_reviews()
+    assert "store" not in empty and action_reviews.STORE_FILE not in json.dumps(empty)
+    _, refusal = refuse(engine, path)
+    record_review(engine, path, refusal)
+    populated = asyncio.run(server.list_action_reviews(session_id=SID))
+    assert populated["ok"] is True and len(populated["items"]) == 1
+    serialized = json.dumps(populated)
+    assert "store" not in populated
+    assert action_reviews.STORE_FILE not in serialized and str(engine.settings.index_dir) not in serialized
+
+
+def test_mcp_server_name_limits_review_pass_through_and_origin_to_the_configured_server(review_env, monkeypatch):
+    engine, path = review_env
+    monkeypatch.delenv("SELF_DIRECT_MCP_SERVER_NAME", raising=False)
+    assert Settings(_env_file=None).mcp_server_name is None
+    assert settings_core.load_hook_settings().mcp_server_name is None
+
+    # Unset: any mcp__<server>__review_action is accepted for pass-through and origin.
+    _, unset_refusal = refuse(engine, path)
+    unset_args = review_args(unset_refusal, reason="checked before the deploy: safe")
+    unset_pass = run(engine, path, "PreToolUse", tool="mcp__any-server__review_action", tool_input=unset_args)
+    assert permission(unset_pass) == "none" and latest_refusal(engine)["review_call_passes"] == 1
+    unset_call = f"toolu_r{next(_calls)}"
+    unset_recorded = engine.review_action(**unset_args)
+    write(path, assistant(use(unset_call, "mcp__any-server__review_action", **unset_args)),
+          tool_result(unset_call, json.dumps(unset_recorded)), mode="a")
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "none"
+    assert review_state(engine, unset_refusal) == "consumed"
+
+    # Set: only mcp__<name>__review_action is accepted; another server's review_action is an ordinary call.
+    monkeypatch.setenv("SELF_DIRECT_MCP_SERVER_NAME", "tsukkomi-mcp")
+    assert Settings(_env_file=None).mcp_server_name == "tsukkomi-mcp"
+    assert settings_core.load_hook_settings().mcp_server_name == "tsukkomi-mcp"
+    engine.settings.mcp_server_name = "tsukkomi-mcp"
+
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal, reason="checked before the deploy: safe")
+    other_pass = run(engine, path, "PreToolUse", tool="mcp__any-server__review_action", tool_input=args)
+    assert permission(other_pass) == "deny"
+    refusal_item = next(i for i in store(engine).listing(limit=50)["items"] if i["refusal_id"] == refusal["refusal_id"])
+    assert refusal_item["review_call_passes"] == 0
+
+    own_pass = run(engine, path, "PreToolUse", tool="mcp__tsukkomi-mcp__review_action", tool_input=args)
+    assert permission(own_pass) == "none"
+    refusal_item = next(i for i in store(engine).listing(limit=50)["items"] if i["refusal_id"] == refusal["refusal_id"])
+    assert refusal_item["review_call_passes"] == 1
+
+    foreign_call = f"toolu_r{next(_calls)}"
+    recorded = engine.review_action(**args)
+    write(path, assistant(use(foreign_call, "mcp__any-server__review_action", **args)),
+          tool_result(foreign_call, json.dumps(recorded)), mode="a")
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "deny"
+    assert review_state(engine, refusal) == "rejected"
+
+    _, second = refuse(engine, path)
+    second_args = review_args(second, reason="checked before the deploy: safe")
+    own_call = f"toolu_r{next(_calls)}"
+    second_recorded = engine.review_action(**second_args)
+    write(path, assistant(use(own_call, "mcp__tsukkomi-mcp__review_action", **second_args)),
+          tool_result(own_call, json.dumps(second_recorded)), mode="a")
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "none"
+    assert review_state(engine, second) == "consumed"
+
+
+def test_review_call_pass_through_requires_exact_review_action_arguments_for_the_refusal(review_env):
+    engine, path = review_env
+    gate_two = "lint-first"
+    engine.upsert_contracts([{"id": gate_two, "provider": "claude", "type": "must", "scope": "tool_call",
+                              "regex": "npm run lint", "before_regex": "deploy", "requires_success": True,
+                              "risk": "high"}])
+    write(path, assistant(use("toolu_l1", "Bash", command="npm run lint")), mode="a")
+
+    _, refusal = refuse(engine, path)
+    assert sorted(c["id"] for c in refusal["contracts"]) == sorted([GATE, gate_two])
+    base = review_args(refusal, reason="checked before the deploy: safe")
+    reviews_store = store(engine)
+
+    invalid_arguments = [
+        {**base, "session_id": OTHER},
+        {k: v for k, v in base.items() if k != "session_id"},
+        {**base, "refusal_id": "0" * 24},
+        {**base, "action_digest": "0" * 64},
+        {**base, "contract_ids": [GATE]},
+        {**base, "contract_ids": [GATE, gate_two, "extra-contract"]},
+        {**base, "contract_ids": [GATE, GATE, gate_two]},
+        {**base, "contract_ids": GATE},
+        {**base, "decision": "allow"},
+        {k: v for k, v in base.items() if k != "decision"},
+        {**base, "command": "deploy now"},
+        {**base, "unexpected_param": True},
+        {**base, "evidence_event_ids": "not-a-list"},
+    ]
+    for bad in invalid_arguments:
+        assert reviews_store.open_refusal_for(host="claude", session_id=SID, agent_id=None,
+                                              tool_name=REVIEW_TOOL, arguments=bad) is None
+        response = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=bad)
+        assert permission(response) == "deny"
+
+    original = next(i for i in reviews_store.listing(limit=100)["items"] if i["refusal_id"] == refusal["refusal_id"])
+    assert original["review_call_passes"] == 0
+
+    reordered = {**base, "contract_ids": [gate_two, GATE], "evidence_event_ids": []}
+    passed = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=reordered)
+    assert permission(passed) == "none"
+    escalated = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input={**base, "decision": "escalate"})
+    assert permission(escalated) == "none"
+    original = next(i for i in reviews_store.listing(limit=100)["items"] if i["refusal_id"] == refusal["refusal_id"])
+    assert original["review_call_passes"] == 2
+
+
+@pytest.mark.parametrize("failure_kind", [
+    "missing_result",
+    "error_result",
+    "implicit_error_result",
+    "permission_rejected",
+    "wrong_review_id",
+    "unlinked_call_id",
+    "shared_call_id",
+])
+def test_review_origin_requires_a_linked_succeeded_result_naming_the_review_id(review_env, failure_kind):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal)
+    recorded = engine.review_action(**args)
+    assert recorded["ok"] is True
+    call_id = f"toolu_r{next(_calls)}"
+
+    if failure_kind == "missing_result":
+        records = [assistant(use(call_id, REVIEW_TOOL, **args))]
+    elif failure_kind == "error_result":
+        records = [assistant(use(call_id, REVIEW_TOOL, **args)),
+                   tool_result(call_id, json.dumps(recorded), is_error=True)]
+    elif failure_kind == "implicit_error_result":
+        block = {"type": "tool_result", "tool_use_id": call_id,
+                 "content": json.dumps({"ok": False, "error": "refusal_expired", "review_id": recorded["review_id"]})}
+        records = [assistant(use(call_id, REVIEW_TOOL, **args)),
+                   env_record("user", message={"role": "user", "content": [block]},
+                              sourceToolAssistantUUID="00000000-0000-4000-8000-0000000000aa")]
+    elif failure_kind == "permission_rejected":
+        records = [assistant(use(call_id, REVIEW_TOOL, **args)),
+                   tool_result(call_id, json.dumps(recorded), is_error=False,
+                               permissionDecision={"decision": "reject", "source": "hook", "reasonType": "hook"})]
+    elif failure_kind == "wrong_review_id":
+        records = [assistant(use(call_id, REVIEW_TOOL, **args)),
+                   tool_result(call_id, json.dumps({**recorded, "review_id": "0" * 24}))]
+    elif failure_kind == "unlinked_call_id":
+        records = [assistant(use(call_id, REVIEW_TOOL, **args)),
+                   tool_result(f"{call_id}_other", json.dumps(recorded))]
+    else:
+        records = [assistant(use(call_id, "Bash", command="echo earlier")),
+                   assistant(use(call_id, REVIEW_TOOL, **args)),
+                   tool_result(call_id, json.dumps(recorded))]
+
+    write(path, *records, mode="a")
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "deny"
+    assert review_state(engine, refusal) == "rejected"
+
+
+def test_review_origin_accepts_a_succeeded_mcp_result_block_after_an_earlier_failed_attempt(review_env):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal)
+    recorded = engine.review_action(**args)
+    assert recorded["ok"] is True
+
+    failed_id = f"toolu_r{next(_calls)}"
+    succeeded_id = f"toolu_r{next(_calls)}"
+    mcp_block = {"type": "tool_result", "tool_use_id": succeeded_id,
+                 "content": [{"type": "text", "text": json.dumps(recorded)}]}
+    write(
+        path,
+        assistant(use(failed_id, REVIEW_TOOL, **args)),
+        tool_result(failed_id, "MCP transport timeout", is_error=True),
+        assistant(use(succeeded_id, REVIEW_TOOL, **args)),
+        env_record("user", message={"role": "user", "content": [mcp_block]},
+                   sourceToolAssistantUUID="00000000-0000-4000-8000-0000000000aa"),
+        mode="a",
+    )
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "none"
+    assert review_state(engine, refusal) == "consumed"
+
+
+def test_judge_action_uses_the_contract_snapshot_judged_by_check_action(review_env, monkeypatch):
+    engine, path = review_env
+    _, first_refusal = refuse(engine, path)
+    assert first_refusal["contracts"] == [{"id": GATE, "revision": 1}]
+    assert record_review(engine, path, first_refusal)["ok"] is True
+
+    real_check_action = engine.check_action
+    pending_mutation: list = []
+
+    def mutating_check_action(*args, **kwargs):
+        while pending_mutation:
+            pending_mutation.pop(0)()
+        return real_check_action(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "check_action", mutating_check_action)
+
+    pending_mutation.append(lambda: engine.upsert_contracts([{
+        "id": GATE, "provider": "claude", "type": "must", "scope": "tool_call", "regex": "npm test",
+        "before_regex": "deploy", "requires_success": True, "risk": "high", "description": "updated rule",
+    }]))
+    retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(retry) == "deny"
+    assert review_state(engine, first_refusal) == "unused"
+    second_refusal = latest_refusal(engine)
+    assert second_refusal["refusal_id"] != first_refusal["refusal_id"]
+    assert second_refusal["contracts"] == [{"id": GATE, "revision": 2}]
+
+    assert record_review(engine, path, second_refusal)["ok"] is True
+    gate_two = "lint-first"
+    write(path, assistant(use("toolu_l1", "Bash", command="npm run lint")), mode="a")
+    pending_mutation.append(lambda: engine.upsert_contracts([{
+        "id": gate_two, "provider": "claude", "type": "must", "scope": "tool_call", "regex": "npm run lint",
+        "before_regex": "deploy", "requires_success": True, "risk": "high",
+    }]))
+    both_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(both_retry) == "deny"
+    assert review_state(engine, second_refusal) == "unused"
+    third_refusal = latest_refusal(engine)
+    assert third_refusal["contracts"] == [{"id": gate_two, "revision": 1}, {"id": GATE, "revision": 2}]
+
+    assert record_review(engine, path, third_refusal)["ok"] is True
+    refusal_count_before = store(engine).listing(limit=100)["counts"]["refusals"]
+    pending_mutation.append(lambda: engine.upsert_contracts([{
+        "id": GATE, "provider": "claude", "type": "must", "scope": "tool_call", "regex": "npm test",
+        "before_regex": "deploy", "requires_success": True, "risk": "high", "on_unverified": "human",
+    }]))
+    human_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(human_retry) == "ask" and "on_unverified: human" in reason_of(human_retry)
+    assert review_state(engine, third_refusal) == "unused"
+    assert store(engine).listing(limit=100)["counts"]["refusals"] == refusal_count_before
+
+
+def test_when_audit_omits_judged_contracts_a_changed_high_risk_contract_asks_and_consumes_nothing(
+    review_env, monkeypatch
+):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    assert record_review(engine, path, refusal)["ok"] is True
+    _, open_refusal = refuse(engine, path, tool_input={"command": "deploy staging"})
+
+    real_check_action = engine.check_action
+    pending_mutation: list = []
+
+    def check_action_without_contracts(*args, **kwargs):
+        result = dict(real_check_action(*args, **kwargs))
+        result.pop("judged_contracts", None)
+        while pending_mutation:
+            pending_mutation.pop(0)()
+        return result
+
+    monkeypatch.setattr(engine, "check_action", check_action_without_contracts)
+
+    refusal_count_before = store(engine).listing(limit=100)["counts"]["refusals"]
+    pending_mutation.append(lambda: engine.upsert_contracts([{
+        "id": GATE, "provider": "claude", "type": "must", "scope": "tool_call", "regex": "npm test",
+        "before_regex": "deploy", "requires_success": True, "risk": "high", "description": "revision two",
+    }]))
+    changed_rev = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(changed_rev) == "ask"
+    assert review_state(engine, refusal) == "unused"
+    assert store(engine).listing(limit=100)["counts"]["refusals"] == refusal_count_before
+
+    _, v2_refusal = refuse(engine, path)
+    assert v2_refusal["contracts"] == [{"id": GATE, "revision": 2}]
+    assert record_review(engine, path, v2_refusal)["ok"] is True
+
+    contracts_path = engine.settings.resolve_contracts_path()
+
+    def set_on_unverified(value: str) -> None:
+        doc = json.loads(contracts_path.read_text(encoding="utf-8"))
+        for item in doc["contracts"]:
+            if item["id"] == GATE:
+                if value == "agent":
+                    item.pop("on_unverified", None)
+                else:
+                    item["on_unverified"] = value
+        contracts_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+
+    refusal_count_before = store(engine).listing(limit=100)["counts"]["refusals"]
+    pending_mutation.append(lambda: set_on_unverified("human"))
+    changed_who = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(changed_who) == "ask"
+    assert review_state(engine, v2_refusal) == "unused"
+    assert store(engine).listing(limit=100)["counts"]["refusals"] == refusal_count_before
+
+    set_on_unverified("agent")
+    _, v2_open = refuse(engine, path, tool_input={"command": "deploy canary"})
+    pass_args = review_args(v2_open, reason="checked before the deploy: safe")
+    refusal_count_before = store(engine).listing(limit=100)["counts"]["refusals"]
+    pending_mutation.append(lambda: set_on_unverified("human"))
+    pass_attempt = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=pass_args)
+    assert permission(pass_attempt) == "ask"
+    open_item = next(i for i in store(engine).listing(limit=100)["items"] if i["refusal_id"] == v2_open["refusal_id"])
+    assert open_item["review_call_passes"] == 0
+    assert store(engine).listing(limit=100)["counts"]["refusals"] == refusal_count_before
+    open_first = next(i for i in store(engine).listing(limit=100)["items"]
+                      if i["refusal_id"] == open_refusal["refusal_id"])
+    assert open_first["review_call_passes"] == 0
+
+
+def test_action_digest_omits_only_exact_tool_prose_fields_without_changing_contract_matching(review_env):
+    from self_directing_mcp import tool_payload
+
+    assert tool_payload.DIGEST_PROSE_FIELDS["claude"] == {"Bash": frozenset({"description"})}
+    assert tool_payload.PROSE_FIELDS["claude"][0] == frozenset({"description"})
+
+    bash_plain = action_reviews.action_digest("claude", "Bash", {"command": "deploy now"})
+    assert action_reviews.action_digest("claude", "Bash", {"command": "deploy now", "description": "first"}) == bash_plain
+    assert action_reviews.action_digest("claude", "Bash", {"command": "deploy now", "description": "second"}) == bash_plain
+    assert action_reviews.action_digest("claude", "Bash", {"command": "deploy now", "description": 7}) != bash_plain
+
+    for other_tool in ("Agent", "Task", "Monitor", "Write", "bash", "mcp__srv__create_issue"):
+        d_plain = action_reviews.action_digest("claude", other_tool, {"prompt": "deploy now"})
+        d_first = action_reviews.action_digest("claude", other_tool, {"prompt": "deploy now", "description": "first"})
+        d_second = action_reviews.action_digest("claude", other_tool, {"prompt": "deploy now", "description": "second"})
+        assert len({d_plain, d_first, d_second}) == 3, other_tool
+
+    rendered = tool_payload.tool_call_text("claude", "Agent", {"prompt": "deploy now", "description": "forbidden-marker"})
+    assert "deploy now" in rendered and "forbidden-marker" not in rendered
+
+    engine, path = review_env
+    engine.upsert_contracts([{"id": "no-marker", "type": "must_not", "scope": "tool_call", "provider": "claude",
+                              "regex": "forbidden-marker"}])
+    agent_first = {"prompt": "deploy now", "description": "forbidden-marker"}
+    agent_second = {"prompt": "deploy now", "description": "forbidden-marker updated"}
+
+    refused_resp, refusal = refuse(engine, path, tool="Agent", tool_input=agent_first)
+    assert "Agent review needed." in reason_of(refused_resp) and "no-marker" not in reason_of(refused_resp)
+    assert record_review(engine, path, refusal)["ok"] is True
+
+    different_desc = run(engine, path, "PreToolUse", tool="Agent", tool_input=agent_second)
+    assert permission(different_desc) == "deny" and "Agent review needed." in reason_of(different_desc)
+    assert review_state(engine, refusal) == "unused"
+
+    same_desc = run(engine, path, "PreToolUse", tool="Agent", tool_input=agent_first)
+    assert permission(same_desc) == "none"
+    assert review_state(engine, refusal) == "consumed"
+
+
+def test_unindexed_review_stays_unused_without_a_new_refusal_when_the_transcript_has_unread_bytes(review_env):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal)
+    recorded = engine.review_action(**args)
+    assert recorded["ok"] is True
+    call_id = f"toolu_r{next(_calls)}"
+    write(path, assistant(use(call_id, REVIEW_TOOL, **args)), mode="a")
+    partial_result = json.dumps(tool_result(call_id, json.dumps(recorded)))
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(partial_result)
+
+    first_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(first_retry) == "deny"
+    text_ = reason_of(first_retry)
+    assert len(text_) < 300
+    assert "not in the indexed transcript yet" in text_ and "identical call can be retried" in text_
+    assert "Agent review needed." not in text_
+    assert review_state(engine, refusal) == "unused"
+    assert store(engine).listing()["counts"]["refusals"] == 1
+
+    second_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(second_retry) == "deny" and reason_of(second_retry) == text_
+    assert review_state(engine, refusal) == "unused"
+    assert store(engine).listing()["counts"]["refusals"] == 1
+
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write("\n")
+
+    third_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(third_retry) == "none"
+    assert review_state(engine, refusal) == "consumed"
+    assert store(engine).listing()["counts"]["refusals"] == 1
+
+
+def test_unindexed_review_stays_unused_when_the_transcript_grows_during_evaluation(review_env, monkeypatch):
+    engine, path = review_env
+    engine.settings.action_settle_sec = 0
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal)
+    recorded = engine.review_action(**args)
+    assert recorded["ok"] is True
+    call_id = f"toolu_r{next(_calls)}"
+    real_refresh = engine._refresh_evidence
+    appended = False
+
+    def append_after_capture(*a, **kw):
+        nonlocal appended
+        refreshed = real_refresh(*a, **kw)
+        if not appended:
+            appended = True
+            write(path, assistant(use(call_id, REVIEW_TOOL, **args)),
+                  tool_result(call_id, json.dumps(recorded)), mode="a")
+        return refreshed
+
+    monkeypatch.setattr(engine, "_refresh_evidence", append_after_capture)
+
+    grown_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert appended is True
+    assert permission(grown_retry) == "deny"
+    assert "not in the indexed transcript yet" in reason_of(grown_retry)
+    assert "identical call can be retried" in reason_of(grown_retry)
+    assert "Agent review needed." not in reason_of(grown_retry)
+    assert review_state(engine, refusal) == "unused"
+    assert store(engine).listing()["counts"]["refusals"] == 1
+
+    settled_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(settled_retry) == "none"
+    assert review_state(engine, refusal) == "consumed"
+    assert store(engine).listing()["counts"]["refusals"] == 1
+
+    _, next_refusal = refuse(engine, path)
+    assert record_review(engine, path, next_refusal, transcript=False)["ok"] is True
+    real_check = engine.check_action
+
+    def changed_during_eval(*a, **kw):
+        out = dict(real_check(*a, **kw))
+        cov = dict(out["coverage"])
+        cov["complete"] = False
+        cov["issues"] = [*cov["issues"], "source_changed_during_evaluation"]
+        cov.pop("judged_prefix", None)
+        out["coverage"] = cov
+        return out
+
+    monkeypatch.setattr(engine, "check_action", changed_during_eval)
+    changed_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(changed_retry) == "deny" and "not in the indexed transcript yet" in reason_of(changed_retry)
+    assert review_state(engine, next_refusal) == "unused"
+    assert store(engine).listing()["counts"]["refusals"] == 2
+
+
+def test_unindexed_review_retries_stop_at_expiry_and_complete_transcript_eof_rejects(review_env, clock):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    assert record_review(engine, path, refusal, transcript=False)["ok"] is True
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(assistant(use("toolu_note1", "Bash", command="echo one"))))
+
+    clock.now += engine.settings.agent_review_ttl_sec - 1
+    before_expiry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(before_expiry) == "deny"
+    assert "not in the indexed transcript yet" in reason_of(before_expiry)
+    assert review_state(engine, refusal) == "unused"
+    assert store(engine).listing()["counts"]["refusals"] == 1
+
+    clock.now += 2
+    after_expiry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(after_expiry) == "deny"
+    assert reason_of(after_expiry).startswith("Agent review needed.")
+    assert review_state(engine, refusal) == "expired"
+    assert store(engine).listing()["counts"]["refusals"] == 2
+    second_refusal = latest_refusal(engine)
+    assert second_refusal["refusal_id"] != refusal["refusal_id"]
+
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write("\n")
+    assert record_review(engine, path, second_refusal, transcript=False)["ok"] is True
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(assistant(use("toolu_note2", "Bash", command="echo two"))))
+
+    while_unread = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(while_unread) == "deny" and review_state(engine, second_refusal) == "unused"
+    assert store(engine).listing()["counts"]["refusals"] == 2
+
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write("\n")
+    at_eof = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(at_eof) == "deny" and reason_of(at_eof).startswith("Agent review needed.")
+    assert review_state(engine, second_refusal) == "rejected"
+    assert store(engine).listing()["counts"]["refusals"] == 3
+
+
+def test_two_unverified_high_risk_contracts_are_not_satisfied_by_a_review_of_one_and_refusal_names_both(review_env):
+    engine, path = review_env
+    _, single_refusal = refuse(engine, path)
+    assert single_refusal["contracts"] == [{"id": GATE, "revision": 1}]
+    assert record_review(engine, path, single_refusal)["ok"] is True
+
+    gate_two = "lint-first"
+    engine.upsert_contracts([{"id": gate_two, "provider": "claude", "type": "must", "scope": "tool_call",
+                              "regex": "npm run lint", "before_regex": "deploy", "requires_success": True,
+                              "risk": "high"}])
+    write(path, assistant(use("toolu_l1", "Bash", command="npm run lint")), mode="a")
+
+    retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(retry) == "deny"
+    assert review_state(engine, single_refusal) == "unused"
+    assert store(engine).listing()["counts"]["consumed"] == {"proceed": 0, "escalate": 0}
+    both_refusal = latest_refusal(engine)
+    assert both_refusal["refusal_id"] != single_refusal["refusal_id"]
+    assert sorted(c["id"] for c in both_refusal["contracts"]) == sorted([GATE, gate_two])
+    text_ = reason_of(retry)
+    assert text_.startswith("Agent review needed.")
+    assert GATE in text_ and gate_two in text_
+    assert f'"{GATE}"' in text_ and f'"{gate_two}"' in text_
+
+
+def test_a_review_call_in_the_transcript_that_differs_in_decision_is_not_an_origin(review_env):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal, decision="proceed")
+    recorded = engine.review_action(**args)
+    assert recorded["ok"] is True
+    call_id = f"toolu_r{next(_calls)}"
+    write(path, assistant(use(call_id, REVIEW_TOOL, **{**args, "decision": "escalate"})),
+          tool_result(call_id, json.dumps(recorded)), mode="a")
+
+    retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(retry) == "deny" and reason_of(retry).startswith("Agent review needed.")
+    assert review_state(engine, refusal) == "rejected"
+    second = latest_refusal(engine)
+    assert second["refusal_id"] != refusal["refusal_id"]
+
+    second_args = review_args(second, decision="escalate")
+    second_recorded = engine.review_action(**second_args)
+    assert second_recorded["ok"] is True
+    second_call = f"toolu_r{next(_calls)}"
+    write(path, assistant(use(second_call, REVIEW_TOOL, **{**second_args, "decision": "proceed"})),
+          tool_result(second_call, json.dumps(second_recorded)), mode="a")
+
+    second_retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(second_retry) == "deny" and reason_of(second_retry).startswith("Agent review needed.")
+    assert review_state(engine, second) == "rejected"
+
+
+def test_a_review_call_in_the_transcript_that_differs_in_action_digest_is_not_an_origin(review_env):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal)
+    recorded = engine.review_action(**args)
+    assert recorded["ok"] is True
+    other_digest = action_reviews.action_digest("claude", "Bash", {"command": "deploy later"})
+    assert other_digest != refusal["action_digest"]
+    call_id = f"toolu_r{next(_calls)}"
+    write(path, assistant(use(call_id, REVIEW_TOOL, **{**args, "action_digest": other_digest})),
+          tool_result(call_id, json.dumps(recorded)), mode="a")
+
+    retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(retry) == "deny" and reason_of(retry).startswith("Agent review needed.")
+    assert review_state(engine, refusal) == "rejected"
+    assert latest_refusal(engine)["refusal_id"] != refusal["refusal_id"]
+
+
+def test_a_review_call_in_the_transcript_that_differs_in_contract_ids_is_not_an_origin(review_env):
+    engine, path = review_env
+    gate_two = "lint-first"
+    engine.upsert_contracts([{"id": gate_two, "provider": "claude", "type": "must", "scope": "tool_call",
+                              "regex": "npm run lint", "before_regex": "deploy", "requires_success": True,
+                              "risk": "high"}])
+    write(path, assistant(use("toolu_l1", "Bash", command="npm run lint")), mode="a")
+
+    _, refusal = refuse(engine, path)
+    assert sorted(c["id"] for c in refusal["contracts"]) == sorted([GATE, gate_two])
+    args = review_args(refusal)
+    recorded = engine.review_action(**args)
+    assert recorded["ok"] is True
+
+    for wrong_ids in ([GATE], [GATE, gate_two, "other-contract"], ["other-contract"]):
+        call_id = f"toolu_r{next(_calls)}"
+        write(path, assistant(use(call_id, REVIEW_TOOL, **{**args, "contract_ids": wrong_ids})),
+              tool_result(call_id, json.dumps(recorded)), mode="a")
+
+    retry = run(engine, path, "PreToolUse", tool_input=DEPLOY)
+    assert permission(retry) == "deny" and reason_of(retry).startswith("Agent review needed.")
+    assert review_state(engine, refusal) == "rejected"
+    assert latest_refusal(engine)["refusal_id"] != refusal["refusal_id"]
+
+
+def test_no_pass_through_for_a_refusal_of_another_session(review_env):
+    engine, path = review_env
+    other = write(main_file(engine.settings.resolve_claude_projects_dir(), OTHER), human("hi"),
+                  assistant(use("toolu_o1", "Bash", command="npm test")))
+    other_denied = run(engine, other, "PreToolUse", sid=OTHER, tool_input=DEPLOY)
+    assert permission(other_denied) == "deny"
+    other_refusal = latest_refusal(engine)
+    assert other_refusal["session_id"] == OTHER
+
+    reviews_store = store(engine)
+    for candidate_sid in (OTHER, SID):
+        attempt = {**review_args(other_refusal, reason="checked before the deploy: safe"),
+                   "session_id": candidate_sid}
+        assert reviews_store.open_refusal_for(host="claude", session_id=SID, agent_id=None,
+                                              tool_name=REVIEW_TOOL, arguments=attempt) is None
+        response = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=attempt)
+        assert permission(response) == "deny" and reason_of(response).startswith("Agent review needed.")
+
+    refreshed = next(i for i in reviews_store.listing(limit=50)["items"]
+                     if i["refusal_id"] == other_refusal["refusal_id"])
+    assert refreshed["review_call_passes"] == 0
+
+
+def test_no_pass_through_for_an_expired_refusal(review_env, clock):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal, reason="checked before the deploy: safe")
+    reviews_store = store(engine)
+
+    clock.now += engine.settings.agent_review_ttl_sec
+    for delta in (0.0, 1.0):
+        clock.now += delta
+        assert reviews_store.open_refusal_for(host="claude", session_id=SID, agent_id=None,
+                                              tool_name=REVIEW_TOOL, arguments=args) is None
+        response = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=args)
+        assert permission(response) == "deny" and reason_of(response).startswith("Agent review needed.")
+
+    original = next(i for i in reviews_store.listing(limit=50)["items"] if i["refusal_id"] == refusal["refusal_id"])
+    assert original["review_call_passes"] == 0
+
+
+def test_no_pass_through_for_an_already_reviewed_refusal(review_env):
+    engine, path = review_env
+    _, refusal = refuse(engine, path)
+    args = review_args(refusal, reason="checked before the deploy: safe")
+    assert record_review(engine, path, refusal)["ok"] is True
+    reviews_store = store(engine)
+
+    assert reviews_store.open_refusal_for(host="claude", session_id=SID, agent_id=None,
+                                          tool_name=REVIEW_TOOL, arguments=args) is None
+    while_unused = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=args)
+    assert permission(while_unused) == "deny" and reason_of(while_unused).startswith("Agent review needed.")
+
+    assert permission(run(engine, path, "PreToolUse", tool_input=DEPLOY)) == "none"
+    assert review_state(engine, refusal) == "consumed"
+
+    after_consumed = run(engine, path, "PreToolUse", tool=REVIEW_TOOL, tool_input=args)
+    assert permission(after_consumed) == "deny" and reason_of(after_consumed).startswith("Agent review needed.")
+
+    original = next(i for i in reviews_store.listing(limit=50)["items"] if i["refusal_id"] == refusal["refusal_id"])
+    assert original["review_call_passes"] == 0
