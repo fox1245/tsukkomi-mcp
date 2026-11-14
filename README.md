@@ -1,4 +1,18 @@
+<div align="center">
+
+<img src="assets/logo.svg" width="160">
+
 # Tsukkomi MCP (ツッコミ)
+
+**Deterministic governance harness for autonomous coding agents.**
+
+[![CI](https://github.com/fox1245/tsukkomi-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/fox1245/tsukkomi-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](#prerequisites)
+
+</div>
+
+---
 
 > Deterministic governance, verifiable checklists, and session GraphRAG for autonomous coding agents (`v0.11.0`).
 > Distribution: `tsukkomi-mcp` · Python package: `self_directing_mcp`
@@ -13,7 +27,7 @@ Every check returns one of four verdicts:
 - `suspicious` — a heuristic or partial hazard indicator requires inspection.
 - `unknown` — required evidence is missing, unindexed, or unreadable (`unknown` is never treated as `clean`).
 
-```
+```text
                   ┌──────────────────────────────────────────────┐
                   │          Autonomous Agent Client             │
                   │ (Claude Code / AGY / Codex / OMP / Grok CLI) │
