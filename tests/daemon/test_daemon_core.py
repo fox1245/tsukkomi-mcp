@@ -381,6 +381,42 @@ def test_past_the_memory_cap_the_daemon_stops_accepting_finishes_in_flight_work_
     assert support.daemon_log(daemon.runtime_area)[-1]["reason"] == "rss"
 
 
+def test_an_orderly_exit_is_announced_before_the_socket_goes(inproc, monkeypatch):
+    """The client that finds no socket starts the successor at once, so the announcement must already be there:
+    otherwise the planned restart is counted as a crash by the spawn guard."""
+    rss = {"value": 10.0}
+    monkeypatch.setattr(core, "read_rss_mb", lambda: rss["value"])
+    daemon = inproc(core.DaemonConfig(max_rss_mb=100), hook_runner=Gate())
+    seen = []
+    unlink = daemon.runtime.unlink
+
+    def watching(name):
+        if name == rundir.SOCKET_NAME:
+            seen.append(json.loads((daemon.runtime_area.dir / rundir.EXITS_NAME).read_text()))
+        unlink(name)
+
+    monkeypatch.setattr(daemon.runtime, "unlink", watching)
+    rss["value"] = 500.0
+    assert request(daemon, hook_frame())[1]["ok"] is True
+    assert daemon.wait_exit(10)
+    assert seen and seen[0] == [{"t": seen[0][0]["t"], "pid": os.getpid(), "reason": "rss"}]
+    assert not list(daemon.runtime_area.dir.glob(rundir.EXITS_NAME + ".*"))     # replaced whole, no scratch left
+
+
+def test_the_exit_announcements_keep_only_the_guard_window(runtime):
+    from self_directing_mcp.daemon import client
+    area = rundir.open_runtime_dir(runtime.environ())
+    try:
+        now = 10_000.0
+        client.record_planned_exit(area, 11, "idle", now=now - client.CRASH_LOOP_WINDOW_SEC - 1)
+        client.record_planned_exit(area, 12, "version", now=now - 5)
+        client.record_planned_exit(area, 13, "rss", now=now)
+        kept = json.loads((runtime.dir / rundir.EXITS_NAME).read_text())
+        assert [(r["pid"], r["reason"]) for r in kept] == [(12, "version"), (13, "rss")]
+    finally:
+        area.close()
+
+
 def test_under_the_cap_nothing_drains(inproc, monkeypatch):
     monkeypatch.setattr(core, "read_rss_mb", lambda: 50.0)
     daemon = inproc(core.DaemonConfig(max_rss_mb=100), hook_runner=Gate())

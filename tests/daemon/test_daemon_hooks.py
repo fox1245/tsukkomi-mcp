@@ -346,6 +346,88 @@ def test_more_than_three_spawns_in_five_minutes_stops_spawning_and_warns(world, 
     assert len(json.loads((runtime.dir / rundir.SPAWNS_NAME).read_text())) == 1
 
 
+def _hooks_through_restarting_daemons(world, runtime, count, **env):
+    """``count`` Stop hooks, each against a daemon whose memory cap (``SELF_DIRECT_DAEMON_MAX_RSS_MB`` passed on by
+    the client) is below any real resident set: the daemon answers, drains for ``rss`` and exits in order. The next
+    hook starts only after that daemon is gone, so every hook needs a fresh start, as under a busy host whose daemon
+    keeps reaching its cap."""
+    index = world.new_index("restarts")
+    runs = []
+    for _ in range(count):
+        runs.append(world.hook("claude", "Stop", flag="on", index=index, SELF_DIRECT_DAEMON_MAX_RSS_MB="1", **env))
+        deadline = time.monotonic() + 30
+        while runtime.alive() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not runtime.alive(), "the daemon did not leave after passing its memory cap"
+    return runs
+
+
+def test_planned_restarts_at_the_memory_cap_are_not_a_crash_loop(world, runtime):
+    """A daemon that drains at its memory cap exits in order; its successor is not a crash. Counting such restarts as
+    crashes made busy hosts fail open with ``daemon_unavailable:crash-loop`` for minutes and made MCP relays exit."""
+    count = client.CRASH_LOOP_SPAWNS + 3
+    runs = _hooks_through_restarting_daemons(world, runtime, count)
+    for run in runs:
+        assert "crash-loop" not in run.stderr and "crash-loop" not in run.stdout, run.stderr
+        assert run.code == 0 and "UNAVAILABLE" not in run.stdout, run.stdout     # every hook judged by a daemon
+    assert len(json.loads((runtime.dir / rundir.SPAWNS_NAME).read_text())) == count
+    stops = [r for r in support.daemon_log(runtime) if r["ev"] == "stopped"]
+    assert len(stops) == count and {r["reason"] for r in stops} == {"rss"}
+    announced = json.loads((runtime.dir / rundir.EXITS_NAME).read_text())
+    assert [r["reason"] for r in announced] == ["rss"] * count
+
+
+def test_more_planned_restarts_than_the_limit_stop_spawning_with_their_own_reason(world, runtime):
+    """A cap below the daemon's working set restarts it after every request; that loop has its own bound and name."""
+    runs = _hooks_through_restarting_daemons(world, runtime, 4, SELF_DIRECT_DAEMON_RESTART_LIMIT="2")
+    for run in runs[:3]:
+        assert run.code == 0 and "UNAVAILABLE" not in run.stdout, run.stdout
+    refused = runs[3]
+    assert "restart-loop" in refused.stderr and "SELF_DIRECT_DAEMON_MAX_RSS_MB" in refused.stderr
+    assert "daemon_unavailable:restart-loop" in refused.stdout and "fail-open" in refused.stdout
+    assert "crash-loop" not in refused.stderr + refused.stdout
+    assert len(json.loads((runtime.dir / rundir.SPAWNS_NAME).read_text())) == 3
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "many", ""])
+def test_a_malformed_restart_limit_is_reported_and_starts_nothing(world, runtime, value):
+    run = world.hook("claude", "PreToolUse", "ls", flag="on", index=world.new_index("limit"),
+                     SELF_DIRECT_DAEMON_RESTART_LIMIT=value)
+    assert run.code == 0 and "daemon_unavailable:setting" in run.stdout
+    assert "SELF_DIRECT_DAEMON_RESTART_LIMIT" in run.stderr
+    assert not (runtime.dir / rundir.SPAWNS_NAME).exists()
+
+
+def test_only_a_spawn_whose_daemon_announced_an_orderly_exit_is_a_planned_restart():
+    recent = [{"t": 100.0 + n, "pid": 1000 + n} for n in range(5)]
+    exits = [{"t": 101.0 + n, "pid": 1000 + n, "reason": "rss"} for n in range(5)]
+    assert client.guard_outcome(recent, exits, 30) is None                            # five planned restarts
+    assert client.guard_outcome(recent, exits, 4) == "restart_loop"
+    assert client.guard_outcome(recent, [], 30) == "crash_loop"                      # nothing announced: as before
+    reused = [dict(r, t=r["t"] - 2) for r in exits]                                # announced before that spawn
+    assert client.guard_outcome(recent, reused, 30) == "crash_loop"
+    assert client.guard_outcome(recent, exits[:2], 30) is None                       # three unannounced: not "more than 3"
+    assert client.guard_outcome(recent + [{"t": 106.0, "pid": 0}], exits[:2], 30) == "crash_loop"
+
+
+def test_a_relay_refuses_a_restart_loop_by_name(runtime):
+    from self_directing_mcp.daemon import relay
+    area = rundir.open_runtime_dir(runtime.environ())
+    try:
+        now = time.time()
+        dead = [2 ** 30 + n for n in range(2)]                                         # above any pid_max: never alive
+        (runtime.dir / rundir.SPAWNS_NAME).write_text(json.dumps([{"t": now - 30 + n, "pid": p}
+                                                                  for n, p in enumerate(dead)]))
+        for pid in dead:
+            client.record_planned_exit(area, pid, "rss", now=now - 5)
+    finally:
+        area.close()
+    environ = {**runtime.environ(), "SELF_DIRECT_DAEMON_RESTART_LIMIT": "1"}
+    with pytest.raises(relay.RelayError, match="daemon_unavailable:restart-loop"):
+        relay.open_session(environ, "default", None, budget=2.0)
+    assert len(json.loads((runtime.dir / rundir.SPAWNS_NAME).read_text())) == 2      # nothing was started
+
+
 def test_a_daemon_that_is_still_starting_is_waited_for_not_started_twice(world, runtime, tmp_path):
     stub = support.make_stub(tmp_path, seconds=5)
     index = world.new_index("grace")

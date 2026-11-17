@@ -76,6 +76,13 @@ def open_session(environ, mode: str, cwd, *, python=None, budget: float = AVAILA
                     raise RelayError("daemon crash-loop guard: more than %d daemon starts within %d s; not starting "
                                      "another (daemon_unavailable:crash-loop)" % (client.CRASH_LOOP_SPAWNS,
                                                                                     int(client.CRASH_LOOP_WINDOW_SEC)))
+                if state == "restart_loop":
+                    raise RelayError("daemon restart-loop guard: more than %d planned daemon restarts within %d s; not "
+                                     "starting another (daemon_unavailable:restart-loop)"
+                                     % (client.restart_limit(environ), int(client.CRASH_LOOP_WINDOW_SEC)))
+                if state == "bad_setting":
+                    raise RelayError(f"invalid value for {client.ENV_RESTART_LIMIT} (a positive integer)",
+                                     EXIT_CONFIGURATION)
                 if state == "failed":
                     raise RelayError("the daemon could not be started (daemon_unavailable)")
                 spawned = state in ("spawned",)
