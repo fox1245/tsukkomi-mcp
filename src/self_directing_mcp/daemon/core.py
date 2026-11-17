@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from self_directing_mcp import __version__
-from self_directing_mcp.daemon import envview, protocol as P, rundir
+from self_directing_mcp.daemon import client, envview, protocol as P, rundir
 from self_directing_mcp.daemon.served import ServedLedger
 
 LOCK_WAIT_SEC = 10.0              # a freshly started daemon waits this long for a draining predecessor to exit
@@ -603,6 +603,12 @@ class Daemon:
             return
         self.draining, self.drain_reason = True, reason
         self.log.event("draining", reason=reason, inflight=self.inflight)
+        # Announced before the socket goes, so the client that starts the successor already sees a planned restart,
+        # not a crash (``client.guard_outcome``). Without the announcement this exit counts as a crash.
+        try:
+            client.record_planned_exit(self.runtime, os.getpid(), reason)
+        except OSError as exc:
+            self.log.event("exit_announce_failed", error=type(exc).__name__)
         if self._server is not None:
             self._server.close()
         self.runtime.unlink(rundir.SOCKET_NAME)

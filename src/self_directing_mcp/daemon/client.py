@@ -18,9 +18,14 @@ fallback on the hot path:
    that matches the trigger of a contract marked ``risk: high`` because the audit did not run, and AGY asks; a visible
    warning with the reason; the failure is recorded in ``hook_health``).
 
-Guards. More than ``CRASH_LOOP_SPAWNS`` spawns within ``CRASH_LOOP_WINDOW_SEC`` (recorded in the runtime directory)
-stops spawning: the reason becomes ``daemon_unavailable:crash-loop`` and a warning is printed. A daemon started less
-than ``STARTUP_GRACE_SEC`` ago and still alive is waited for, not started a second time.
+Guards. Spawns are recorded in the runtime directory (``spawns.json``), and a daemon announces its own orderly exit
+(memory cap, idle exit, version switch, stop request, signal) in ``exits.json`` before it stops accepting. A spawn
+whose daemon announced no orderly exit counts as a crash: more than ``CRASH_LOOP_SPAWNS`` of them within
+``CRASH_LOOP_WINDOW_SEC`` stops spawning with ``daemon_unavailable:crash-loop``. Planned restarts have their own bound:
+more than ``SELF_DIRECT_DAEMON_RESTART_LIMIT`` (default ``DEFAULT_RESTART_LIMIT``) within the same window stops spawning
+with ``daemon_unavailable:restart-loop`` (a memory cap below the daemon's working set would otherwise restart it after
+every request). Either prints a warning. A daemon started less than ``STARTUP_GRACE_SEC`` ago and still alive is waited
+for, not started a second time.
 
 Versions. A client whose proto or package version is NEWER than the daemon's asks it to drain and then starts the
 successor (the answer of THIS hook is still bounded by the availability budget, and during a switchover other hooks
@@ -45,8 +50,10 @@ FAST_EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSub
 SLOW_EVENTS = ("Stop", "SubagentStop", "SessionStart")
 AVAILABILITY_FAST_SEC = 0.3
 AVAILABILITY_SLOW_SEC = 3.0
-CRASH_LOOP_SPAWNS = 3                  # more than this many spawns ...
+CRASH_LOOP_SPAWNS = 3                  # more than this many spawns without an announced orderly exit ...
 CRASH_LOOP_WINDOW_SEC = 300.0          # ... within this window: do not spawn again
+ENV_RESTART_LIMIT = "SELF_DIRECT_DAEMON_RESTART_LIMIT"
+DEFAULT_RESTART_LIMIT = 30             # more than this many planned restarts within the window: do not spawn again
 STARTUP_GRACE_SEC = 10.0
 POLL_SEC = 0.01
 CONNECT_TIMEOUT_SEC = 0.25
@@ -60,6 +67,8 @@ KEEP_ENV_PREFIXES = ("LC_", "SELF_DIRECT_DAEMON_")
 R_UNAVAILABLE = "daemon_unavailable"
 R_TIMEOUT = "daemon_timeout"
 R_CRASH_LOOP = "daemon_unavailable:crash-loop"
+R_RESTART_LOOP = "daemon_unavailable:restart-loop"
+R_SETTING = "daemon_unavailable:setting"
 R_RUNTIME_DIR = "daemon_unavailable:runtime_dir"
 
 
@@ -177,10 +186,78 @@ def _write_spawns(runtime, records) -> None:
         json.dump(records, stream)
 
 
+def restart_limit(environ=None) -> int:
+    """``SELF_DIRECT_DAEMON_RESTART_LIMIT``: planned restarts allowed within ``CRASH_LOOP_WINDOW_SEC`` (a positive
+    integer, default ``DEFAULT_RESTART_LIMIT``). A malformed value is an error (``ValueError``), never a silent default."""
+    environ = os.environ if environ is None else environ
+    text = environ.get(ENV_RESTART_LIMIT)
+    if text is None:
+        return DEFAULT_RESTART_LIMIT
+    try:
+        value = int(text.strip())
+    except ValueError:
+        raise ValueError(f"invalid value for {ENV_RESTART_LIMIT}") from None
+    if value <= 0:
+        raise ValueError(f"invalid value for {ENV_RESTART_LIMIT}")
+    return value
+
+
+def _read_exits(runtime) -> list[dict]:
+    import json
+    try:
+        fd = runtime.open_file(rundir.EXITS_NAME, os.O_RDONLY)
+    except OSError:
+        return []
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            records = json.load(stream)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(records, list):
+        return []
+    return [r for r in records if isinstance(r, dict) and isinstance(r.get("t"), (int, float))
+            and isinstance(r.get("pid"), int) and not isinstance(r.get("pid"), bool)]
+
+
+def record_planned_exit(runtime, pid: int, reason: str, now: float | None = None) -> None:
+    """The daemon's announcement that it is leaving in order (``exits.json``). Called by the daemon while it holds the
+    instance lock, before it removes its socket, so a client that finds no socket already sees it. Only the lock holder
+    writes the file; it is replaced whole, so a reader never sees a partial list. Raises ``OSError``."""
+    import json
+    now = time.time() if now is None else now
+    records = [r for r in _read_exits(runtime) if 0 <= now - r["t"] < CRASH_LOOP_WINDOW_SEC]
+    records.append({"t": now, "pid": int(pid), "reason": reason})
+    scratch = f"{rundir.EXITS_NAME}.{int(pid)}.tmp"
+    fd = runtime.open_file(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(records, stream)
+    os.replace(scratch, rundir.EXITS_NAME, src_dir_fd=runtime.fd, dst_dir_fd=runtime.fd)
+
+
+def guard_outcome(recent: list[dict], exits: list[dict], limit: int) -> str | None:
+    """``crash_loop``, ``restart_loop`` or None for the spawns of the window. A spawn whose daemon announced an orderly
+    exit after it was started is a planned restart; any other spawn (a daemon that died without announcing, or one that
+    is still around) counts as before."""
+    announced: dict[int, list[float]] = {}
+    for record in exits:
+        announced.setdefault(record["pid"], []).append(record["t"])
+    planned = sum(1 for r in recent if any(t >= r["t"] for t in announced.get(r.get("pid"), ())))
+    if len(recent) - planned > CRASH_LOOP_SPAWNS:
+        return "crash_loop"
+    if planned > limit:
+        return "restart_loop"
+    return None
+
+
 def start_daemon(runtime, environ, python=None, *, reachable=lambda: False):
     """Start a daemon unless something forbids it. ``(outcome, process)``; outcome is ``spawned``, ``busy`` (another
-    client is spawning), ``starting`` (a recent daemon is still coming up), ``up``, ``crash_loop`` or ``failed``."""
+    client is spawning), ``starting`` (a recent daemon is still coming up), ``up``, ``crash_loop``, ``restart_loop``,
+    ``bad_setting`` (``SELF_DIRECT_DAEMON_RESTART_LIMIT`` is malformed) or ``failed``."""
     import fcntl
+    try:
+        limit = restart_limit(environ)
+    except ValueError:
+        return "bad_setting", None
     lock = runtime.open_file(rundir.SPAWN_LOCK_NAME, os.O_RDWR | os.O_CREAT)
     try:
         try:
@@ -193,8 +270,9 @@ def start_daemon(runtime, environ, python=None, *, reachable=lambda: False):
         recent = [r for r in _read_spawns(runtime) if 0 <= now - r["t"] < CRASH_LOOP_WINDOW_SEC]
         if recent and now - recent[-1]["t"] < STARTUP_GRACE_SEC and _pid_alive(recent[-1].get("pid")):
             return "starting", None
-        if len(recent) > CRASH_LOOP_SPAWNS:
-            return "crash_loop", None
+        refused = guard_outcome(recent, _read_exits(runtime), limit)
+        if refused is not None:
+            return refused, None
         try:
             process = _start_process(environ, python)
             recent.append({"t": now, "pid": process.pid})
@@ -338,6 +416,16 @@ def _serve(host, event, payload, argv, environ, python):
                           "another. Hooks fail open until it is repaired (see the daemon log in the runtime directory)."
                           % (CRASH_LOOP_SPAWNS, int(CRASH_LOOP_WINDOW_SEC)), file=sys.stderr)
                     return None, R_CRASH_LOOP
+                if outcome == "restart_loop":
+                    print("tsukkomi: daemon restart-loop guard: more than %d planned daemon restarts within %d s (the "
+                          "daemon log in the runtime directory names the reason; for \"rss\" raise "
+                          "SELF_DIRECT_DAEMON_MAX_RSS_MB); not starting another. Hooks fail open until the window passes."
+                          % (restart_limit(environ), int(CRASH_LOOP_WINDOW_SEC)), file=sys.stderr)
+                    return None, R_RESTART_LOOP
+                if outcome == "bad_setting":
+                    print(f"tsukkomi: invalid value for {ENV_RESTART_LIMIT} (a positive integer); not starting a daemon.",
+                          file=sys.stderr)
+                    return None, R_SETTING
                 spawned = outcome in ("spawned", "failed")
                 if outcome == "failed":
                     return None, R_UNAVAILABLE

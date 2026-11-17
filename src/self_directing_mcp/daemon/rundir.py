@@ -11,7 +11,8 @@ limit, so the check and the use cannot be separated by a swapped path component.
 
 Contents (all mode 0600): ``daemon.sock`` (the Unix socket), ``daemon.lock`` (held for the daemon's lifetime),
 ``daemon.pid``, ``daemon.log`` (event names, sizes, durations, error classes), ``spawn.lock`` and ``spawns.json``
-(spawn times, for the crash-loop guard).
+(spawn times, for the crash-loop guard), ``exits.json`` (the orderly exits daemons announced, so that a planned restart
+is not counted as a crash).
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ PID_NAME = "daemon.pid"
 LOG_NAME = "daemon.log"
 SPAWN_LOCK_NAME = "spawn.lock"
 SPAWNS_NAME = "spawns.json"
+EXITS_NAME = "exits.json"
 SUN_PATH_SAFE = 100          # sockaddr_un.sun_path holds 108 bytes on Linux, 104 on macOS; stay well below
 
 
