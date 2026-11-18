@@ -377,6 +377,11 @@ def _wait_again(host, event, payload, reason) -> bool:
     return state.gating_rule(event, payload) is not None
 
 
+def judged_locally(host, event, payload) -> bool:
+    """Whether the hook's own engine judges this call instead of the daemon. Not decided yet."""
+    return False
+
+
 def serve_hook(host: str, event, payload, argv, *, environ=None, python=None) -> tuple[dict, bool]:
     """``(response, served_by_daemon)``. Always returns a response and never imports the engine. A daemon response
     is already masked; a fail-open response (``False``) carries only class names and contract ids.

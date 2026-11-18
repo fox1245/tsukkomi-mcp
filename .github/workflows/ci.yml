@@ -146,6 +146,7 @@ jobs:
           tests/test_claude_provider.py
           tests/test_claude_hooks.py
           tests/test_hook_transient_audit.py
+          tests/test_hook_gated_local.py
           tests/test_claude_install.py
           tests/test_hook_import_budget.py
           tests/test_hook_settings_parity.py

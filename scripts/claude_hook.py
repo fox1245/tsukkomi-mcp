@@ -167,6 +167,10 @@ def _via_daemon():
     return True
 
 
+def _replay_stdin(text):
+    """Make the payload that was read readable again. Not done yet."""
+
+
 def main():
     if _bypass_grok():
         return
