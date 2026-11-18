@@ -337,12 +337,19 @@ def high_risk_match(contracts_path, session_id, tool_call, provider: str = "agy"
 
 
 def high_risk_hit(contracts_path, session_id, tool_call, provider: str = "agy") -> tuple[str, str] | None:
-    """``(id, type)`` of an enabled ``risk: high`` contract that applies to this call, or None.
+    """``(id, type)`` of an enabled ``risk: high`` contract that applies to this call, or None (see ``high_risk_rule``)."""
+    rule = high_risk_rule(contracts_path, session_id, tool_call, provider)
+    return rule[:2] if rule else None
+
+
+def high_risk_rule(contracts_path, session_id, tool_call, provider: str = "agy") -> tuple[str, str, str] | None:
+    """``(id, type, on_unverified)`` of an enabled ``risk: high`` contract that applies to this call, or None.
 
     Reads the contracts file with ``json`` only. An unreadable file means "unknown", never a guess. A
     high-risk contract with no usable pattern applies to every call, as it does in the audit itself. ``type`` says what
     an unchecked match means: a ``must_not`` trigger is what the contract forbids, a ``must`` trigger only asks for a
-    prerequisite that history may already satisfy.
+    prerequisite that history may already satisfy. ``on_unverified`` is the contract's own declaration of who settles a
+    call it cannot verify: ``agent`` (the default) or ``human``; any other stored value counts as ``human``, the cautious side.
     """
     try:
         document = json.loads(Path(contracts_path).read_text(encoding="utf-8"))
@@ -370,17 +377,21 @@ def high_risk_hit(contracts_path, session_id, tool_call, provider: str = "agy") 
                 # A typed contract stores no regex: it is derived from the guard (the same function the engine loads
                 # it with) and run on the contract engine, whose time limit a hook needs.
                 if _typed_match(rule["path_guard"], text):
-                    return str(rule.get("id")), "must_not"
+                    return str(rule.get("id")), "must_not", _settled_by(rule)
                 continue
             try:
                 judged = shellview.tool_view(text) if shellview is not None and shellview.targets_command(rule) else text
                 if not pattern or re.search(pattern, judged, re.IGNORECASE | re.MULTILINE):
-                    return str(rule.get("id")), str(rule.get("type"))
+                    return str(rule.get("id")), str(rule.get("type")), _settled_by(rule)
             except re.error:
-                return str(rule.get("id")), str(rule.get("type"))
+                return str(rule.get("id")), str(rule.get("type")), _settled_by(rule)
     except Exception:
         return None
     return None
+
+
+def _settled_by(rule) -> str:
+    return "agent" if rule.get("on_unverified", "agent") == "agent" else "human"
 
 
 def _typed_match(guard, text) -> bool:

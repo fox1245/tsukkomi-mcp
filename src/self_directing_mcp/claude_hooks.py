@@ -17,7 +17,10 @@ Default ``confirmed_only`` (``SELF_DIRECT_CLAUDE_ENFORCEMENT``):
 * SubagentStop: judges the subagent's own transcript and reports, but never blocks. A global obligation the user
   set for their session is not a task the subagent was given, so it cannot justify restarting the subagent.
 * Internal errors fail open with a visible warning in every mode and are recorded in ``hook_health``; Stop always
-  allows. Repeated failures show a banner at the next UserPromptSubmit or SessionStart.
+  allows. Repeated failures show a banner at the next UserPromptSubmit or SessionStart. A PreToolUse audit that finds the
+  index busy is repeated inside the hook's budget (``run_hook``); in ``agent_review`` a call that a high-risk ``must``
+  contract gates and whose audit still fails for such a transient cause is refused to the agent
+  (``claude_hook_state.AGENT_RETRY_TEXT``) instead of asked of the user.
 * UserPromptSubmit also fires for scheduled, loop, subagent-report and peer messages, so it is never authority:
   the prompt is not read. Authority comes only from the transcript's recorded origin (the ``claude`` parser).
 
@@ -41,6 +44,7 @@ from self_directing_mcp import hook_policy
 from self_directing_mcp.agy_hook_state import AUDIT_UNAVAILABLE, CHECK_FAILED
 from self_directing_mcp.claude_hook_state import CONTEXT_EVENTS, EVENTS, STOP_EVENTS, ClaudeHookState
 from self_directing_mcp.hook_policy import HookRuntimeError
+from self_directing_mcp.request_control import IndexBusy, RequestStopped, current_request
 from self_directing_mcp.security.mask import mask_value
 
 if TYPE_CHECKING:
@@ -63,7 +67,7 @@ SUBAGENT_NEVER_BLOCKS = "A subagent's stop is reported, never blocked."
 _FINAL_MESSAGE_SCOPES = ("message", "any")     # what the unflushed final assistant text could still satisfy
 SUBAGENT_HISTORY = ("A subagent's own history is not consulted for this call; "
                     "history-dependent obligations stay unverified.")
-AGENT_REVIEW = "agent_review"             # SELF_DIRECT_CLAUDE_ENFORCEMENT: confirmed_only, with agent reviews (``_agent_review``)
+AGENT_REVIEW = hook_state.AGENT_REVIEW     # SELF_DIRECT_CLAUDE_ENFORCEMENT: confirmed_only, with agent reviews (``_agent_review``)
 SUBAGENT_NOT_REVIEWED = ("Agent review covers the main agent's calls only; the user decides this subagent call. ")
 HUMAN_ONLY = "Contract [{ids}] sends an unverified call to the user (on_unverified: human). "
 REVIEW_UNAVAILABLE = "Agent review is unavailable (its store could not be used); the user decides this call. "
@@ -276,8 +280,8 @@ def _agent_review(engine: SelfDirectEngine, call: HookCall, judged: hook_policy.
     no coverage issues, unread bytes or growth during evaluation, and otherwise stays unused without a new refusal while
     the call is refused for retry until the review expires; the ``review_action`` call that records the review of an open
     refusal passes this step (it would otherwise be refused for a review of its own when a contract reads it too); anything
-    else is refused once, with the instructions for the review. Any failure in this step asks the user: a refusal is never
-    issued without a record."""
+    else is refused once, with the instructions for the review. Any failure in this step asks the user (a busy index or an expired request budget is the tool's own transient condition
+    and propagates to ``run_hook`` instead): a refusal is never issued without a record."""
     human = [cid for cid, _rev, who in judged.unverified if who != "agent"]
     if human:
         return {"decision": "ask", "reason": HUMAN_ONLY.format(ids=", ".join(human)) + judged.reason}
@@ -337,6 +341,8 @@ def _agent_review(engine: SelfDirectEngine, call: HookCall, judged: hook_policy.
             source_offset=coverage.get("judged_through_byte") or coverage.get("byte_offset") or 0,
             ttl_sec=engine.settings.agent_review_ttl_sec)
         return {"decision": "deny", "reason": _refusal_text(engine, refusal, judged.reason)}
+    except (IndexBusy, RequestStopped):
+        raise                                # the tool's own transient condition: ``run_hook`` retries, then refuses to the agent
     except Exception:
         return {"decision": "ask", "reason": REVIEW_UNAVAILABLE + judged.reason}
 
@@ -665,7 +671,9 @@ def _dispatch(payload: Any, event: str | None, engine: SelfDirectEngine | None, 
     engine = engine if engine is not None else _new_engine()
     try:
         context.update(mode=engine.settings.claude_enforcement, index_dir=engine.settings.index_dir,
-                       contracts_path=engine.settings.resolve_contracts_path())
+                       contracts_path=engine.settings.resolve_contracts_path(),
+                       retry_window_sec=engine.settings.audit_timeout_sec,
+                       retry_spacing_sec=engine.settings.lock_wait_timeout_sec)
         if event == "SessionStart":
             return handle_session_start(engine, call)
         path = _validated_path(engine, call.session_id, call.transcript_path)
@@ -694,21 +702,57 @@ def dispatch_claude_hook(payload: dict[str, Any], event_name: str | None = None)
     return render(event_name, _dispatch(payload, event_name, None, {}))
 
 
+def _may_retry(context: dict[str, Any], started: float, attempt_started: float) -> float | None:
+    """The pause before the next attempt of an audit that found the index busy, or None when none may follow.
+
+    The retries share the hook's own budget for getting the index, ``audit_timeout_sec`` (counted from the start of the hook;
+    ``_new_engine`` grants a standalone hook the same time as its lease wait), and never run past the request deadline.
+    Every attempt already waits ``lock_wait_timeout_sec`` for the lease, so that is the spacing: an attempt that was refused
+    sooner is paused up to it, and a next attempt is made only if it can end inside the budget. A standalone hook that waited
+    the whole budget for its lease in the first attempt gets no second one. Without these settings in ``context`` (the
+    failure came before they were known) nothing is retried."""
+    window, spacing = context.get("retry_window_sec"), context.get("retry_spacing_sec")
+    if window is None or spacing is None:
+        return None
+    now = _monotonic()
+    next_start = max(now, attempt_started + spacing)
+    limit = started + window
+    control = current_request()
+    if control is not None and control.deadline is not None:
+        limit = min(limit, control.deadline)
+    return next_start - now if next_start + spacing <= limit else None
+
+
 def run_hook(event: str | None, payload: Any, *, engine: SelfDirectEngine | None = None) -> dict[str, Any]:
-    """The hook's whole contract: a masked Claude Code response for every input, never an exception."""
-    context: dict[str, Any] = {}
-    try:
-        response = render(event, _dispatch(payload, event, engine, context))
-    except Exception as exc:
-        # Messages can contain transcript data or credentials; only the class name leaves this function.
-        unavailable = isinstance(exc, HookRuntimeError)
-        cause = exc.__cause__ if unavailable and exc.__cause__ is not None else exc
-        return mask_value(hook_state.fail_open(
-            event, payload, type(cause).__name__, AUDIT_UNAVAILABLE if unavailable else CHECK_FAILED,
-            mode=context.get("mode"), index_dir=context.get("index_dir"), contracts_path=context.get("contracts_path")))
-    if "index_dir" in context:
-        ClaudeHookState(context["index_dir"]).record_success(event)
-    return mask_value(response)  # contract text, reasons and history excerpts may quote secrets
+    """The hook's whole contract: a masked Claude Code response for every input, never an exception.
+
+    A PreToolUse audit that fails because the index is busy (``IndexBusy``, bare or as the cause of a ``HookRuntimeError``)
+    is made again within the bounds of ``_may_retry``. What still fails is answered by ``fail_open``, told whether the cause
+    is transient (the index busy or the request budget spent, both typed) so that ``agent_review`` refuses a gated call to
+    the agent instead of asking the user."""
+    started = _monotonic()
+    while True:
+        context: dict[str, Any] = {}
+        attempt_started = _monotonic()
+        try:
+            response = render(event, _dispatch(payload, event, engine, context))
+        except Exception as exc:
+            # Messages can contain transcript data or credentials; only the class name leaves this function.
+            unavailable = isinstance(exc, HookRuntimeError)
+            cause = exc.__cause__ if unavailable and exc.__cause__ is not None else exc
+            if event == "PreToolUse" and isinstance(cause, IndexBusy):
+                pause = _may_retry(context, started, attempt_started)
+                if pause is not None:
+                    if pause > 0:
+                        _sleep(pause)
+                    continue
+            return mask_value(hook_state.fail_open(
+                event, payload, type(cause).__name__, AUDIT_UNAVAILABLE if unavailable else CHECK_FAILED,
+                mode=context.get("mode"), index_dir=context.get("index_dir"), contracts_path=context.get("contracts_path"),
+                transient=isinstance(cause, (IndexBusy, RequestStopped))))
+        if "index_dir" in context:
+            ClaudeHookState(context["index_dir"]).record_success(event)
+        return mask_value(response)  # contract text, reasons and history excerpts may quote secrets
 
 
 def _event_from_argv(argv: list[str]) -> str | None:

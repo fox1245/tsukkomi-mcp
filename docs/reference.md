@@ -1199,7 +1199,7 @@ The authentication boundary is **the operating-system user**, and nothing finer.
 
 ### Failure behaviour: never an in-process fallback
 
-With the flag on, a hook's whole answer comes from the daemon or from a visible fail-open. If the daemon cannot be reached or started the client **never imports the engine and never judges itself**; it answers through `claude_hook_state.fail_open` / `agy_hook_state.fail_open`: no deny in general, a visible warning with the reason, the failure recorded in `hook_health`, and **a refusal (Claude Code) or an `ask` (AGY) when a contract marked `risk: high` matches the proposed action** (the same policy as every other unavailability).
+With the flag on, a hook's whole answer comes from the daemon or from a visible fail-open. If the daemon cannot be reached or started the client **never imports the engine and never judges itself**; it answers through `claude_hook_state.fail_open` / `agy_hook_state.fail_open`: no deny in general, a visible warning with the reason, the failure recorded in `hook_health`, and **a refusal (Claude Code) or an `ask` (AGY) when a contract marked `risk: high` matches the proposed action** (the same policy as every other unavailability). In `agent_review` mode the Claude Code client refuses a gated `must` prerequisite to the agent instead (`daemon_unavailable` and `daemon_timeout` are transient causes; see [When the audit cannot run](claude-installation.md#when-the-audit-cannot-run)), and a gated call that found no daemon within the availability budget waits for the daemon it started until `AVAILABILITY_SLOW_SEC` (3 s) after the hook began.
 
 | Situation | Reason in the warning |
 |---|---|
