@@ -19,7 +19,7 @@ PORTABLE = {"test_daemon_protocol.py"}
 # runtime and die at import; timings under a sanitizer mean nothing either. The tests that start real processes are
 # therefore skipped there; the in-process daemon tests (the daemon's own threads and sockets) still run.
 SANITIZED = any(name in os.environ.get("LD_PRELOAD", "") for name in ("libasan", "libtsan", "libubsan"))
-REAL_PROCESS_MODULES = {"test_daemon_hooks.py", "test_daemon_mcp.py"}
+REAL_PROCESS_MODULES = {"test_daemon_hooks.py", "test_daemon_mcp.py", "test_daemon_gated_local.py"}
 
 
 def pytest_collection_modifyitems(config, items):
