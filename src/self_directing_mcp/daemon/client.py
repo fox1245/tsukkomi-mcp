@@ -43,6 +43,9 @@ import _socket as socket       # the C module: the socket module's Python layer 
 from self_directing_mcp import __version__
 from self_directing_mcp.daemon import protocol as P, rundir
 
+_monotonic = time.monotonic            # the clock and the pause of the wait in ``serve_hook`` (tests replace them)
+_sleep = time.sleep
+
 ENV_FLAG = "SELF_DIRECT_DAEMON"
 ENV_PYTHON = "SELF_DIRECT_DAEMON_PYTHON"          # interpreter that starts the daemon (default: the checkout's .venv)
 

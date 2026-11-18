@@ -30,7 +30,10 @@ STATE_FILE = "claude-hook-state.sqlite"
 ENV_MODE = "SELF_DIRECT_CLAUDE_ENFORCEMENT"
 # Claude Code also has ``agent_review`` (``settings_core.CLAUDE_ENFORCEMENT_MODES``). After an import failure no review
 # can be checked, so the fallback treats it as ``confirmed_only``: it refuses or asks for a high-risk contract's trigger.
-CLAUDE_MODES = MODES + ("agent_review",)
+AGENT_REVIEW = "agent_review"
+CLAUDE_MODES = MODES + (AGENT_REVIEW,)
+# The kind of the ``hook_health`` row that counts the calls refused to the agent because the audit could not run.
+AGENT_RETRY_REFUSED = "agent_retry_refused"
 EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure",
           "Stop", "SubagentStop")
 CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")

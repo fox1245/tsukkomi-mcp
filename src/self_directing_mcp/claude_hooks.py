@@ -30,6 +30,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Any, TYPE_CHECKING
 
 from self_directing_mcp import contract_paths
@@ -44,6 +45,9 @@ from self_directing_mcp.security.mask import mask_value
 
 if TYPE_CHECKING:
     from self_directing_mcp.engine import SelfDirectEngine
+
+_monotonic = time.monotonic        # the clock and the pause of the retry in ``run_hook`` (tests replace them)
+_sleep = time.sleep
 
 PATH_EVENTS = ("PreToolUse", "Stop", "SubagentStop")        # events that read the transcript
 LIGHT_EVENTS = ("UserPromptSubmit", "PostToolUse", "PostToolUseFailure")   # bookkeeping only; no engine
