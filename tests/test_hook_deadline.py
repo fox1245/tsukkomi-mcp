@@ -208,3 +208,41 @@ def test_an_attempt_that_used_the_whole_bound_leaves_no_time_to_judge_and_is_ref
 def client_module():
     from self_directing_mcp.daemon import client
     return client
+
+
+# --- the handed-over budget can never make the run unbounded --------------------------------------------------------
+
+from self_directing_mcp.daemon.client import ENV_LOCAL_BUDGET  # noqa: E402
+
+KEPT = {"a remainder": ("0.4", 0.4), "the whole bound": (str(BOUND), BOUND)}
+NO_TIME = {"zero": "0", "negative": "-5", "minus zero": "-0.0", "infinite": "inf", "negative infinite": "-inf",
+           "not a number": "nan", "text": "soon", "empty": "", "overflows to infinity": "1e999",
+           "above the bound": str(BOUND + 5), "just above the bound": str(BOUND + 0.01)}
+
+
+@pytest.mark.parametrize("name", sorted(KEPT))
+def test_a_handed_over_remainder_within_the_bound_is_the_run_s_deadline(env, monkeypatch, name):
+    text, seconds = KEPT[name]
+    monkeypatch.setenv("SELF_DIRECT_HOOK_DEADLINE_SEC", str(BOUND))
+    monkeypatch.setenv(ENV_LOCAL_BUDGET, text)
+    before = time.monotonic()
+    deadline = claude_hooks._hook_deadline("PreToolUse")
+    assert deadline is not None and before + seconds - 0.05 <= deadline <= time.monotonic() + seconds + 0.05
+    assert ENV_LOCAL_BUDGET not in __import__("os").environ                 # used once
+
+
+@pytest.mark.parametrize("name", sorted(NO_TIME))
+def test_any_other_handed_over_value_counts_as_no_time_left(env, monkeypatch, name):
+    monkeypatch.setenv("SELF_DIRECT_HOOK_DEADLINE_SEC", str(BOUND))
+    monkeypatch.setenv(ENV_LOCAL_BUDGET, NO_TIME[name])
+    deadline = claude_hooks._hook_deadline("PreToolUse")
+    assert deadline is not None and deadline <= time.monotonic() + 0.05, deadline      # already over, never open-ended
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "soon", str(1000 * BOUND)])
+def test_a_bad_handed_over_value_gives_the_typed_refusal_not_an_unjudged_pass(agent_review, monkeypatch, capsys, value):
+    engine, path = agent_review                      # the lease is free and the prerequisite is satisfied: only the budget decides
+    monkeypatch.setenv(ENV_LOCAL_BUDGET, value)
+    response, elapsed = run_main(monkeypatch, capsys, path)
+    assert elapsed < 2 * BOUND, elapsed
+    assert permission(response) == "deny" and "audit could not run" in json.dumps(response)
