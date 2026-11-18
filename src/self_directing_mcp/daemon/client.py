@@ -43,6 +43,9 @@ import _socket as socket       # the C module: the socket module's Python layer 
 from self_directing_mcp import __version__
 from self_directing_mcp.daemon import protocol as P, rundir
 
+_monotonic = time.monotonic            # the clock and the pause of the wait in ``serve_hook`` (tests replace them)
+_sleep = time.sleep
+
 ENV_FLAG = "SELF_DIRECT_DAEMON"
 ENV_PYTHON = "SELF_DIRECT_DAEMON_PYTHON"          # interpreter that starts the daemon (default: the checkout's .venv)
 
@@ -350,22 +353,51 @@ def _request_frame(host, event, payload, argv, environ) -> dict:
             "env": P.forwarded_environment(environ), "argv": P.forwarded_argv(argv)}
 
 
+TRANSIENT_REASONS = (R_UNAVAILABLE, R_TIMEOUT)     # a daemon that is not there (yet) or did not answer in time: a retry may clear it
+
+
 def _fail_open(host, event, payload, reason):
     kind_unavailable = reason.startswith(("daemon_unavailable", "daemon_timeout"))
     if host == "claude":
         from self_directing_mcp import claude_hook_state as state
-    else:
-        from self_directing_mcp import agy_hook_state as state
+        return state.fail_open(event, payload, reason, state.AUDIT_UNAVAILABLE if kind_unavailable else state.CHECK_FAILED,
+                               transient=reason in TRANSIENT_REASONS)
+    from self_directing_mcp import agy_hook_state as state
     return state.fail_open(event, payload, reason, state.AUDIT_UNAVAILABLE if kind_unavailable else state.CHECK_FAILED)
+
+
+def _wait_again(host, event, payload, reason) -> bool:
+    """Whether a call that found no daemon is worth waiting for it once more: only a Claude Code PreToolUse that a
+    ``risk: high`` contract gates (every other hook costs nothing when it fails open, and waits no longer than before) and
+    only for ``daemon_unavailable`` itself. ``daemon_timeout`` has used the whole response budget already, and the guards
+    (``crash-loop``, ``restart-loop``, a bad setting) are decisions not to start a daemon."""
+    if host != "claude" or event != "PreToolUse" or reason != R_UNAVAILABLE:
+        return False
+    from self_directing_mcp import claude_hook_state as state
+    return state.gating_rule(event, payload) is not None
 
 
 def serve_hook(host: str, event, payload, argv, *, environ=None, python=None) -> tuple[dict, bool]:
     """``(response, served_by_daemon)``. Always returns a response and never imports the engine. A daemon response
-    is already masked; a fail-open response (``False``) carries only class names and contract ids."""
+    is already masked; a fail-open response (``False``) carries only class names and contract ids.
+
+    A gated call (``_wait_again``) that found no daemon within the usual availability budget waits for the daemon that was
+    started, without starting another, until ``AVAILABILITY_SLOW_SEC`` after the hook began: the longest wait the client
+    already allows any event for a daemon to come up, and far inside the response budget."""
     environ = os.environ if environ is None else environ
+    started = _monotonic()
     reason = R_UNAVAILABLE
     try:
         response, reason = _serve(host, event, payload, argv, environ, python)
+        while response is None and _wait_again(host, event, payload, reason):
+            remaining = started + AVAILABILITY_SLOW_SEC - _monotonic()
+            if remaining <= 0:
+                break
+            attempt = _monotonic()
+            response, reason = _serve(host, event, payload, argv, environ, python, spawn=False, wait=remaining)
+            if response is None and _monotonic() - attempt < AVAILABILITY_FAST_SEC:
+                # An answer refused at once is not asked for again at once (nor past the end of the wait).
+                _sleep(max(0.0, min(AVAILABILITY_FAST_SEC, started + AVAILABILITY_SLOW_SEC - _monotonic())))
     except Exception:
         response = None
     if response is not None:
@@ -373,8 +405,9 @@ def serve_hook(host: str, event, payload, argv, *, environ=None, python=None) ->
     return _fail_open(host, event, payload, reason), False
 
 
-def _serve(host, event, payload, argv, environ, python):
-    """``(response, None)`` or ``(None, reason)``."""
+def _serve(host, event, payload, argv, environ, python, *, spawn=True, wait=None):
+    """``(response, None)`` or ``(None, reason)``. ``spawn=False`` only waits (up to ``wait`` seconds, instead of the
+    event's availability budget) for a daemon that is already coming up."""
     try:
         request = _request_frame(host, event, payload, argv, environ)
         P.encode_frame(request)                      # size check before anything is started
@@ -387,7 +420,7 @@ def _serve(host, event, payload, argv, environ, python):
         return None, R_RUNTIME_DIR
     with runtime:
         timeout = response_timeout(environ)
-        deadline = time.monotonic() + availability_budget(event)
+        deadline = time.monotonic() + (availability_budget(event) if wait is None else wait)
         process, spawned = None, False
         while True:
             try:
@@ -409,7 +442,7 @@ def _serve(host, event, payload, argv, environ, python):
                 return None, R_UNAVAILABLE
             if process is not None and process.poll() is not None:
                 return None, R_UNAVAILABLE                       # the daemon we started died at once
-            if not spawned:
+            if spawn and not spawned:
                 outcome, process = start_daemon(runtime, environ, python, reachable=lambda: _reachable(runtime))
                 if outcome == "crash_loop":
                     print("tsukkomi: daemon crash-loop guard: more than %d daemon starts within %d s; not starting "
