@@ -129,7 +129,7 @@ def test_the_attempt_at_a_daemon_that_never_answers_ends_at_the_bound(world, run
         response, served = client.serve_hook("claude", "PreToolUse", body, [], local_fallback=True,
                                              deadline=started + 1.0)
         elapsed = time.monotonic() - started
-        assert served is False and response is None                           # transient, but no time is left to judge it
+        assert served is False and response is not None and "daemon_timeout" in json.dumps(response)    # no time is left to judge it: refused as before
         assert elapsed < 2.5, elapsed                                            # not the request budget of 50 s
     finally:
         fake.close()

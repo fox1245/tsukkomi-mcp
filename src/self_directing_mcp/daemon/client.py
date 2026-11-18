@@ -5,8 +5,12 @@ The flag is ``SELF_DIRECT_DAEMON`` read from the process environment: ``off`` (d
 On a platform without the daemon (anything but Linux) ``on`` behaves as ``off`` and says so once.
 
 When the flag is on, the hook's whole answer comes from the daemon or from a visible fail-open, with one exception: a
-Claude Code PreToolUse call that a ``risk: high`` contract gates (``judged_locally``) is not sent to the daemon at all;
-the hook script judges it with its own engine, as a standalone hook does. There is NO in-process fallback on the hot path:
+Claude Code PreToolUse call that an enabled ``risk: high`` contract gates and whose attempt at the daemon failed for a
+transient cause (no daemon within the availability budget, no answer in time, or a daemon that reports it could not judge the
+call: ``transient_failure``) is handed back to the hook script (``serve_hook(local_fallback=True)``), which judges it with its
+own engine as a standalone hook does, inside what is left of one bound on the whole run (``hook_deadline``). Every call goes to
+the daemon first, and nothing about the gate is read or imported unless that attempt failed. There is NO in-process fallback on
+the hot path otherwise:
 
 1. Connect to the daemon's socket in the verified runtime directory and send ``hello`` plus the hook request in one
    write; the daemon's ``same`` version relation means it judged the request.
@@ -49,6 +53,7 @@ _sleep = time.sleep
 
 ENV_FLAG = "SELF_DIRECT_DAEMON"
 ENV_LOCAL_BUDGET = "TSUKKOMI_HANDOFF_BUDGET_SEC"       # set by the hook script for the standalone path that takes over: seconds left
+ENV_DEADLINE = "SELF_DIRECT_HOOK_DEADLINE_SEC"      # the bound on the whole run of a pre-tool hook (settings_core: hook_deadline_sec)
 ENV_PYTHON = "SELF_DIRECT_DAEMON_PYTHON"          # interpreter that starts the daemon (default: the checkout's .venv)
 
 FAST_EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit", "PreInvocation")
@@ -356,7 +361,7 @@ def _request_frame(host, event, payload, argv, environ) -> dict:
             "env": P.forwarded_environment(environ), "argv": P.forwarded_argv(argv)}
 
 
-TRANSIENT_REASONS = (R_UNAVAILABLE, R_TIMEOUT)     # a daemon that is not there (yet) or did not answer in time: a retry may clear it
+TRANSIENT_REASONS = (R_UNAVAILABLE, R_TIMEOUT, R_TRANSIENT)     # not there (yet), no answer in time, or could not judge now: a retry may clear it
 
 
 def _fail_open(host, event, payload, reason):
@@ -380,42 +385,75 @@ def _wait_again(host, event, payload, reason) -> bool:
     return state.gating_rule(event, payload) is not None
 
 
-def judged_locally(host, event, payload) -> bool:
-    """Whether the hook's own engine judges this call instead of the daemon: a Claude Code PreToolUse that an enabled
-    ``risk: high`` contract gates, by the same typed test that decides between refusing and passing a call whose audit
-    cannot run (``claude_hook_state.gating_rule``: the contracts file read with ``json``, the contract's own fields,
-    no lease; ``advisory`` mode and a contracts file that cannot be read gate nothing). Every other call is the daemon's.
-
-    A gated call is rare and its answer must not depend on the daemon's one-second wait for the index lease (the daemon's
-    engine is shared by every session; a hook that owns its engine waits up to the audit budget for each acquisition).
-    The price is the standalone start-up of that one call. Never raises: what cannot be decided is not gated."""
+def hook_deadline(host: str, event, environ=None) -> float | None:
+    """The moment the whole run of this hook must be over (on this module's clock), or None. Only a Claude Code PreToolUse has
+    one: the host lets the call through when it times that hook out, so the answer, a refusal included, comes before that.
+    ``SELF_DIRECT_HOOK_DEADLINE_SEC`` is the setting ``hook_deadline_sec`` (default: the host's timeout for the hook, less a
+    margin, from ``hook_timeouts``); a value that is not a positive finite number is the default here, and the standalone
+    reader reports it as the settings error it is."""
     if host != "claude" or event != "PreToolUse":
-        return False
-    try:
-        from self_directing_mcp import claude_hook_state as state
-        return state.gating_rule(event, payload) is not None
-    except Exception:
-        return False
+        return None
+    from self_directing_mcp import hook_timeouts          # a twenty-line standard-library module, read by this one event only
+    environ = os.environ if environ is None else environ
+    seconds = hook_timeouts.default_deadline_sec(event)
+    for name, value in environ.items():
+        if name.upper() == ENV_DEADLINE:
+            try:
+                parsed = float(value.strip())
+            except ValueError:
+                break
+            if 0 < parsed < float("inf"):
+                seconds = parsed
+            break
+    return _monotonic() + seconds
 
 
-def serve_hook(host: str, event, payload, argv, *, environ=None, python=None) -> tuple[dict, bool]:
+def time_left(deadline: float | None) -> float | None:
+    return None if deadline is None else deadline - _monotonic()
+
+
+def _judge_locally(host, event, payload, reason, deadline) -> bool:
+    """Whether a failed attempt at the daemon hands the call to the hook's own engine: a Claude Code PreToolUse that an
+    enabled ``risk: high`` contract gates (``claude_hook_state.gating_rule``: the contracts file read with ``json``, the
+    contract's own fields; ``advisory`` mode and an unreadable file gate nothing), the attempt failed for a transient cause, and
+    some of the bound is left. Read only here, after a failure: a call the daemon answered never reaches it."""
+    if host != "claude" or event != "PreToolUse" or reason not in TRANSIENT_REASONS:
+        return False
+    if deadline is not None and deadline - _monotonic() <= 0:
+        return False
+    from self_directing_mcp import claude_hook_state as state
+    return state.gating_rule(event, payload) is not None
+
+
+def serve_hook(host: str, event, payload, argv, *, environ=None, python=None, local_fallback=False,
+               deadline=None) -> tuple[dict | None, bool]:
     """``(response, served_by_daemon)``. Always returns a response and never imports the engine. A daemon response
     is already masked; a fail-open response (``False``) carries only class names and contract ids.
 
-    A gated call (``_wait_again``) that found no daemon within the usual availability budget waits for the daemon that was
-    started, without starting another, until ``AVAILABILITY_SLOW_SEC`` after the hook began: the longest wait the client
-    already allows any event for a daemon to come up, and far inside the response budget."""
+    ``local_fallback``: the caller (the Claude Code hook script) can judge a gated call itself. A gated call (``_judge_locally``)
+    whose attempt failed for a transient cause then returns ``(None, False)`` at once, instead of waiting for a daemon or being
+    refused; the caller judges it. ``deadline`` (this module's clock) bounds the attempt: no wait for the daemon's answer
+    outlasts it, and once it has passed the call is refused as before (the typed transient failure), never judged.
+
+    Without ``local_fallback`` a gated call (``_wait_again``) that found no daemon within the usual availability budget waits for
+    the daemon that was started, without starting another, until ``AVAILABILITY_SLOW_SEC`` after the hook began: the longest wait
+    the client already allows any event for a daemon to come up, and far inside the response budget."""
     environ = os.environ if environ is None else environ
     started = _monotonic()
     reason = R_UNAVAILABLE
     try:
-        response, reason = _serve(host, event, payload, argv, environ, python)
+        response, reason = _serve(host, event, payload, argv, environ, python, bound=deadline)
+        if response is None and local_fallback and _judge_locally(host, event, payload, reason, deadline):
+            return None, False
         while response is None and _wait_again(host, event, payload, reason):
             remaining = started + AVAILABILITY_SLOW_SEC - _monotonic()
+            if deadline is not None:
+                remaining = min(remaining, deadline - _monotonic())
             if remaining <= 0:
                 break
             attempt = _monotonic()
-            response, reason = _serve(host, event, payload, argv, environ, python, spawn=False, wait=remaining)
+            response, reason = _serve(host, event, payload, argv, environ, python, spawn=False, wait=remaining,
+                                      bound=deadline)
             if response is None and _monotonic() - attempt < AVAILABILITY_FAST_SEC:
                 # An answer refused at once is not asked for again at once (nor past the end of the wait).
                 _sleep(max(0.0, min(AVAILABILITY_FAST_SEC, started + AVAILABILITY_SLOW_SEC - _monotonic())))
@@ -426,7 +464,7 @@ def serve_hook(host: str, event, payload, argv, *, environ=None, python=None) ->
     return _fail_open(host, event, payload, reason), False
 
 
-def _serve(host, event, payload, argv, environ, python, *, spawn=True, wait=None):
+def _serve(host, event, payload, argv, environ, python, *, spawn=True, wait=None, bound=None):
     """``(response, None)`` or ``(None, reason)``. ``spawn=False`` only waits (up to ``wait`` seconds, instead of the
     event's availability budget) for a daemon that is already coming up."""
     try:
@@ -441,6 +479,8 @@ def _serve(host, event, payload, argv, environ, python, *, spawn=True, wait=None
         return None, R_RUNTIME_DIR
     with runtime:
         timeout = response_timeout(environ)
+        if bound is not None:
+            timeout = min(timeout, max(0.05, bound - _monotonic()))            # the answer is not waited for past the bound
         deadline = time.monotonic() + (availability_budget(event) if wait is None else wait)
         process, spawned = None, False
         while True:

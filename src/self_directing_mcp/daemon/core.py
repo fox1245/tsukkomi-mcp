@@ -45,6 +45,7 @@ from types import SimpleNamespace
 from self_directing_mcp import __version__
 from self_directing_mcp.daemon import client, envview, protocol as P, rundir
 from self_directing_mcp.daemon.served import ServedLedger
+from self_directing_mcp.request_control import TransientHookFailure
 
 LOCK_WAIT_SEC = 10.0              # a freshly started daemon waits this long for a draining predecessor to exit
 HELLO_TIMEOUT_SEC = 5.0
@@ -516,6 +517,12 @@ class Daemon:
             context = contextvars.copy_context()
             response = await self._loop.run_in_executor(self._hook_pool, context.run, timed,
                                                         host, event, payload, env, argv)
+        except TransientHookFailure:
+            # A gated call whose judgement failed for a cause a retry may clear: reported, not answered, so that the hook
+            # script can judge it with its own engine before anything is refused.
+            self.stats["transient"] += 1
+            self.log.event("hook_transient", host=host)
+            return self._unknown(P.REASON_TRANSIENT)
         except Exception as exc:
             self.stats["hook_errors"] += 1
             self.log.event("hook_error", host=host, error=type(exc).__name__)
@@ -553,7 +560,8 @@ class Daemon:
                 engine = None
             budget = (settings.request_timeout_sec if settings is not None else DEFAULT_REQUEST_TIMEOUT_SEC)
             with request_scope(deadline=time.monotonic() + budget + REQUEST_MARGIN_SEC):
-                response = module.run_hook(event, payload, engine=engine)
+                response = (module.run_hook(event, payload, engine=engine, defer_transient=True) if host == "claude"
+                            else module.run_hook(event, payload, engine=engine))
             response = mask_value(response)
         if settings is not None:
             self.ledger.add(host, settings.index_dir, event if isinstance(event, str) else "none")

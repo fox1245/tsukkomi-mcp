@@ -142,8 +142,8 @@ def _via_daemon():
     try:
         sys.path.insert(0, os.path.join(root, "src"))
         from self_directing_mcp.daemon import client
-        if not client.use_daemon():
-            return False
+        if not client.use_daemon() or client.ENV_LOCAL_BUDGET in os.environ:
+            return False        # (a process that took a call over from a failed attempt does not ask the daemon again)
     except Exception:
         return False        # the package is unusable: the standalone path below reports it, fail-open
     python = os.path.join(root, ".venv", "Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -158,12 +158,16 @@ def _via_daemon():
             response, served = state.fail_open(event, None, type(exc).__name__, state.CHECK_FAILED), False
         else:
             event = _event(argv, payload)
-            if client.judged_locally("claude", event, payload):
-                # A call that a high-risk contract gates is not the daemon's: the standalone path below judges it.
+            deadline = client.hook_deadline("claude", event)
+            response, served = client.serve_hook("claude", event, payload, argv,
+                                                 python=python if os.path.isfile(python) else None,
+                                                 local_fallback=True, deadline=deadline)
+            if response is None:
+                # A call that a high-risk contract gates and whose attempt at the daemon failed for a transient cause is
+                # judged by the standalone path below, with what is left of the bound and the payload readable again.
+                os.environ[client.ENV_LOCAL_BUDGET] = repr(max(0.0, client.time_left(deadline)))
                 _replay_stdin(text)
                 return False
-            response, served = client.serve_hook("claude", event, payload, argv,
-                                                 python=python if os.path.isfile(python) else None)
         json.dump(response if served else _mask(response), sys.stdout)
         sys.stdout.write("\n")
     except Exception as exc:

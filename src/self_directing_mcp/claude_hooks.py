@@ -44,7 +44,9 @@ from self_directing_mcp import hook_policy
 from self_directing_mcp.agy_hook_state import AUDIT_UNAVAILABLE, CHECK_FAILED
 from self_directing_mcp.claude_hook_state import CONTEXT_EVENTS, EVENTS, STOP_EVENTS, ClaudeHookState
 from self_directing_mcp.hook_policy import HookRuntimeError
-from self_directing_mcp.request_control import IndexBusy, RequestStopped, current_request
+from self_directing_mcp.request_control import (
+    IndexBusy, RequestStopped, TransientHookFailure, current_request, request_scope,
+)
 from self_directing_mcp.security.mask import mask_value
 
 if TYPE_CHECKING:
@@ -723,13 +725,19 @@ def _may_retry(context: dict[str, Any], started: float, attempt_started: float) 
     return next_start - now if next_start + spacing <= limit else None
 
 
-def run_hook(event: str | None, payload: Any, *, engine: SelfDirectEngine | None = None) -> dict[str, Any]:
+def run_hook(event: str | None, payload: Any, *, engine: SelfDirectEngine | None = None,
+             defer_transient: bool = False) -> dict[str, Any]:
     """The hook's whole contract: a masked Claude Code response for every input, never an exception.
 
     A PreToolUse audit that fails because the index is busy (``IndexBusy``, bare or as the cause of a ``HookRuntimeError``)
     is made again within the bounds of ``_may_retry``. What still fails is answered by ``fail_open``, told whether the cause
     is transient (the index busy or the request budget spent, both typed) so that ``agent_review`` refuses a gated call to
-    the agent instead of asking the user."""
+    the agent instead of asking the user.
+
+    ``defer_transient`` (the resident daemon asks for it): a PreToolUse call that an enabled ``risk: high`` contract gates and
+    whose judgement still fails for such a transient cause is not answered; ``TransientHookFailure`` is raised instead, so that
+    the caller can have the call judged another way before anything is refused. Every other call, and every other failure, is
+    answered as without it."""
     started = _monotonic()
     while True:
         context: dict[str, Any] = {}
@@ -746,10 +754,15 @@ def run_hook(event: str | None, payload: Any, *, engine: SelfDirectEngine | None
                     if pause > 0:
                         _sleep(pause)
                     continue
+            transient = isinstance(cause, (IndexBusy, RequestStopped))
+            if (defer_transient and transient and event == "PreToolUse"
+                    and hook_state.gating_rule(event, payload, mode=context.get("mode"),
+                                               contracts_path=context.get("contracts_path")) is not None):
+                raise TransientHookFailure(type(cause).__name__) from None
             return mask_value(hook_state.fail_open(
                 event, payload, type(cause).__name__, AUDIT_UNAVAILABLE if unavailable else CHECK_FAILED,
                 mode=context.get("mode"), index_dir=context.get("index_dir"), contracts_path=context.get("contracts_path"),
-                transient=isinstance(cause, (IndexBusy, RequestStopped))))
+                transient=transient))
         if "index_dir" in context:
             ClaudeHookState(context["index_dir"]).record_success(event)
         return mask_value(response)  # contract text, reasons and history excerpts may quote secrets
@@ -763,6 +776,25 @@ def _event_from_argv(argv: list[str]) -> str | None:
 def _event_from_payload(payload: Any) -> str | None:
     name = payload.get("hook_event_name") if isinstance(payload, dict) else None
     return name if name in EVENTS else None
+
+
+def _hook_deadline(event: str | None) -> float | None:
+    """The moment the whole run of a pre-tool hook must be over, on the monotonic clock, or None.
+
+    A host that times a pre-tool hook out lets the call through, so this run is bounded below that timeout
+    (``hook_deadline_sec``) and, because it is a request deadline, every wait for the index lease ends at it
+    (``RequestStopped``: the transient failure that ``agent_review`` refuses to the agent). A hook script that took the call
+    over from a failed attempt at the daemon passes what is left of the bound in the environment; it is used once."""
+    if event != "PreToolUse":
+        return None
+    import os
+    from self_directing_mcp.daemon.client import ENV_LOCAL_BUDGET
+    handed_over = os.environ.pop(ENV_LOCAL_BUDGET, None)
+    try:
+        seconds = float(handed_over) if handed_over is not None else _new_settings().hook_deadline_sec
+    except (ValueError, HookRuntimeError):
+        return None         # the run itself reports unusable settings
+    return time.monotonic() + seconds
 
 
 def main() -> None:
@@ -784,7 +816,9 @@ def main() -> None:
     else:
         if grok_ids.is_grok_payload(payload):
             return          # silent: see _dispatch
-        response = run_hook(event or _event_from_payload(payload), payload)
+        event = event or _event_from_payload(payload)
+        with request_scope(deadline=_hook_deadline(event)):
+            response = run_hook(event, payload)
     json.dump(mask_value(response), sys.stdout)
     sys.stdout.write("\n")
 
