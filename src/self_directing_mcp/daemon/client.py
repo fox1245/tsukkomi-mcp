@@ -48,6 +48,7 @@ _monotonic = time.monotonic            # the clock and the pause of the wait in 
 _sleep = time.sleep
 
 ENV_FLAG = "SELF_DIRECT_DAEMON"
+ENV_LOCAL_BUDGET = "TSUKKOMI_HANDOFF_BUDGET_SEC"       # set by the hook script for the standalone path that takes over: seconds left
 ENV_PYTHON = "SELF_DIRECT_DAEMON_PYTHON"          # interpreter that starts the daemon (default: the checkout's .venv)
 
 FAST_EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit", "PreInvocation")
@@ -70,6 +71,7 @@ KEEP_ENV_PREFIXES = ("LC_", "SELF_DIRECT_DAEMON_")
 
 R_UNAVAILABLE = "daemon_unavailable"
 R_TIMEOUT = "daemon_timeout"
+R_TRANSIENT = P.REASON_TRANSIENT
 R_CRASH_LOOP = "daemon_unavailable:crash-loop"
 R_RESTART_LOOP = "daemon_unavailable:restart-loop"
 R_SETTING = "daemon_unavailable:setting"

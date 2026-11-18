@@ -285,15 +285,8 @@ def test_the_client_against_a_live_daemon_imports_only_the_standard_library(worl
     assert not set(HEAVY_OURS) & loaded, sorted(set(HEAVY_OURS) & loaded)
     assert third_party(report) == [], third_party(report)
     ours = sorted(name for name in loaded if name.startswith("self_directing_mcp"))
-    allowed = {"self_directing_mcp", "self_directing_mcp.daemon", "self_directing_mcp.daemon.client",
-               "self_directing_mcp.daemon.protocol", "self_directing_mcp.daemon.rundir"}
-    if host == "claude":
-        # A Claude Code PreToolUse asks the typed gate whether a high-risk contract gates the call (it would then be judged
-        # by the hook's own engine, not the daemon): the standard-library-only modules of that test, nothing else.
-        allowed |= {"self_directing_mcp.claude_hook_state", "self_directing_mcp.agy_hook_state",
-                    "self_directing_mcp.tool_payload", "self_directing_mcp.audit", "self_directing_mcp.audit.shellview",
-                    "self_directing_mcp.contract_paths"}
-    assert set(ours) <= allowed, ours
+    assert set(ours) <= {"self_directing_mcp", "self_directing_mcp.daemon", "self_directing_mcp.daemon.client",
+                         "self_directing_mcp.daemon.protocol", "self_directing_mcp.daemon.rundir"}, ours
     runtime.stop()
 
 

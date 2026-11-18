@@ -42,6 +42,7 @@ REASON_VERSION_MISMATCH = "version_mismatch"
 REASON_DRAINING = "draining"
 REASON_BAD_REQUEST = "bad_request"
 REASON_INTERNAL = "internal_error"
+REASON_TRANSIENT = "transient_failure"     # a gated call whose judgement failed for a cause a retry may clear
 
 FORWARD_PREFIXES = ("SELF_DIRECT_", "TSUKKOMI_")
 FORWARD_NAMES = frozenset({"HOME", "USERPROFILE", "CODEX_SESSIONS_DIR", "CLAUDE_CONFIG_DIR"})
