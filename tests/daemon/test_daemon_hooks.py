@@ -211,8 +211,13 @@ def test_a_matching_high_risk_contract_is_not_waved_through_when_the_daemon_is_u
     response = asked.json
     decision = (response["hookSpecificOutput"]["permissionDecision"] if host == "claude" else response["decision"])
     reason = (response["hookSpecificOutput"]["permissionDecisionReason"] if host == "claude" else response["reason"])
-    # Claude Code refuses (the audit that would judge the action did not run); AGY still asks the user.
-    assert decision == ("deny" if host == "claude" else "ask") and "no-prod-deploy" in reason and "daemon_unavailable" in reason
+    if host == "claude":
+        # A call that a high-risk contract gates is not the daemon's: the hook judges it with its own engine, so the
+        # missing daemon changes nothing and the answer is the contract's own verdict, not a refusal for an unusable audit.
+        assert decision == "deny" and "no-prod-deploy" in reason and "daemon_unavailable" not in reason
+    else:
+        # AGY still asks the user (the audit that would judge the action did not run).
+        assert decision == "ask" and "no-prod-deploy" in reason and "daemon_unavailable" in reason
     other = world.hook(host, "PreToolUse", "ls", flag="on", index=index, SELF_DIRECT_DAEMON_PYTHON=failing_python)
     # the degraded notice was said with the refusal; it is not repeated for the same session and event
     assert "ask" not in json.dumps(other.json) and "deny" not in json.dumps(other.json)
@@ -280,8 +285,15 @@ def test_the_client_against_a_live_daemon_imports_only_the_standard_library(worl
     assert not set(HEAVY_OURS) & loaded, sorted(set(HEAVY_OURS) & loaded)
     assert third_party(report) == [], third_party(report)
     ours = sorted(name for name in loaded if name.startswith("self_directing_mcp"))
-    assert set(ours) <= {"self_directing_mcp", "self_directing_mcp.daemon", "self_directing_mcp.daemon.client",
-                         "self_directing_mcp.daemon.protocol", "self_directing_mcp.daemon.rundir"}, ours
+    allowed = {"self_directing_mcp", "self_directing_mcp.daemon", "self_directing_mcp.daemon.client",
+               "self_directing_mcp.daemon.protocol", "self_directing_mcp.daemon.rundir"}
+    if host == "claude":
+        # A Claude Code PreToolUse asks the typed gate whether a high-risk contract gates the call (it would then be judged
+        # by the hook's own engine, not the daemon): the standard-library-only modules of that test, nothing else.
+        allowed |= {"self_directing_mcp.claude_hook_state", "self_directing_mcp.agy_hook_state",
+                    "self_directing_mcp.tool_payload", "self_directing_mcp.audit", "self_directing_mcp.audit.shellview",
+                    "self_directing_mcp.contract_paths"}
+    assert set(ours) <= allowed, ours
     runtime.stop()
 
 

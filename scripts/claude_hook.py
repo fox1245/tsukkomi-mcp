@@ -6,7 +6,9 @@ library fallback answers fail-open with a visible warning and records ``hook_hea
 
 With ``SELF_DIRECT_DAEMON=on`` (Linux; experimental, see README "Resident daemon") this script is a thin client of the
 resident daemon: it imports only the standard library and ``self_directing_mcp.daemon.client``, and the answer is the
-daemon's or a visible fail-open (``daemon_unavailable``), never an in-process judgement.
+daemon's or a visible fail-open (``daemon_unavailable``), never an in-process judgement, except for a PreToolUse call
+that a ``risk: high`` contract gates (``client.judged_locally``): that call is never sent to the daemon and is judged by
+the standalone path with the hook's own engine.
 """
 import json
 import os
@@ -133,7 +135,8 @@ def _via_daemon():
     """Resident-daemon mode (``SELF_DIRECT_DAEMON=on``, Linux): a thin client that imports only the standard library
     and the daemon's client module (not even ``pathlib``, whose import costs more than the rest of the client).
     Returns False, having read nothing, when the daemon is not in use. With the daemon in use the answer is the
-    daemon's or a visible fail-open; there is no in-process fallback."""
+    daemon's or a visible fail-open; there is no in-process fallback. The one call that is not the daemon's, a PreToolUse
+    that a ``risk: high`` contract gates, is handed back to the standalone path (False) with its payload readable again."""
     here = os.path.realpath(__file__)
     root = os.path.dirname(os.path.dirname(here))
     try:
@@ -148,12 +151,17 @@ def _via_daemon():
     event = _event(argv, None)
     try:
         try:
-            payload = json.load(sys.stdin)
+            text = sys.stdin.read()
+            payload = json.loads(text)
         except Exception as exc:
             from self_directing_mcp import claude_hook_state as state
             response, served = state.fail_open(event, None, type(exc).__name__, state.CHECK_FAILED), False
         else:
             event = _event(argv, payload)
+            if client.judged_locally("claude", event, payload):
+                # A call that a high-risk contract gates is not the daemon's: the standalone path below judges it.
+                _replay_stdin(text)
+                return False
             response, served = client.serve_hook("claude", event, payload, argv,
                                                  python=python if os.path.isfile(python) else None)
         json.dump(response if served else _mask(response), sys.stdout)
@@ -168,7 +176,18 @@ def _via_daemon():
 
 
 def _replay_stdin(text):
-    """Make the payload that was read readable again. Not done yet."""
+    """Make the payload that was read readable again, for the standalone path that follows: ``sys.stdin`` for this
+    process and, when the script is about to re-execute into the repository's interpreter, file descriptor 0 for the next
+    one (an anonymous in-memory file, so the size of the payload is not bound by a pipe)."""
+    import io
+    sys.stdin = io.StringIO(text)
+    if _reexec_target() is not None:
+        fd = os.memfd_create("hook-stdin")
+        with open(fd, "wb", closefd=False) as stream:
+            stream.write(text.encode("utf-8"))
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.dup2(fd, 0)
+        os.close(fd)
 
 
 def main():

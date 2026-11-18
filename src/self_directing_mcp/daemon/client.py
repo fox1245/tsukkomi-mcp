@@ -4,8 +4,9 @@ through it) never loads the engine, pydantic, NumPy, NeoGraph or the MCP SDK.
 The flag is ``SELF_DIRECT_DAEMON`` read from the process environment: ``off`` (default) leaves everything standalone.
 On a platform without the daemon (anything but Linux) ``on`` behaves as ``off`` and says so once.
 
-When the flag is on, the hook's whole answer comes from the daemon or from a visible fail-open. There is NO in-process
-fallback on the hot path:
+When the flag is on, the hook's whole answer comes from the daemon or from a visible fail-open, with one exception: a
+Claude Code PreToolUse call that a ``risk: high`` contract gates (``judged_locally``) is not sent to the daemon at all;
+the hook script judges it with its own engine, as a standalone hook does. There is NO in-process fallback on the hot path:
 
 1. Connect to the daemon's socket in the verified runtime directory and send ``hello`` plus the hook request in one
    write; the daemon's ``same`` version relation means it judged the request.
@@ -378,8 +379,21 @@ def _wait_again(host, event, payload, reason) -> bool:
 
 
 def judged_locally(host, event, payload) -> bool:
-    """Whether the hook's own engine judges this call instead of the daemon. Not decided yet."""
-    return False
+    """Whether the hook's own engine judges this call instead of the daemon: a Claude Code PreToolUse that an enabled
+    ``risk: high`` contract gates, by the same typed test that decides between refusing and passing a call whose audit
+    cannot run (``claude_hook_state.gating_rule``: the contracts file read with ``json``, the contract's own fields,
+    no lease; ``advisory`` mode and a contracts file that cannot be read gate nothing). Every other call is the daemon's.
+
+    A gated call is rare and its answer must not depend on the daemon's one-second wait for the index lease (the daemon's
+    engine is shared by every session; a hook that owns its engine waits up to the audit budget for each acquisition).
+    The price is the standalone start-up of that one call. Never raises: what cannot be decided is not gated."""
+    if host != "claude" or event != "PreToolUse":
+        return False
+    try:
+        from self_directing_mcp import claude_hook_state as state
+        return state.gating_rule(event, payload) is not None
+    except Exception:
+        return False
 
 
 def serve_hook(host: str, event, payload, argv, *, environ=None, python=None) -> tuple[dict, bool]:
