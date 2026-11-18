@@ -5,8 +5,10 @@ Always exits 0 with a JSON response (exit code 2 would block). If the package ca
 library fallback answers fail-open with a visible warning and records ``hook_health``.
 
 With ``SELF_DIRECT_DAEMON=on`` (Linux; experimental, see README "Resident daemon") this script is a thin client of the
-resident daemon: it imports only the standard library and ``self_directing_mcp.daemon.client``, and the answer is the
-daemon's or a visible fail-open (``daemon_unavailable``), never an in-process judgement.
+resident daemon: it imports only the standard library and ``self_directing_mcp.daemon.client``, and every call is sent to the
+daemon first. The answer is the daemon's or a visible fail-open (``daemon_unavailable``), with one exception: a PreToolUse
+call that a ``risk: high`` contract gates and whose attempt at the daemon failed for a transient cause is judged by the
+standalone path with the hook's own engine, inside what is left of the bound on the whole run (``hook_deadline_sec``).
 """
 import json
 import os
@@ -132,15 +134,17 @@ def _bypass_grok():
 def _via_daemon():
     """Resident-daemon mode (``SELF_DIRECT_DAEMON=on``, Linux): a thin client that imports only the standard library
     and the daemon's client module (not even ``pathlib``, whose import costs more than the rest of the client).
-    Returns False, having read nothing, when the daemon is not in use. With the daemon in use the answer is the
-    daemon's or a visible fail-open; there is no in-process fallback."""
+    Returns False, having read nothing, when the daemon is not in use. With the daemon in use every call is sent to it first
+    and the answer is the daemon's or a visible fail-open. The exception: a PreToolUse that a ``risk: high`` contract gates
+    and whose attempt failed for a transient cause is handed back to the standalone path (False), with its payload readable
+    again and what is left of the bound passed in the environment; that path judges it with the hook's own engine."""
     here = os.path.realpath(__file__)
     root = os.path.dirname(os.path.dirname(here))
     try:
         sys.path.insert(0, os.path.join(root, "src"))
         from self_directing_mcp.daemon import client
-        if not client.use_daemon():
-            return False
+        if not client.use_daemon() or client.ENV_LOCAL_BUDGET in os.environ:
+            return False        # (a process that took a call over from a failed attempt does not ask the daemon again)
     except Exception:
         return False        # the package is unusable: the standalone path below reports it, fail-open
     python = os.path.join(root, ".venv", "Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -148,14 +152,23 @@ def _via_daemon():
     event = _event(argv, None)
     try:
         try:
-            payload = json.load(sys.stdin)
+            text = sys.stdin.read()
+            payload = json.loads(text)
         except Exception as exc:
             from self_directing_mcp import claude_hook_state as state
             response, served = state.fail_open(event, None, type(exc).__name__, state.CHECK_FAILED), False
         else:
             event = _event(argv, payload)
+            deadline = client.hook_deadline("claude", event)
             response, served = client.serve_hook("claude", event, payload, argv,
-                                                 python=python if os.path.isfile(python) else None)
+                                                 python=python if os.path.isfile(python) else None,
+                                                 local_fallback=True, deadline=deadline)
+            if response is None:
+                # A call that a high-risk contract gates and whose attempt at the daemon failed for a transient cause is
+                # judged by the standalone path below, with what is left of the bound and the payload readable again.
+                os.environ[client.ENV_LOCAL_BUDGET] = repr(max(0.0, client.time_left(deadline)))
+                _replay_stdin(text)
+                return False
         json.dump(response if served else _mask(response), sys.stdout)
         sys.stdout.write("\n")
     except Exception as exc:
@@ -165,6 +178,21 @@ def _via_daemon():
         print(reason, file=sys.stderr)
         print(json.dumps(_minimal_fail_open(event, reason)))
     return True
+
+
+def _replay_stdin(text):
+    """Make the payload that was read readable again, for the standalone path that follows: ``sys.stdin`` for this
+    process and, when the script is about to re-execute into the repository's interpreter, file descriptor 0 for the next
+    one (an anonymous in-memory file, so the size of the payload is not bound by a pipe)."""
+    import io
+    sys.stdin = io.StringIO(text)
+    if _reexec_target() is not None:
+        fd = os.memfd_create("hook-stdin")
+        with open(fd, "wb", closefd=False) as stream:
+            stream.write(text.encode("utf-8"))
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.dup2(fd, 0)
+        os.close(fd)
 
 
 def main():

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, ClassVar
 from urllib.parse import urlsplit
 
+from self_directing_mcp import hook_timeouts
 from self_directing_mcp.compressed_source import DEFAULT_MAX_DECOMPRESSED_BYTES
 
 ENV_PREFIX = "SELF_DIRECT_"
@@ -78,6 +79,10 @@ DEFAULT_AUDIT_TIMEOUT_SEC = 8.0
 # than 2 s per contract for; a monitor that runs out is dropped and never kept.
 DEFAULT_AUDIT_FOLD_BUDGET_SEC = 60.0
 DEFAULT_REQUEST_TIMEOUT_SEC = 45.0
+# The bound on the whole run of a pre-tool hook (the attempt at the daemon, the retries and the local judgement together):
+# the host's timeout for that hook, taken from the table the installer writes, less a margin (``hook_timeouts``). A host that
+# times such a hook out lets the call through, so the hook answers before that.
+DEFAULT_HOOK_DEADLINE_SEC = hook_timeouts.default_deadline_sec("PreToolUse")
 # A check of a proposed action whose session grew while it was judged reads the appended records and judges again; no
 # evaluation starts later than this many seconds after the first one ended (0 judges once). A host appends records about
 # the proposed call while its PreToolUse hook runs; a hook's timeout (60 s for Claude Code's PreToolUse) leaves room for
@@ -665,6 +670,8 @@ FIELDS: tuple[FieldSpec, ...] = (
               _static(DEFAULT_AUDIT_FOLD_BUDGET_SEC)),
     FieldSpec("request_timeout_sec", lambda name, text: _to_float(name, text, positive=True),
               _static(DEFAULT_REQUEST_TIMEOUT_SEC)),
+    FieldSpec("hook_deadline_sec", lambda name, text: _to_float(name, text, positive=True, finite=True),
+              _static(DEFAULT_HOOK_DEADLINE_SEC)),
     FieldSpec("action_settle_sec", _to_nonnegative_finite, _static(DEFAULT_ACTION_SETTLE_SEC)),
     FieldSpec("graph_update_timeout_sec", lambda name, text: _to_float(name, text, positive=True, finite=True),
               _static(DEFAULT_GRAPH_UPDATE_TIMEOUT_SEC)),

@@ -21,6 +21,16 @@ class RequestStopped(TimeoutError):
         super().__init__(reason)
 
 
+class TransientHookFailure(Exception):
+    """A hook judgement that a retry may clear (the index busy, the request budget spent) for a call that a high-risk
+    contract gates. Raised by ``run_hook`` only when its caller asked for it (``defer_transient``), so that the caller can
+    judge the call another way instead of answering the refusal; ``error_class`` names the cause and nothing else."""
+
+    def __init__(self, error_class: str):
+        self.error_class = error_class
+        super().__init__(error_class)
+
+
 class IndexBusy(TimeoutError):
     reason = "index_busy"
 

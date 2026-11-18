@@ -24,20 +24,18 @@ import shutil
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from self_directing_mcp.hook_timeouts import HOST_TIMEOUT_SEC      # standard library only; also the base of the hooks' own bound
+
 SCRIPT_NAME = "claude_hook.py"
 ENV_KEY = "SELF_DIRECT_CLAUDE_ENFORCEMENT"
 MODES = ("confirmed_only", "advisory", "enforced", "agent_review")
 # event -> (matcher or None, timeout seconds). Tool events keep "*": reads can be restricted and tool names
-# do not prove the absence of side effects.
-EVENT_SPECS = {
-    "SessionStart": (None, 30),
-    "UserPromptSubmit": (None, 30),
-    "PreToolUse": ("*", 60),
-    "PostToolUse": ("*", 30),
-    "PostToolUseFailure": ("*", 30),
-    "Stop": (None, 120),
-    "SubagentStop": (None, 120),
-}
+# do not prove the absence of side effects. The timeouts are the table the hooks derive their own bound from
+# (``self_directing_mcp.hook_timeouts``).
+_MATCHERS = {"SessionStart": None, "UserPromptSubmit": None, "PreToolUse": "*", "PostToolUse": "*",
+             "PostToolUseFailure": "*", "Stop": None, "SubagentStop": None}
+EVENT_SPECS = {event: (matcher, HOST_TIMEOUT_SEC[event]) for event, matcher in _MATCHERS.items()}
 _OWNED = re.compile(r"(?:^|[\\/\"' ])scripts[\\/]" + re.escape(SCRIPT_NAME) + r"(?=[\"' ]|$)")
 
 
