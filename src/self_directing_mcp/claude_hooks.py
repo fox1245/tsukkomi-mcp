@@ -784,16 +784,26 @@ def _hook_deadline(event: str | None) -> float | None:
     A host that times a pre-tool hook out lets the call through, so this run is bounded below that timeout
     (``hook_deadline_sec``) and, because it is a request deadline, every wait for the index lease ends at it
     (``RequestStopped``: the transient failure that ``agent_review`` refuses to the agent). A hook script that took the call
-    over from a failed attempt at the daemon passes what is left of the bound in the environment; it is used once."""
+    over from a failed attempt at the daemon passes what is left of the bound in the environment; it is used once, and only
+    a finite number from 0 up to the bound is believed. Anything else (not a number, not finite, negative, above the bound)
+    counts as no time left, so the call gets that same typed refusal and the run can never be longer than the bound."""
     if event != "PreToolUse":
         return None
+    import math
     import os
     from self_directing_mcp.daemon.client import ENV_LOCAL_BUDGET
     handed_over = os.environ.pop(ENV_LOCAL_BUDGET, None)
     try:
-        seconds = float(handed_over) if handed_over is not None else _new_settings().hook_deadline_sec
-    except (ValueError, HookRuntimeError):
+        bound = _new_settings().hook_deadline_sec
+    except HookRuntimeError:
         return None         # the run itself reports unusable settings
+    seconds = bound
+    if handed_over is not None:
+        try:
+            left = float(handed_over)
+        except ValueError:
+            left = math.nan
+        seconds = left if math.isfinite(left) and 0.0 <= left <= bound else 0.0
     return time.monotonic() + seconds
 
 

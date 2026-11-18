@@ -5,10 +5,10 @@ Always exits 0 with a JSON response (exit code 2 would block). If the package ca
 library fallback answers fail-open with a visible warning and records ``hook_health``.
 
 With ``SELF_DIRECT_DAEMON=on`` (Linux; experimental, see README "Resident daemon") this script is a thin client of the
-resident daemon: it imports only the standard library and ``self_directing_mcp.daemon.client``, and the answer is the
-daemon's or a visible fail-open (``daemon_unavailable``), never an in-process judgement, except for a PreToolUse call
-that a ``risk: high`` contract gates (``client.judged_locally``): that call is never sent to the daemon and is judged by
-the standalone path with the hook's own engine.
+resident daemon: it imports only the standard library and ``self_directing_mcp.daemon.client``, and every call is sent to the
+daemon first. The answer is the daemon's or a visible fail-open (``daemon_unavailable``), with one exception: a PreToolUse
+call that a ``risk: high`` contract gates and whose attempt at the daemon failed for a transient cause is judged by the
+standalone path with the hook's own engine, inside what is left of the bound on the whole run (``hook_deadline_sec``).
 """
 import json
 import os
@@ -134,9 +134,10 @@ def _bypass_grok():
 def _via_daemon():
     """Resident-daemon mode (``SELF_DIRECT_DAEMON=on``, Linux): a thin client that imports only the standard library
     and the daemon's client module (not even ``pathlib``, whose import costs more than the rest of the client).
-    Returns False, having read nothing, when the daemon is not in use. With the daemon in use the answer is the
-    daemon's or a visible fail-open; there is no in-process fallback. The one call that is not the daemon's, a PreToolUse
-    that a ``risk: high`` contract gates, is handed back to the standalone path (False) with its payload readable again."""
+    Returns False, having read nothing, when the daemon is not in use. With the daemon in use every call is sent to it first
+    and the answer is the daemon's or a visible fail-open. The exception: a PreToolUse that a ``risk: high`` contract gates
+    and whose attempt failed for a transient cause is handed back to the standalone path (False), with its payload readable
+    again and what is left of the bound passed in the environment; that path judges it with the hook's own engine."""
     here = os.path.realpath(__file__)
     root = os.path.dirname(os.path.dirname(here))
     try:
