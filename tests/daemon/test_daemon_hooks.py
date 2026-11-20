@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from self_directing_mcp import __version__
-from self_directing_mcp.daemon import client, core, protocol as P, rundir, served
+from self_directing_mcp.daemon import client, core, identity, protocol as P, rundir, served
 import daemon_support as support
 from daemon_support import AGY_SID, CONTRACTS, HIGH_RISK, SID, UNMET_AUTO_CONTINUE, World
 
@@ -551,7 +551,7 @@ class FakeDaemon:
             try:
                 P.read_frame(conn)
                 P.write_frame(conn, {"op": "hello", "ok": True, "proto": P.PROTO, "package_version": __version__,
-                                     "relation": "same", "draining": False})
+                                     "code_identity": identity.code_identity(), "relation": "same", "draining": False})
                 P.read_frame(conn)
                 self.behaviour(conn)
             except Exception:

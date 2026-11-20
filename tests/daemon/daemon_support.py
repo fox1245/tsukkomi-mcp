@@ -211,7 +211,9 @@ class InProcessDaemon:
             raise self.failure
 
     # -- raw protocol access ---------------------------------------------------------------------------------
-    def connect(self, *, hello: bool = True, version: str | None = None, proto: int | None = None):
+    def connect(self, *, hello: bool = True, version: str | None = None, proto: int | None = None,
+                code_identity=...):
+        """``code_identity``: this package's own by default, ``None`` for a client that sends none."""
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(10)
         runtime = rundir.open_runtime_dir(self.runtime_area.environ(), create=False)
@@ -221,7 +223,11 @@ class InProcessDaemon:
             runtime.close()
         if hello:
             from self_directing_mcp import __version__
-            P.write_frame(sock, P.hello_request("test", version or __version__, proto=proto or P.PROTO))
+            from self_directing_mcp.daemon import identity
+            if code_identity is ...:
+                code_identity = identity.code_identity()
+            P.write_frame(sock, P.hello_request("test", version or __version__, proto=proto or P.PROTO,
+                                                code_identity=code_identity))
             reply = P.read_frame(sock)
             return sock, reply
         return sock, None
