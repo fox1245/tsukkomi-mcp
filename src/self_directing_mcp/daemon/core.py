@@ -42,7 +42,7 @@ from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from self_directing_mcp import __version__
+from self_directing_mcp import __version__, settings_core
 from self_directing_mcp.daemon import client, envview, identity, protocol as P, rundir
 from self_directing_mcp.daemon.served import ServedLedger
 from self_directing_mcp.request_control import TransientHookFailure
@@ -78,12 +78,25 @@ class DaemonConfig:
 
     @classmethod
     def from_environment(cls, environ=None) -> "DaemonConfig":
-        """``SELF_DIRECT_DAEMON_IDLE_EXIT_SEC`` (900), ``..._MAX_RSS_MB`` (400), ``..._SESSION_BOUND`` (16) and
-        ``..._DEFER_DERIVED`` (``on``, or ``off`` to write every derived row synchronously as a standalone process does).
+        """The daemon's own limits, from three layers (highest first): the environment variables
+        ``SELF_DIRECT_DAEMON_IDLE_EXIT_SEC`` (900), ``..._MAX_RSS_MB`` (400), ``..._SESSION_BOUND`` (16) and
+        ``..._DEFER_DERIVED`` (``on``, or ``off`` to write every derived row synchronously as a standalone process does);
+        the ``[daemon]`` table of the user configuration with the same four keys in lower case (``settings_core``); the
+        defaults shown.
 
-        A malformed value is an error (``ValueError``), never a silent default."""
+        The file is what makes a daemon's limits independent of which client started it: a client passes on only the
+        variables of its own environment, and the hook commands and the MCP relay of one machine do not share one. With no
+        ``environ`` given the file is the user configuration; with a mapping given by the caller it is the file that mapping
+        names in ``SELF_DIRECT_CONFIG_FILE`` and none otherwise.
+
+        A malformed value in either layer is an error (``ValueError``), never a silent default."""
+        explicit = environ is not None
         environ = os.environ if environ is None else environ
         config = cls()
+        named = environ.get("SELF_DIRECT_CONFIG_FILE")
+        if not explicit or named:                   # no mapping given: the user configuration; a mapping: the file it names
+            for key, value in settings_core.toml_daemon_settings(named or None).items():
+                setattr(config, key, (value == "on") if key == "defer_derived" else value)
         text = environ.get("SELF_DIRECT_DAEMON_DEFER_DERIVED")
         if text is not None:
             if text.strip().lower() not in ("on", "off"):
@@ -316,6 +329,7 @@ class Daemon:
                 "connections": self.connections, "engines": len(self.engines),
                 "integrity_workers": self.engines.worker_count(), "draining": self.draining,
                 "drain_reason": self.drain_reason, "rss_mb": round(read_rss_mb(), 1),
+                "max_rss_mb": self.config.max_rss_mb,
                 "requests": dict(self.stats)}
 
     # -- startup ---------------------------------------------------------------------------------------------------
@@ -371,7 +385,8 @@ class Daemon:
                 self._loop.add_signal_handler(number, self.begin_drain, "signal")
         threading.Thread(target=self._warm, name="tsukkomi-warm", daemon=True).start()
         idle_task = asyncio.create_task(self._watch_idle())
-        self.log.event("started", pid=os.getpid(), version=self.version, proto=self.proto)
+        self.log.event("started", pid=os.getpid(), version=self.version, proto=self.proto,
+                       max_rss_mb=self.config.max_rss_mb)
         try:
             await self._stop.wait()
         finally:

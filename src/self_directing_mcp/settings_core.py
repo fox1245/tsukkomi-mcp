@@ -139,6 +139,11 @@ CLAUDE_TOML_KEYS = {
     "mcp_server_name": "mcp_server_name",
 }
 
+# The ``[daemon]`` table: limits of the resident daemon, which belong to the daemon and not to the client that starts it.
+# Each key is the lower-case form of the environment variable ``SELF_DIRECT_DAEMON_<KEY>`` that overrides it.
+DAEMON_TOML_NUMBERS = {"idle_exit_sec": float, "max_rss_mb": float, "session_bound": int}
+DAEMON_TOML_FLAGS = ("defer_derived",)
+
 
 def check_mcp_server_name(name: object) -> str:
     """A Claude Code MCP server registration name as it appears in ``mcp__<name>__<tool>``."""
@@ -295,8 +300,43 @@ def toml_path(value: object, directory: Path) -> Path:
     return (path if path.is_absolute() else directory / path).resolve()
 
 
+def toml_daemon_settings(source: Path | None = None) -> dict[str, object]:
+    """The user TOML ``[daemon]`` table as ``{key: value}`` (``ValueError`` when unusable; ``{}`` when there is none).
+
+    ``source`` names the file; ``None`` is the user configuration (``get_config_path``). A missing file is no table. The
+    values are checked as the environment variables of the same names are: a number is finite and positive, an integer is
+    an integer, a flag is ``"on"`` or ``"off"``; anything else, an unknown key included, is an error that names no value."""
+    path = get_config_path() if source is None else Path(source)
+    try:
+        with path.open("rb") as stream:
+            document = tomllib.load(stream)
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        raise ValueError("Unable to read valid TOML daemon configuration") from None
+    table = document.get("daemon", {})
+    if not isinstance(table, dict) or set(table) - set(DAEMON_TOML_NUMBERS) - set(DAEMON_TOML_FLAGS):
+        raise ValueError("Invalid or unknown TOML daemon setting")
+    checked: dict[str, object] = {}
+    for key, value in table.items():
+        if key in DAEMON_TOML_FLAGS:
+            if value not in ("on", "off"):
+                raise ValueError(f"TOML daemon {key} must be \"on\" or \"off\"")
+            checked[key] = value
+            continue
+        kind = DAEMON_TOML_NUMBERS[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or (kind is int and not isinstance(value, int)):
+            raise ValueError(f"TOML daemon {key} must be a positive number")
+        if not value > 0 or value != value or value == float("inf"):
+            raise ValueError(f"TOML daemon {key} must be a positive number")
+        checked[key] = kind(value)
+    return checked
+
+
 def toml_path_settings() -> dict[str, object]:
-    """The user TOML ``[paths]``, ``[graph]`` and ``[claude]`` tables (raises ``ValueError`` when unusable)."""
+    """The user TOML ``[paths]``, ``[graph]`` and ``[claude]`` tables (raises ``ValueError`` when unusable).
+
+    A ``[daemon]`` table is read by ``toml_daemon_settings``; here it is only allowed to exist."""
     source = get_config_path()
     try:
         with source.open("rb") as stream:
@@ -307,8 +347,8 @@ def toml_path_settings() -> dict[str, object]:
         return {}
     except (OSError, UnicodeError, tomllib.TOMLDecodeError):
         raise ValueError("Unable to read valid TOML path configuration") from None
-    if set(document) - {"paths", "graph", "claude"}:
-        raise ValueError("TOML path configuration only supports [paths], [graph] and [claude]")
+    if set(document) - {"paths", "graph", "claude", "daemon"}:
+        raise ValueError("TOML path configuration only supports [paths], [graph], [claude] and [daemon]")
     paths = document.get("paths", {})
     if not isinstance(paths, dict) or set(paths) - PATH_FIELDS:
         raise ValueError("Invalid or unknown TOML path setting")
