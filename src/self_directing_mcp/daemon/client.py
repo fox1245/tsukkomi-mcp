@@ -18,7 +18,7 @@ the hot path otherwise:
    ``/dev/null``) unless the guards forbid it, and wait for its socket for a bounded time (``AVAILABILITY_FAST_SEC``
    for ``PreToolUse`` / ``PostToolUse`` / ``UserPromptSubmit`` / ``PreInvocation``, ``AVAILABILITY_SLOW_SEC`` for
    ``Stop`` / ``SubagentStop`` / ``SessionStart``).
-3. Still unavailable, a dead daemon mid-request, ``queue_full``, ``version_mismatch``: the host's fail-open response
+3. Still unavailable, a dead daemon mid-request, ``queue_full``, ``version_mismatch``, ``code_mismatch``: the host's fail-open response
    from ``claude_hook_state.fail_open`` / ``agy_hook_state.fail_open`` (no deny except for Claude Code, which refuses a call
    that matches the trigger of a contract marked ``risk: high`` because the audit did not run, and AGY asks; a visible
    warning with the reason; the failure is recorded in ``hook_health``).
@@ -35,6 +35,13 @@ for, not started a second time.
 Versions. A client whose proto or package version is NEWER than the daemon's asks it to drain and then starts the
 successor (the answer of THIS hook is still bounded by the availability budget, and during a switchover other hooks
 fail open). An OLDER or mixed client never replaces the daemon: its hooks fail open with ``version_mismatch``.
+
+Code identity. The version string names a release, not the files, so the hello exchange also carries a digest of the
+package's source files (``identity``). Equal proto and version with another identity (or one that either side cannot name) is
+not ``same``: the daemon does not judge the request, and the client does not use anything the daemon answered (a daemon from
+before identities judges it and says ``same``; its answer is dropped here). The client never asks that daemon to drain, because
+it cannot know which code is newer; the daemon leaves by its own rules or by ``--stop``. A Claude Code hook (``local_fallback``)
+then judges the call itself, for every event, as the standalone hook does; an AGY hook fails open with ``code_mismatch``.
 """
 from __future__ import annotations
 
@@ -46,7 +53,7 @@ import time
 import _socket as socket       # the C module: the socket module's Python layer costs ~2.5 ms of import per hook process
 
 from self_directing_mcp import __version__
-from self_directing_mcp.daemon import protocol as P, rundir
+from self_directing_mcp.daemon import identity, protocol as P, rundir
 
 _monotonic = time.monotonic            # the clock and the pause of the wait in ``serve_hook`` (tests replace them)
 _sleep = time.sleep
@@ -77,6 +84,7 @@ KEEP_ENV_PREFIXES = ("LC_", "SELF_DIRECT_DAEMON_")
 R_UNAVAILABLE = "daemon_unavailable"
 R_TIMEOUT = "daemon_timeout"
 R_TRANSIENT = P.REASON_TRANSIENT
+R_CODE_MISMATCH = P.REASON_CODE_MISMATCH       # the daemon runs other code under the same version: this client judges for itself
 R_CRASH_LOOP = "daemon_unavailable:crash-loop"
 R_RESTART_LOOP = "daemon_unavailable:restart-loop"
 R_SETTING = "daemon_unavailable:setting"
@@ -325,14 +333,28 @@ def _connect(runtime) -> socket.socket:
     return sock
 
 
+def own_identity() -> str | None:
+    """The code identity this client sends and compares (computed from the package's files once per process; a test seam)."""
+    return identity.code_identity()
+
+
 def _exchange(runtime, request: dict, timeout: float) -> dict:
-    """Hello + request on one connection. Returns the daemon's result frame (with ``relation`` merged in)."""
+    """Hello + request on one connection. Returns the daemon's result frame (with ``relation`` merged in).
+
+    The relation is judged here as well as by the daemon: a daemon from before identities calls equal versions ``same``
+    and judges the request. When the code differs (or either side cannot name its own), the daemon's answer is not read
+    and not used: the result is ``code_mismatch``."""
+    own = own_identity()
     sock = _connect(runtime)
     try:
         try:
-            sock.sendall(P.encode_frame(P.hello_request("hook", __version__)) + P.encode_frame(request))
+            sock.sendall(P.encode_frame(P.hello_request("hook", __version__, code_identity=own)) + P.encode_frame(request))
             sock.settimeout(HELLO_TIMEOUT_SEC)
             hello = P.read_frame(sock)
+            relation = P.relation_with_code(hello.get("relation"), own, P.identity_of(hello))
+            if relation == P.RELATION_CODE:
+                return {"op": "result", "ok": False, "status": "unknown", "reason": P.REASON_CODE_MISMATCH,
+                        "relation": relation, "draining": bool(hello.get("draining"))}
             sock.settimeout(timeout)
             result = P.read_frame(sock)
         except P.ProtocolError as exc:
@@ -417,6 +439,8 @@ def _judge_locally(host, event, payload, reason, deadline) -> bool:
     enabled ``risk: high`` contract gates (``claude_hook_state.gating_rule``: the contracts file read with ``json``, the
     contract's own fields; ``advisory`` mode and an unreadable file gate nothing), the attempt failed for a transient cause, and
     some of the bound is left. Read only here, after a failure: a call the daemon answered never reaches it."""
+    if host == "claude" and reason == R_CODE_MISMATCH:
+        return deadline is None or deadline - _monotonic() > 0      # every event: other code is no cause for a retry
     if host != "claude" or event != "PreToolUse" or reason not in TRANSIENT_REASONS:
         return False
     if deadline is not None and deadline - _monotonic() <= 0:

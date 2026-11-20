@@ -6,8 +6,9 @@ before anything is allocated.
 
 Operations (``op``):
 
-* ``hello``  -> ``{proto, package_version, index_schema, parser_versions, evaluator_version, features, pid}``.
-  Always the first frame on a connection; its layout is stable across protocol versions.
+* ``hello``  -> ``{proto, package_version, code_identity, index_schema, parser_versions, evaluator_version, features, pid}``.
+  Always the first frame on a connection; its layout is stable across protocol versions. ``code_identity`` is the digest
+  of the sender's source files (``identity``); the request carries it too.
 * ``hook``   -> ``{host, event, payload, env, argv}``; the answer carries the host's hook response unchanged.
 * ``drain``  -> a NEWER client asks an older daemon to finish its in-flight requests and exit.
 * ``status`` -> counters (no request or response content).
@@ -15,7 +16,7 @@ Operations (``op``):
   (the MCP stdio framing) in both directions until either side closes it.
 
 Failures the daemon reports are ``{"ok": false, "status": "unknown", "reason": <name>}``: ``queue_full``,
-``version_mismatch``, ``draining``, ``bad_request``, ``internal_error``. A hook client turns every one of them into
+``version_mismatch``, ``code_mismatch``, ``draining``, ``bad_request``, ``internal_error``. A hook client turns every one of them into
 its host's fail-open response; none of them is a compliance verdict.
 
 The environment a client forwards is a whitelist (``forwarded_environment``): ``SELF_DIRECT_*``, ``TSUKKOMI_*``,
@@ -39,6 +40,8 @@ HOSTS = ("claude", "agy")
 
 REASON_QUEUE_FULL = "queue_full"
 REASON_VERSION_MISMATCH = "version_mismatch"
+REASON_CODE_MISMATCH = "code_mismatch"     # the same proto and version, other (or unnamed) code: never judged, never drained
+RELATION_CODE = "code"
 REASON_DRAINING = "draining"
 REASON_BAD_REQUEST = "bad_request"
 REASON_INTERNAL = "internal_error"
@@ -155,8 +158,27 @@ def compare(client: tuple[int, tuple[int, ...]], daemon: tuple[int, tuple[int, .
     return "newer" if ahead else "older" if behind else "same"
 
 
-def hello_request(role: str, package_version: str, *, proto: int = PROTO) -> dict:
-    return {"op": OP_HELLO, "proto": proto, "package_version": package_version, "role": role}
+def hello_request(role: str, package_version: str, *, proto: int = PROTO, code_identity: str | None = None) -> dict:
+    frame = {"op": OP_HELLO, "proto": proto, "package_version": package_version, "role": role}
+    if code_identity is not None:
+        frame["code_identity"] = code_identity
+    return frame
+
+
+def identity_of(frame: dict) -> str | None:
+    """The code identity a frame names: a non-empty string, else ``None`` (a peer from before identities, or one that
+    could not read its own files)."""
+    value = frame.get("code_identity")
+    return value if isinstance(value, str) and value else None
+
+
+def relation_with_code(relation: str, own: str | None, other: str | None) -> str:
+    """The version ``relation`` unless it is ``same``: equal proto and version are the same release, not the same code.
+    Then the two identities must both exist and be equal, or the relation is ``code``. A different version decides first
+    (``newer``, ``older``, ``mixed`` stay as they are). The relation is never ``same`` for a peer that cannot name its code."""
+    if relation == "same" and not (own is not None and own == other):
+        return RELATION_CODE
+    return relation
 
 
 def versions_of(frame: dict) -> tuple[int, tuple[int, ...]]:

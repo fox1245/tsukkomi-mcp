@@ -286,6 +286,7 @@ def test_the_client_against_a_live_daemon_imports_only_the_standard_library(worl
     assert third_party(report) == [], third_party(report)
     ours = sorted(name for name in loaded if name.startswith("self_directing_mcp"))
     allowed = {"self_directing_mcp", "self_directing_mcp.daemon", "self_directing_mcp.daemon.client",
+               "self_directing_mcp.daemon.identity",          # the digest of the package's own files (stdlib only)
                "self_directing_mcp.daemon.protocol", "self_directing_mcp.daemon.rundir"}
     if host == "claude":
         allowed.add("self_directing_mcp.hook_timeouts")        # the bound on a pre-tool hook: a table of numbers, nothing more

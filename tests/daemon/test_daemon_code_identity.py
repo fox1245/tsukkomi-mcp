@@ -49,6 +49,15 @@ def test_the_identity_is_a_digest_of_the_source_files_and_follows_every_byte(tmp
         assert identity.digest_of(package(tmp_path / str(len(str(changed))), changed)) != first
 
 
+def test_the_digest_is_the_documented_sha256_framing(tmp_path):
+    import hashlib
+    root = package(tmp_path, {"b.py": b"two", "a/c.py": b"one"})
+    expected = hashlib.sha256()
+    for name, content in (("a/c.py", b"one"), ("b.py", b"two")):
+        expected.update(name.encode() + b"\0" + len(content).to_bytes(8, "big") + content)
+    assert identity.digest_of(root) == expected.hexdigest()
+
+
 def test_the_framing_cannot_be_confused_by_moving_bytes_between_a_name_and_a_content(tmp_path):
     one = identity.digest_of(package(tmp_path / "one", {"a.py": b"bc", "ab.py": b"c"}))
     two = identity.digest_of(package(tmp_path / "two", {"a.py": b"b", "abc.py": b"c"}))
