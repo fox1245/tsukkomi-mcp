@@ -462,7 +462,7 @@ def _run_update_pipeline(*, session_id, provider, events, api_key, model,
     )
     extracted_events: list[dict[str, Any]] = list(events or [])
     control = current_request()
-    callback_error = None
+    failures: list[BaseException] = []     # emptied before this function leaves: see ``neograph_runtime.run_stages``
     transport = _Transport(
         api_key,
         model,
@@ -474,13 +474,12 @@ def _run_update_pipeline(*, session_id, provider, events, api_key, model,
     def callback(method):
         @wraps(method)
         def invoke(*args, **kwargs):
-            nonlocal callback_error
             with request_scope(control):
                 try:
                     check_request()
                     return method(*args, **kwargs)
                 except Exception as exc:
-                    callback_error = exc
+                    failures.append(exc)
                     raise
         return invoke
 
@@ -604,15 +603,18 @@ def _run_update_pipeline(*, session_id, provider, events, api_key, model,
     check_request()
     thread_id = f"graphrag:{provider}:{session_id}:{uuid.uuid4().hex}"
     try:
-        result = engine.run(ng.RunConfig(thread_id=thread_id,
-                                       input={"events": events, "session_id": session_id},
-                                       resume_if_exists=False))
-    except Exception as exc:
-        if callback_error is not None:
-            raise callback_error from exc
-        raise
-    if callback_error is not None:
-        raise callback_error
+        try:
+            result = engine.run(ng.RunConfig(thread_id=thread_id,
+                                           input={"events": events, "session_id": session_id},
+                                           resume_if_exists=False))
+        except Exception as exc:
+            if failures:
+                raise failures[-1] from exc
+            raise
+        if failures:
+            raise failures[-1]
+    finally:
+        failures.clear()
     # Preserve native completed receipts/observed admitted commit outcomes.
     # Response expiry is handled by the dispatcher, not fake pipeline rollback.
     channels = result.output["channels"]

@@ -42,8 +42,8 @@ from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from self_directing_mcp import __version__
-from self_directing_mcp.daemon import client, envview, protocol as P, rundir
+from self_directing_mcp import __version__, settings_core
+from self_directing_mcp.daemon import client, envview, identity, protocol as P, rundir
 from self_directing_mcp.daemon.served import ServedLedger
 from self_directing_mcp.request_control import TransientHookFailure
 
@@ -78,12 +78,25 @@ class DaemonConfig:
 
     @classmethod
     def from_environment(cls, environ=None) -> "DaemonConfig":
-        """``SELF_DIRECT_DAEMON_IDLE_EXIT_SEC`` (900), ``..._MAX_RSS_MB`` (400), ``..._SESSION_BOUND`` (16) and
-        ``..._DEFER_DERIVED`` (``on``, or ``off`` to write every derived row synchronously as a standalone process does).
+        """The daemon's own limits, from three layers (highest first): the environment variables
+        ``SELF_DIRECT_DAEMON_IDLE_EXIT_SEC`` (900), ``..._MAX_RSS_MB`` (400), ``..._SESSION_BOUND`` (16) and
+        ``..._DEFER_DERIVED`` (``on``, or ``off`` to write every derived row synchronously as a standalone process does);
+        the ``[daemon]`` table of the user configuration with the same four keys in lower case (``settings_core``); the
+        defaults shown.
 
-        A malformed value is an error (``ValueError``), never a silent default."""
+        The file is what makes a daemon's limits independent of which client started it: a client passes on only the
+        variables of its own environment, and the hook commands and the MCP relay of one machine do not share one. With no
+        ``environ`` given the file is the user configuration; with a mapping given by the caller it is the file that mapping
+        names in ``SELF_DIRECT_CONFIG_FILE`` and none otherwise.
+
+        A malformed value in either layer is an error (``ValueError``), never a silent default."""
+        explicit = environ is not None
         environ = os.environ if environ is None else environ
         config = cls()
+        named = environ.get("SELF_DIRECT_CONFIG_FILE")
+        if not explicit or named:                   # no mapping given: the user configuration; a mapping: the file it names
+            for key, value in settings_core.toml_daemon_settings(named or None).items():
+                setattr(config, key, (value == "on") if key == "defer_derived" else value)
         text = environ.get("SELF_DIRECT_DAEMON_DEFER_DERIVED")
         if text is not None:
             if text.strip().lower() not in ("on", "off"):
@@ -265,11 +278,14 @@ class Engines:
 
 class Daemon:
     def __init__(self, runtime: rundir.RuntimeDir, config: DaemonConfig | None = None, *, hook_runner=None,
-                 engine_factory=None, version: str = __version__, proto: int = P.PROTO,
+                 engine_factory=None, version: str = __version__, proto: int = P.PROTO, code_identity=...,
                  install_signals: bool = False, exit_watchdog: bool = False, mcp_server=None) -> None:
         self.runtime = runtime
         self.config = config or DaemonConfig()
         self.version, self.proto = version, proto
+        # The digest of this package's source files; ``None`` (it cannot be read) equals nothing. ``...`` is the process's own.
+        self.code_identity = identity.code_identity() if code_identity is ... else code_identity
+        self._code_mismatch_logged: set[str] = set()
         self.log = DaemonLog(runtime)
         self.engines = Engines(engine_factory, self.log, defer_derived=self.config.defer_derived)
         self.ledger = ServedLedger()
@@ -313,6 +329,7 @@ class Daemon:
                 "connections": self.connections, "engines": len(self.engines),
                 "integrity_workers": self.engines.worker_count(), "draining": self.draining,
                 "drain_reason": self.drain_reason, "rss_mb": round(read_rss_mb(), 1),
+                "max_rss_mb": self.config.max_rss_mb,
                 "requests": dict(self.stats)}
 
     # -- startup ---------------------------------------------------------------------------------------------------
@@ -368,7 +385,8 @@ class Daemon:
                 self._loop.add_signal_handler(number, self.begin_drain, "signal")
         threading.Thread(target=self._warm, name="tsukkomi-warm", daemon=True).start()
         idle_task = asyncio.create_task(self._watch_idle())
-        self.log.event("started", pid=os.getpid(), version=self.version, proto=self.proto)
+        self.log.event("started", pid=os.getpid(), version=self.version, proto=self.proto,
+                       max_rss_mb=self.config.max_rss_mb)
         try:
             await self._stop.wait()
         finally:
@@ -435,14 +453,17 @@ class Daemon:
 
     def hello_reply(self, relation: str) -> dict:
         return {"op": P.OP_HELLO, "ok": True, "proto": self.proto, "package_version": self.version,
-                **self.info, "features": ["hook", "mcp", "drain", "status"], "pid": os.getpid(),
+                "code_identity": self.code_identity, **self.info, "features": ["hook", "mcp", "drain", "status"], "pid": os.getpid(),
                 "draining": self.draining, "relation": relation}
 
     async def _serve_connection(self, reader, writer) -> None:
         hello = await asyncio.wait_for(P.read_frame_async(reader), HELLO_TIMEOUT_SEC)
         if hello.get("op") != P.OP_HELLO:
             raise P.ProtocolError("first frame must be hello")
-        relation = P.compare(P.versions_of(hello), self.versions())
+        relation = P.relation_with_code(P.compare(P.versions_of(hello), self.versions()), self.code_identity,
+                                        P.identity_of(hello))
+        if relation == P.RELATION_CODE:
+            self._note_code_mismatch(P.identity_of(hello))
         await P.write_frame_async(writer, self.hello_reply(relation))
         while True:
             frame = await P.read_frame_async(reader)
@@ -460,6 +481,19 @@ class Daemon:
                 reply = self._unknown(P.REASON_BAD_REQUEST)
             await P.write_frame_async(writer, reply)
 
+    def _note_code_mismatch(self, client_identity: str | None) -> None:
+        """Log a client of other code by its class (``absent`` or ``different``), the first of each class only; the counter
+        in ``stats`` counts every request refused. No identity value, path or payload is logged."""
+        kind = "absent" if client_identity is None else "different"
+        if kind not in self._code_mismatch_logged:
+            self._code_mismatch_logged.add(kind)
+            self.log.event("code_mismatch", client=kind)
+
+    @staticmethod
+    def _refusal(relation: str) -> dict:
+        """What a client that is not ``same`` is told: it names the kind of difference."""
+        return Daemon._unknown(P.REASON_CODE_MISMATCH if relation == P.RELATION_CODE else P.REASON_VERSION_MISMATCH)
+
     @staticmethod
     def _unknown(reason: str) -> dict:
         return {"op": "result", "ok": False, "status": "unknown", "reason": reason}
@@ -473,7 +507,9 @@ class Daemon:
 
     async def _op_mcp(self, frame, relation, reader, writer) -> None:
         if relation != "same":
-            await P.write_frame_async(writer, {**self._unknown(P.REASON_VERSION_MISMATCH), "op": "mcp"})
+            if relation == P.RELATION_CODE:
+                self.stats["code_mismatch"] += 1
+            await P.write_frame_async(writer, {**self._refusal(relation), "op": "mcp"})
             return
         if self.draining:
             await P.write_frame_async(writer, {**self._unknown(P.REASON_DRAINING), "op": "mcp"})
@@ -485,8 +521,8 @@ class Daemon:
 
     async def _op_hook(self, frame: dict, relation: str) -> dict:
         if relation != "same":
-            self.stats["version_mismatch"] += 1
-            return self._unknown(P.REASON_VERSION_MISMATCH)
+            self.stats["code_mismatch" if relation == P.RELATION_CODE else "version_mismatch"] += 1
+            return self._refusal(relation)
         if self.draining:
             self.stats["draining"] += 1
             return self._unknown(P.REASON_DRAINING)
@@ -653,7 +689,7 @@ def query(runtime: rundir.RuntimeDir, frame: dict, timeout: float = 3.0) -> dict
     sock.settimeout(timeout)
     try:
         sock.connect(runtime.address())
-        P.write_frame(sock, P.hello_request("cli", __version__))
+        P.write_frame(sock, P.hello_request("cli", __version__, code_identity=client.own_identity()))
         P.read_frame(sock)
         P.write_frame(sock, frame)
         return P.read_frame(sock)

@@ -164,9 +164,11 @@ def _via_daemon():
                                                  python=python if os.path.isfile(python) else None,
                                                  local_fallback=True, deadline=deadline)
             if response is None:
-                # A call that a high-risk contract gates and whose attempt at the daemon failed for a transient cause is
-                # judged by the standalone path below, with what is left of the bound and the payload readable again.
-                os.environ[client.ENV_LOCAL_BUDGET] = repr(max(0.0, client.time_left(deadline)))
+                # A call that a high-risk contract gates and whose attempt at the daemon failed for a transient cause, or
+                # any call when the daemon runs other code (code_mismatch), is judged by the standalone path below, with
+                # what is left of the bound (only a PreToolUse has one) and the payload readable again.
+                left = client.time_left(deadline)
+                os.environ[client.ENV_LOCAL_BUDGET] = repr(0.0 if left is None else max(0.0, left))
                 _replay_stdin(text)
                 return False
         json.dump(response if served else _mask(response), sys.stdout)

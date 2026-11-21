@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from self_directing_mcp import __version__
-from self_directing_mcp.daemon import client, core, protocol as P, rundir, served
+from self_directing_mcp.daemon import client, core, identity, protocol as P, rundir, served
 import daemon_support as support
 from daemon_support import AGY_SID, CONTRACTS, HIGH_RISK, SID, UNMET_AUTO_CONTINUE, World
 
@@ -286,6 +286,7 @@ def test_the_client_against_a_live_daemon_imports_only_the_standard_library(worl
     assert third_party(report) == [], third_party(report)
     ours = sorted(name for name in loaded if name.startswith("self_directing_mcp"))
     allowed = {"self_directing_mcp", "self_directing_mcp.daemon", "self_directing_mcp.daemon.client",
+               "self_directing_mcp.daemon.identity",          # the digest of the package's own files (stdlib only)
                "self_directing_mcp.daemon.protocol", "self_directing_mcp.daemon.rundir"}
     if host == "claude":
         allowed.add("self_directing_mcp.hook_timeouts")        # the bound on a pre-tool hook: a table of numbers, nothing more
@@ -551,7 +552,7 @@ class FakeDaemon:
             try:
                 P.read_frame(conn)
                 P.write_frame(conn, {"op": "hello", "ok": True, "proto": P.PROTO, "package_version": __version__,
-                                     "relation": "same", "draining": False})
+                                     "code_identity": identity.code_identity(), "relation": "same", "draining": False})
                 P.read_frame(conn)
                 self.behaviour(conn)
             except Exception:

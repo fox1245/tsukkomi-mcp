@@ -46,9 +46,9 @@ def hook_frame(session="s1", host="claude", event="PreToolUse", payload=None):
     return {"op": P.OP_HOOK, "host": host, "event": event, "payload": payload, "env": {}, "argv": []}
 
 
-def request(daemon, frame, *, version=None, proto=None):
+def request(daemon, frame, *, version=None, proto=None, code_identity=...):
     """One connection, hello, one frame; returns ``(hello_reply, answer)``."""
-    sock, hello = daemon.connect(version=version, proto=proto)
+    sock, hello = daemon.connect(version=version, proto=proto, code_identity=code_identity)
     try:
         P.write_frame(sock, frame)
         return hello, P.read_frame(sock)

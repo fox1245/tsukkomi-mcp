@@ -68,18 +68,22 @@ def run_stages(name: str, stages: Sequence[tuple[str, Callable]]) -> dict:
     """
     control = current_request()
     check_request()
-    callback_error = None
+    # The exception of a failing stage, kept here for the caller. The native engine holds the stage objects and so these
+    # closures, and Python's cyclic collector cannot see into native memory: an exception left in a variable the closure
+    # reaches would close a cycle (exception, traceback, this frame, engine, stage, closure, exception) that no collection
+    # breaks, and everything the frames of the failed call reach (an audit's whole event list) would stay for good.
+    # It is emptied before this function leaves, however it leaves.
+    failures: list[BaseException] = []
 
     def bind(callback):
         def invoke():
-            nonlocal callback_error
             with request_scope(control):
                 try:
                     check_request()
                     callback()
                 except Exception as exc:
                     # Native bindings may wrap a Python callback exception.
-                    callback_error = exc
+                    failures.append(exc)
                     raise
         return invoke
     names = [stage for stage, _ in stages]
@@ -110,15 +114,18 @@ def run_stages(name: str, stages: Sequence[tuple[str, Callable]]) -> dict:
     started = time.monotonic()
     check_request()
     try:
-        result = engine.run(ng.RunConfig(thread_id=invocation, input={},
-                                       resume_if_exists=False, max_steps=len(names) + 2))
-    except Exception as exc:
-        if callback_error is not None:
-            raise callback_error from exc
-        check_request()
-        raise
-    if callback_error is not None:
-        raise callback_error
+        try:
+            result = engine.run(ng.RunConfig(thread_id=invocation, input={},
+                                           resume_if_exists=False, max_steps=len(names) + 2))
+        except Exception as exc:
+            if failures:
+                raise failures[-1] from exc
+            check_request()
+            raise
+        if failures:
+            raise failures[-1]
+    finally:
+        failures.clear()
     # Do not perform a global stopped-success check here: workflow callbacks
     # must retain actual owned execution outcomes and completed cleanup receipts.
     completed = result.output.get("channels", {}).get("completed", {}).get("value", [])

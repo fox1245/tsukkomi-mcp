@@ -93,14 +93,20 @@ def _handshake(sock, request):
     """The socket when the session is established, ``None`` when the daemon is going away or being replaced."""
     try:
         sock.settimeout(client.HELLO_TIMEOUT_SEC)
-        P.write_frame(sock, P.hello_request("relay", __version__))
+        own = client.own_identity()
+        P.write_frame(sock, P.hello_request("relay", __version__, code_identity=own))
         hello = P.read_frame(sock)
-        relation = hello.get("relation")
+        relation = P.relation_with_code(hello.get("relation"), own, P.identity_of(hello))
         if relation == "newer":                               # a newer relay asks the older daemon to leave
             P.write_frame(sock, {"op": P.OP_DRAIN})
             P.read_frame(sock)
             sock.close()
             return None
+        if relation == P.RELATION_CODE:
+            sock.close()
+            raise RelayError("the running daemon runs other code under the same version (code_mismatch); a session is not "
+                             "served by it, and a standalone server is not started instead. Stop it with "
+                             "`python -m self_directing_mcp.daemon --stop` and restart this server")
         if relation != "same":
             sock.close()
             raise RelayError("the running daemon is newer than this client (version_mismatch); "
